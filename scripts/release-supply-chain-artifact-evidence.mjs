@@ -51,6 +51,17 @@ function validateSourceCommitBinding(evidence) {
   return { valid: true, sourceCommit };
 }
 
+function validateSourceCheckoutClean(evidence) {
+  const checkoutState = evidence?.sourceCheckoutState;
+  if (!checkoutState || typeof checkoutState !== 'string') {
+    return { valid: false, reason: 'source_checkout_state_missing' };
+  }
+  if (checkoutState !== 'clean') {
+    return { valid: false, reason: 'source_checkout_not_clean', checkoutState };
+  }
+  return { valid: true, checkoutState };
+}
+
 function validateSmokeEvidence(smokeEvidence) {
   if (!smokeEvidence || !Array.isArray(smokeEvidence.steps)) {
     return { valid: false, reason: 'smoke_evidence_missing_or_invalid' };
@@ -614,6 +625,7 @@ export function buildSupplyChainArtifactEvidence(options = {}) {
   const provenancePath = normalizeRelativePath(path.join(outDir, 'brownie-runtime-provenance.json'));
   const sourceCommit = gitValue(repoRoot, ['rev-parse', 'HEAD']);
   const treeStatus = sourceTreeStatus(repoRoot);
+  const sourceCheckoutState = treeStatus.length === 0 ? 'clean' : 'dirty';
   const sbom = buildSbom(repoRoot, generatedAt);
   const sbomPath = normalizeRelativePath(path.join(outDir, 'brownie-runtime-sbom.json'));
   writeJson(repoRoot, sbomPath, sbom);
@@ -744,7 +756,14 @@ export function buildSupplyChainArtifactEvidence(options = {}) {
     }
   };
 
-  const failClosedReasons = treeStatus.length > 0 ? ['source_tree_dirty:true'] : [];
+  const sourceCheckoutValidation = validateSourceCheckoutClean({ sourceCheckoutState });
+  const failClosedReasons = [];
+  if (treeStatus.length > 0) {
+    failClosedReasons.push('source_tree_dirty:true');
+  }
+  if (!sourceCheckoutValidation.valid) {
+    failClosedReasons.push(`source_checkout_state:${sourceCheckoutState}`);
+  }
   for (const sectionId of requiredSections) {
     const section = sections[sectionId];
     if (!section || section.status !== 'satisfied') {
@@ -760,6 +779,12 @@ export function buildSupplyChainArtifactEvidence(options = {}) {
     generated_at: generatedAt,
     source_commit: sourceCommit,
     source_tree_dirty: treeStatus.length > 0,
+    sourceCheckoutState,
+    source_checkout: {
+      state: sourceCheckoutState,
+      validation: sourceCheckoutValidation,
+      dirty_path_count: treeStatus.length
+    },
     release_ready: false,
     runtime_release_ready: false,
     required_sections: requiredSections,

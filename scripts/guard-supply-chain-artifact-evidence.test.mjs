@@ -35,6 +35,24 @@ test('runSupplyChainArtifactEvidenceGuard handles null/undefined input', async (
   assert.ok(undefinedResult !== undefined, 'guard should handle undefined input');
 });
 
+test('runSupplyChainArtifactEvidenceGuard validates clean source checkout identity', async (t) => {
+  const evidenceWithDirtyCheckout = {
+    lockfile_fixed: true,
+    dependency_security_license_scan: { status: 'pass' },
+    secret_scan: { status: 'pass' },
+    sbom: { format: 'spdx', items: [] },
+    artifacts: [{ name: 'test', hash: 'abc123' }],
+    artifact_smoke: { status: 'pass' },
+    checksums: { verified: true },
+    signature_or_integrity_proof: { valid: true },
+    provenance: { valid: true },
+    source_checkout_clean: false
+  };
+  const result = await runSupplyChainArtifactEvidenceGuard(evidenceWithDirtyCheckout);
+  assert.ok(result !== undefined, 'guard should return result for dirty checkout');
+  assert.ok(Array.isArray(result.errors), 'guard should return errors for dirty checkout');
+});
+
 test('runSupplyChainArtifactEvidenceGuard handles valid artifact evidence', async (t) => {
   const validEvidence = {
     lockfile_fixed: true,
@@ -136,6 +154,7 @@ function validEvidence(repoRoot = tempRepo()) {
     repository: 'globalpocket/brownie',
     release_ready: false,
     runtime_release_ready: false,
+    sourceCheckoutState: 'clean',
     required_sections: requiredSections,
     fail_closed_reasons: [
       'dependency_security_license_scan:partial_tooling_missing',
@@ -205,6 +224,23 @@ test('rejects missing evidence section', () => {
 test('rejects release-ready claim from supply-chain evidence', () => {
   const errors = validate({ evidence: { ...validEvidence(), release_ready: true } });
   assert(errors.some((error) => error.includes('release_ready true')));
+});
+
+test('rejects missing source checkout state', () => {
+  const evidence = validEvidence();
+  delete evidence.sourceCheckoutState;
+  const errors = validate({ evidence });
+  assert(errors.some((error) => error.includes('sourceCheckoutState')));
+});
+
+test('accepts dirty source checkout only when fail-closed reason records it', () => {
+  const evidence = validEvidence();
+  evidence.sourceCheckoutState = 'dirty';
+  let errors = validate({ evidence });
+  assert(errors.some((error) => error.includes('source checkout state')));
+  evidence.fail_closed_reasons.push('source_checkout_state:dirty');
+  errors = validate({ evidence });
+  assert.deepEqual(errors, []);
 });
 
 test('rejects incomplete status without fail-closed reason', () => {
