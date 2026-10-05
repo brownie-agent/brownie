@@ -601,6 +601,74 @@ Quality rubric:
   assert.equal(result.repair.post_repair_validation.ok, true, JSON.stringify(result, null, 2));
 });
 
+test('preserves implementable child TODOs whose completed source is a stalled replan', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const replanTodo = `- [x] E-22e-replan-stalled-leaf-16e2c69e67bb: Patch only \`.brownie/todo.md\` and \`.brownie/todo-breakdown.md\` to replan stalled Brownie TODO leaf into implementable child TODOs:
+  Route: todo-decomposition.
+  Source TODO: E-22e-release-contract-trace-binding-guard.
+  Depends on: <none>.
+  Completion condition: stalled source is superseded by implementable leaves.
+  Forbidden changes: do not implement the release-evidence fix here.
+  Verification: run \`pnpm --workspace-root guard:todo-decomposition\`.`;
+  const childOne = `- [ ] E-22e-guard-release-contract-impl-1: Patch only \`scripts/guard-release-contract.mjs\`:
+  Route: implementation.
+  Source TODO: E-22e-replan-stalled-leaf-16e2c69e67bb.
+  Depends on: <none>.
+  Completion condition: guard validates release evidence binding.
+  Forbidden changes: do not weaken guards/tests.
+  Verification: run \`pnpm --workspace-root guard:release-contract:test\`.`;
+  const childTwo = `- [ ] E-22e-guard-release-contract-impl-2: Patch only \`scripts/guard-release-contract.test.mjs\`:
+  Route: implementation.
+  Source TODO: E-22e-replan-stalled-leaf-16e2c69e67bb.
+  Depends on: E-22e-guard-release-contract-impl-1.
+  Completion condition: tests cover release evidence binding rejection.
+  Forbidden changes: do not weaken guards/tests.
+  Verification: run \`pnpm --workspace-root guard:release-contract:test\`.`;
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `${replanTodo}\n\n${childOne}\n\n${childTwo}\n`);
+  fs.writeFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `# breakdown
+
+## TODO-repair-E-22e-replan-stalled-leaf-16e2c69e67bb
+
+Parent TODO: E-22e-release-contract-trace-binding-guard
+
+Dependency graph:
+- E-22e-replan-stalled-leaf-16e2c69e67bb: <none>
+- E-22e-guard-release-contract-impl-1: <none>
+- E-22e-guard-release-contract-impl-2: E-22e-guard-release-contract-impl-1
+
+Verification ledger:
+- E-22e-replan-stalled-leaf-16e2c69e67bb: run \`pnpm --workspace-root guard:todo-decomposition\`
+- E-22e-guard-release-contract-impl-1: run \`pnpm --workspace-root guard:release-contract:test\`
+- E-22e-guard-release-contract-impl-2: run \`pnpm --workspace-root guard:release-contract:test\`
+
+Quality rubric:
+- E-22e-replan-stalled-leaf-16e2c69e67bb: replan broad leaf into bounded children.
+- E-22e-guard-release-contract-impl-1: bounded implementation child.
+- E-22e-guard-release-contract-impl-2: bounded test child.
+`);
+  execFileSync('git', ['add', '.brownie/todo.md', '.brownie/todo-breakdown.md'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'completed replan children fixture'], { cwd: repo, stdio: 'ignore' });
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'blocked',
+    run_id: 'claim-failed',
+    consecutive_failures: 5,
+    detail: 'Failed to claim first pending TODO from queue: .brownie/todo.md'
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+
+  assert.match(todo, /E-22e-guard-release-contract-impl-1/u);
+  assert.match(todo, /E-22e-guard-release-contract-impl-2/u);
+  assert.equal(
+    result.repair.non_live_todo_residue.reason,
+    'no_non_live_todo_residue_detected',
+    JSON.stringify(result, null, 2)
+  );
+});
+
 test('does not restart phase-loop when only owner blockers remain but dirty delivery is required', () => {
   const repo = makeRepo();
   fs.mkdirSync(path.join(repo, '.brownie'), { recursive: true });
