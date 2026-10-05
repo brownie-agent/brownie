@@ -472,6 +472,57 @@ Quality rubric:
   assert.match(todo, /E-20i-runtime-release-ops-blocker/u);
 });
 
+test('preserves stalled replan TODO when source TODO is blocked', () => {
+  const repo = makeRepo();
+  const sourceTodo = `- [ ] E-22e-release-contract-trace-binding-guard: Patch only \`scripts/guard-release-contract.mjs\` and \`scripts/guard-release-contract.test.mjs\`:
+  Route: implementation.
+  Source TODO: E-22e.
+  Depends on: <none>.
+  Completion condition: source is blocked after repeated invalid patch.
+  Forbidden changes: do not weaken guards/tests.
+  Verification: run \`pnpm --workspace-root guard:release-contract:test\`.`;
+  const replanTodo = `- [ ] E-22e-replan-stalled-leaf-16e2c69e67bb: Patch only \`.brownie/todo.md\` and \`.brownie/todo-breakdown.md\` to replan stalled Brownie TODO leaf into implementable child TODOs:
+  Route: todo-decomposition.
+  Source TODO: E-22e-release-contract-trace-binding-guard.
+  Depends on: <none>.
+  Completion condition: stalled source is superseded by implementable leaves.
+  Failure evidence: invalid_patch_followed_by_no_progress; same_progress_count=1.
+  Forbidden changes: do not implement the release-evidence fix here.
+  Verification: run \`pnpm --workspace-root guard:todo-decomposition\`.`;
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `${sourceTodo}\n\n${replanTodo}\n`);
+  fs.writeFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `# breakdown
+
+## TODO-repair-E-22e-replan-stalled-leaf-16e2c69e67bb
+
+Parent TODO: E-22e-release-contract-trace-binding-guard
+`);
+  execFileSync('git', ['add', '.brownie/todo.md', '.brownie/todo-breakdown.md'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'blocked source replan fixture'], { cwd: repo, stdio: 'ignore' });
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress',
+    run_id: 'blocked-source-replan',
+    consecutive_failures: 0,
+    detail: 'Brownie run exited successfully but repeated the same non-progress fingerprint.'
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl', {
+    selected_todo_id: 'E-22e-release-contract-trace-binding-guard',
+    reason: 'invalid_patch_followed_by_no_progress'
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+  const breakdown = fs.readFileSync(path.join(repo, '.brownie/todo-breakdown.md'), 'utf8');
+
+  assert.notEqual(
+    result.repair.non_live_todo_residue.reason,
+    'stalled_replan_source_blocked',
+    JSON.stringify(result, null, 2)
+  );
+  assert.match(todo, /E-22e-replan-stalled-leaf-16e2c69e67bb/u);
+  assert.match(breakdown, /TODO-repair-E-22e-replan-stalled-leaf-16e2c69e67bb/u);
+});
+
 test('removes live child TODOs whose source parent is already checked complete', () => {
   const repo = makeRepo();
   writeTodo(repo);

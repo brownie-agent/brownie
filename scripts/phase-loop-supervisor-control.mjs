@@ -964,16 +964,14 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
     const sourceIsLive = sourceId ? uncheckedIds.has(sourceId) : false;
     const sourceIsCompleted = sourceId ? completedIds.has(sourceId) : false;
     const sourceIsBlocked = sourceId ? blockedIds.has(sourceId) : false;
-    if (!sourceId || !sourceIsLive || sourceIsCompleted || sourceIsBlocked) {
+    if (!sourceId || (!sourceIsLive && !sourceIsBlocked) || sourceIsCompleted) {
       idsToRemove.add(id);
       reasons.push({
         todo_id: id,
         source_todo_id: sourceId,
         reason: sourceIsCompleted
           ? 'stalled_replan_source_completed'
-          : sourceIsBlocked
-            ? 'stalled_replan_source_blocked'
-            : 'stalled_replan_source_not_live'
+          : 'stalled_replan_source_not_live'
       });
     }
   }
