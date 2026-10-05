@@ -6,7 +6,7 @@
   Forbidden changes: do not invent artifact hashes, do not accept dirty source as release-ready, do not weaken existing supply-chain evidence failures, and do not declare Product Ready.
   Verification: run `pnpm --workspace-root guard:supply-chain-artifact-evidence:test` and `pnpm --workspace-root guard:supply-chain-artifact-evidence`.
 
-- [ ] E-22c-runtime-artifact-e2e-evidence: Patch only `scripts/release-runtime-operational-evidence.mjs` and `scripts/guard-runtime-operational-evidence.test.mjs`:
+- [x] E-22c-runtime-artifact-e2e-evidence: Patch only `scripts/release-runtime-operational-evidence.mjs` and `scripts/guard-runtime-operational-evidence.test.mjs`:
   Route: implementation.
   Source TODO: 2026-10-04 review: generated artifacts are not yet installed and exercised for Mode Pack load, minimal task, ledger generation, resume, and replay rejection.
   Depends on: E-22b-release-artifact-provenance-binding.
@@ -14,7 +14,7 @@
   Forbidden changes: do not replace E2E evidence with version/help smoke only, do not mark unavailable platforms as satisfied, and do not declare Runtime Product Ready.
   Verification: run `pnpm --workspace-root release:runtime-operational-evidence:test` and `pnpm --workspace-root guard:runtime-operational-evidence`.
 
-- [ ] E-22d-runtime-stateful-soak-evidence: Patch only `scripts/release-runtime-operational-evidence.mjs` and `scripts/guard-runtime-operational-evidence.test.mjs`:
+- [x] E-22d-runtime-stateful-soak-evidence: Patch only `scripts/release-runtime-operational-evidence.mjs` and `scripts/guard-runtime-operational-evidence.test.mjs`:
   Route: implementation.
   Source TODO: 2026-10-04 review: stateful soak does not yet cover process loss, duplicate side effects, ledger/workspace consistency, or finite convergence.
   Depends on: E-22c-runtime-artifact-e2e-evidence.

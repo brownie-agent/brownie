@@ -628,6 +628,9 @@ function validateDependencies(text, blocks, errors, options = {}) {
   const owner = options.path ?? defaultTodoPath;
   const uncheckedIds = uncheckedTodoIdSet(text);
   const checkedIds = checkedTodoIds(text);
+  const completedIds = options.completedTodoIds instanceof Set
+    ? options.completedTodoIds
+    : new Set(Array.isArray(options.completedTodoIds) ? options.completedTodoIds : []);
   const graph = dependencyGraph(blocks);
   if (hasDependencyCycle(graph)) {
     errors.push(`${owner}: TODO dependencies must not contain cycles.`);
@@ -637,6 +640,9 @@ function validateDependencies(text, blocks, errors, options = {}) {
     for (const dep of parseDependsOn(block)) {
       if (dep === id) {
         errors.push(`${owner} ${id}: TODO must not depend on itself.`);
+      }
+      if (completedIds.has(dep)) {
+        continue;
       }
       if (!uncheckedIds.has(dep) && !checkedIds.has(dep) && options.breakdownText && options.breakdownText.includes(dep)) {
         errors.push(`${owner} ${id}: dependency ${dep} is present only in the breakdown ledger, not the live TODO queue; leaf TODOs must not depend on abstract/decomposed parent IDs because Runtime cannot schedule them.`);

@@ -1627,30 +1627,6 @@ if index > 0 and not text[:index].endswith("\n\n") and replacement[index:index +
     replacement = text[:index] + "\n" + text[end:]
 replacement = re.sub(r"\n{3,}", "\n\n", replacement).rstrip() + "\n"
 pruned_dependency_lines = []
-if selected_id:
-    def prune_completed_dependency(match):
-        prefix = match.group("prefix")
-        value = match.group("value").strip()
-        trailing = match.group("trailing") or ""
-        if not value or value == "<none>":
-            return match.group(0)
-        dependencies = [
-            dependency.strip()
-            for dependency in re.split(r"\s*,\s*", value)
-            if dependency.strip()
-        ]
-        if selected_id not in dependencies:
-            return match.group(0)
-        remaining = [dependency for dependency in dependencies if dependency != selected_id]
-        new_value = ", ".join(remaining) if remaining else "<none>"
-        pruned_dependency_lines.append({"from": value, "to": new_value})
-        return f"{prefix}{new_value}{trailing}"
-
-    replacement = re.sub(
-        r"(?m)^(?P<prefix>\s*Depends on:\s*)(?P<value>[^\n.]*?)(?P<trailing>\.?)$",
-        prune_completed_dependency,
-        replacement,
-    )
 tmp_path = todo_path.with_name(f"{todo_path.name}.{os.getpid()}.completed-{run_stamp}.tmp")
 with open(tmp_path, "w", encoding="utf-8") as handle:
     handle.write(replacement)
@@ -1731,6 +1707,25 @@ PY
       else
         printf '%s run=%s completed_release_ops_blocker_not_applied=true result=%s\n' "$(now_utc)" "$run_stamp" "${release_ops_blocker_output:-<no output>}" >> "$SUPERVISOR_LOG"
       fi
+      local integrated_supervisor_output integrated_supervisor_status integrated_supervisor_guard_output
+      set +e
+      integrated_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "completed_todo_removal_guard_failed" 2>&1)"
+      integrated_supervisor_status=$?
+      set -e
+      printf '%s run=%s completed_todo_removal_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_status" "${integrated_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
+      if integrated_supervisor_guard_output="$(
+        cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+        node scripts/guard-todo-decomposition.mjs "$todo_guard_path" 2>&1
+      )"; then
+        printf '%s run=%s completed_todo_removal_guard_repaired_by_integrated_supervisor=true guard=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_guard_output" >> "$SUPERVISOR_LOG"
+        python3 - "$todo_backup" <<'PY'
+import pathlib
+import sys
+pathlib.Path(sys.argv[1]).unlink(missing_ok=True)
+PY
+        return 0
+      fi
+      printf '%s run=%s completed_todo_removal_integrated_supervisor_guard_failed=true guard=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_guard_output" >> "$SUPERVISOR_LOG"
       cp "$todo_backup" "$PHASE_LOOP_TODO"
       write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
       PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED=1
@@ -6060,8 +6055,10 @@ validate_todo_queue_integrity_before_claim() {
       validation_output="$revalidation_output"
     fi
     local integrated_supervisor_output integrated_supervisor_status
+    set +e
     integrated_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "todo_queue_integrity_failed_before_claim" 2>&1)"
     integrated_supervisor_status=$?
+    set -e
     printf '%s todo_queue_integrity_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$integrated_supervisor_status" "${integrated_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
     if revalidation_output="$(
       cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
@@ -6259,6 +6256,71 @@ def backticked_values(text):
 def completion_blocks(text):
     return {todo_id(block): block for block in unchecked_todo_blocks(text) if todo_id(block)}
 
+def split_dependency_ids(value):
+    value = (value or "").strip()
+    if not value or value == "<none>":
+        return []
+    return [
+        part.strip()
+        for part in re.split(r",|\band\b", value)
+        if part.strip() and part.strip() != "<none>"
+    ]
+
+def replace_depends_on_line(block, dependencies):
+    replacement = ", ".join(dependencies) if dependencies else "<none>"
+    lines = block.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("Depends on:"):
+            continue
+        prefix = line[: len(line) - len(line.lstrip())]
+        newline = "\n" if line.endswith("\n") else ""
+        lines[index] = f"{prefix}Depends on: {replacement}.{newline}"
+        return "".join(lines)
+    return block
+
+def normalize_removed_parent_dependencies(before_text, after_text, selected_block, selected_id):
+    before_blocks = completion_blocks(before_text)
+    after_blocks = completion_blocks(after_text)
+    if selected_id in after_blocks:
+        return after_text, []
+    added_ids = [ident for ident in after_blocks if ident not in before_blocks]
+    parent_dependencies = split_dependency_ids(line_value(selected_block, "Depends on:"))
+    repaired = []
+    rebuilt = after_text
+    for ident in added_ids:
+        block = after_blocks.get(ident, "")
+        dependencies = split_dependency_ids(line_value(block, "Depends on:"))
+        if selected_id not in dependencies:
+            continue
+        replacement_dependencies = []
+        for dep in dependencies:
+            if dep == selected_id:
+                replacement_dependencies.extend(parent_dependencies)
+            else:
+                replacement_dependencies.append(dep)
+        deduped = []
+        for dep in replacement_dependencies:
+            if dep and dep != ident and dep not in deduped:
+                deduped.append(dep)
+        rewritten = replace_depends_on_line(block, deduped)
+        if rewritten != block:
+            rebuilt = rebuilt.replace(block, rewritten, 1)
+            repaired.append({
+                "todo_id": ident,
+                "removed_parent_dependency": selected_id,
+                "replacement_dependencies": deduped,
+            })
+    return rebuilt, repaired
+
+selected_id = todo_id(selected)
+updated, stale_dependency_repairs = normalize_removed_parent_dependencies(
+    todo_text,
+    updated,
+    selected,
+    selected_id,
+)
+
 if selected_is_derived_leaf and not contract_replan_feedback_selected:
     guard = subprocess.run(
         ["pnpm", "--workspace-root", "guard:todo-decomposition"],
@@ -6359,7 +6421,6 @@ before_blocks_for_safety = completion_blocks(todo_text)
 after_blocks_for_safety = completion_blocks(updated)
 before_ids_for_safety = set(before_blocks_for_safety)
 after_ids_for_safety = set(after_blocks_for_safety)
-selected_id = todo_id(selected)
 removed_ids = sorted(before_ids_for_safety - after_ids_for_safety)
 added_ids = sorted(after_ids_for_safety - before_ids_for_safety)
 unexpected_removed_ids = [ident for ident in removed_ids if ident != selected_id]
@@ -6506,6 +6567,7 @@ if guard_result.returncode != 0:
             "stderr_tail": guard_result.stderr[-4000:],
         }],
         "supplemented_breakdown_ids": supplemented_breakdown_ids,
+        "stale_dependency_repairs": stale_dependency_repairs,
     }, sort_keys=True))
     sys.exit(1)
 tmp_path.replace(todo_path)
@@ -6520,6 +6582,7 @@ print(json.dumps({
     "source_run_id": run_id,
     "selected_todo_first_line": selected_first,
     "supplemented_breakdown_ids": supplemented_breakdown_ids,
+    "stale_dependency_repairs": stale_dependency_repairs,
 }, sort_keys=True))
 PY
 }
@@ -12547,8 +12610,10 @@ PY
       detail="Rejected Brownie TODO refinement proposal before applying it because TODO guard preflight failed; recorded repair feedback. apply=$todo_patch_proposal_apply_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
       write_status "no_progress" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"
       local todo_patch_rejection_supervisor_output todo_patch_rejection_supervisor_status
+      set +e
       todo_patch_rejection_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "todo_patch_proposal_preflight_failed" 2>&1)"
       todo_patch_rejection_supervisor_status=$?
+      set -e
       printf '%s run=%s todo_patch_rejection_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$todo_patch_rejection_supervisor_status" "${todo_patch_rejection_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
       printf '%s run=%s valid_todo_patch_proposal_fallback_preflight_failed=true apply=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$todo_patch_proposal_apply_output" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
       write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"todo_patch_proposal_preflight_failed"}'
@@ -12786,8 +12851,10 @@ PY
         detail="Brownie run exited successfully but repeated the same non-progress fingerprint; recovery=$recovery_hint stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         local no_progress_supervisor_output no_progress_supervisor_status
         write_status "no_progress" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"
+        set +e
         no_progress_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "no_progress" 2>&1)"
         no_progress_supervisor_status=$?
+        set -e
         printf '%s run=%s no_progress_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$no_progress_supervisor_status" "${no_progress_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
         printf '%s run=%s exit=%s recovery=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$exit_code" "$recovery_hint" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
         write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"no_progress"}'

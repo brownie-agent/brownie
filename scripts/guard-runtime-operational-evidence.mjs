@@ -8,7 +8,13 @@ const defaultRepoRoot = path.resolve(__dirname, '..');
 const defaultContractPath = 'docs/architecture/runtime-release-contract.json';
 const defaultEvidencePath = '.brownie/release-evidence/runtime-operational-evidence.json';
 
-const requiredSections = ['artifact_lifecycle', 'golden_journey_fixture', 'soak_test', 'executable_evidence_validation'];
+export const runtimeOperationalEvidenceRequiredSections = Object.freeze([
+  'artifact_lifecycle',
+  'golden_journey_fixture',
+  'soak_test',
+  'executable_evidence_validation'
+]);
+const requiredSections = runtimeOperationalEvidenceRequiredSections;
 const requiredStatefulSoakStepIds = [
   'task_state_transition',
   'ledger_workspace_consistency',
@@ -154,7 +160,13 @@ export function validateRuntimeOperationalEvidence(evidence) {
     requireValue(evidence.fail_closed === true, errors, 'runtime operational evidence fail_closed must be true.');
   }
 
-  const required = new Set(Array.isArray(evidence.required_sections) ? evidence.required_sections : []);
+  requireValue(Array.isArray(evidence.required_sections), errors, 'runtime operational evidence required_sections must be an array.');
+  const requiredSectionEntries = Array.isArray(evidence.required_sections) ? evidence.required_sections : [];
+  const required = new Set(requiredSectionEntries);
+  const knownRequired = new Set(requiredSections);
+  for (const sectionId of requiredSectionEntries) {
+    requireValue(knownRequired.has(sectionId), errors, `runtime operational evidence required_sections contains unknown section ${sectionId}.`);
+  }
   for (const sectionId of requiredSections) {
     requireValue(required.has(sectionId), errors, `runtime operational evidence required_sections must include ${sectionId}.`);
     const section = evidence.sections?.[sectionId];

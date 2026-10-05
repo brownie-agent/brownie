@@ -582,6 +582,46 @@ test('selects first schedulable TODO after dependency blockers', () => {
   assert.equal(nextSchedulableTodoId(text), 'E-15b-parent');
 });
 
+test('accepts dependency on checked live TODO after completed parent remains in public queue', () => {
+  const text = `- [x] E-22c-runtime-artifact-e2e-evidence: Patch only \`scripts/release-runtime-operational-evidence.mjs\` and \`scripts/guard-runtime-operational-evidence.test.mjs\`:
+  Route: implementation.
+  Source TODO: E-22c.
+  Depends on: <none>.
+  Completion condition: Runtime operational evidence represents artifact E2E checks as executable fail-closed evidence.
+  Forbidden changes: do not weaken Golden Journey evidence and do not declare Runtime Product Ready.
+  Verification: run \`pnpm --workspace-root release:runtime-operational-evidence:test\` and \`pnpm --workspace-root guard:runtime-operational-evidence\`.
+- [ ] E-22d-runtime-stateful-soak-evidence: Patch only \`scripts/release-runtime-operational-evidence.mjs\` and \`scripts/guard-runtime-operational-evidence.test.mjs\`:
+  Route: implementation.
+  Source TODO: E-22d.
+  Depends on: E-22c-runtime-artifact-e2e-evidence.
+  Completion condition: Runtime operational evidence fails closed unless stateful soak evidence covers process loss recovery and finite convergence.
+  Forbidden changes: do not weaken Golden Journey evidence and do not declare Runtime Product Ready.
+  Verification: run \`pnpm --workspace-root release:runtime-operational-evidence:test\` and \`pnpm --workspace-root guard:runtime-operational-evidence\`.`;
+
+  assert.deepEqual(validateTodoDecompositionText(text, {
+    repoRoot: process.cwd(),
+    packageScripts: new Set(['release:runtime-operational-evidence:test', 'guard:runtime-operational-evidence'])
+  }), []);
+});
+
+test('rejects dependency that is satisfied only by private completion state', () => {
+  const text = `- [ ] E-22d-runtime-stateful-soak-evidence: Patch only \`scripts/release-runtime-operational-evidence.mjs\` and \`scripts/guard-runtime-operational-evidence.test.mjs\`:
+  Route: implementation.
+  Source TODO: E-22d.
+  Depends on: E-22c-runtime-artifact-e2e-evidence.
+  Completion condition: Runtime operational evidence fails closed unless stateful soak evidence covers process loss recovery and finite convergence.
+  Forbidden changes: do not weaken Golden Journey evidence and do not declare Runtime Product Ready.
+  Verification: run \`pnpm --workspace-root release:runtime-operational-evidence:test\` and \`pnpm --workspace-root guard:runtime-operational-evidence\`.`;
+
+  const errors = validateTodoDecompositionText(text, {
+    repoRoot: process.cwd(),
+    packageScripts: new Set(['release:runtime-operational-evidence:test', 'guard:runtime-operational-evidence']),
+    breakdownText: '- E-22c-runtime-artifact-e2e-evidence: E-22b-release-artifact-provenance-binding\n'
+  });
+
+  assert(errors.some((error) => error.includes('dependency E-22c-runtime-artifact-e2e-evidence is present only in the breakdown ledger')), errors.join('\n'));
+});
+
 test('accepts explicit blocker route and skips it for schedulable implementation work', () => {
   const text = `- [ ] E-20i-runtime-release-ops-blocker: Blocker: Owner-controlled Runtime Release Ops authority is required for clean CI build, artifact upload/provenance, and GitHub Release publication.
   Route: blocker.
