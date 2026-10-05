@@ -1056,6 +1056,104 @@ function maybeArchiveStaleActiveClaim(repoRoot, diagnostic) {
   }
 }
 
+function maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, diagnostic, ledgerSummary) {
+  if (ledgerSummary?.should_replan) {
+    return { attempted: false, reason: 'todo_contract_replan_takes_precedence' };
+  }
+  const projection = diagnostic.progress?.progress_projection ?? {};
+  const projectionStatus = projection.cli_status ?? diagnostic.progress?.projection_status ?? null;
+  const projectionClosure = projection.closure ?? diagnostic.progress?.projection_closure ?? null;
+  const noEligible = (
+    projectionStatus === 'no_eligible_task' ||
+    projectionClosure === 'no_eligible_task' ||
+    projectionStatus === 'no_actionable_work' ||
+    projectionClosure === 'no_actionable_work'
+  );
+  const terminalTaskFailed = (
+    projection.stop_reason === 'terminal_task_failed' ||
+    projection.blocked_by_terminal_task_failure === true ||
+    diagnostic.progress?.classification === 'no_progress'
+  );
+  const workspaceChanged = diagnostic.progress?.workspace_changed === true;
+  const dirtyFiles = Array.isArray(diagnostic.git?.dirty_files)
+    ? diagnostic.git.dirty_files.filter((line) => !/^\?\?\s+\.brownie\/private\//u.test(String(line)))
+    : [];
+  const dirty = dirtyFiles.length > 0;
+  if (!noEligible || !terminalTaskFailed) {
+    return { attempted: false, reason: 'terminal_no_eligible_not_reported' };
+  }
+  if (workspaceChanged || dirty) {
+    return {
+      attempted: false,
+      reason: 'workspace_changed_or_dirty_not_archiving_claim',
+      workspace_changed: workspaceChanged,
+      dirty_files: dirtyFiles
+    };
+  }
+
+  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
+  const claim = readJsonOrNull(claimPath);
+  if (!claim) {
+    return { attempted: true, ok: false, reason: 'claim_missing_or_invalid' };
+  }
+  const claimStatus = String(claim.status ?? '');
+  if (!['claimed', 'in_progress'].includes(claimStatus)) {
+    return { attempted: false, reason: 'claim_not_active', claim_status: claimStatus };
+  }
+  const selectedTodo = claim.selected_todo ?? selectedTodoBlock(diagnostic);
+  const selectedFirstLine = todoFirstLine(selectedTodo);
+  const selectedId = todoIdFromFirstLine(selectedFirstLine);
+  const liveSelectedId = diagnostic.todo?.evaluator?.selected_todo_id ?? null;
+  if (!selectedId || (liveSelectedId && liveSelectedId !== selectedId)) {
+    return {
+      attempted: false,
+      reason: 'claim_selected_todo_not_current_live_selection',
+      claim_todo_id: selectedId,
+      live_selected_todo_id: liveSelectedId
+    };
+  }
+
+  const stamp = new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
+  const archivePath = path.join(
+    repoRoot,
+    '.brownie/private/phase-loop/todo-claims',
+    `terminal-no-eligible-current-${stamp}.json`
+  );
+  const archived = {
+    ...claim,
+    archived_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
+    archived_by: 'phase-loop-supervisor-control',
+    archive_reason: 'terminal_no_eligible_active_claim_reset',
+    evaluator_selected_todo_id: liveSelectedId,
+    progress_run_stamp: diagnostic.progress?.run_stamp ?? null,
+    status_run_id: diagnostic.phase_loop?.run_id ?? null,
+    same_progress_count: diagnostic.progress?.same_progress_count ?? null,
+    terminal_status: projectionStatus,
+    terminal_closure: projectionClosure,
+    terminal_stop_reason: projection.stop_reason ?? null
+  };
+  try {
+    fs.writeFileSync(archivePath, `${JSON.stringify(archived, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fs.rmSync(claimPath, { force: true });
+    fsyncFileAndParent(archivePath);
+    return {
+      attempted: true,
+      ok: true,
+      changed: true,
+      path: path.relative(repoRoot, archivePath),
+      removed_path: path.relative(repoRoot, claimPath),
+      archived_claim_id: claim.claim_id ?? null,
+      todo_id: selectedId
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      ok: false,
+      error: error?.message ?? String(error)
+    };
+  }
+}
+
 function parentPrefixFromTodoId(parentId) {
   if (typeof parentId !== 'string' || !/^E-\d+/u.test(parentId) || !parentId.includes('-')) {
     return null;
@@ -1503,18 +1601,24 @@ export function controlPhaseLoop(options = {}) {
   const afterClaimRepair = staleActiveClaimRepair.attempted && staleActiveClaimRepair.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterResidueRepair;
+  const terminalNoEligibleClaimRepair = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, afterClaimRepair, ledgerSummary);
+  const afterTerminalNoEligibleClaimRepair = terminalNoEligibleClaimRepair.attempted && terminalNoEligibleClaimRepair.ok
+    ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
+    : afterClaimRepair;
   const todoContractReplanRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : maybeWriteTodoContractReplanFeedback(repoRoot, afterClaimRepair, ledgerSummary);
+    : maybeWriteTodoContractReplanFeedback(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary);
   const stalledTodoBlocked = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
-      ? appendStalledTodoBlockedRecord(repoRoot, afterClaimRepair, ledgerSummary)
+      ? appendStalledTodoBlockedRecord(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary)
       : { attempted: false, reason: 'todo_contract_replan_not_active' };
   const stalledTodoDecomposition = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : todoContractReplanRepair.attempted && todoContractReplanRepair.ok && stalledTodoBlocked.ok === true
-      ? ensureStalledTodoDecompositionRequest(repoRoot, afterClaimRepair, ledgerSummary)
+      ? ensureStalledTodoDecompositionRequest(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary)
       : {
           attempted: false,
           reason: todoContractReplanRepair.attempted && todoContractReplanRepair.ok
@@ -1530,12 +1634,12 @@ export function controlPhaseLoop(options = {}) {
     ? { attempted: false, reason: 'repair_disabled' }
     : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
       ? { attempted: false, reason: 'todo_contract_replan_feedback_takes_precedence' }
-      : maybeWriteInvalidPatchRepairFeedback(repoRoot, afterClaimRepair);
+      : maybeWriteInvalidPatchRepairFeedback(repoRoot, afterTerminalNoEligibleClaimRepair);
   const boundedLeafApplyRejectionRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
       ? { attempted: false, reason: 'todo_contract_replan_feedback_takes_precedence' }
-      : maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, afterClaimRepair);
+      : maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, afterTerminalNoEligibleClaimRepair);
   const repairResults = {
     failure_ledger: failureLedger,
     todo_queue_integrity: queueIntegrityRepair,
@@ -1546,19 +1650,20 @@ export function controlPhaseLoop(options = {}) {
     stalled_todo_decomposition: stalledTodoDecomposition,
     non_live_todo_residue: nonLiveTodoResidueRepair,
     stale_active_claim: staleActiveClaimRepair,
+    terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
     semantic_verification: semanticVerificationRepair,
     invalid_patch: invalidPatchRepair,
     bounded_leaf_apply_rejection: boundedLeafApplyRejectionRepair
   };
   const postRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : postRepairValidation(repoRoot, repairResults, afterClaimRepair);
+    : postRepairValidation(repoRoot, repairResults, afterTerminalNoEligibleClaimRepair);
   const start = postRepair.attempted && !postRepair.ok
     ? { attempted: false, reason: 'post_repair_validation_failed', validation: postRepair }
-    : maybeStartPhaseLoop(repoRoot, Boolean(options.start), afterClaimRepair);
+    : maybeStartPhaseLoop(repoRoot, Boolean(options.start), afterTerminalNoEligibleClaimRepair);
   const final = start.attempted && start.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
-    : afterClaimRepair;
+    : afterTerminalNoEligibleClaimRepair;
   return {
     schema_version: 1,
     control_kind: 'brownie_phase_loop_supervisor_control',
@@ -1576,6 +1681,7 @@ export function controlPhaseLoop(options = {}) {
       stalled_todo_decomposition: stalledTodoDecomposition,
       non_live_todo_residue: nonLiveTodoResidueRepair,
       stale_active_claim: staleActiveClaimRepair,
+      terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
       semantic_verification: semanticVerificationRepair,
       invalid_patch: invalidPatchRepair,
       bounded_leaf_apply_rejection: boundedLeafApplyRejectionRepair,

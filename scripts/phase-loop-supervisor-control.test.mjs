@@ -65,6 +65,8 @@ function writeTodo(repo) {
   fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `${runtimeEvidenceTodo}\n`);
   fs.writeFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `# breakdown
 
+Parent TODO: E-21c-runtime-operational-evidence
+
 Dependency graph:
 - E-21c-runtime-operational-evidence-impl-2-target-02: <none>
 
@@ -667,6 +669,48 @@ Quality rubric:
     'no_non_live_todo_residue_detected',
     JSON.stringify(result, null, 2)
   );
+});
+
+test('archives terminal no_eligible active claim so the same live TODO can be claimed fresh', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress',
+    run_id: 'run-terminal-no-eligible',
+    consecutive_failures: 0,
+    detail: 'Brownie run exited successfully but repeated the same non-progress fingerprint'
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress',
+    same_progress_count: 1,
+    run_stamp: '20261005T180844Z',
+    workspace_changed: false,
+    progress_projection: {
+      cli_status: 'no_eligible_task',
+      closure: 'no_eligible_task',
+      stop_reason: 'terminal_task_failed',
+      claim_id: 'claim-terminal-no-eligible',
+      selected_todo: runtimeEvidenceTodo
+    }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-terminal-no-eligible',
+    status: 'in_progress',
+    selected_todo: runtimeEvidenceTodo
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const claimPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/current.json');
+  const archivedClaims = fs.readdirSync(path.join(repo, '.brownie/private/phase-loop/todo-claims'))
+    .filter((name) => name.startsWith('terminal-no-eligible-current-'));
+
+  assert.equal(result.repair.terminal_no_eligible_claim.attempted, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.terminal_no_eligible_claim.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.terminal_no_eligible_claim.archived_claim_id, 'claim-terminal-no-eligible');
+  assert.equal(fs.existsSync(claimPath), false);
+  assert.equal(archivedClaims.length, 1);
+  assert.equal(result.repair.todo_contract_replan.attempted, false, JSON.stringify(result, null, 2));
 });
 
 test('does not restart phase-loop when only owner blockers remain but dirty delivery is required', () => {
