@@ -1106,10 +1106,8 @@ function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPa
         normalization: 'removed_non_live_leaf_dependencies',
         removed: removedDependencies
       });
-      for (const removed of removedDependencies) {
-        const graphPattern = new RegExp(`(^-\\s+${selectedId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\s*)${removed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s*$)`, 'mu');
-        breakdownText = breakdownText.replace(graphPattern, `$1<none>$2`);
-      }
+      const graphPattern = new RegExp(`(^-\\s+${selectedId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\s*).*(\\s*$)`, 'mu');
+      breakdownText = breakdownText.replace(graphPattern, `$1${liveDependencies.join(', ') || '<none>'}$2`);
     }
   }
 
@@ -1129,6 +1127,7 @@ function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPa
     packageScripts: packageScripts(),
     breakdownPath,
     breakdownText,
+    completedTodoIds: completedIds,
     productReady: false,
     releaseBlockersRemaining: true
   });
@@ -1174,7 +1173,7 @@ function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, bre
     if (breakdownOnlyDependencies.length === 0) {
       continue;
     }
-    const liveDependencies = dependencies.filter((dependency) => ids.has(dependency));
+    const liveDependencies = dependencies.filter((dependency) => ids.has(dependency) || completedIds.has(dependency));
     const replaced = replaceDependsOn(block, liveDependencies);
     if (!replaced.changed) {
       continue;
@@ -1190,10 +1189,8 @@ function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, bre
       };
     }
     updatedTodo = replacedTodo;
-    for (const removed of breakdownOnlyDependencies) {
-      const graphPattern = new RegExp(`(^-\\s+${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\s*)${removed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s*$)`, 'mu');
-      updatedBreakdown = updatedBreakdown.replace(graphPattern, `$1${liveDependencies.join(', ') || '<none>'}$2`);
-    }
+    const graphPattern = new RegExp(`(^-\\s+${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\s*).*(\\s*$)`, 'mu');
+    updatedBreakdown = updatedBreakdown.replace(graphPattern, `$1${liveDependencies.join(', ') || '<none>'}$2`);
     notes.push({
       todo_id: id,
       normalization: 'removed_breakdown_only_dependency',

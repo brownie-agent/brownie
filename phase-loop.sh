@@ -6285,17 +6285,7 @@ def normalize_removed_parent_dependencies(before_text, after_text, selected_bloc
     if selected_id in after_blocks:
         return after_text, []
     added_ids = [ident for ident in after_blocks if ident not in before_blocks]
-    concrete_replacements = [
-        ident
-        for ident in added_ids
-        if ident != selected_id
-        and (
-            ident.startswith(f"{selected_id}-")
-            or line_value(after_blocks[ident], "Source TODO:") == selected_id
-        )
-    ]
-    if not concrete_replacements:
-        concrete_replacements = split_dependency_ids(line_value(selected_block, "Depends on:"))
+    parent_dependencies = split_dependency_ids(line_value(selected_block, "Depends on:"))
     repaired = []
     rebuilt = after_text
     for ident in added_ids:
@@ -6306,7 +6296,7 @@ def normalize_removed_parent_dependencies(before_text, after_text, selected_bloc
         replacement_dependencies = []
         for dep in dependencies:
             if dep == selected_id:
-                replacement_dependencies.extend(concrete_replacements)
+                replacement_dependencies.extend(parent_dependencies)
             else:
                 replacement_dependencies.append(dep)
         deduped = []
