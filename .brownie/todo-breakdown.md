@@ -1463,12 +1463,18 @@ Parent TODO: E-22e-release-contract-trace-binding-guard
 
 Dependency graph:
 - E-22e-replan-stalled-leaf-16e2c69e67bb: <none>
+- E-22e-guard-release-contract-impl-1: <none>
+- E-22e-guard-release-contract-impl-2: E-22e-guard-release-contract-impl-1
 
 Verification ledger:
 - E-22e-replan-stalled-leaf-16e2c69e67bb: run `pnpm --workspace-root guard:todo-decomposition` and `pnpm --workspace-root phase-loop:todo-queue-integrity`.
+- E-22e-guard-release-contract-impl-1: run `pnpm --workspace-root guard:release-contract:test` and `pnpm --workspace-root guard:release-contract`.
+- E-22e-guard-release-contract-impl-2: run `pnpm --workspace-root guard:release-contract:test`.
 
 Quality rubric:
 - E-22e-replan-stalled-leaf-16e2c69e67bb: replace the stalled leaf with implementable child TODOs while preserving parent intent, exact patch targets, existing verification commands, and fail-closed release evidence semantics.
+- E-22e-guard-release-contract-impl-1: implement fail-closed Release Contract trace binding validation without weakening runtime release readiness.
+- E-22e-guard-release-contract-impl-2: cover null, stale, and inconsistent evidence rejection paths without inventing Release evidence.
 
 History:
 
