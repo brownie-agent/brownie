@@ -1708,8 +1708,10 @@ PY
         printf '%s run=%s completed_release_ops_blocker_not_applied=true result=%s\n' "$(now_utc)" "$run_stamp" "${release_ops_blocker_output:-<no output>}" >> "$SUPERVISOR_LOG"
       fi
       local integrated_supervisor_output integrated_supervisor_status integrated_supervisor_guard_output
+      set +e
       integrated_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "completed_todo_removal_guard_failed" 2>&1)"
       integrated_supervisor_status=$?
+      set -e
       printf '%s run=%s completed_todo_removal_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_status" "${integrated_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
       if integrated_supervisor_guard_output="$(
         cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
@@ -6053,8 +6055,10 @@ validate_todo_queue_integrity_before_claim() {
       validation_output="$revalidation_output"
     fi
     local integrated_supervisor_output integrated_supervisor_status
+    set +e
     integrated_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "todo_queue_integrity_failed_before_claim" 2>&1)"
     integrated_supervisor_status=$?
+    set -e
     printf '%s todo_queue_integrity_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$integrated_supervisor_status" "${integrated_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
     if revalidation_output="$(
       cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
@@ -12616,8 +12620,10 @@ PY
       detail="Rejected Brownie TODO refinement proposal before applying it because TODO guard preflight failed; recorded repair feedback. apply=$todo_patch_proposal_apply_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
       write_status "no_progress" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"
       local todo_patch_rejection_supervisor_output todo_patch_rejection_supervisor_status
+      set +e
       todo_patch_rejection_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "todo_patch_proposal_preflight_failed" 2>&1)"
       todo_patch_rejection_supervisor_status=$?
+      set -e
       printf '%s run=%s todo_patch_rejection_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$todo_patch_rejection_supervisor_status" "${todo_patch_rejection_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
       printf '%s run=%s valid_todo_patch_proposal_fallback_preflight_failed=true apply=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$todo_patch_proposal_apply_output" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
       write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"todo_patch_proposal_preflight_failed"}'
@@ -12855,8 +12861,10 @@ PY
         detail="Brownie run exited successfully but repeated the same non-progress fingerprint; recovery=$recovery_hint stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         local no_progress_supervisor_output no_progress_supervisor_status
         write_status "no_progress" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"
+        set +e
         no_progress_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "no_progress" 2>&1)"
         no_progress_supervisor_status=$?
+        set -e
         printf '%s run=%s no_progress_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$no_progress_supervisor_status" "${no_progress_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
         printf '%s run=%s exit=%s recovery=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$exit_code" "$recovery_hint" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
         write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"no_progress"}'
