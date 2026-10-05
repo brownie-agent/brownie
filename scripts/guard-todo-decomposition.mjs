@@ -295,6 +295,32 @@ function checkedTodoIds(text) {
   );
 }
 
+function completionRecordTodoIds(repoRoot = defaultRepoRoot) {
+  const completionDir = path.resolve(repoRoot, '.brownie/private/phase-loop/todo-completions');
+  const ids = new Set();
+  let entries = [];
+  try {
+    entries = fs.readdirSync(completionDir, { withFileTypes: true });
+  } catch {
+    return ids;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) {
+      continue;
+    }
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(completionDir, entry.name), 'utf8'));
+      const id = typeof record?.selected_todo_id === 'string' ? record.selected_todo_id.trim() : '';
+      if (id) {
+        ids.add(id);
+      }
+    } catch {
+      // Malformed completion records must not grant dependency credit.
+    }
+  }
+  return ids;
+}
+
 function uncheckedTodoIdSet(text) {
   return new Set(uncheckedTodoBlocks(text).map(todoId).filter(Boolean));
 }
@@ -628,6 +654,9 @@ function validateDependencies(text, blocks, errors, options = {}) {
   const owner = options.path ?? defaultTodoPath;
   const uncheckedIds = uncheckedTodoIdSet(text);
   const checkedIds = checkedTodoIds(text);
+  const completedIds = options.completedTodoIds instanceof Set
+    ? options.completedTodoIds
+    : new Set(Array.isArray(options.completedTodoIds) ? options.completedTodoIds : []);
   const graph = dependencyGraph(blocks);
   if (hasDependencyCycle(graph)) {
     errors.push(`${owner}: TODO dependencies must not contain cycles.`);
@@ -637,6 +666,9 @@ function validateDependencies(text, blocks, errors, options = {}) {
     for (const dep of parseDependsOn(block)) {
       if (dep === id) {
         errors.push(`${owner} ${id}: TODO must not depend on itself.`);
+      }
+      if (completedIds.has(dep)) {
+        continue;
       }
       if (!uncheckedIds.has(dep) && !checkedIds.has(dep) && options.breakdownText && options.breakdownText.includes(dep)) {
         errors.push(`${owner} ${id}: dependency ${dep} is present only in the breakdown ledger, not the live TODO queue; leaf TODOs must not depend on abstract/decomposed parent IDs because Runtime cannot schedule them.`);
@@ -913,6 +945,7 @@ export function validateTodoDecomposition(repoRoot = defaultRepoRoot, todoPath =
     packageScripts: packageScripts(repoRoot),
     breakdownPath: defaultBreakdownPath,
     breakdownText: maybeReadText(repoRoot, defaultBreakdownPath),
+    completedTodoIds: completionRecordTodoIds(repoRoot),
     productReady: state.productReady,
     releaseBlockersRemaining: state.releaseBlockersRemaining
   });

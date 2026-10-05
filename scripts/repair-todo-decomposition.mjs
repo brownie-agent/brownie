@@ -79,6 +79,32 @@ function readTodoReplanRecords() {
   return records;
 }
 
+function readTodoCompletionIds() {
+  const absoluteDir = path.resolve(repoRoot, '.brownie/private/phase-loop/todo-completions');
+  let entries = [];
+  try {
+    entries = fs.readdirSync(absoluteDir, { withFileTypes: true });
+  } catch {
+    return new Set();
+  }
+  const ids = new Set();
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) {
+      continue;
+    }
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(absoluteDir, entry.name), 'utf8'));
+      const id = typeof record?.selected_todo_id === 'string' ? record.selected_todo_id.trim() : '';
+      if (id) {
+        ids.add(id);
+      }
+    } catch {
+      // Malformed completion records must not authorize dependency rewrites.
+    }
+  }
+  return ids;
+}
+
 function writeTransitiveReplanRecords({ removedParentIds, replacementSourceTodoId, generatedChildIds, runStamp }) {
   const removed = new Set(removedParentIds.filter(Boolean));
   const written = [];
@@ -1068,9 +1094,10 @@ function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPa
   }
 
   const ids = existingIds(todoText);
+  const completedIds = readTodoCompletionIds();
   const dependencies = parseDependsOn(normalizedBlock);
-  const liveDependencies = dependencies.filter((dependency) => ids.has(dependency));
-  const removedDependencies = dependencies.filter((dependency) => !ids.has(dependency));
+  const liveDependencies = dependencies.filter((dependency) => ids.has(dependency) || completedIds.has(dependency));
+  const removedDependencies = dependencies.filter((dependency) => !ids.has(dependency) && !completedIds.has(dependency));
   if (removedDependencies.length > 0) {
     const replaced = replaceDependsOn(normalizedBlock, liveDependencies);
     normalizedBlock = replaced.block;
@@ -1131,6 +1158,7 @@ function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPa
 function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, breakdownPath }) {
   const blocks = uncheckedTodoBlocks(todoText);
   const ids = existingIds(todoText);
+  const completedIds = readTodoCompletionIds();
   const notes = [];
   let updatedTodo = todoText;
   let updatedBreakdown = breakdownText;
@@ -1141,7 +1169,7 @@ function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, bre
       continue;
     }
     const dependencies = parseDependsOn(block);
-    const danglingDependencies = dependencies.filter((dependency) => !ids.has(dependency));
+    const danglingDependencies = dependencies.filter((dependency) => !ids.has(dependency) && !completedIds.has(dependency));
     const breakdownOnlyDependencies = danglingDependencies.filter((dependency) => breakdownText.includes(dependency));
     if (breakdownOnlyDependencies.length === 0) {
       continue;

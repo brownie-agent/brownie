@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  runtimeOperationalEvidenceRequiredSections,
   runRuntimeOperationalEvidenceGuard,
   validateRuntimeOperationalEvidence
 } from './guard-runtime-operational-evidence.mjs';
@@ -13,7 +14,7 @@ import {
   redactDelegatedResult
 } from './release-runtime-operational-evidence.mjs';
 
-const requiredSections = ['artifact_lifecycle', 'golden_journey_fixture', 'soak_test', 'executable_evidence_validation'];
+const requiredSections = runtimeOperationalEvidenceRequiredSections;
 
 const forbiddenGeneratedEvidencePatterns = [
   /\/Users\//,
@@ -71,6 +72,28 @@ test('evidence must not contain blocker placeholders', () => {
   const errors = validateRuntimeOperationalEvidence(evidence);
   assert(errors.some((error) => error.includes('blocker') || error.includes('placeholder')),
     'evidence must not contain blocker placeholders');
+});
+
+test('rejects required_sections drift outside the runtime operational evidence contract', () => {
+  const evidence = validEvidence({
+    required_sections: [...requiredSections, 'runtime_operational_evidence'],
+    fail_closed_reasons: ['runtime_operational_evidence:missing']
+  });
+  const errors = validateRuntimeOperationalEvidence(evidence);
+  assert(
+    errors.some((error) => error.includes('unknown section runtime_operational_evidence')),
+    'runtime operational evidence guard must reject unconnected required_sections entries'
+  );
+});
+
+test('generated runtime operational evidence uses the guard-required section set', async () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-runtime-evidence-'));
+  const evidence = await buildRuntimeOperationalEvidence({ repoRoot });
+  assert.deepEqual(evidence.required_sections, requiredSections);
+  assert.deepEqual(
+    Object.keys(evidence.sections).filter((sectionId) => requiredSections.includes(sectionId)).sort(),
+    [...requiredSections].sort()
+  );
 });
 
 test('runtime operational evidence models release operation as executable fail-closed evidence', async (t) => {

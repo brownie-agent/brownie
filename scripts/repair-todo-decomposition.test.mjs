@@ -736,3 +736,33 @@ test('expands residual Release Ops blocker decomposition into fail-closed eviden
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('does not prune dependencies backed by durable completion records', () => {
+  const root = makeTempRepo();
+  try {
+    const selected = `- [ ] E-22d-runtime-stateful-soak-evidence: Patch only \`scripts/release-runtime-operational-evidence.mjs\` and \`scripts/guard-runtime-operational-evidence.test.mjs\`:
+  Route: implementation.
+  Source TODO: E-22d.
+  Depends on: E-22c-runtime-artifact-e2e-evidence.
+  Completion condition: Runtime operational evidence fails closed unless stateful soak evidence covers process-loss recovery and finite convergence.
+  Forbidden changes: do not weaken Golden Journey evidence and do not declare Runtime Product Ready.
+  Verification: run \`pnpm --workspace-root release:runtime-operational-evidence:test\` and \`pnpm --workspace-root guard:runtime-operational-evidence\`.`;
+    fs.writeFileSync(path.join(root, '.brownie/todo.md'), `${selected}\n`);
+    fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-completions'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-completions/e22c.json'), JSON.stringify({
+      selected_todo_id: 'E-22c-runtime-artifact-e2e-evidence'
+    }, null, 2));
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-claims/current.json'), JSON.stringify({
+      schema_version: 1,
+      claim_id: 'claim-completed-dependency',
+      selected_todo: selected
+    }, null, 2));
+
+    const result = runRepair(root);
+    assert.equal(result.status, 2, `${result.stdout}\n${result.stderr}`);
+    const todoText = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8');
+    assert.match(todoText, /Depends on: E-22c-runtime-artifact-e2e-evidence\./u);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

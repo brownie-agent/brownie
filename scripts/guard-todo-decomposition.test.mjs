@@ -582,6 +582,22 @@ test('selects first schedulable TODO after dependency blockers', () => {
   assert.equal(nextSchedulableTodoId(text), 'E-15b-parent');
 });
 
+test('accepts dependency on durable completion record after completed parent leaves live queue', () => {
+  const text = `- [ ] E-22d-runtime-stateful-soak-evidence: Patch only \`scripts/release-runtime-operational-evidence.mjs\` and \`scripts/guard-runtime-operational-evidence.test.mjs\`:
+  Route: implementation.
+  Source TODO: E-22d.
+  Depends on: E-22c-runtime-artifact-e2e-evidence.
+  Completion condition: Runtime operational evidence fails closed unless stateful soak evidence covers process loss recovery and finite convergence.
+  Forbidden changes: do not weaken Golden Journey evidence and do not declare Runtime Product Ready.
+  Verification: run \`pnpm --workspace-root release:runtime-operational-evidence:test\` and \`pnpm --workspace-root guard:runtime-operational-evidence\`.`;
+
+  assert.deepEqual(validateTodoDecompositionText(text, {
+    repoRoot: process.cwd(),
+    packageScripts: new Set(['release:runtime-operational-evidence:test', 'guard:runtime-operational-evidence']),
+    completedTodoIds: ['E-22c-runtime-artifact-e2e-evidence']
+  }), []);
+});
+
 test('accepts explicit blocker route and skips it for schedulable implementation work', () => {
   const text = `- [ ] E-20i-runtime-release-ops-blocker: Blocker: Owner-controlled Runtime Release Ops authority is required for clean CI build, artifact upload/provenance, and GitHub Release publication.
   Route: blocker.

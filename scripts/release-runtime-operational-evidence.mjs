@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { runtimeOperationalEvidenceRequiredSections } from './guard-runtime-operational-evidence.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,12 +13,7 @@ const defaultOutPath = '.brownie/release-evidence/runtime-operational-evidence.j
 const defaultArtifactRoot = '.brownie/release-evidence/artifacts';
 const defaultLocalReleaseTargetsPath = '.brownie/local-release-targets.json';
 
-const requiredSections = [
-  'artifact_lifecycle',
-  'golden_journey_fixture',
-  'soak_test',
-  'executable_evidence_validation',
-];
+const requiredSections = runtimeOperationalEvidenceRequiredSections;
 
 const requiredStatefulSoakStepIds = [
   'task_state_transition',
