@@ -135,6 +135,70 @@ test('escalates repeated no-progress on the same bounded leaf to TODO contract r
   assert.equal(ledger[0].todo_id, 'E-21c-runtime-operational-evidence-impl-2-target-02');
 });
 
+test('ensures stalled TODO decomposition request even when blocked record already exists', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress',
+    run_id: 'run-no-progress-existing-blocked',
+    consecutive_failures: 1,
+    detail: 'Brownie run exited successfully but repeated the same non-progress fingerprint'
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress',
+    same_progress_count: 1,
+    run_stamp: '20261003T171000Z',
+    progress_projection: {
+      cli_status: 'no_eligible_task',
+      closure: 'no_eligible_task',
+      claim_id: 'claim-existing-blocked',
+      selected_todo: runtimeEvidenceTodo
+    }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-existing-blocked',
+    status: 'claimed',
+    selected_todo: runtimeEvidenceTodo
+  });
+  fs.writeFileSync(
+    path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl'),
+    `${JSON.stringify({
+      schema_version: 1,
+      record_type: 'todo_blocked',
+      todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02',
+      selected_todo_first_line: runtimeEvidenceTodo.split('\n')[0],
+      reason: 'previous_replan_feedback'
+    })}\n`
+  );
+  fs.writeFileSync(
+    path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl'),
+    `${JSON.stringify({
+      schema_version: 1,
+      record_type: 'phase_loop_failure_event',
+      event_id: 'event-invalid-before-existing-blocked',
+      observed_at: '2026-10-03T17:00:00Z',
+      todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02',
+      selected_todo_first_line: runtimeEvidenceTodo.split('\n')[0],
+      kind: 'invalid_patch',
+      status: 'no_progress',
+      progress_run_stamp: '20261003T170000Z',
+      same_progress_count: 2
+    })}\n`
+  );
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+
+  assert.equal(result.repair.todo_contract_replan.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.stalled_todo_blocked.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.stalled_todo_blocked.changed, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.stalled_todo_decomposition.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.stalled_todo_decomposition.changed, true, JSON.stringify(result, null, 2));
+  assert.match(todo, /E-21c-replan-stalled-leaf-/u);
+  assert.match(todo, /Route: todo-decomposition/u);
+});
+
 test('removes completed TODO residue and stale stalled-leaf replan before restart', () => {
   const repo = makeRepo();
   writeTodo(repo);
