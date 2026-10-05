@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "record_type": "todo_replan",
+  "operation": "split_parent_into_children",
+  "parent_status": "superseded_by_children",
+  "parent_todo_id": "E-22e-replan-stalled-leaf-16e2c69e67bb",
+  "parent_todo_first_line": "- [ ] E-22e-replan-stalled-leaf-16e2c69e67bb: Patch only `.brownie/todo.md` and `.brownie/todo-breakdown.md` to replan stalled Brownie TODO leaf into implementable child TODOs:",
+  "generated_child_ids": [
+    "E-22e-guard-release-contract-impl-1",
+    "E-22e-guard-release-contract-impl-2"
+  ],
+  "generated_leaf_ids": [
+    "E-22e-guard-release-contract-impl-1",
+    "E-22e-guard-release-contract-impl-2"
+  ],
+  "replan_record_reason": "reconstructed_after_objective_apply_todo_decomposition_guard_failure",
+  "changed_files": [
+    ".brownie/todo.md",
+    ".brownie/todo-breakdown.md"
+  ],
+  "workspace_changed_files": [
+    ".brownie/todo.md",
+    ".brownie/todo-breakdown.md"
+  ],
+  "run_stamp": "20261005T163237Z",
+  "written_at": "2026-10-05T16:53:00Z"
+}
