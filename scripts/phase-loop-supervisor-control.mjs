@@ -937,6 +937,9 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
     }
     const sourceId = sourceTodoFromBlock(block.block);
     if (sourceId && completedIds.has(sourceId)) {
+      if (isStalledLeafReplanId(sourceId)) {
+        continue;
+      }
       idsToRemove.add(id);
       const completionRecord = writeSupervisorCompletionRecord(
         repoRoot,
