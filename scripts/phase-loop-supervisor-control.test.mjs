@@ -906,6 +906,15 @@ test('runs TODO guard after repair when diagnostic reports an existing TODO cont
   assert.equal(result.start.reason, 'post_repair_validation_failed');
 });
 
+test('workspace supervisor-control script restarts after safe repair by default', () => {
+  const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+
+  assert.equal(
+    packageJson.scripts['phase-loop:supervisor-control'],
+    'node scripts/phase-loop-supervisor-control.mjs --repair --start'
+  );
+});
+
 test('repairs generated TODO leaf prefix and breakdown ledger after decomposition guard rejection', () => {
   const repo = makeRepo();
   writeTodo(repo);
