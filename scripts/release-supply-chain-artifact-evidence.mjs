@@ -51,6 +51,68 @@ function validateSourceCommitBinding(evidence) {
   return { valid: true, sourceCommit };
 }
 
+function validateProvenanceBinding(evidence) {
+  const requiredFields = ['implementationCommit', 'testedCommit', 'workflowRunId', 'artifactSha256', 'platform', 'architecture'];
+  for (const field of requiredFields) {
+    if (!evidence || !(field in evidence) || evidence[field] === null || evidence[field] === undefined) {
+      return { valid: false, reason: `provenance_field_${field}_missing` };
+    }
+  }
+  if (typeof evidence.implementationCommit !== 'string' || !/^[a-f0-9]{40}$/.test(evidence.implementationCommit)) {
+    return { valid: false, reason: 'implementation_commit_invalid_format' };
+  }
+  if (typeof evidence.testedCommit !== 'string' || !/^[a-f0-9]{40}$/.test(evidence.testedCommit)) {
+    return { valid: false, reason: 'tested_commit_invalid_format' };
+  }
+  if (typeof evidence.workflowRunId !== 'string' || evidence.workflowRunId.length === 0) {
+    return { valid: false, reason: 'workflow_run_id_invalid_format' };
+  }
+  if (typeof evidence.artifactSha256 !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(evidence.artifactSha256)) {
+    return { valid: false, reason: 'artifact_sha256_invalid_format' };
+  }
+  if (typeof evidence.platform !== 'string' || evidence.platform.length === 0) {
+    return { valid: false, reason: 'platform_invalid_format' };
+  }
+  if (typeof evidence.architecture !== 'string' || evidence.architecture.length === 0) {
+    return { valid: false, reason: 'architecture_invalid_format' };
+  }
+  return { valid: true };
+}
+
+function validateArtifactBuildSourceMetadata(artifact, sourceCommit) {
+  if (!artifact || typeof artifact !== 'object') {
+    return { valid: false, reason: 'artifact_missing' };
+  }
+  const expectedBuildSourceCommit = sourceCommit ? `sha256:${sourceCommit}` : null;
+  if (typeof artifact.source_commit !== 'string' || !/^sha256:[a-f0-9]{40}$/.test(artifact.source_commit)) {
+    return { valid: false, reason: 'artifact_source_commit_missing_or_invalid' };
+  }
+  if (expectedBuildSourceCommit && artifact.source_commit !== expectedBuildSourceCommit) {
+    return {
+      valid: false,
+      reason: 'artifact_source_commit_mismatch',
+      expectedBuildSourceCommit,
+      actualBuildSourceCommit: artifact.source_commit
+    };
+  }
+  if (artifact.source_clean_tree !== 'clean') {
+    return { valid: false, reason: 'artifact_source_clean_tree_not_clean' };
+  }
+  if (!hashPattern.test(artifact.source_identity)) {
+    return { valid: false, reason: 'artifact_source_identity_missing_or_invalid' };
+  }
+  const expectedSourceIdentity = sha256Text(`${artifact.source_commit}:${artifact.source_clean_tree}`);
+  if (artifact.source_identity !== expectedSourceIdentity) {
+    return {
+      valid: false,
+      reason: 'artifact_source_identity_mismatch',
+      expectedSourceIdentity,
+      actualSourceIdentity: artifact.source_identity
+    };
+  }
+  return { valid: true };
+}
+
 function validateSourceCheckoutClean(evidence) {
   const checkoutState = evidence?.sourceCheckoutState;
   if (!checkoutState || typeof checkoutState !== 'string') {
@@ -209,6 +271,63 @@ function sha256File(filePath) {
 
 function sha256Text(text) {
   return `sha256:${crypto.createHash('sha256').update(text).digest('hex')}`;
+}
+
+function buildArtifactProvenanceBinding({ artifact, sourceCommit, sourceCheckoutState }) {
+  const implementationCommit = sourceCommit;
+  const testedCommit = process.env.GITHUB_SHA ?? sourceCommit;
+  const workflowRunId = process.env.GITHUB_RUN_ID ?? null;
+  const platform = artifact.platform ?? artifact.target?.split('-')[0] ?? null;
+  const architecture = artifact.arch ?? artifact.target?.split('-').slice(1).join('-') ?? null;
+  const binding = {
+    implementationCommit,
+    testedCommit,
+    workflowRunId,
+    artifactSha256: artifact.sha256,
+    platform,
+    architecture,
+    sourceCheckoutState,
+    buildSourceCommit: artifact.source_commit ?? null,
+    buildSourceCleanTree: artifact.source_clean_tree ?? null,
+    buildSourceIdentity: artifact.source_identity ?? null
+  };
+  return {
+    ...binding,
+    validation: validateProvenanceBinding(binding),
+    buildSourceMetadataValidation: validateArtifactBuildSourceMetadata(artifact, sourceCommit)
+  };
+}
+
+function bindArtifactSourceIdentity(artifact, provenanceBinding) {
+  if (
+    provenanceBinding.validation.valid &&
+    provenanceBinding.buildSourceMetadataValidation.valid &&
+    provenanceBinding.sourceCheckoutState === 'clean'
+  ) {
+    const provenanceIdentity = sha256Text(
+      [
+        provenanceBinding.implementationCommit,
+        provenanceBinding.testedCommit,
+        provenanceBinding.workflowRunId,
+        artifact.path,
+        provenanceBinding.artifactSha256,
+        provenanceBinding.platform,
+        provenanceBinding.architecture
+      ].join('\n')
+    );
+    return {
+      ...artifact,
+      source_commit: provenanceBinding.buildSourceCommit,
+      source_clean_tree: 'clean',
+      source_identity: provenanceBinding.buildSourceIdentity,
+      provenance_identity: provenanceIdentity,
+      provenance_binding: provenanceBinding
+    };
+  }
+  return {
+    ...artifact,
+    provenance_binding: provenanceBinding
+  };
 }
 
 function run(repoRoot, command, args) {
@@ -380,6 +499,9 @@ function findReleaseArtifacts(repoRoot) {
           platform: artifactEvidence.platform ?? null,
           arch: artifactEvidence.arch ?? null,
           target: artifactEvidence.target ?? artifact.target ?? entry.name,
+          source_commit: artifact.source_commit ?? null,
+          source_clean_tree: artifact.source_clean_tree ?? null,
+          source_identity: artifact.source_identity ?? null,
           artifact_evidence_path: evidencePath,
           smoke_evidence_path: smokeEvidence ? smokePath : null,
           smoke_evidence: smokeEvidence
@@ -621,11 +743,17 @@ export function buildSupplyChainArtifactEvidence(options = {}) {
       sha256: sha256File(repoPath(repoRoot, relativePath))
     }));
   const secretFindings = scanSecrets(repoRoot, files);
-  const artifacts = findReleaseArtifacts(repoRoot);
+  const discoveredArtifacts = findReleaseArtifacts(repoRoot);
   const provenancePath = normalizeRelativePath(path.join(outDir, 'brownie-runtime-provenance.json'));
   const sourceCommit = gitValue(repoRoot, ['rev-parse', 'HEAD']);
   const treeStatus = sourceTreeStatus(repoRoot);
   const sourceCheckoutState = treeStatus.length === 0 ? 'clean' : 'dirty';
+  const artifacts = discoveredArtifacts.map((artifact) =>
+    bindArtifactSourceIdentity(
+      artifact,
+      buildArtifactProvenanceBinding({ artifact, sourceCommit, sourceCheckoutState })
+    )
+  );
   const sbom = buildSbom(repoRoot, generatedAt);
   const sbomPath = normalizeRelativePath(path.join(outDir, 'brownie-runtime-sbom.json'));
   writeJson(repoRoot, sbomPath, sbom);
