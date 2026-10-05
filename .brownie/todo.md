@@ -6,6 +6,22 @@
   Forbidden changes: do not invent artifact hashes, do not accept dirty source as release-ready, do not weaken existing supply-chain evidence failures, and do not declare Product Ready.
   Verification: run `pnpm --workspace-root guard:supply-chain-artifact-evidence:test` and `pnpm --workspace-root guard:supply-chain-artifact-evidence`.
 
+- [x] E-22c-runtime-artifact-e2e-evidence: Patch only `scripts/release-runtime-operational-evidence.mjs` and `scripts/guard-runtime-operational-evidence.test.mjs`:
+  Route: implementation.
+  Source TODO: 2026-10-04 review: generated artifacts are not yet installed and exercised for Mode Pack load, minimal task, ledger generation, resume, and replay rejection.
+  Depends on: E-22b-release-artifact-provenance-binding.
+  Completion condition: Runtime operational evidence represents artifact E2E checks as executable fail-closed evidence for install/run, Base Mode Pack load, minimal task execution, ledger generation, forced stop/resume, and stale/replay rejection.
+  Forbidden changes: do not replace E2E evidence with version/help smoke only, do not mark unavailable platforms as satisfied, and do not declare Runtime Product Ready.
+  Verification: run `pnpm --workspace-root release:runtime-operational-evidence:test` and `pnpm --workspace-root guard:runtime-operational-evidence`.
+
+- [x] E-22d-runtime-stateful-soak-evidence: Patch only `scripts/release-runtime-operational-evidence.mjs` and `scripts/guard-runtime-operational-evidence.test.mjs`:
+  Route: implementation.
+  Source TODO: 2026-10-04 review: stateful soak does not yet cover process loss, duplicate side effects, ledger/workspace consistency, or finite convergence.
+  Depends on: E-22c-runtime-artifact-e2e-evidence.
+  Completion condition: Runtime operational evidence fails closed unless stateful soak evidence covers process loss recovery, duplicate side-effect rejection, ledger/workspace consistency, resume/replay, and finite convergence.
+  Forbidden changes: do not count version-only loops as stateful soak, do not weaken Golden Journey evidence, and do not declare Runtime Product Ready.
+  Verification: run `pnpm --workspace-root release:runtime-operational-evidence:test` and `pnpm --workspace-root guard:runtime-operational-evidence`.
+
 - [ ] E-22e-release-contract-trace-binding-guard: Patch only `scripts/guard-release-contract.mjs` and `scripts/guard-release-contract.test.mjs`:
   Route: implementation.
   Source TODO: 2026-10-04 review: Release Contract is not mechanically bound to latest commit, workflow run, artifact SHA, and executable evidence.

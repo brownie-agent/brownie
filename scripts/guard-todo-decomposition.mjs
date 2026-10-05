@@ -295,32 +295,6 @@ function checkedTodoIds(text) {
   );
 }
 
-function completionRecordTodoIds(repoRoot = defaultRepoRoot) {
-  const completionDir = path.resolve(repoRoot, '.brownie/private/phase-loop/todo-completions');
-  const ids = new Set();
-  let entries = [];
-  try {
-    entries = fs.readdirSync(completionDir, { withFileTypes: true });
-  } catch {
-    return ids;
-  }
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) {
-      continue;
-    }
-    try {
-      const record = JSON.parse(fs.readFileSync(path.join(completionDir, entry.name), 'utf8'));
-      const id = typeof record?.selected_todo_id === 'string' ? record.selected_todo_id.trim() : '';
-      if (id) {
-        ids.add(id);
-      }
-    } catch {
-      // Malformed completion records must not grant dependency credit.
-    }
-  }
-  return ids;
-}
-
 function uncheckedTodoIdSet(text) {
   return new Set(uncheckedTodoBlocks(text).map(todoId).filter(Boolean));
 }
@@ -945,7 +919,6 @@ export function validateTodoDecomposition(repoRoot = defaultRepoRoot, todoPath =
     packageScripts: packageScripts(repoRoot),
     breakdownPath: defaultBreakdownPath,
     breakdownText: maybeReadText(repoRoot, defaultBreakdownPath),
-    completedTodoIds: completionRecordTodoIds(repoRoot),
     productReady: state.productReady,
     releaseBlockersRemaining: state.releaseBlockersRemaining
   });
