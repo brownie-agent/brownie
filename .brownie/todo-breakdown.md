@@ -1610,3 +1610,30 @@ Quality rubric:
 History:
 
 2026-10-06T04:33:33Z: Supervisor detected repeated invalid_patch_followed_by_no_progress on E-22f-2-release-readiness-audit-sync and promoted Brownie-owned TODO replan instead of retrying the same single-target leaf.
+
+## E-23a-release-artifact-portable-archive no-eligible multi-target split
+
+Parent TODO: E-23a-release-artifact-portable-archive: - [ ] E-23a-release-artifact-portable-archive: Patch only `scripts/release-local-artifact.mjs`, `scripts/release-local-artifact.test.mjs`, and `.github/workflows/release.yml`:
+Parent source: 2026-10-06 external review: Unix binaries are uploaded directly and downloaded execution permissions are not proven
+
+Targets:
+
+- E-23a-release-artifact-portable-archive-target-01: `scripts/release-local-artifact.mjs`
+- E-23a-release-artifact-portable-archive-target-02: `scripts/release-local-artifact.test.mjs`
+- E-23a-release-artifact-portable-archive-target-03: `.github/workflows/release.yml`
+
+Dependency graph:
+
+- E-23a-release-artifact-portable-archive-target-01: <none>
+- E-23a-release-artifact-portable-archive-target-02: E-23a-release-artifact-portable-archive-target-01
+- E-23a-release-artifact-portable-archive-target-03: E-23a-release-artifact-portable-archive-target-02
+
+Verification ledger:
+
+- E-23a-release-artifact-portable-archive-target-01: `run `pnpm --workspace-root release:local-artifact:test`, `pnpm --workspace-root guard:supply-chain-artifact-evidence:test`, and the Release Workflow matrix`
+- E-23a-release-artifact-portable-archive-target-02: `run `pnpm --workspace-root release:local-artifact:test`, `pnpm --workspace-root guard:supply-chain-artifact-evidence:test`, and the Release Workflow matrix`
+- E-23a-release-artifact-portable-archive-target-03: `run `pnpm --workspace-root release:local-artifact:test`, `pnpm --workspace-root guard:supply-chain-artifact-evidence:test`, and the Release Workflow matrix`
+
+History:
+
+- 2026-10-06T14:40:41Z: Applied deterministic no_eligible_task fallback during run 20261006T144039Z; the checked parent remains in the queue so existing downstream dependencies still have a durable dependency anchor, and the implementation work moves to ordered single-target leaves.

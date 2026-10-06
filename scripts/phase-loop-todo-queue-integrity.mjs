@@ -2,6 +2,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import {
+  readAllTodoReplanRecords,
+  readTodoCompletionRecords,
+  readTrackedBreakdownReplanRecords,
+  resolveTodoState
+} from './phase-loop-todo-state.mjs';
+
+export { readTrackedBreakdownReplanRecords as trackedBreakdownReplanRecords };
 
 const defaultTodoPath = '.brownie/todo.md';
 
@@ -173,119 +181,6 @@ function contractDrift(before, after) {
   return drifts;
 }
 
-function completedTodoIds(repoRoot) {
-  const dir = path.join(repoRoot, '.brownie/private/phase-loop/todo-completions');
-  const ids = new Set();
-  let entries = [];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      return ids;
-    }
-    throw error;
-  }
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) {
-      continue;
-    }
-    try {
-      const record = JSON.parse(fs.readFileSync(path.join(dir, entry.name), 'utf8'));
-      const id = typeof record.selected_todo_id === 'string' ? record.selected_todo_id.trim() : '';
-      if (id) {
-        ids.add(id);
-      }
-    } catch {
-      // Ignore malformed completion evidence. It must not grant completion
-      // credit to a missing TODO.
-    }
-  }
-  return ids;
-}
-
-function todoReplanRecords(repoRoot) {
-  const dir = path.join(repoRoot, '.brownie/private/phase-loop/todo-replans');
-  const records = [];
-  let entries = [];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      return records;
-    }
-    throw error;
-  }
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) {
-      continue;
-    }
-    try {
-      const record = JSON.parse(fs.readFileSync(path.join(dir, entry.name), 'utf8'));
-      if (
-        record?.record_type === 'todo_replan' &&
-        record?.operation === 'split_parent_into_children' &&
-        typeof record.parent_todo_id === 'string' &&
-        Array.isArray(record.generated_child_ids)
-      ) {
-        records.push(record);
-      }
-    } catch {
-      // Ignore malformed replan records. They must not grant permission to
-      // remove or supersede a TODO.
-    }
-  }
-  return records;
-}
-
-function trackedBreakdownReplanRecords(repoRoot) {
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
-  const text = maybeReadText(breakdownPath);
-  if (!text) {
-    return [];
-  }
-  const records = [];
-  const headingPattern = /^## TODO-repair-([^\n]+)\n/gmu;
-  const headings = [];
-  let heading;
-  while ((heading = headingPattern.exec(text)) !== null) {
-    headings.push({
-      parent_todo_id: heading[1].trim(),
-      start: heading.index,
-      content_start: headingPattern.lastIndex
-    });
-  }
-  for (let index = 0; index < headings.length; index += 1) {
-    const current = headings[index];
-    const next = headings[index + 1];
-    const section = text.slice(current.content_start, next ? next.start : text.length);
-    const childIds = [];
-    for (const line of section.split('\n')) {
-      const match = line.match(/^-\s+([A-Za-z0-9][A-Za-z0-9_.-]*):\s*/u);
-      if (!match) {
-        continue;
-      }
-      const childId = match[1].trim();
-      if (childId && childId !== current.parent_todo_id && !childIds.includes(childId)) {
-        childIds.push(childId);
-      }
-    }
-    if (childIds.length === 0) {
-      continue;
-    }
-    records.push({
-      schema_version: 1,
-      record_type: 'todo_replan',
-      operation: 'split_parent_into_children',
-      parent_status: 'superseded_by_children',
-      parent_todo_id: current.parent_todo_id,
-      generated_child_ids: childIds,
-      generated_leaf_ids: childIds,
-      replan_record_reason: 'tracked_todo_breakdown_repair_section'
-    });
-  }
-  return records;
-}
-
 function replanRecordsByParent(records) {
   const map = new Map();
   for (const record of records ?? []) {
@@ -453,16 +348,19 @@ export function loadCliInput(args) {
   const todoRelative = path.relative(repoRoot, todoPath).split(path.sep).join('/');
   const todoBefore = gitHeadText(repoRoot, todoRelative);
   const todoAfter = maybeReadText(todoPath);
+  const replanRecords = readAllTodoReplanRecords(repoRoot);
+  const todoState = resolveTodoState({
+    todoText: todoAfter,
+    replanRecords,
+    completionRecords: readTodoCompletionRecords(repoRoot)
+  });
   return {
     repoRoot,
     todoRelative,
     todoBefore,
     todoAfter,
-    completedTodoIds: [...completedTodoIds(repoRoot)],
-    todoReplanRecords: [
-      ...todoReplanRecords(repoRoot),
-      ...trackedBreakdownReplanRecords(repoRoot)
-    ]
+    completedTodoIds: [...todoState.completedIds],
+    todoReplanRecords: replanRecords
   };
 }
 

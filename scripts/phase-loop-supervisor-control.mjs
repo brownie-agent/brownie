@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { diagnosePhaseLoop } from './phase-loop-supervisor-diagnose.mjs';
+import { loadTodoState } from './phase-loop-todo-state.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -228,62 +229,6 @@ function completedTodoIds(todoText) {
     }
   }
   return ids;
-}
-
-function durableCompletedTodoIds(repoRoot) {
-  const dir = path.join(repoRoot, '.brownie/private/phase-loop/todo-completions');
-  const ids = new Set();
-  let entries = [];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      return ids;
-    }
-    throw error;
-  }
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) {
-      continue;
-    }
-    try {
-      const record = JSON.parse(fs.readFileSync(path.join(dir, entry.name), 'utf8'));
-      const id = typeof record.selected_todo_id === 'string' ? record.selected_todo_id.trim() : '';
-      if (id) {
-        ids.add(id);
-      }
-    } catch {
-      // Malformed completion evidence is ignored here; the queue-integrity
-      // guard will fail closed when it cannot parse durable state.
-    }
-  }
-  return ids;
-}
-
-function writeSupervisorCompletionRecord(repoRoot, todoId, reason, extra = {}) {
-  const id = typeof todoId === 'string' ? todoId.trim() : '';
-  if (!id) {
-    return null;
-  }
-  const dir = path.join(repoRoot, '.brownie/private/phase-loop/todo-completions');
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const record = {
-    schema_version: 1,
-    record_type: 'phase_loop_supervisor_completion',
-    selected_todo_id: id,
-    reason,
-    completed_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
-    ...extra
-  };
-  const fileName = `supervisor-${id.replace(/[^0-9A-Za-z_.-]+/gu, '-')}-${crypto
-    .createHash('sha256')
-    .update(JSON.stringify(record))
-    .digest('hex')
-    .slice(0, 12)}.json`;
-  const filePath = path.join(dir, fileName);
-  fs.writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  fsyncFileAndParent(filePath);
-  return path.relative(repoRoot, filePath);
 }
 
 function durableBlockedTodoIds(repoRoot) {
@@ -913,48 +858,17 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
     return { attempted: false, reason: 'todo_missing' };
   }
   const todoText = fs.readFileSync(todoPath, 'utf8');
-  const completedIds = new Set([
-    ...durableCompletedTodoIds(repoRoot),
-    ...completedTodoIds(todoText)
-  ]);
+  const todoState = loadTodoState(repoRoot, todoText);
+  const completedIds = todoState.completedIds;
   const blockedIds = durableBlockedTodoIds(repoRoot);
   const uncheckedIds = liveUncheckedTodoIds(todoText);
   const idsToRemove = new Set();
   const reasons = [];
-  const completionRecords = [];
 
   for (const id of uncheckedIds) {
     if (completedIds.has(id)) {
       idsToRemove.add(id);
       reasons.push({ todo_id: id, reason: 'durable_completion_reappeared_in_live_queue' });
-    }
-  }
-
-  for (const block of todoBlocks(todoText)) {
-    const id = todoIdFromBlock(block.block);
-    if (!id || !uncheckedIds.has(id)) {
-      continue;
-    }
-    const sourceId = sourceTodoFromBlock(block.block);
-    if (sourceId && completedIds.has(sourceId)) {
-      if (isStalledLeafReplanId(sourceId)) {
-        continue;
-      }
-      idsToRemove.add(id);
-      const completionRecord = writeSupervisorCompletionRecord(
-        repoRoot,
-        id,
-        'source_parent_completed',
-        { source_todo_id: sourceId }
-      );
-      if (completionRecord) {
-        completionRecords.push(completionRecord);
-      }
-      reasons.push({
-        todo_id: id,
-        source_todo_id: sourceId,
-        reason: 'live_child_source_todo_completed'
-      });
     }
   }
 
@@ -1005,7 +919,7 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
     changed: true,
     paths: ['.brownie/todo.md', ...(breakdownRemoved.length > 0 ? ['.brownie/todo-breakdown.md'] : [])],
     removed_todo_ids: removedBlocks.removed,
-    completion_records: completionRecords,
+    invalidated_completion_record_count: todoState.invalidatedCompletionRecords.length,
     pruned_dependency_lines: prunedDepends.pruned,
     removed_breakdown_sections: breakdownRemoved,
     reasons

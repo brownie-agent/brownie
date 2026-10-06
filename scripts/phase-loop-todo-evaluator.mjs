@@ -7,6 +7,11 @@ import {
   scoreTodoDecompositionText,
   uncheckedTodoBlocks
 } from './guard-todo-decomposition.mjs';
+import {
+  loadTodoState,
+  resolveTodoState,
+  todoStateSummary
+} from './phase-loop-todo-state.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -261,9 +266,20 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
 
 export function selectFirstSchedulableTodo(text, options = {}) {
   const blocks = uncheckedTodoBlocks(text);
+  const todoState = options.todoState ?? (
+    options.repoRoot
+      ? loadTodoState(options.repoRoot, text, { additionalReplanRecords: options.todoReplanRecords })
+      : resolveTodoState({
+          todoText: text,
+          replanRecords: options.todoReplanRecords,
+          completionRecords: options.todoCompletionRecords
+        })
+  );
+  if (todoState.errors.length > 0) {
+    return '';
+  }
   const queueFingerprint = sha256Text(text);
   const blocked = readBlockedClaims(options.blockedPath, queueFingerprint, options.controllerFingerprint ?? '');
-  const uncheckedIds = new Set(blocks.map(todoId).filter(Boolean));
   const blockedQueueDecompositionQueued = blocks.some((block) => todoId(block).startsWith('TODO-decompose-blocked-queue-'));
   let fallbackParentForRedecomposition = '';
   const derivedPrefixes = new Set(
@@ -276,6 +292,9 @@ export function selectFirstSchedulableTodo(text, options = {}) {
   for (const block of blocks) {
     const id = todoId(block);
     if (!id) {
+      continue;
+    }
+    if (todoState.completedIds.has(id) || todoState.supersededIds.has(id)) {
       continue;
     }
     if (blockedQueueDecompositionQueued && !id.startsWith('TODO-decompose-blocked-queue-')) {
@@ -297,19 +316,23 @@ export function selectFirstSchedulableTodo(text, options = {}) {
       continue;
     }
     const deps = dependsOn(block);
-    if (deps.some((dep) => (uncheckedIds.has(dep) && !blocked.stableIds.has(dep)) || dependencyBlockedIds.has(dep))) {
+    if (deps.some((dep) => (
+      (
+        todoState.knownIds.has(dep)
+        && !todoState.resolvedIds.has(dep)
+      )
+      || dependencyBlockedIds.has(dep)
+    ))) {
       dependencyBlockedIds.add(id);
       continue;
     }
     const firstLine = block.split('\n')[0]?.trim() ?? '';
     const blockHash = sha256Text(block);
     if (blocked.stableIds.has(id)) {
-      // A stable blocked id represents a TODO that the supervisor has already
-      // isolated or replanned in an earlier queue generation. Treat it as
-      // unschedulable, but do not let the stale unchecked line block later
-      // dependent work forever. The TODO queue integrity guard is responsible
-      // for preserving the replan/completion ledger; the selector must keep
-      // moving to the next valid leaf instead of deadlocking on the old parent.
+      // A blocked record is not completion evidence. Dependents remain blocked
+      // until the shared TODO state marks this id completed or resolves a
+      // superseded parent through all of its generated children.
+      dependencyBlockedIds.add(id);
       continue;
     }
     const blockedInCurrentQueue = blocked.hashes.has(blockHash) || blocked.firstLines.has(firstLine);
@@ -326,7 +349,16 @@ export function selectFirstSchedulableTodo(text, options = {}) {
 }
 
 export function evaluateTodoQueue(text, options = {}) {
-  const selected = selectFirstSchedulableTodo(text, options);
+  const todoState = options.todoState ?? (
+    options.repoRoot
+      ? loadTodoState(options.repoRoot, text, { additionalReplanRecords: options.todoReplanRecords })
+      : resolveTodoState({
+          todoText: text,
+          replanRecords: options.todoReplanRecords,
+          completionRecords: options.todoCompletionRecords
+        })
+  );
+  const selected = selectFirstSchedulableTodo(text, { ...options, todoState });
   const decomposition = needsTodoDecomposition(selected);
   return {
     schema_version: 1,
@@ -334,7 +366,8 @@ export function evaluateTodoQueue(text, options = {}) {
     selected_todo: selected,
     selected_todo_needs_decomposition: decomposition.needs_decomposition,
     selected_todo_decomposition_reason: decomposition.reason,
-    decomposition_score: scoreTodoDecompositionText(text)
+    decomposition_score: scoreTodoDecompositionText(text),
+    todo_state: todoStateSummary(todoState)
   };
 }
 
@@ -367,7 +400,11 @@ if (isMainModule()) {
   const args = parseArgs(process.argv);
   const todoPath = args.todo ? path.resolve(defaultRepoRoot, args.todo) : path.join(defaultRepoRoot, '.brownie/todo.md');
   const text = fs.readFileSync(todoPath, 'utf8');
-  const result = evaluateTodoQueue(text, { blockedPath: args.blocked, controllerFingerprint: args.controllerFingerprint });
+  const result = evaluateTodoQueue(text, {
+    repoRoot: defaultRepoRoot,
+    blockedPath: args.blocked,
+    controllerFingerprint: args.controllerFingerprint
+  });
   if (args.mode === 'score' || args.mode === 'needs-decomposition' || args.json) {
     console.log(JSON.stringify(result, null, 2));
   } else {

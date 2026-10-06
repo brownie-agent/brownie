@@ -202,6 +202,7 @@ function validateRuntimeReleaseContract(contract, options = {}) {
   requireValue(packageJson.scripts?.['release:integrity-verify'] === 'node scripts/release-integrity-verify.mjs', errors, `${defaultPackagePath} must define release:integrity-verify.`);
   requireValue(packageJson.scripts?.['release:owner-governance-evidence'] === 'node scripts/release-owner-governance-evidence.mjs', errors, `${defaultPackagePath} must define release:owner-governance-evidence.`);
   requireValue(packageJson.scripts?.['release:owner-governance-evidence:test'] === 'node --test scripts/release-owner-governance-evidence.test.mjs', errors, `${defaultPackagePath} must define release:owner-governance-evidence:test.`);
+  requireValue(packageJson.scripts?.['phase-loop:todo-state:test'] === 'node --test scripts/phase-loop-todo-state.test.mjs', errors, `${defaultPackagePath} must define phase-loop:todo-state:test.`);
   requireValue(packageJson.scripts?.['phase-loop:supervisor-diagnose:test'] === 'node --test scripts/phase-loop-supervisor-diagnose.test.mjs', errors, `${defaultPackagePath} must define phase-loop:supervisor-diagnose:test.`);
   requireValue(packageJson.scripts?.['phase-loop:supervisor-control:test'] === 'node --test scripts/phase-loop-supervisor-control.test.mjs', errors, `${defaultPackagePath} must define phase-loop:supervisor-control:test.`);
   requireValue(packageJson.scripts?.['guard:local-release-targets'] === 'node scripts/guard-local-release-targets.mjs', errors, `${defaultPackagePath} must define guard:local-release-targets.`);
@@ -239,6 +240,7 @@ function validateRuntimeReleaseContract(contract, options = {}) {
   requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root guard:owner-governance-evidence'), errors, `${defaultVsixPackagePath} check must invoke guard:owner-governance-evidence.`);
   requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root guard:owner-governance-evidence:test'), errors, `${defaultVsixPackagePath} check must invoke guard:owner-governance-evidence:test.`);
   requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root release:owner-governance-evidence:test'), errors, `${defaultVsixPackagePath} check must invoke release:owner-governance-evidence:test.`);
+  requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root phase-loop:todo-state:test'), errors, `${defaultVsixPackagePath} check must invoke phase-loop:todo-state:test.`);
   requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root phase-loop:supervisor-diagnose:test'), errors, `${defaultVsixPackagePath} check must invoke phase-loop:supervisor-diagnose:test.`);
   requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root phase-loop:supervisor-control:test'), errors, `${defaultVsixPackagePath} check must invoke phase-loop:supervisor-control:test.`);
   requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root release:dependency-security-license-audit:test'), errors, `${defaultVsixPackagePath} check must invoke release:dependency-security-license-audit:test.`);

@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { loadTodoState } from './phase-loop-todo-state.mjs';
 
 const defaultTodoPath = '.brownie/todo.md';
 
@@ -232,36 +233,6 @@ function completionRecordExists(repoRoot, claimId, runStamp) {
   return completionRecordPaths(repoRoot, claimId, runStamp).some((recordPath) => fs.existsSync(recordPath));
 }
 
-function completedTodoIds(repoRoot) {
-  const dir = path.join(repoRoot, '.brownie/private/phase-loop/todo-completions');
-  const ids = new Set();
-  let entries = [];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      return ids;
-    }
-    throw error;
-  }
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) {
-      continue;
-    }
-    try {
-      const record = readJson(path.join(dir, entry.name));
-      if (typeof record.selected_todo_id === 'string' && record.selected_todo_id.trim()) {
-        ids.add(record.selected_todo_id.trim());
-      }
-    } catch {
-      // Ignore malformed completion records here. Other guards are responsible
-      // for validating record syntax; progress integrity should not grant
-      // completion credit from unreadable evidence.
-    }
-  }
-  return ids;
-}
-
 function isExplicitBlocker(block) {
   const lower = block.toLowerCase();
   return (
@@ -467,6 +438,7 @@ export function loadCliInput(args) {
   const todoBefore = typeof claim.baseline_todo_text === 'string'
     ? claim.baseline_todo_text
     : gitHeadText(repoRoot, todoRelative) ?? todoAfter;
+  const todoState = loadTodoState(repoRoot, todoAfter);
   return {
     repoRoot,
     claim,
@@ -476,7 +448,7 @@ export function loadCliInput(args) {
     todoAfter,
     runStamp: args.runStamp,
     completionRecordExists: completionRecordExists(repoRoot, claim.claim_id, args.runStamp),
-    completedTodoIds: completedTodoIds(repoRoot)
+    completedTodoIds: todoState.completedIds
   };
 }
 
