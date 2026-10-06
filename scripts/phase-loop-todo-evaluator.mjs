@@ -408,6 +408,8 @@ function isMainModule() {
 if (isMainModule()) {
   const args = parseArgs(process.argv);
   const todoPath = args.todo ? path.resolve(defaultRepoRoot, args.todo) : path.join(defaultRepoRoot, '.brownie/todo.md');
+  // Lineage belongs to the active queue; never pair an overridden TODO with
+  // the controller repository's unrelated default breakdown ledger.
   const breakdownPath = args.breakdown
     ? path.resolve(defaultRepoRoot, args.breakdown)
     : path.join(path.dirname(todoPath), 'todo-breakdown.md');
