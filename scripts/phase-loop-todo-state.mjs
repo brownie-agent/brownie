@@ -72,13 +72,20 @@ export function readTrackedBreakdownReplanRecords(repoRoot) {
   const records = [];
   for (let index = 0; index < headings.length; index += 1) {
     const current = headings[index];
-    if (!current.title.startsWith('TODO-repair-')) {
+    const repairPrefix = 'TODO-repair-';
+    const noEligibleSuffix = ' no-eligible multi-target split';
+    const isRepairSection = current.title.startsWith(repairPrefix);
+    const isNoEligibleSplitSection = current.title.endsWith(noEligibleSuffix);
+    if (!isRepairSection && !isNoEligibleSplitSection) {
       continue;
     }
-    const parentTodoId = current.title.slice('TODO-repair-'.length).trim();
+    const parentTodoId = isRepairSection
+      ? current.title.slice(repairPrefix.length).trim()
+      : current.title.slice(0, -noEligibleSuffix.length).trim();
     const section = text.slice(current.contentStart, headings[index + 1]?.start ?? text.length);
     const lines = section.split('\n');
-    const graphStart = lines.findIndex((line) => line.trim() === 'Dependency graph:');
+    const childListLabel = isRepairSection ? 'Dependency graph:' : 'Targets:';
+    const graphStart = lines.findIndex((line) => line.trim() === childListLabel);
     const childIds = [];
     if (graphStart >= 0) {
       for (const line of lines.slice(graphStart + 1)) {
@@ -106,7 +113,9 @@ export function readTrackedBreakdownReplanRecords(repoRoot) {
       parent_todo_id: parentTodoId,
       generated_child_ids: childIds,
       generated_leaf_ids: childIds,
-      replan_record_reason: 'tracked_todo_breakdown_repair_section'
+      replan_record_reason: isRepairSection
+        ? 'tracked_todo_breakdown_repair_section'
+        : 'tracked_todo_breakdown_no_eligible_split_section'
     });
   }
   return records;
