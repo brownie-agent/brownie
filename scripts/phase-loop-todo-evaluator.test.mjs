@@ -183,7 +183,7 @@ test('skips stalled replan blocked IDs across queue fingerprints regardless of T
   assert(selected.startsWith('- [ ] E-22b-replan-stalled-leaf-4030af97e57f:'), selected);
 });
 
-test('treats stable replanned parent dependency as satisfied for later leaves', () => {
+test('does not treat a stable blocked record as dependency completion evidence', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');
   const parent = `- [ ] E-22f-release-contract-audit-doc-sync: Patch only \`docs/architecture/runtime-release-contract.json\` and \`docs/architecture/runtime-release-readiness-audit.json\`:
@@ -210,7 +210,72 @@ test('treats stable replanned parent dependency as satisfied for later leaves', 
 
   const selected = selectFirstSchedulableTodo(queue, { blockedPath: blocked });
 
-  assert(selected.startsWith('- [ ] E-22g-final-judgment-manifest-doc-sync:'), selected);
+  assert.equal(selected, '');
+});
+
+test('keeps a superseded parent unresolved until every generated child completes', () => {
+  const queue = `- [x] E-23a-parent: Split this work into bounded children.
+- [ ] E-23a-child-1: Patch only \`scripts/one.mjs\`:
+  Route: implementation.
+  Source TODO: E-23a-parent.
+  Depends on: <none>.
+  Completion condition: first child is complete.
+  Forbidden changes: do not edit unrelated files.
+  Verification: run \`node --test scripts/one.test.mjs\`.
+- [ ] E-23a-child-2: Patch only \`scripts/two.mjs\`:
+  Route: implementation.
+  Source TODO: E-23a-parent.
+  Depends on: E-23a-child-1.
+  Completion condition: second child is complete.
+  Forbidden changes: do not edit unrelated files.
+  Verification: run \`node --test scripts/two.test.mjs\`.
+- [ ] E-23b-dependent: Patch only \`scripts/dependent.mjs\`:
+  Route: implementation.
+  Source TODO: review.
+  Depends on: E-23a-parent.
+  Completion condition: downstream work begins only after the full parent replacement resolves.
+  Forbidden changes: do not edit unrelated files.
+  Verification: run \`node --test scripts/dependent.test.mjs\`.`;
+  const replan = {
+    record_type: 'todo_replan',
+    operation: 'split_parent_into_children',
+    parent_status: 'superseded_by_children',
+    parent_todo_id: 'E-23a-parent',
+    generated_child_ids: ['E-23a-child-1', 'E-23a-child-2']
+  };
+  const inheritedCompletion = {
+    selected_todo_id: 'E-23a-child-1',
+    source_todo_id: 'E-23a-parent',
+    reason: 'source_parent_completed'
+  };
+
+  const first = evaluateTodoQueue(queue, {
+    todoReplanRecords: [replan],
+    todoCompletionRecords: [inheritedCompletion]
+  });
+
+  assert.equal(first.selected_todo_id, 'E-23a-child-1');
+  assert.equal(first.todo_state.invalidated_completion_record_count, 1);
+  assert(!first.todo_state.resolved_todo_ids.includes('E-23a-parent'), first.todo_state);
+
+  const second = evaluateTodoQueue(queue, {
+    todoReplanRecords: [replan],
+    todoCompletionRecords: [
+      { selected_todo_id: 'E-23a-child-1', reason: 'verified_completion' }
+    ]
+  });
+  assert.equal(second.selected_todo_id, 'E-23a-child-2');
+  assert(!second.todo_state.resolved_todo_ids.includes('E-23a-parent'), second.todo_state);
+
+  const downstream = evaluateTodoQueue(queue, {
+    todoReplanRecords: [replan],
+    todoCompletionRecords: [
+      { selected_todo_id: 'E-23a-child-1', reason: 'verified_completion' },
+      { selected_todo_id: 'E-23a-child-2', reason: 'verified_completion' }
+    ]
+  });
+  assert.equal(downstream.selected_todo_id, 'E-23b-dependent');
+  assert(downstream.todo_state.resolved_todo_ids.includes('E-23a-parent'), downstream.todo_state);
 });
 
 test('skips broad parent after a generated leaf for the same product prefix was blocked', () => {

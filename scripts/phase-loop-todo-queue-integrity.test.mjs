@@ -4,7 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import test from 'node:test';
-import { validateTodoQueueIntegrity } from './phase-loop-todo-queue-integrity.mjs';
+import {
+  trackedBreakdownReplanRecords,
+  validateTodoQueueIntegrity
+} from './phase-loop-todo-queue-integrity.mjs';
 
 const e20a = `- [ ] E-20a-golden-journey-workspace-mutation: Patch only \`scripts/release-runtime-operational-evidence.mjs\` and \`scripts/guard-runtime-operational-evidence.test.mjs\`: make Golden Journey require mutation.
   Route: implementation.
@@ -30,6 +33,29 @@ const e20c = `- [ ] E-20c-release-contract-binding: Patch only \`docs/architectu
 function queue(...blocks) {
   return `# Brownie TODO Queue\n\n## Product Ready Blocking Queue\n\n${blocks.join('\n\n')}\n`;
 }
+
+test('tracked breakdown replan parsing stops at the next level-two heading', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-breakdown-boundary-'));
+  fs.mkdirSync(path.join(tmp, '.brownie'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, '.brownie/todo-breakdown.md'), `# Brownie TODO breakdown
+
+## TODO-repair-E-22-source
+
+Dependency graph:
+- E-22-child: <none>
+
+## E-23 unrelated multi-target split
+
+Dependency graph:
+- E-23-child: <none>
+`);
+
+  const records = trackedBreakdownReplanRecords(tmp);
+
+  assert.equal(records.length, 1);
+  assert.equal(records[0].parent_todo_id, 'E-22-source');
+  assert.deepEqual(records[0].generated_child_ids, ['E-22-child']);
+});
 
 test('allows removing a completed TODO while preserving dependent TODO contract', () => {
   const result = validateTodoQueueIntegrity({
@@ -379,6 +405,7 @@ test('CLI rejects dirty queue contract drift against HEAD', () => {
 test('CLI accepts parent TODO superseded by children when durable replan record exists', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-replan-integrity-'));
   fs.mkdirSync(path.join(tmp, '.brownie/private/phase-loop/todo-replans'), { recursive: true });
+  fs.mkdirSync(path.join(tmp, '.brownie/private/phase-loop/todo-completions'), { recursive: true });
   fs.writeFileSync(path.join(tmp, '.brownie/todo.md'), queue(e20a, e20b));
   execFileSync('git', ['init', '-b', 'main'], { cwd: tmp, stdio: 'ignore' });
   execFileSync('git', ['add', '.brownie/todo.md'], { cwd: tmp, stdio: 'ignore' });
@@ -410,6 +437,14 @@ test('CLI accepts parent TODO superseded by children when durable replan record 
         'E-20a-golden-journey-workspace-mutation-target-01',
         'E-20a-golden-journey-workspace-mutation-target-02'
       ]
+    }, null, 2)}\n`
+  );
+  fs.writeFileSync(
+    path.join(tmp, '.brownie/private/phase-loop/todo-completions/incorrect-child-completion.json'),
+    `${JSON.stringify({
+      selected_todo_id: 'E-20a-golden-journey-workspace-mutation-target-01',
+      reason: 'source_parent_completed',
+      source_todo_id: 'E-20a-golden-journey-workspace-mutation'
     }, null, 2)}\n`
   );
 

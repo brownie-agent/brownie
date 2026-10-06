@@ -43,13 +43,17 @@ function makeRepo() {
     path.join(repo, 'scripts/phase-loop-todo-queue-integrity.mjs')
   );
   fs.copyFileSync(
+    path.join(__dirname, 'phase-loop-todo-state.mjs'),
+    path.join(repo, 'scripts/phase-loop-todo-state.mjs')
+  );
+  fs.copyFileSync(
     path.join(__dirname, 'guard-todo-decomposition.mjs'),
     path.join(repo, 'scripts/guard-todo-decomposition.mjs')
   );
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' });
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
   execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
-  execFileSync('git', ['add', 'package.json', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/guard-todo-decomposition.mjs'], { cwd: repo });
+  execFileSync('git', ['add', 'package.json', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-state.mjs', 'scripts/guard-todo-decomposition.mjs'], { cwd: repo });
   execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
   return repo;
 }
@@ -525,7 +529,7 @@ Parent TODO: E-22e-release-contract-trace-binding-guard
   assert.match(breakdown, /TODO-repair-E-22e-replan-stalled-leaf-16e2c69e67bb/u);
 });
 
-test('removes live child TODOs whose source parent is already checked complete', () => {
+test('does not inherit completion from Source TODO lineage', () => {
   const repo = makeRepo();
   writeTodo(repo);
   const parentTodo = `- [x] E-21c-owner-governance-reproducibility-impl-7: Patch only \`scripts/release-owner-governance-evidence.mjs\` and \`scripts/guard-owner-governance-evidence.test.mjs\`:
@@ -589,18 +593,77 @@ Quality rubric:
   const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
   const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
 
-  assert.equal(result.repair.non_live_todo_residue.attempted, true, JSON.stringify(result, null, 2));
-  assert.deepEqual(
-    result.repair.non_live_todo_residue.removed_todo_ids.sort(),
-    [
-      'E-21c-owner-governance-reproducibility-impl-7-target-01',
-      'E-21c-owner-governance-reproducibility-impl-7-target-02'
-    ].sort()
+  assert.equal(
+    result.repair.non_live_todo_residue.reason,
+    'no_non_live_todo_residue_detected',
+    JSON.stringify(result, null, 2)
   );
-  assert.doesNotMatch(todo, /E-21c-owner-governance-reproducibility-impl-7-target-01/u);
-  assert.doesNotMatch(todo, /E-21c-owner-governance-reproducibility-impl-7-target-02/u);
+  assert.match(todo, /E-21c-owner-governance-reproducibility-impl-7-target-01/u);
+  assert.match(todo, /E-21c-owner-governance-reproducibility-impl-7-target-02/u);
   assert.match(todo, /E-20i-runtime-release-ops-blocker/u);
-  assert.equal(result.repair.post_repair_validation.ok, true, JSON.stringify(result, null, 2));
+});
+
+test('preserves superseded split children when the checked parent is only a dependency anchor', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const parentId = 'E-23a-release-artifact-portable-archive';
+  const childOneId = `${parentId}-target-01`;
+  const childTwoId = `${parentId}-target-02`;
+  const parentTodo = `- [x] ${parentId}: Patch only \`scripts/release-local-artifact.mjs\` and \`scripts/release-local-artifact.test.mjs\`:
+  Route: implementation.
+  Source TODO: external review.
+  Depends on: <none>.
+  Completion condition: parent is superseded by bounded children.
+  Forbidden changes: do not weaken checks.
+  Verification: run \`pnpm --workspace-root phase-loop:supervisor-control:test\`.`;
+  const childOne = `- [ ] ${childOneId}: Patch only \`scripts/release-local-artifact.mjs\`:
+  Route: implementation.
+  Source TODO: ${parentId}.
+  Depends on: <none>.
+  Completion condition: implement the first bounded slice.
+  Forbidden changes: do not edit sibling targets.
+  Verification: run \`pnpm --workspace-root phase-loop:supervisor-control:test\`.`;
+  const childTwo = `- [ ] ${childTwoId}: Patch only \`scripts/release-local-artifact.test.mjs\`:
+  Route: implementation.
+  Source TODO: ${parentId}.
+  Depends on: ${childOneId}.
+  Completion condition: verify the bounded implementation slice.
+  Forbidden changes: do not edit sibling targets.
+  Verification: run \`pnpm --workspace-root phase-loop:supervisor-control:test\`.`;
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `${parentTodo}\n\n${childOne}\n\n${childTwo}\n`);
+  fs.writeFileSync(path.join(repo, '.brownie/todo-breakdown.md'), '# breakdown\n');
+  execFileSync('git', ['add', '.brownie/todo.md', '.brownie/todo-breakdown.md'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'superseded split fixture'], { cwd: repo, stdio: 'ignore' });
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress',
+    run_id: 'superseded-split-residue',
+    consecutive_failures: 1,
+    detail: 'Supervisor is evaluating generated child residue.'
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-replans/split.json', {
+    record_type: 'todo_replan',
+    operation: 'split_parent_into_children',
+    parent_todo_id: parentId,
+    parent_status: 'superseded_by_children',
+    generated_child_ids: [childOneId, childTwoId]
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-completions/incorrect-child-one.json', {
+    selected_todo_id: childOneId,
+    reason: 'source_parent_completed',
+    source_todo_id: parentId
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+
+  assert.match(todo, new RegExp(`${childOneId}:`, 'u'));
+  assert.match(todo, new RegExp(`${childTwoId}:`, 'u'));
+  assert.equal(
+    result.repair.non_live_todo_residue.reason,
+    'no_non_live_todo_residue_detected',
+    JSON.stringify(result, null, 2)
+  );
 });
 
 test('preserves implementable child TODOs whose completed source is a stalled replan', () => {

@@ -74,6 +74,7 @@
     "guard:todo-contract:test": "node --test scripts/guard-todo-contract.test.mjs",
     "guard:tool-intent-contract": "node scripts/guard-tool-intent-contract.mjs",
     "guard:tool-intent-contract:test": "node --test scripts/guard-tool-intent-contract.test.mjs",
+    "phase-loop:todo-state:test": "node --test scripts/phase-loop-todo-state.test.mjs",
     "phase-loop:todo-evaluator:test": "node --test scripts/phase-loop-todo-evaluator.test.mjs",
     "phase-loop:progress-integrity": "node scripts/phase-loop-progress-integrity.mjs",
     "phase-loop:progress-integrity:test": "node --test scripts/phase-loop-progress-integrity.test.mjs",

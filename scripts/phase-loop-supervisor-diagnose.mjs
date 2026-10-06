@@ -666,7 +666,10 @@ export function diagnosePhaseLoop(options = {}) {
   const progressSameCount = Number(progress?.same_progress_count ?? 0);
   const progressStamp = progressRunStamp(progress);
   const evaluator = todoText
-    ? evaluateTodoQueue(todoText, { blockedPath: path.join(stateRoot, 'todo-claims/blocked.jsonl') })
+    ? evaluateTodoQueue(todoText, {
+        repoRoot,
+        blockedPath: path.join(stateRoot, 'todo-claims/blocked.jsonl')
+      })
     : null;
   const todoQueueIntegrity = runTodoQueueIntegrity(repoRoot);
   const statusVerificationFailureAnalysis = analyzeVerificationFailure(status, selectedTodo, repoRoot);
