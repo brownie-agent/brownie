@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isExplicitBlockerTodo, evaluateTodoQueue } from './phase-loop-todo-evaluator.mjs';
 import { validateTodoDecomposition } from './guard-todo-decomposition.mjs';
+import { diagnoseDeliveryReconciliation } from './phase-loop-delivery-reconcile.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -683,6 +684,13 @@ export function diagnosePhaseLoop(options = {}) {
   const dirtyFiles = gitStatus
     ? gitStatus.split('\n').map((line) => line.trim()).filter(Boolean)
     : [];
+  let deliveryReconciliation = null;
+  try {
+    const candidate = diagnoseDeliveryReconciliation({ repoRoot, target: 'origin/main' });
+    if (candidate.head !== candidate.target_commit) deliveryReconciliation = candidate;
+  } catch {
+    // A repository without origin/main (for example a unit-test fixture) has no remote delivery to reconcile.
+  }
   const evaluatorSelectedTodo = typeof evaluator?.selected_todo === 'string' ? evaluator.selected_todo : '';
   const evaluatorSelectedIsExplicitBlocker =
     evaluatorSelectedTodo.length > 0 && isExplicitBlockerTodo(evaluatorSelectedTodo);
@@ -990,6 +998,29 @@ export function diagnosePhaseLoop(options = {}) {
       { dirty_files: dirtyFiles.slice(0, 50) }
     );
   }
+  if (deliveryReconciliation?.safe_to_reconcile) {
+    addIssue(
+      issues,
+      'warning',
+      'merged_delivery_pending_reconciliation',
+      'origin/main へマージ済みの配送内容とローカル作業ツリーを安全に照合できます。',
+      'phase-loop:delivery-reconcile をdry-run後、--writeで受領し、preflight成功後にworkerを再開する。',
+      {
+        head: deliveryReconciliation.head,
+        target_commit: deliveryReconciliation.target_commit,
+        classified_files: deliveryReconciliation.files.length
+      }
+    );
+  } else if (deliveryReconciliation && !deliveryReconciliation.safe_to_reconcile) {
+    addIssue(
+      issues,
+      'critical',
+      'delivery_reconciliation_blocked',
+      'origin/mainとの差分に配送履歴で説明できないローカル変更があります。',
+      '自動同期せず、unrelated_local_changeをユーザー/Brownie作業として保全して個別確認する。',
+      { blockers: deliveryReconciliation.blockers }
+    );
+  }
 
   const stdoutLog = progress?.stdout_log ?? null;
   const stderrLog = progress?.stderr_log ?? null;
@@ -1064,6 +1095,7 @@ export function diagnosePhaseLoop(options = {}) {
       dirty: dirtyFiles.length > 0,
       dirty_files: dirtyFiles
     },
+    delivery_reconciliation: deliveryReconciliation,
     issues
   };
 
