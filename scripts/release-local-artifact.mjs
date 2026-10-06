@@ -9,6 +9,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const defaultRepoRoot = path.resolve(__dirname, '..');
 
+export const releaseArtifactSmokeArgs = [
+  ['--version'],
+  ['help', 'run'],
+  ['--json', 'status'],
+  ['--json', 'mode', 'list'],
+  ['help', 'resume']
+];
+
+export const releaseArtifactBuildTimeoutMs = 15 * 60_000;
+export const releaseArtifactSetupTimeoutMs = 5 * 60_000;
+export const releaseArtifactSmokeTimeoutMs = 60_000;
+
 function isMainModule() {
   return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 }
@@ -118,21 +130,38 @@ function run(repoRoot, command, args, options = {}) {
 }
 
 function tailText(value, maxLength = 4000) {
+  if (typeof value !== 'string') {
+    return '';
+  }
   return value.length > maxLength ? value.slice(-maxLength) : value;
 }
 
-function smoke(repoRoot, artifactPath, args) {
-  const result = spawnSync(artifactPath, args, {
-    cwd: repoRoot,
-    encoding: 'utf8',
-    timeout: 15_000,
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  return {
-    args,
-    exit_code: result.status,
-    passed: result.status === 0
-  };
+function smoke(artifactPath, args) {
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-release-smoke-'));
+  try {
+    const result = spawnSync(artifactPath, args, {
+      cwd: workspaceRoot,
+      encoding: 'utf8',
+      timeout: releaseArtifactSmokeTimeoutMs,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        BROWNIE_WORKSPACE_ROOT: workspaceRoot,
+        BROWNIE_CLI_DEBUG_INVALID_RESPONSE: '1'
+      }
+    });
+    return {
+      args,
+      command: [artifactPath, ...args].join(' '),
+      exit_code: result.status,
+      passed: result.status === 0,
+      error_code: result.error?.code ?? null,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? ''
+    };
+  } finally {
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
 }
 
 function writeJson(filePath, value) {
@@ -158,7 +187,7 @@ function assertNativeTargetMatchesRuntime(target) {
   }
 }
 
-function buildPlanForTarget(target) {
+export function buildPlanForTarget(target) {
   if (target === 'win32-x64' && process.platform === 'win32' && process.arch === 'arm64') {
     const vsDevCmd = 'C:\\BuildTools\\Common7\\Tools\\VsDevCmd.bat';
     if (!fs.existsSync(vsDevCmd)) {
@@ -172,10 +201,12 @@ function buildPlanForTarget(target) {
       buildArgs: [
         '/d',
         '/c',
-        `call ${vsDevCmd} -arch=x64 -host_arch=arm64 && cargo build --release -p brownie-cli --target x86_64-pc-windows-msvc`
+        `call ${vsDevCmd} -arch=x64 -host_arch=arm64 && cargo build --release -p brownie-cli -p brownie-runtime --target x86_64-pc-windows-msvc`
       ],
       sourceArtifact: 'target/x86_64-pc-windows-msvc/release/brownie.exe',
+      sourceRuntime: 'target/x86_64-pc-windows-msvc/release/brownie-runtime.exe',
       binaryName: 'brownie.exe',
+      runtimeName: 'brownie-runtime.exe',
       setup: {
         command: 'rustup',
         args: ['target', 'add', 'x86_64-pc-windows-msvc']
@@ -188,9 +219,11 @@ function buildPlanForTarget(target) {
   return {
     cargoTarget: null,
     buildCommand: 'cargo',
-    buildArgs: ['build', '--release', '-p', 'brownie-cli'],
+    buildArgs: ['build', '--release', '-p', 'brownie-cli', '-p', 'brownie-runtime'],
     sourceArtifact: `target/release/${binaryName}`,
+    sourceRuntime: `target/release/brownie-runtime${target.startsWith('win32-') ? '.exe' : ''}`,
     binaryName,
+    runtimeName: `brownie-runtime${target.startsWith('win32-') ? '.exe' : ''}`,
     setup: null
   };
 }
@@ -203,12 +236,18 @@ export function buildLocalArtifact(options = {}) {
   fs.mkdirSync(outFull, { recursive: true });
   const buildPlan = buildPlanForTarget(target);
 
-  const setup = buildPlan.setup ? run(repoRoot, buildPlan.setup.command, buildPlan.setup.args) : null;
+  const setup = buildPlan.setup
+    ? run(repoRoot, buildPlan.setup.command, buildPlan.setup.args, {
+      timeoutMs: releaseArtifactSetupTimeoutMs
+    })
+    : null;
   if (setup && !setup.passed) {
     throw new Error(`cargo target setup failed for ${target}\n${tailText(setup.stderr || setup.stdout)}`);
   }
 
-  const build = run(repoRoot, buildPlan.buildCommand, buildPlan.buildArgs);
+  const build = run(repoRoot, buildPlan.buildCommand, buildPlan.buildArgs, {
+    timeoutMs: releaseArtifactBuildTimeoutMs
+  });
   if (!build.passed) {
     throw new Error(`cargo release build failed for ${target}\n${tailText(build.stderr || build.stdout)}`);
   }
@@ -218,30 +257,35 @@ export function buildLocalArtifact(options = {}) {
   if (!fs.existsSync(sourceArtifact)) {
     throw new Error(`Expected release artifact is missing: ${buildPlan.sourceArtifact}`);
   }
+  const sourceRuntime = resolveRepoRelative(repoRoot, buildPlan.sourceRuntime);
+  if (!fs.existsSync(sourceRuntime)) {
+    throw new Error(`Expected Runtime companion is missing: ${buildPlan.sourceRuntime}`);
+  }
   const artifactRelativePath = normalizeRelativePath(path.join(outDir, binaryName));
   const artifactPath = resolveRepoRelative(repoRoot, artifactRelativePath);
+  const runtimeRelativePath = normalizeRelativePath(path.join(outDir, buildPlan.runtimeName));
+  const runtimePath = resolveRepoRelative(repoRoot, runtimeRelativePath);
   fs.copyFileSync(sourceArtifact, artifactPath);
+  fs.copyFileSync(sourceRuntime, runtimePath);
   if (!target.startsWith('win32-')) {
     fs.chmodSync(artifactPath, 0o755);
+    fs.chmodSync(runtimePath, 0o755);
   }
 
-  const smokeResults = [
-    smoke(repoRoot, artifactPath, ['--version']),
-    smoke(repoRoot, artifactPath, ['help', 'run']),
-    smoke(repoRoot, artifactPath, ['task', 'run', '--help']),
-    smoke(repoRoot, artifactPath, ['ledger', 'generate', '--help']),
-    smoke(repoRoot, artifactPath, ['stop', '--help']),
-    smoke(repoRoot, artifactPath, ['resume', '--help'])
-  ];
+  const smokeResults = releaseArtifactSmokeArgs.map((args) => smoke(artifactPath, args));
 
   // Validate smoke test results and reject raw stdout/stderr storage
   for (const result of smokeResults) {
     if (!result.passed) {
-      throw new Error(`Smoke test failed: ${result.command}\n${tailText(result.stderr || result.stdout)}`);
+      const reason = result.error_code
+        ? `spawn error: ${result.error_code}`
+        : `exit code: ${String(result.exit_code)}`;
+      throw new Error(
+        `Smoke test failed: ${result.command} (${reason})\n${tailText(result.stderr || result.stdout)}`
+      );
     }
   }
-  // sourceCommit already declared earlier; use existing value
-  // const sourceCommit = sha256SourceCommit(repoRoot);
+  const sourceCommit = sha256SourceCommit(repoRoot);
   const sourceCleanTree = sha256CleanTree(repoRoot);
   const sourceIdentity = sha256String(`${sourceCommit}:${sourceCleanTree}`);
   const artifactEvidence = {
@@ -260,6 +304,11 @@ export function buildLocalArtifact(options = {}) {
       source_commit: sourceCommit,
       source_clean_tree: sourceCleanTree,
       source_identity: sourceIdentity
+    },
+    runtime_companion: {
+      path: runtimeRelativePath,
+      sha256: sha256File(runtimePath),
+      bytes: fs.statSync(runtimePath).size
     },
     build: {
       setup: setup
@@ -284,11 +333,17 @@ export function buildLocalArtifact(options = {}) {
     artifact_path: artifactRelativePath,
     artifact_sha256: artifactEvidence.artifact.sha256,
     status: smokeResults.every((entry) => entry.passed) ? 'satisfied' : 'failed',
-    commands: smokeResults,
+    commands: smokeResults.map(({ args, exit_code, passed }) => ({ args, exit_code, passed })),
     release_ready: false
   };
   const checksumPath = resolveRepoRelative(repoRoot, normalizeRelativePath(path.join(outDir, 'SHA256SUMS')));
-  fs.writeFileSync(checksumPath, `${artifactEvidence.artifact.sha256.replace(/^sha256:/, '')}  ${artifactRelativePath}\n`);
+  fs.writeFileSync(
+    checksumPath,
+    [
+      `${artifactEvidence.artifact.sha256.replace(/^sha256:/, '')}  ${artifactRelativePath}`,
+      `${artifactEvidence.runtime_companion.sha256.replace(/^sha256:/, '')}  ${runtimeRelativePath}`
+    ].join('\n') + '\n'
+  );
   writeJson(resolveRepoRelative(repoRoot, normalizeRelativePath(path.join(outDir, 'artifact-evidence.json'))), artifactEvidence);
   writeJson(resolveRepoRelative(repoRoot, normalizeRelativePath(path.join(outDir, 'smoke-evidence.json'))), smokeEvidence);
 

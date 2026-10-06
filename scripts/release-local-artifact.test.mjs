@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  buildPlanForTarget,
+  releaseArtifactBuildTimeoutMs,
+  releaseArtifactSetupTimeoutMs,
+  releaseArtifactSmokeTimeoutMs,
+  releaseArtifactSmokeArgs
+} from './release-local-artifact.mjs';
+
+test('release build and toolchain setup have CI-safe time budgets', () => {
+  assert(releaseArtifactBuildTimeoutMs >= 10 * 60_000);
+  assert(releaseArtifactSetupTimeoutMs >= 5 * 60_000);
+  assert(releaseArtifactSmokeTimeoutMs >= 60_000);
+});
+
+test('release artifact build contains the CLI and its Runtime companion', () => {
+  const platform = process.platform === 'win32' ? 'win32' : process.platform;
+  const arch = process.arch === 'x64' ? 'x64' : process.arch;
+  const plan = buildPlanForTarget(`${platform}-${arch}`);
+  assert.match(plan.sourceArtifact, /brownie(?:\.exe)?$/u);
+  assert.match(plan.sourceRuntime, /brownie-runtime(?:\.exe)?$/u);
+  assert(plan.buildArgs.includes('brownie-cli'));
+  assert(plan.buildArgs.includes('brownie-runtime'));
+});
+
+test('release artifact smoke invokes only current CLI surfaces', () => {
+  assert.deepEqual(releaseArtifactSmokeArgs, [
+    ['--version'],
+    ['help', 'run'],
+    ['--json', 'status'],
+    ['--json', 'mode', 'list'],
+    ['help', 'resume']
+  ]);
+  const serialized = JSON.stringify(releaseArtifactSmokeArgs);
+  assert.doesNotMatch(serialized, /task.*run|ledger.*generate|stop/u);
+});
+
+test('release artifact smoke commands are independently safe to probe', () => {
+  for (const args of releaseArtifactSmokeArgs) {
+    if (args.includes('run') || args.includes('resume')) {
+      assert.equal(args[0], 'help');
+    }
+  }
+});
