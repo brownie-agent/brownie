@@ -408,7 +408,7 @@ todo_first_pending_item() {
   if [ ! -f "$PHASE_LOOP_TODO" ]; then
     return 0
   fi
-  node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" select --todo "$PHASE_LOOP_TODO" --blocked "$TODO_BLOCKED_FILE" --controller-fingerprint "$(phase_loop_controller_fingerprint)"
+  node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" select --todo "$PHASE_LOOP_TODO" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" --blocked "$TODO_BLOCKED_FILE" --controller-fingerprint "$(phase_loop_controller_fingerprint)"
 }
 
 phase_loop_controller_fingerprint() {
@@ -917,7 +917,7 @@ ensure_broad_todo_decomposition_request() {
     return 1
   fi
   local evaluation
-  if ! evaluation="$(node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" needs-decomposition --todo "$PHASE_LOOP_TODO" --blocked "$TODO_BLOCKED_FILE" --json 2>/dev/null)"; then
+  if ! evaluation="$(node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" needs-decomposition --todo "$PHASE_LOOP_TODO" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" --blocked "$TODO_BLOCKED_FILE" --json 2>/dev/null)"; then
     return 1
   fi
   python3 - "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$evaluation" "$(now_utc)" <<'PY'

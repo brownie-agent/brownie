@@ -268,7 +268,10 @@ export function selectFirstSchedulableTodo(text, options = {}) {
   const blocks = uncheckedTodoBlocks(text);
   const todoState = options.todoState ?? (
     options.repoRoot
-      ? loadTodoState(options.repoRoot, text, { additionalReplanRecords: options.todoReplanRecords })
+      ? loadTodoState(options.repoRoot, text, {
+          additionalReplanRecords: options.todoReplanRecords,
+          breakdownPath: options.breakdownPath
+        })
       : resolveTodoState({
           todoText: text,
           replanRecords: options.todoReplanRecords,
@@ -351,7 +354,10 @@ export function selectFirstSchedulableTodo(text, options = {}) {
 export function evaluateTodoQueue(text, options = {}) {
   const todoState = options.todoState ?? (
     options.repoRoot
-      ? loadTodoState(options.repoRoot, text, { additionalReplanRecords: options.todoReplanRecords })
+      ? loadTodoState(options.repoRoot, text, {
+          additionalReplanRecords: options.todoReplanRecords,
+          breakdownPath: options.breakdownPath
+        })
       : resolveTodoState({
           todoText: text,
           replanRecords: options.todoReplanRecords,
@@ -379,6 +385,9 @@ function parseArgs(argv) {
     if (key === '--todo') {
       args.todo = value;
       index += 1;
+    } else if (key === '--breakdown') {
+      args.breakdown = value;
+      index += 1;
     } else if (key === '--blocked') {
       args.blocked = value;
       index += 1;
@@ -399,9 +408,13 @@ function isMainModule() {
 if (isMainModule()) {
   const args = parseArgs(process.argv);
   const todoPath = args.todo ? path.resolve(defaultRepoRoot, args.todo) : path.join(defaultRepoRoot, '.brownie/todo.md');
+  const breakdownPath = args.breakdown
+    ? path.resolve(defaultRepoRoot, args.breakdown)
+    : path.join(path.dirname(todoPath), 'todo-breakdown.md');
   const text = fs.readFileSync(todoPath, 'utf8');
   const result = evaluateTodoQueue(text, {
     repoRoot: defaultRepoRoot,
+    breakdownPath,
     blockedPath: args.blocked,
     controllerFingerprint: args.controllerFingerprint
   });

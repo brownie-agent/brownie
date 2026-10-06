@@ -54,10 +54,10 @@ export function readTodoReplanRecords(repoRoot) {
   ));
 }
 
-export function readTrackedBreakdownReplanRecords(repoRoot) {
+export function readTrackedBreakdownReplanRecords(repoRoot, breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md')) {
   let text;
   try {
-    text = fs.readFileSync(path.join(repoRoot, '.brownie/todo-breakdown.md'), 'utf8');
+    text = fs.readFileSync(breakdownPath, 'utf8');
   } catch (error) {
     if (error?.code === 'ENOENT') {
       return [];
@@ -121,10 +121,10 @@ export function readTrackedBreakdownReplanRecords(repoRoot) {
   return records;
 }
 
-export function readAllTodoReplanRecords(repoRoot) {
+export function readAllTodoReplanRecords(repoRoot, options = {}) {
   return [
     ...readTodoReplanRecords(repoRoot),
-    ...readTrackedBreakdownReplanRecords(repoRoot)
+    ...readTrackedBreakdownReplanRecords(repoRoot, options.breakdownPath)
   ];
 }
 
@@ -257,7 +257,7 @@ export function loadTodoState(repoRoot, todoText, options = {}) {
   return resolveTodoState({
     todoText,
     replanRecords: [
-      ...readAllTodoReplanRecords(repoRoot),
+      ...readAllTodoReplanRecords(repoRoot, { breakdownPath: options.breakdownPath }),
       ...(options.additionalReplanRecords ?? [])
     ],
     completionRecords: readTodoCompletionRecords(repoRoot)

@@ -133,3 +133,20 @@ Dependency graph:
   assert(!state.completedIds.has('E-23a-release-artifact-portable-archive'));
   assert(!state.resolvedIds.has('E-23a-release-artifact-portable-archive'));
 });
+
+test('tracked replans are read from the queue-specific breakdown path', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-state-root-'));
+  const queueRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-state-queue-'));
+  fs.mkdirSync(path.join(repoRoot, '.brownie'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, '.brownie/todo-breakdown.md'), `# Breakdown
+
+## E-collision no-eligible multi-target split
+
+Targets:
+- E-collision-target-01: \`wrong.mjs\`
+`);
+  const queueBreakdownPath = path.join(queueRoot, 'todo-breakdown.md');
+  fs.writeFileSync(queueBreakdownPath, '# Queue-specific breakdown\n');
+
+  assert.deepEqual(readTrackedBreakdownReplanRecords(repoRoot, queueBreakdownPath), []);
+});
