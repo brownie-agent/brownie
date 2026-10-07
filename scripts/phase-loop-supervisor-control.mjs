@@ -1680,8 +1680,15 @@ export function controlPhaseLoop(options = {}) {
   const postRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : postRepairValidation(repoRoot, repairResults, afterTerminalNoEligibleClaimRepair);
+  const terminalClaimRecoveryBlocked = terminalNoEligibleClaimRepair.reason === 'workspace_changed_or_dirty_not_archiving_claim';
   const start = postRepair.attempted && !postRepair.ok
     ? { attempted: false, reason: 'post_repair_validation_failed', validation: postRepair }
+    : terminalClaimRecoveryBlocked
+      ? {
+          attempted: false,
+          reason: 'terminal_no_eligible_claim_requires_verified_baseline',
+          terminal_claim_repair: terminalNoEligibleClaimRepair
+        }
     : maybeStartPhaseLoop(repoRoot, Boolean(options.start), afterTerminalNoEligibleClaimRepair);
   const final = start.attempted && start.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
