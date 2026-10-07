@@ -1528,9 +1528,19 @@ export function controlPhaseLoop(options = {}) {
   const afterTerminalNoEligibleClaimRepair = terminalNoEligibleClaimRepair.attempted && terminalNoEligibleClaimRepair.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterClaimRepair;
+  // A rejected refinement of an already bounded leaf is not evidence that the
+  // leaf needs another decomposition.  It is a targeted execution failure:
+  // retain the leaf contract and force the next worker turn onto its declared
+  // patch target.  This must win over the generic no-progress ledger, which
+  // can otherwise turn one rejected refinement into an endless replan chain.
+  const boundedLeafApplyRejectionRepair = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, afterTerminalNoEligibleClaimRepair);
   const todoContractReplanRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : maybeWriteTodoContractReplanFeedback(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary);
+    : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
+      ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
+      : maybeWriteTodoContractReplanFeedback(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary);
   const stalledTodoBlocked = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
@@ -1548,19 +1558,18 @@ export function controlPhaseLoop(options = {}) {
         };
   const semanticVerificationRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
+    : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
+      ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
+      : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
       ? { attempted: false, reason: 'todo_contract_replan_feedback_takes_precedence' }
       : maybeWriteSemanticVerificationRepairFeedback(repoRoot, afterRepair);
   const invalidPatchRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
+    : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
+      ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
+      : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
       ? { attempted: false, reason: 'todo_contract_replan_feedback_takes_precedence' }
       : maybeWriteInvalidPatchRepairFeedback(repoRoot, afterTerminalNoEligibleClaimRepair);
-  const boundedLeafApplyRejectionRepair = options.repair === false
-    ? { attempted: false, reason: 'repair_disabled' }
-    : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
-      ? { attempted: false, reason: 'todo_contract_replan_feedback_takes_precedence' }
-      : maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, afterTerminalNoEligibleClaimRepair);
   const repairResults = {
     failure_ledger: failureLedger,
     todo_queue_integrity: queueIntegrityRepair,
