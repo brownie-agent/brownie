@@ -15,6 +15,7 @@ function fixture() {
   git(repo, ['init', '-b', 'main']);
   git(repo, ['config', 'user.name', 'brownie-agent']);
   git(repo, ['config', 'user.email', 'brownie-agent@local']);
+  fs.writeFileSync(path.join(repo, '.gitignore'), '.brownie/private/\n');
   fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base\n');
   fs.writeFileSync(path.join(repo, 'clean-target-change.txt'), 'base\n');
   git(repo, ['add', '.']);
@@ -101,4 +102,69 @@ test('does not accept a blob that existed only before the delivered range', () =
   assert.equal(result.safe_to_reconcile, false);
   assert.equal(git(repo, ['rev-parse', 'HEAD']), base);
   assert.equal(fs.readFileSync(path.join(repo, 'created.txt'), 'utf8'), 'base\n');
+});
+
+test('receives a clean squash-equivalent delivery without overwriting the worktree', () => {
+  const { repo, base, target } = fixture();
+  git(repo, ['branch', 'delivery-tip', target]);
+  git(repo, ['switch', '-C', 'squash-target', base]);
+  git(repo, ['checkout', 'delivery-tip', '--', '.']);
+  git(repo, ['add', '.']);
+  git(repo, ['commit', '-m', 'squash delivery']);
+  const squashTarget = git(repo, ['rev-parse', 'HEAD']);
+  git(repo, ['switch', 'delivery-tip']);
+  const diagnosis = diagnoseDeliveryReconciliation({ repoRoot: repo, target: squashTarget });
+  assert.equal(diagnosis.head_is_ancestor, false);
+  assert.equal(diagnosis.head_tree_matches_target, true);
+  assert.equal(diagnosis.safe_to_reconcile, true);
+  const result = reconcileDelivery({ repoRoot: repo, target: squashTarget, write: true });
+  assert.equal(result.applied, true);
+  assert.equal(result.reconciliation_mode, 'squash_equivalent');
+  assert.equal(git(repo, ['rev-parse', 'HEAD']), squashTarget);
+  assert.equal(git(repo, ['status', '--porcelain', '--untracked-files=no']), '');
+});
+
+test('refuses a squash-equivalent delivery when the workspace is not clean', () => {
+  const { repo, base, target } = fixture();
+  git(repo, ['branch', 'delivery-tip', target]);
+  git(repo, ['switch', '-C', 'squash-target', base]);
+  git(repo, ['checkout', 'delivery-tip', '--', '.']);
+  git(repo, ['add', '.']);
+  git(repo, ['commit', '-m', 'squash delivery']);
+  const squashTarget = git(repo, ['rev-parse', 'HEAD']);
+  git(repo, ['switch', 'delivery-tip']);
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'user-owned\n');
+  const result = reconcileDelivery({ repoRoot: repo, target: squashTarget, write: true });
+  assert.equal(result.safe_to_reconcile, false);
+  assert(result.blockers.some((blocker) => blocker.code === 'squash_target_requires_clean_workspace'));
+  assert.equal(fs.readFileSync(path.join(repo, 'tracked.txt'), 'utf8'), 'user-owned\n');
+});
+
+test('cleans the index for a tree-equal fast-forward instead of treating it as squash-equivalent', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-delivery-reconcile-'));
+  git(repo, ['init', '-b', 'main']);
+  git(repo, ['config', 'user.name', 'brownie-agent']);
+  git(repo, ['config', 'user.email', 'brownie-agent@local']);
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base\n');
+  git(repo, ['add', '.']);
+  git(repo, ['commit', '-m', 'base']);
+  const base = git(repo, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'delivery\n');
+  git(repo, ['commit', '-am', 'delivery']);
+  const delivery = git(repo, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base\n');
+  git(repo, ['commit', '-am', 'revert delivery']);
+  const target = git(repo, ['rev-parse', 'HEAD']);
+  git(repo, ['branch', 'target', target]);
+  git(repo, ['switch', '-C', 'workspace', base]);
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'delivery\n');
+  git(repo, ['add', 'tracked.txt']);
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base\n');
+  const result = reconcileDelivery({ repoRoot: repo, target: 'target', write: true });
+  assert.equal(result.applied, true);
+  assert.equal(result.reconciliation_mode, 'fast_forward');
+  assert.equal(git(repo, ['rev-parse', 'HEAD']), target);
+  assert.equal(git(repo, ['status', '--porcelain', '--untracked-files=no']), '');
+  assert.equal(git(repo, ['show', ':tracked.txt']), 'base');
+  assert.notEqual(delivery, target);
 });
