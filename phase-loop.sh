@@ -86,8 +86,8 @@ write_bdk_trajectory_event() {
     payload_json="{}"
   fi
   python3 - "$TODO_CLAIM_FILE" "$BDK_TRAJECTORY_FILE" "$BDK_TRAJECTORY_DIR/$run_stamp.jsonl" "$run_stamp" "$event_type" "$(now_utc)" "$payload_json" <<'PY'
-import json
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -1270,6 +1270,17 @@ claim["queue_fingerprint"] = fingerprint
 claim["queue_generation"] = generation
 claim["baseline_commit"] = baseline_commit
 claim["baseline_diff_files"] = baseline_diff_files
+baseline_dirty_file_sha256 = {}
+for relative_path in baseline_diff_files:
+    try:
+        candidate = (workspace / relative_path).resolve()
+        if candidate.is_file() and candidate.is_relative_to(workspace.resolve()):
+            baseline_dirty_file_sha256[relative_path] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        else:
+            baseline_dirty_file_sha256[relative_path] = None
+    except Exception:
+        baseline_dirty_file_sha256[relative_path] = None
+claim["baseline_dirty_file_sha256"] = baseline_dirty_file_sha256
 claim["baseline_todo_text"] = todo_text
 claim["run_stamp"] = run_stamp
 claim["updated_at"] = timestamp
@@ -8602,6 +8613,7 @@ write_todo_claim() {
   timestamp="$(now_utc)"
   tmp_claim="$TODO_CLAIM_FILE.$$.$RANDOM.tmp"
   python3 - "$tmp_claim" "$claim_id" "$status" "$selected_todo" "$queue_fingerprint" "$queue_generation" "$PHASE_LOOP_TODO" "$run_stamp" "$PHASE_LOOP_WORKSPACE_ROOT" "$timestamp" <<'PY'
+import hashlib
 import json
 import os
 import pathlib
@@ -8658,6 +8670,16 @@ if not claim:
         baseline_diff_files = sorted(baseline_diff_file_set)
     except Exception:
         baseline_diff_files = []
+    baseline_dirty_file_sha256 = {}
+    for relative_path in baseline_diff_files:
+        try:
+            candidate = (workspace / relative_path).resolve()
+            if candidate.is_file() and candidate.is_relative_to(workspace.resolve()):
+                baseline_dirty_file_sha256[relative_path] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            else:
+                baseline_dirty_file_sha256[relative_path] = None
+        except Exception:
+            baseline_dirty_file_sha256[relative_path] = None
     try:
         baseline_todo_text = pathlib.Path(sys.argv[7]).read_text(encoding="utf-8")
     except Exception:
@@ -8671,6 +8693,7 @@ if not claim:
         "todo_path": sys.argv[7],
         "baseline_commit": baseline_commit,
         "baseline_diff_files": baseline_diff_files,
+        "baseline_dirty_file_sha256": baseline_dirty_file_sha256,
         "baseline_todo_text": baseline_todo_text,
         "created_at": timestamp,
         "status_history": [],
