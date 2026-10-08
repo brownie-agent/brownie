@@ -61,12 +61,12 @@
         "diagnostics_mentions": 0
       },
       "crates/brownie-runtime/src/controlled_tool_execution.rs": {
-        "line_count": 8005,
+        "line_count": 8036,
         "public_items": 74,
         "private_items": 119,
         "state_mutation_mentions": 47,
         "durable_write_mentions": 47,
-        "permission_decision_mentions": 102,
+        "permission_decision_mentions": 103,
         "recovery_mentions": 82,
         "rpc_dispatch_mentions": 0,
         "approval_mentions": 228,

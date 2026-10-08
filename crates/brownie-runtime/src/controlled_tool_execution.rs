@@ -3264,6 +3264,13 @@ pub(super) fn todo_md_workspace_write_rejection_reason(
             "Previous verification reported a concrete target-file failure; do not rewrite `.brownie/todo.md` or decompose the TODO. Repair the named target file directly or fail closed.",
         );
     }
+    if record.goal.contains("leaf_todo_write_forbidden_policy")
+        && !record.goal.contains("leaf_contract_replan_policy")
+    {
+        return Some(
+            "Bounded leaf execution policy forbids rewriting `.brownie/todo.md`; repair the named target file directly or fail closed.",
+        );
+    }
     if todo_md_write_looks_like_decomposition_attempt(input) {
         return todo_decomposition_workspace_write_rejection_reason(record, input);
     }
@@ -7544,6 +7551,30 @@ mod mcp_approval_lock_tests {
         );
 
         assert!(reason.is_none(), "{reason:?}");
+    }
+
+    #[test]
+    fn bounded_leaf_execution_policy_denies_todo_refinement_even_when_the_patch_is_valid() {
+        let mut record = test_task_record();
+        let selected = "- [ ] E-23a-leaf: Patch only `scripts/release-local-artifact.mjs` to create a portable archive:\n  Route: implementation.\n  Source TODO: E-23a.\n  Depends on: <none>.\n  Completion condition: archive contains the required binaries.\n  Forbidden changes: do not publish releases.\n  Verification: run `pnpm --workspace-root release:local-artifact:test`.\n";
+        record.goal = format!(
+            "# Brownie Phase Loop Effective Prompt\n\n## BDK Execution Packet\n\n- leaf_todo_write_forbidden_policy: bounded leaf must patch the named target.\n\n## Selected TODO\n\n{selected}"
+        );
+
+        let reason = todo_md_workspace_write_rejection_reason(
+            &record,
+            &json!({
+                "path": ".brownie/todo.md",
+                "operation": "patch_file",
+                "old_text": selected,
+                "new_text": "- [ ] E-23a-child: Patch only `scripts/release-local-artifact.mjs` to add archive metadata:\n  Route: implementation.\n  Source TODO: E-23a-leaf.\n  Depends on: <none>.\n  Completion condition: archive has metadata.\n  Forbidden changes: do not publish releases.\n  Verification: run `pnpm --workspace-root release:local-artifact:test`.\n"
+            }),
+        );
+
+        assert_eq!(
+            reason,
+            Some("Bounded leaf execution policy forbids rewriting `.brownie/todo.md`; repair the named target file directly or fail closed.")
+        );
     }
 
     #[test]
