@@ -10,6 +10,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const defaultRepoRoot = path.resolve(__dirname, '..');
 const maxRequestBytes = 12_000;
+const maxAttemptsPerFingerprint = 3;
+const retryBaseDelayMs = 60_000;
+const retryMaxDelayMs = 30 * 60_000;
 
 function parseArgs(argv) {
   const args = { repo: defaultRepoRoot, dispatch: false, request: null };
@@ -47,6 +50,50 @@ function gitDirtyFiles(repoRoot, run = spawnSync) {
 
 function requestFailure(reason, extra = {}) {
   return { eligible: false, reason, ...extra };
+}
+
+function selfUpdateStatePath(repoRoot) {
+  return path.join(repoRoot, '.brownie/private/phase-loop/self-update/retry-state.json');
+}
+
+function selfUpdateFingerprint({ request, eligibility }) {
+  const payload = JSON.stringify({
+    request: request.trim(),
+    status: eligibility.diagnostic?.phase_loop?.status ?? null,
+    issue_codes: (eligibility.diagnostic?.issues ?? []).map((issue) => issue.code).sort()
+  });
+  return `sha256:${crypto.createHash('sha256').update(payload).digest('hex')}`;
+}
+
+function retryDelayMs(failedAttempts) {
+  return Math.min(retryBaseDelayMs * (2 ** Math.max(0, failedAttempts - 1)), retryMaxDelayMs);
+}
+
+function readRetryState(repoRoot) {
+  const state = readJson(selfUpdateStatePath(repoRoot));
+  return state && state.schema_version === 1 && typeof state.fingerprints === 'object'
+    ? state
+    : { schema_version: 1, kind: 'brownie_phase_loop_self_update_retry_state', fingerprints: {} };
+}
+
+function retryDecision({ repoRoot, request, eligibility, now }) {
+  const state = readRetryState(repoRoot);
+  const fingerprint = selfUpdateFingerprint({ request, eligibility });
+  const entry = state.fingerprints[fingerprint] ?? null;
+  const currentTime = now().getTime();
+  if (!entry || entry.status !== 'failed') return { allowed: true, fingerprint, state, entry };
+  if (entry.failed_attempts >= maxAttemptsPerFingerprint) {
+    return { allowed: false, reason: 'self_update_retry_budget_exhausted', fingerprint, state, entry, max_attempts: maxAttemptsPerFingerprint };
+  }
+  const retryAfter = Date.parse(entry.retry_after ?? '');
+  if (Number.isFinite(retryAfter) && currentTime < retryAfter) {
+    return { allowed: false, reason: 'self_update_retry_backoff_active', fingerprint, state, entry, retry_after: entry.retry_after };
+  }
+  return { allowed: true, fingerprint, state, entry };
+}
+
+function persistRetryState(repoRoot, state) {
+  writeAtomically(selfUpdateStatePath(repoRoot), `${JSON.stringify(state, null, 2)}\n`);
 }
 
 export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSync }) {
@@ -98,6 +145,21 @@ function writeAtomically(filePath, contents) {
 export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = () => new Date() }) {
   const eligibility = evaluateSelfUpdateEligibility({ repoRoot, request, run });
   if (!eligibility.eligible) return { dispatched: false, eligibility };
+  const retry = retryDecision({ repoRoot, request, eligibility, now });
+  if (!retry.allowed) {
+    return {
+      dispatched: false,
+      eligibility,
+      retry: {
+        allowed: false,
+        reason: retry.reason,
+        fingerprint: retry.fingerprint,
+        retry_after: retry.retry_after ?? null,
+        failed_attempts: retry.entry?.failed_attempts ?? 0,
+        max_attempts: retry.max_attempts ?? maxAttemptsPerFingerprint
+      }
+    };
+  }
 
   const stamp = now().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
   const stateDir = path.join(repoRoot, '.brownie/private/phase-loop/self-update');
@@ -123,12 +185,37 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
     dirty_brownie_files_preserved: eligibility.dirty_brownie_files
   };
   writeAtomically(resultPath, `${JSON.stringify(record, null, 2)}\n`);
+  const previousFailures = retry.entry?.failed_attempts ?? 0;
+  const failedAttempts = result.status === 0 ? 0 : previousFailures + 1;
+  const nextRetryAt = result.status === 0
+    ? null
+    : new Date(now().getTime() + retryDelayMs(failedAttempts)).toISOString();
+  retry.state.fingerprints[retry.fingerprint] = {
+    fingerprint: retry.fingerprint,
+    status: result.status === 0 ? 'succeeded' : 'failed',
+    request_sha256: crypto.createHash('sha256').update(request.trim()).digest('hex'),
+    failed_attempts: failedAttempts,
+    max_attempts: maxAttemptsPerFingerprint,
+    last_attempt_at: record.dispatched_at,
+    retry_after: nextRetryAt,
+    last_result_path: path.relative(repoRoot, resultPath),
+    last_exit_code: result.status,
+    exhausted: result.status !== 0 && failedAttempts >= maxAttemptsPerFingerprint
+  };
+  persistRetryState(repoRoot, retry.state);
   return {
     dispatched: true,
     ok: result.status === 0,
     objective_path: record.objective_path,
     result_path: path.relative(repoRoot, resultPath),
     exit_code: result.status,
+    retry: {
+      fingerprint: retry.fingerprint,
+      failed_attempts: failedAttempts,
+      max_attempts: maxAttemptsPerFingerprint,
+      retry_after: nextRetryAt,
+      exhausted: result.status !== 0 && failedAttempts >= maxAttemptsPerFingerprint
+    },
     diagnostic: eligibility.diagnostic
   };
 }

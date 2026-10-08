@@ -1826,6 +1826,10 @@ export function controlPhaseLoop(options = {}) {
           : 'self_update_failed_not_starting',
         self_update: selfUpdate
       }
+    : selfUpdate.retry?.reason === 'self_update_retry_backoff_active'
+      ? { attempted: false, reason: 'self_update_retry_backoff_active_not_starting', self_update: selfUpdate }
+      : selfUpdate.retry?.reason === 'self_update_retry_budget_exhausted'
+        ? { attempted: false, reason: 'self_update_retry_budget_exhausted_not_starting', self_update: selfUpdate }
     : postRepair.attempted && !postRepair.ok
     ? { attempted: false, reason: 'post_repair_validation_failed', validation: postRepair }
     : postReplanClaimArchivalFailed

@@ -59,3 +59,32 @@ test('dispatches Brownie through an immutable private objective and records the 
   assert.equal(fs.existsSync(path.join(repo, result.objective_path)), true);
   assert.equal(fs.existsSync(path.join(repo, result.result_path)), true);
 });
+
+test('backs off failed recovery implementers and exhausts only the same failure fingerprint', () => {
+  const repo = makeRepo();
+  let attempts = 0;
+  const run = (command, args, options) => {
+    if (command === 'git') return spawnSync(command, args, options);
+    attempts += 1;
+    return { status: 17, stdout: '', stderr: 'recoverer stopped' };
+  };
+  const request = 'Repair controller policy contradiction.';
+  const first = dispatchSelfUpdate({ repoRoot: repo, request, run, now: () => new Date('2026-10-09T00:00:00.000Z') });
+  assert.equal(first.dispatched, true);
+  assert.equal(first.retry.failed_attempts, 1);
+
+  const backedOff = dispatchSelfUpdate({ repoRoot: repo, request, run, now: () => new Date('2026-10-09T00:00:30.000Z') });
+  assert.equal(backedOff.dispatched, false);
+  assert.equal(backedOff.retry.reason, 'self_update_retry_backoff_active');
+
+  dispatchSelfUpdate({ repoRoot: repo, request, run, now: () => new Date('2026-10-09T00:01:00.000Z') });
+  dispatchSelfUpdate({ repoRoot: repo, request, run, now: () => new Date('2026-10-09T00:03:00.000Z') });
+  const exhausted = dispatchSelfUpdate({ repoRoot: repo, request, run, now: () => new Date('2026-10-09T00:10:00.000Z') });
+  assert.equal(attempts, 3);
+  assert.equal(exhausted.dispatched, false);
+  assert.equal(exhausted.retry.reason, 'self_update_retry_budget_exhausted');
+
+  const changedRequest = dispatchSelfUpdate({ repoRoot: repo, request: 'Repair a distinct controller policy contradiction.', run, now: () => new Date('2026-10-09T00:10:00.000Z') });
+  assert.equal(changedRequest.dispatched, true);
+  assert.equal(attempts, 4);
+});
