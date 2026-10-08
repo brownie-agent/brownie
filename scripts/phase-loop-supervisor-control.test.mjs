@@ -84,6 +84,37 @@ Quality rubric:
   execFileSync('git', ['commit', '-m', 'todo fixture'], { cwd: repo, stdio: 'ignore' });
 }
 
+test('dispatches a requested self-update instead of restarting the stale supervisor', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress',
+    run_id: 'run-self-update',
+    consecutive_failures: 0
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress',
+    same_progress_count: 1,
+    progress_projection: { selected_todo: runtimeEvidenceTodo }
+  });
+  let dispatchedRequest = null;
+  const result = controlPhaseLoop({
+    repoRoot: repo,
+    write: false,
+    repair: false,
+    start: true,
+    selfUpdateRequest: 'Repair the controller contradiction without touching TODO state.',
+    selfUpdateDispatcher({ request }) {
+      dispatchedRequest = request;
+      return { dispatched: true, ok: true, objective_path: '.brownie/private/phase-loop/self-update/request.md' };
+    }
+  });
+  assert.equal(dispatchedRequest, 'Repair the controller contradiction without touching TODO state.');
+  assert.equal(result.self_update.dispatched, true);
+  assert.equal(result.start.attempted, false);
+  assert.equal(result.start.reason, 'self_update_dispatched_requires_review_and_delivery');
+});
+
 test('escalates repeated no-progress on the same bounded leaf to TODO contract replan feedback', () => {
   const repo = makeRepo();
   writeTodo(repo);
