@@ -9460,7 +9460,7 @@ leaf_force_write_on_repair = bool(
     and (
         not harness_has_terminal_repair_required
         or semantic_repair_requires_exact_write
-        or leaf_todo_refinement_rejected_for_implementation
+        or (leaf_todo_refinement_rejected_for_implementation and leaf_has_read_preview_for_repair)
     )
     and not leaf_allow_bounded_reread_for_exact_patch
     and (
@@ -9468,14 +9468,13 @@ leaf_force_write_on_repair = bool(
         or
         not leaf_has_oversized_repair
         or leaf_has_missing_fence_repair
-        or leaf_todo_refinement_rejected_for_implementation
+        or (leaf_todo_refinement_rejected_for_implementation and leaf_has_read_preview_for_repair)
         or selected_linux_helper_source_identity_repair
         or selected_linux_fields_source_identity_repair
         or selected_supply_chain_clean_source_guard_repair
     )
     and (
         leaf_has_read_preview_for_repair
-        or leaf_todo_refinement_rejected_for_implementation
         or (
             isinstance(repair_feedback.get("verification"), dict)
             and repair_feedback.get("verification", {}).get("invalid_patch_proposals")
@@ -9500,6 +9499,10 @@ if "Source TODO:" in selected_todo and re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:
         )
         leaf_execution_policy_lines.append(
             f"- leaf_contract_replan_scope_policy: the `.brownie/todo.md` patch must remove the selected leaf `{selected_parent_id or '<selected leaf id>'}`, preserve the parent intent, keep existing unrelated TODOs, use existing verification commands, and must not declare Product Ready or weaken guards."
+        )
+    elif leaf_todo_refinement_rejected_for_implementation and selected_leaf_target_path and not leaf_has_read_preview_for_repair:
+        leaf_execution_policy_lines.append(
+            f"- leaf_target_context_recovery_policy: the prior `.brownie/todo.md` refinement was rejected, but there is no saved read preview for `{selected_leaf_target_path}`. The next tool may be exactly one `workspace.read` for `{selected_leaf_target_path}` to obtain exact patch context. Do not read `.brownie/todo.md`, split the leaf, or modify any file in this recovery turn. After that target preview exists, the next repair turn must patch `{selected_leaf_target_path}` directly."
         )
     elif leaf_force_write_on_repair:
         leaf_execution_policy_lines.append(
