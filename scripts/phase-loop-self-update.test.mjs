@@ -67,6 +67,14 @@ test('plans a self-update only while the phase loop is stopped and source tree i
   assert.match(objective, /Patch only `scripts\/phase-loop-self-update\.mjs`/u);
 });
 
+test('tells a recoverer to use trusted exact patch context without rereading a large target', () => {
+  const repo = makeRepo();
+  const request = `${recoveryRequest()}\n\nTrusted exact old_text:\nold\n\nTrusted exact new_text:\nnew`;
+  const eligibility = evaluateSelfUpdateEligibility({ repoRoot: repo, request });
+  const objective = buildSelfUpdateObjective({ request, eligibility });
+  assert.match(objective, /Do not use workspace\.read to rediscover that hunk/u);
+});
+
 test('requires explicit workspace-relative targets for a self-update request', () => {
   const repo = makeRepo();
   const eligibility = evaluateSelfUpdateEligibility({ repoRoot: repo, request: 'Repair controller policy contradiction.' });
@@ -218,6 +226,58 @@ test('treats exit-zero terminal and continuation outcomes as failed self-updates
   });
   assert.equal(continuation.ok, false);
   assert.equal(continuation.retry.failed_attempts, 1);
+});
+
+test('resumes its own applied recovery continuation exactly once', () => {
+  const repo = makeRepo();
+  const invocations = [];
+  const appliedContinuation = JSON.stringify({
+    ok: true,
+    automation: {
+      status: 'continuation_required',
+      controller_action: 'resume',
+      completed: false,
+      blocked: false,
+      continuation_required: true,
+      terminal_failure: false
+    },
+    run: {
+      automation: {
+        status: 'continuation_required',
+        controller_action: 'resume',
+        completed: false,
+        blocked: false,
+        continuation_required: true,
+        terminal_failure: false,
+        objective_apply_applied: true,
+        session_id: 'session-recovery',
+        journey_id: 'journey-recovery',
+        task_id: 'task-recovery',
+        run_id: 'run-recovery'
+      }
+    }
+  });
+  const result = dispatchSelfUpdate({
+    repoRoot: repo,
+    request: recoveryRequest(),
+    now: () => new Date('2026-10-09T00:00:00.000Z'),
+    run(command, args, options) {
+      if (command === 'git') return spawnSync(command, args, options);
+      if (command.endsWith('brownie-runtime')) return runtimeStatusResult();
+      invocations.push(args);
+      return invocations.length === 1
+        ? { status: 0, stdout: appliedContinuation, stderr: '' }
+        : { status: 0, stdout: completedOutcome, stderr: '' };
+    }
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.deepEqual(invocations[1], [
+    '--json', 'resume',
+    '--session-id', 'session-recovery',
+    '--journey-id', 'journey-recovery',
+    '--task-id', 'task-recovery',
+    '--run-id', 'run-recovery'
+  ]);
 });
 
 test('backs off failed recovery implementers and exhausts only the same failure fingerprint', () => {

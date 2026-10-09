@@ -313,6 +313,54 @@ test('does not carry a no-progress ledger streak across a changed progress finge
   assert.equal(result.repair.failure_ledger_summary.should_replan, false, JSON.stringify(result, null, 2));
 });
 
+test('anchors bounded-leaf rejection feedback to the active claim identity', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const apply = {
+    kind: 'todo_apply_rejected',
+    reason: 'selected_todo_is_already_a_bounded_leaf',
+    repair_hint: 'Do not refine a bounded leaf TODO into another child TODO.',
+    selected_patch_targets: ['scripts/guard-runtime-operational-evidence.test.mjs'],
+    selected_todo_first_line: runtimeEvidenceTodo.split('\n')[0],
+    semantic_repair_policy: { mode: 'bounded_leaf_target_repair' },
+    source_run_id: 'run-bounded-feedback'
+  };
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress',
+    run_id: 'run-bounded-feedback',
+    consecutive_failures: 1,
+    detail: `Rejected Brownie TODO refinement proposal before applying it because TODO guard preflight failed; apply=${JSON.stringify(apply)}`
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'continuation_required',
+    same_progress_count: 1,
+    run_stamp: '20261009T020000Z',
+    progress_projection: {
+      cli_status: 'routed_explicit_action',
+      closure: 'routed_explicit_action',
+      claim_id: 'claim-bounded-feedback',
+      selected_todo: runtimeEvidenceTodo
+    }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-bounded-feedback',
+    status: 'in_progress',
+    queue_generation: 17,
+    queue_fingerprint: 'queue-bounded-feedback',
+    selected_todo: runtimeEvidenceTodo
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const feedback = JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8'));
+
+  assert.equal(result.repair.bounded_leaf_apply_rejection.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(feedback.kind, 'phase_loop_bounded_leaf_apply_rejection_repair_feedback');
+  assert.equal(feedback.claim_id, 'claim-bounded-feedback');
+  assert.equal(feedback.queue_generation, 17);
+  assert.equal(feedback.queue_fingerprint, 'queue-bounded-feedback');
+});
+
 test('archives a stale claim and keeps a rejected bounded leaf out of the generic replan path', () => {
   const repo = makeRepo();
   writeTodo(repo);

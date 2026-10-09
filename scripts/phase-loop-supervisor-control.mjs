@@ -1531,6 +1531,9 @@ function maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, diagnostic) {
     reason: 'supervisor_bounded_leaf_refinement_rejected',
     selected_todo: selectedTodo,
     selected_todo_first_line: todoFirstLine(selectedTodo) ?? applyRejection?.selected_todo?.first_line ?? null,
+    claim_id: claim?.claim_id ?? null,
+    queue_generation: claim?.queue_generation ?? null,
+    queue_fingerprint: claim?.queue_fingerprint ?? null,
     apply_rejection: applyRejection,
     repair_hint: [
       'The selected TODO is already a bounded leaf.',
