@@ -3271,6 +3271,12 @@ pub(super) fn todo_md_workspace_write_rejection_reason(
     if decomposition_only {
         return todo_decomposition_workspace_write_rejection_reason(record, input);
     }
+    if selected_todo_allows_todo_md_edit(&record.goal) {
+        if let Some(reason) = todo_repair_workspace_write_rejection_reason(input) {
+            return Some(reason);
+        }
+        return None;
+    }
     if record
         .goal
         .contains("- leaf_oversized_repair_next_tool_policy:")
@@ -3286,12 +3292,6 @@ pub(super) fn todo_md_workspace_write_rejection_reason(
         return Some(
             "Bounded Patch only leaves must not rewrite the live TODO queue unless the supervisor explicitly authorizes a contract replan or oversized-patch recovery.",
         );
-    }
-    if selected_todo_allows_todo_md_edit(&record.goal) {
-        if let Some(reason) = todo_repair_workspace_write_rejection_reason(input) {
-            return Some(reason);
-        }
-        return None;
     }
     if verification_failure_requires_target_file_repair(&record.goal) {
         return Some(
@@ -7900,7 +7900,7 @@ mod mcp_approval_lock_tests {
     #[test]
     fn explicit_todo_md_maintenance_todos_can_patch_todo_md() {
         let mut record = test_task_record();
-        record.goal = "# Brownie Phase Loop Effective Prompt\n\n## Selected TODO\n\n- [ ] TODO-maintenance: Update todo.md by decomposing an oversized blocker TODO.\n".to_string();
+        record.goal = "# Brownie Phase Loop Effective Prompt\n\n- leaf_todo_write_forbidden_policy: bounded Patch only leaves must not rewrite the TODO queue without an exception.\n\n## Selected TODO\n\n- [ ] TODO-maintenance: Update todo.md by decomposing an oversized blocker TODO.\n".to_string();
 
         let reason = todo_md_workspace_write_rejection_reason(
             &record,

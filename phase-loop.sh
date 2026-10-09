@@ -9421,7 +9421,10 @@ leaf_has_truncated_read_preview_for_repair = bool(
     selected_leaf_target_path
     and any(
         preview_is_for_path(preview, selected_leaf_target_path)
-        and "[...previous workspace.read preview middle omitted by phase-loop...]" in str(preview)
+        and (
+            "[...previous workspace.read preview middle omitted by phase-loop...]" in str(preview)
+            or "[truncated at line boundary]" in str(preview)
+        )
         for preview in repair_workspace_read_previews
     )
 )
