@@ -14970,12 +14970,6 @@ fn build_workspace_patch_proposal_from_input(
             result.validation_reason = Some("target file is not UTF-8");
             return result;
         };
-        if scan_text_for_sensitive_content(&existing) {
-            result.validation_status = "Blocked";
-            result.validation_reason = Some("target file contains sensitive-like data");
-            result.diff_redacted = true;
-            return result;
-        }
         if let Err(reason) = apply_text_hunks(&existing, &hunks) {
             result.validation_status = "Invalid";
             result.validation_reason = Some(reason);
@@ -46439,8 +46433,11 @@ modes:
     fn proposal_apply_patch_file_replaces_single_hunk_after_approval_and_current_hash() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("README.md"), "alpha\nbeta\ngamma\n")
-            .expect("write readme");
+        std::fs::write(
+            temp.path().join("README.md"),
+            "const EXAMPLE_TOKEN = \"sk-proposed-token-with-enough-length\";\nalpha\nbeta\ngamma\n",
+        )
+        .expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
         let start = parse_line(
@@ -46506,7 +46503,7 @@ modes:
         );
         assert_eq!(
             std::fs::read_to_string(temp.path().join("README.md")).unwrap(),
-            "alpha\ndelta\ngamma\n"
+            "const EXAMPLE_TOKEN = \"sk-proposed-token-with-enough-length\";\nalpha\ndelta\ngamma\n"
         );
 
         let events = parse_line(&format!(
@@ -52918,6 +52915,25 @@ modes:
         assert_eq!(proposed_secret.content_preview, "[redacted]");
         assert!(proposed_secret.diff_preview.is_none());
         assert!(proposed_secret.diff_redacted);
+
+        let sensitive_patch_hunk = build_workspace_patch_proposal_from_input(
+            &store,
+            "README.md",
+            WorkspacePatchOperation::PatchFile.as_str(),
+            "",
+            &json!({
+                "old_text": "old\n",
+                "new_text": "sk-proposed-token-with-enough-length\n",
+            }),
+        );
+        assert_eq!(sensitive_patch_hunk.validation_status, "Blocked");
+        assert_eq!(
+            sensitive_patch_hunk.validation_reason,
+            Some("patch_file hunks contain sensitive-like data")
+        );
+        assert_eq!(sensitive_patch_hunk.content_preview, "[redacted]");
+        assert!(sensitive_patch_hunk.diff_preview.is_none());
+        assert!(sensitive_patch_hunk.diff_redacted);
 
         let existing_secret = build_workspace_patch_proposal(
             &store,

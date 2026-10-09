@@ -1924,17 +1924,6 @@ fn apply_patch_file_proposal(
             )
         }
     };
-    if scan_text_for_sensitive_content(current_content) {
-        return deny_patch_file_apply(
-            store,
-            task,
-            params,
-            apply_result,
-            "target_file_sensitive_scan",
-            "Blocked",
-            "Target file contains sensitive-like data.",
-        );
-    }
     apply_result
         .checklist
         .push(apply_result_check("target_file_utf8", "Pass", None));
