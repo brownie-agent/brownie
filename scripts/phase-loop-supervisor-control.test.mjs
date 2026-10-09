@@ -115,6 +115,37 @@ test('dispatches a requested self-update instead of restarting the stale supervi
   assert.equal(result.start.reason, 'self_update_dispatched_requires_review_and_delivery');
 });
 
+test('does not restart the normal loop when a requested self-update is rejected', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress',
+    run_id: 'run-self-update-rejected',
+    consecutive_failures: 0
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress',
+    same_progress_count: 1,
+    progress_projection: { selected_todo: runtimeEvidenceTodo }
+  });
+  const result = controlPhaseLoop({
+    repoRoot: repo,
+    write: false,
+    repair: false,
+    start: true,
+    selfUpdateRequest: 'Repair the controller contradiction without touching TODO state.',
+    selfUpdateDispatcher() {
+      return {
+        dispatched: false,
+        eligibility: { eligible: false, reason: 'implementation_provider_unavailable' }
+      };
+    }
+  });
+  assert.equal(result.self_update.dispatched, false);
+  assert.equal(result.start.attempted, false);
+  assert.equal(result.start.reason, 'self_update_request_not_dispatched_not_starting');
+});
+
 test('escalates repeated no-progress on the same bounded leaf to TODO contract replan feedback', () => {
   const repo = makeRepo();
   writeTodo(repo);

@@ -35,16 +35,30 @@ function readJson(filePath) {
 }
 
 function gitDirtyFiles(repoRoot, run = spawnSync) {
-  const result = run('git', ['status', '--porcelain=v1'], {
+  const result = run('git', ['status', '--porcelain=v1', '-z'], {
     cwd: repoRoot,
     encoding: 'utf8'
   });
   if (result.status !== 0) return { ok: false, files: [] };
+  const records = String(result.stdout ?? '').split('\0');
+  const files = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (!record) continue;
+    const status = record.slice(0, 2);
+    const firstPath = record.slice(3);
+    if (firstPath) files.push(firstPath);
+    // In porcelain v1 -z output, rename/copy records carry both the new and
+    // old path as NUL-delimited records.  Checking only one lets a source
+    // path be hidden by a rename to or from .brownie/.
+    if (status.includes('R') || status.includes('C')) {
+      const secondPath = records[++index];
+      if (secondPath) files.push(secondPath);
+    }
+  }
   return {
     ok: true,
-    files: result.stdout.split('\n')
-      .filter(Boolean)
-      .map((line) => line.slice(3))
+    files: [...new Set(files)]
   };
 }
 
@@ -96,6 +110,56 @@ function persistRetryState(repoRoot, state) {
   writeAtomically(selfUpdateStatePath(repoRoot), `${JSON.stringify(state, null, 2)}\n`);
 }
 
+function providerFailure(reason, brownieRuntimeBin, diagnostic, detail = null) {
+  return requestFailure('implementation_provider_unavailable', {
+    provider_reason: reason,
+    brownie_runtime_bin: brownieRuntimeBin,
+    diagnostic,
+    ...(detail ? { provider_detail: detail } : {})
+  });
+}
+
+function implementationProviderEligibility({ repoRoot, brownieRuntimeBin, diagnostic, run }) {
+  if (!fs.existsSync(brownieRuntimeBin)) {
+    return providerFailure('runtime_binary_missing', brownieRuntimeBin, diagnostic);
+  }
+  const result = run(brownieRuntimeBin, [], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    input: '{"jsonrpc":"2.0","id":1,"method":"llm.status"}\n',
+    env: { ...process.env, BROWNIE_CLI_RUN_MODE_ID: 'implementer' }
+  });
+  if (result.status !== 0 || result.signal) {
+    return providerFailure('runtime_status_unavailable', brownieRuntimeBin, diagnostic);
+  }
+
+  let status;
+  try {
+    status = JSON.parse(String(result.stdout ?? '').trim())?.result;
+  } catch {
+    return providerFailure('runtime_status_invalid', brownieRuntimeBin, diagnostic);
+  }
+  if (!status || typeof status !== 'object') {
+    return providerFailure('runtime_status_invalid', brownieRuntimeBin, diagnostic);
+  }
+  const detail = {
+    provider: typeof status.provider === 'string' ? status.provider : null,
+    enabled: status.enabled === true,
+    strict: status.strict === true,
+    will_fallback_to_fake: status.will_fallback_to_fake === true,
+    llm_provider_access_allowed: status.llm_provider_access_allowed === true,
+    task_run_network_allowed: status.task_run_network_allowed === true
+  };
+  if (detail.provider === 'Fake' || detail.provider === null) {
+    return providerFailure('fake_provider_forbidden', brownieRuntimeBin, diagnostic, detail);
+  }
+  if (!detail.enabled || !detail.strict || detail.will_fallback_to_fake
+    || !detail.llm_provider_access_allowed || !detail.task_run_network_allowed) {
+    return providerFailure('provider_not_permitted_for_implementation', brownieRuntimeBin, diagnostic, detail);
+  }
+  return { eligible: true, brownie_runtime_bin: brownieRuntimeBin, implementation_provider: detail };
+}
+
 export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSync }) {
   if (typeof request !== 'string' || request.trim().length === 0) {
     return requestFailure('self_update_request_missing');
@@ -120,10 +184,15 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
 
   const brownieBin = process.env.BROWNIE_BIN || path.join(repoRoot, 'target/debug/brownie');
   if (!fs.existsSync(brownieBin)) return requestFailure('brownie_binary_missing', { brownie_bin: brownieBin, diagnostic });
+  const brownieRuntimeBin = process.env.BROWNIE_RUNTIME_PATH || path.join(repoRoot, 'target/debug/brownie-runtime');
+  const provider = implementationProviderEligibility({ repoRoot, brownieRuntimeBin, diagnostic, run });
+  if (!provider.eligible) return provider;
 
   return {
     eligible: true,
     brownie_bin: brownieBin,
+    brownie_runtime_bin: brownieRuntimeBin,
+    implementation_provider: provider.implementation_provider,
     dirty_brownie_files: dirty.files,
     diagnostic
   };
@@ -199,7 +268,14 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
   const result = run(eligibility.brownie_bin, ['--json', 'run', '--file', objectivePath], {
     cwd: repoRoot,
     encoding: 'utf8',
-    env: { ...process.env, PHASE_LOOP_SELF_UPDATE_ACTIVE: '1' }
+    // Self-update is a repair write path.  Never inherit a caller's read-only
+    // mode because that would turn an apparently dispatched recovery into a
+    // no-op; runtime policy remains authoritative over this mode hint.
+    env: {
+      ...process.env,
+      PHASE_LOOP_SELF_UPDATE_ACTIVE: '1',
+      BROWNIE_CLI_RUN_MODE_ID: 'implementer'
+    }
   });
   const outcome = selfUpdateOutcome(result);
   const record = {

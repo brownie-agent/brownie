@@ -18,6 +18,23 @@ const completedOutcome = JSON.stringify({
   }
 });
 
+const realProviderStatus = JSON.stringify({
+  jsonrpc: '2.0',
+  id: 1,
+  result: {
+    provider: 'OpenAiCompatible',
+    enabled: true,
+    strict: true,
+    will_fallback_to_fake: false,
+    llm_provider_access_allowed: true,
+    task_run_network_allowed: true
+  }
+});
+
+function runtimeStatusResult(status = realProviderStatus) {
+  return { status: 0, stdout: status, stderr: '' };
+}
+
 function makeRepo() {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-self-update-'));
   fs.mkdirSync(path.join(repo, '.brownie/private/phase-loop'), { recursive: true });
@@ -25,6 +42,7 @@ function makeRepo() {
   fs.writeFileSync(path.join(repo, '.brownie/todo.md'), '- [ ] E-test: Patch only `scripts/example.mjs`:\n  Route: implementation.\n');
   fs.writeFileSync(path.join(repo, '.brownie/todo-breakdown.md'), '# breakdown\n');
   fs.writeFileSync(path.join(repo, 'target/debug/brownie'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(repo, 'target/debug/brownie-runtime'), `#!/bin/sh\nprintf '%s\\n' '${realProviderStatus}'\n`, { mode: 0o755 });
   fs.writeFileSync(path.join(repo, 'package.json'), '{}\n');
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' });
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
@@ -52,6 +70,38 @@ test('refuses self-update when user source changes are present', () => {
   assert.equal(eligibility.reason, 'non_brownie_workspace_changes_present');
 });
 
+test('refuses self-update when a renamed source file is hidden by a .brownie path', () => {
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'src/controller.mjs'), 'export const source = true;\n');
+  execFileSync('git', ['add', 'src/controller.mjs'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'track controller'], { cwd: repo, stdio: 'ignore' });
+  fs.renameSync(path.join(repo, 'src/controller.mjs'), path.join(repo, '.brownie/controller.mjs'));
+  execFileSync('git', ['add', '-A'], { cwd: repo });
+  const eligibility = evaluateSelfUpdateEligibility({ repoRoot: repo, request: 'Repair controller policy contradiction.' });
+  assert.equal(eligibility.eligible, false);
+  assert.equal(eligibility.reason, 'non_brownie_workspace_changes_present');
+  assert.ok(eligibility.non_brownie_dirty_files.includes('src/controller.mjs'));
+});
+
+test('refuses self-update unless an enabled strict non-Fake provider is permitted', () => {
+  const repo = makeRepo();
+  const eligibility = evaluateSelfUpdateEligibility({
+    repoRoot: repo,
+    request: 'Repair controller policy contradiction.',
+    run(command, args, options) {
+      if (command === 'git') return spawnSync(command, args, options);
+      if (command.endsWith('brownie-runtime')) {
+        return runtimeStatusResult(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { provider: 'Fake', enabled: true, strict: false, will_fallback_to_fake: false, llm_provider_access_allowed: false, task_run_network_allowed: false } }));
+      }
+      throw new Error(`unexpected command: ${command}`);
+    }
+  });
+  assert.equal(eligibility.eligible, false);
+  assert.equal(eligibility.reason, 'implementation_provider_unavailable');
+  assert.equal(eligibility.provider_reason, 'fake_provider_forbidden');
+});
+
 test('dispatches Brownie through an immutable private objective and records the result', () => {
   const repo = makeRepo();
   let invocation;
@@ -61,6 +111,7 @@ test('dispatches Brownie through an immutable private objective and records the 
     now: () => new Date('2026-10-09T00:00:00.000Z'),
     run(command, args, options) {
       if (command === 'git') return spawnSync(command, args, options);
+      if (command.endsWith('brownie-runtime')) return runtimeStatusResult();
       invocation = { command, args, options };
       return { status: 0, stdout: completedOutcome, stderr: '' };
     }
@@ -68,6 +119,7 @@ test('dispatches Brownie through an immutable private objective and records the 
   assert.equal(result.dispatched, true, JSON.stringify(result));
   assert.equal(result.ok, true);
   assert.deepEqual(invocation.args.slice(0, 3), ['--json', 'run', '--file']);
+  assert.equal(invocation.options.env.BROWNIE_CLI_RUN_MODE_ID, 'implementer');
   assert.equal(fs.existsSync(path.join(repo, result.objective_path)), true);
   assert.equal(fs.existsSync(path.join(repo, result.result_path)), true);
 });
@@ -80,6 +132,7 @@ test('treats exit-zero terminal and continuation outcomes as failed self-updates
     now: () => new Date('2026-10-09T00:00:00.000Z'),
     run(command, args, options) {
       if (command === 'git') return spawnSync(command, args, options);
+      if (command.endsWith('brownie-runtime')) return runtimeStatusResult();
       return {
         status: 0,
         stdout: JSON.stringify({ ok: true, automation: { status: 'terminal_failure', controller_action: 'stop', completed: false, blocked: true, continuation_required: false, terminal_failure: true } }),
@@ -96,6 +149,7 @@ test('treats exit-zero terminal and continuation outcomes as failed self-updates
     now: () => new Date('2026-10-09T00:00:00.000Z'),
     run(command, args, options) {
       if (command === 'git') return spawnSync(command, args, options);
+      if (command.endsWith('brownie-runtime')) return runtimeStatusResult();
       return {
         status: 0,
         stdout: JSON.stringify({ ok: true, automation: { status: 'continuation_required', controller_action: 'resume', completed: false, blocked: false, continuation_required: true, terminal_failure: false } }),
@@ -112,6 +166,7 @@ test('backs off failed recovery implementers and exhausts only the same failure 
   let attempts = 0;
   const run = (command, args, options) => {
     if (command === 'git') return spawnSync(command, args, options);
+    if (command.endsWith('brownie-runtime')) return runtimeStatusResult();
     attempts += 1;
     return { status: 17, stdout: '', stderr: 'recoverer stopped' };
   };

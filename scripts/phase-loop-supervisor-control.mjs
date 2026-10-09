@@ -1815,10 +1815,17 @@ export function controlPhaseLoop(options = {}) {
   // worker may change the controller/runtime that selected the stopped state.
   // Starting the old controller in parallel would reintroduce the same loop.
   const selfUpdateDispatcher = options.selfUpdateDispatcher ?? dispatchSelfUpdate;
-  const selfUpdate = typeof options.selfUpdateRequest === 'string'
+  const selfUpdateRequested = typeof options.selfUpdateRequest === 'string';
+  const selfUpdate = selfUpdateRequested
     ? selfUpdateDispatcher({ repoRoot, request: options.selfUpdateRequest })
     : { dispatched: false, reason: 'self_update_not_requested' };
-  const start = selfUpdate.dispatched
+  const start = selfUpdateRequested && !selfUpdate.dispatched
+    ? {
+        attempted: false,
+        reason: 'self_update_request_not_dispatched_not_starting',
+        self_update: selfUpdate
+      }
+    : selfUpdate.dispatched
     ? {
         attempted: false,
         reason: selfUpdate.ok
