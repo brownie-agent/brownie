@@ -13,6 +13,21 @@ const maxRequestBytes = 12_000;
 const maxAttemptsPerFingerprint = 3;
 const retryBaseDelayMs = 60_000;
 const retryMaxDelayMs = 30 * 60_000;
+const maxAppliedRecoveryResumes = 3;
+
+function hasUnambiguousTrustedPatchContext(request) {
+  const oldHeadings = [...request.matchAll(/^Trusted exact old_text:\s*$/gmu)];
+  const newHeadings = [...request.matchAll(/^Trusted exact new_text:\s*$/gmu)];
+  if (oldHeadings.length !== 1 || newHeadings.length !== 1) return false;
+
+  const oldStart = oldHeadings[0].index + oldHeadings[0][0].length;
+  const newStart = newHeadings[0].index + newHeadings[0][0].length;
+  if (oldStart >= newHeadings[0].index) return false;
+
+  const oldText = request.slice(oldStart, newHeadings[0].index).trim();
+  const newText = request.slice(newStart).trim();
+  return oldText.length > 0 && newText.length > 0;
+}
 
 function parseArgs(argv) {
   const args = { repo: defaultRepoRoot, dispatch: false, request: null };
@@ -287,7 +302,11 @@ export function buildSelfUpdateObjective({ request, eligibility }) {
   const issueCodes = (eligibility.diagnostic?.issues ?? []).map((issue) => issue.code).join(', ') || 'none';
   const status = eligibility.diagnostic?.phase_loop?.status ?? 'unknown';
   const targetPaths = eligibility.target_paths ?? [];
-  return `# Brownie controller self-update recovery\n\nYou are the dedicated Brownie recovery implementer. The normal phase loop is stopped. Runtime permissions and the bounded target contract below override this request.\n\n## Observed controller state\n\n- status: ${status}\n- diagnostic issue codes: ${issueCodes}\n- preserved Brownie state files: ${(eligibility.dirty_brownie_files ?? []).join(', ') || '<none>'}\n\n## Selected TODO\n\n- [ ] phase-loop-self-update: Patch only ${targetPaths.map((target) => `\`${target}\``).join(' and ')}.\n  Route: implementation.\n  Source TODO: phase-loop-self-update.\n  Depends on: <none>.\n  Completion condition: the diagnosed controller contradiction is removed without changing operational state.\n  Forbidden changes: do not edit \`.brownie/todo.md\`, \`.brownie/todo-breakdown.md\`, or any pre-existing \`.brownie/**\` state.\n  Verification: run the smallest targeted regression tests for the changed file.\n\n## Recovery request\n\n${request.trim()}\n\n## Required outcome\n\n1. Implement only the minimum controller/runtime change that removes the diagnosed contradiction.\n2. Add a regression test that proves the recovery path works and retain the denial test for the unsafe path.\n3. Run the smallest relevant tests and report exact commands/results.\n4. Do not stage, overwrite, revert, or delete pre-existing .brownie/ changes.\n5. Do not restart the normal phase loop. Finish with a concise summary suitable for a brownie-agent-authored PR.\n`;
+  const hasTrustedPatchContext = hasUnambiguousTrustedPatchContext(request);
+  const trustedPatchInstruction = hasTrustedPatchContext
+    ? 'The recovery request supplies an exact trusted patch context. Do not use workspace.read to rediscover that hunk; emit the compact workspace.write patch_file directly so a large target file cannot truncate the recovery context.\n\n'
+    : '';
+  return `# Brownie controller self-update recovery\n\nYou are the dedicated Brownie recovery implementer. The normal phase loop is stopped. Runtime permissions and the bounded target contract below override this request.\n\n## Observed controller state\n\n- status: ${status}\n- diagnostic issue codes: ${issueCodes}\n- preserved Brownie state files: ${(eligibility.dirty_brownie_files ?? []).join(', ') || '<none>'}\n\n## Selected TODO\n\n- [ ] phase-loop-self-update: Patch only ${targetPaths.map((target) => `\`${target}\``).join(' and ')}.\n  Route: implementation.\n  Source TODO: phase-loop-self-update.\n  Depends on: <none>.\n  Completion condition: the diagnosed controller contradiction is removed without changing operational state.\n  Forbidden changes: do not edit \`.brownie/todo.md\`, \`.brownie/todo-breakdown.md\`, or any pre-existing \`.brownie/**\` state.\n  Verification: run the smallest targeted regression tests for the changed file.\n\n## Recovery request\n\n${request.trim()}\n\n${trustedPatchInstruction}## Required outcome\n\n1. Implement only the minimum controller/runtime change that removes the diagnosed contradiction.\n2. Add a regression test that proves the recovery path works and retain the denial test for the unsafe path.\n3. Run the smallest relevant tests and report exact commands/results.\n4. Do not stage, overwrite, revert, or delete pre-existing .brownie/ changes.\n5. Do not restart the normal phase loop. Finish with a concise summary suitable for a brownie-agent-authored PR.\n`;
 }
 
 function writeAtomically(filePath, contents) {
@@ -325,6 +344,61 @@ function selfUpdateOutcome(result) {
   return { ok: true, reason: 'completed' };
 }
 
+function appliedRecoveryContinuationScope(result) {
+  if (result.status !== 0 || result.signal) return null;
+  let payload;
+  try {
+    payload = JSON.parse(String(result.stdout ?? '').trim());
+  } catch {
+    return null;
+  }
+  const run = payload?.run;
+  const automation = run?.automation;
+  if (!automation
+    || automation.continuation_required !== true
+    || automation.controller_action !== 'resume'
+    || run?.objective_apply_applied !== true) {
+    return null;
+  }
+  const scope = {
+    session_id: run.session_id,
+    journey_id: run.journey_id,
+    task_id: run.task_id,
+    run_id: run.run_id
+  };
+  return Object.values(scope).every((value) => typeof value === 'string' && value.trim().length > 0)
+    ? scope
+    : null;
+}
+
+function resumeAppliedRecovery({ brownieBin, repoRoot, workerEnv, run, scope }) {
+  return run(brownieBin, [
+    '--json',
+    'resume',
+    '--session-id', scope.session_id,
+    '--journey-id', scope.journey_id,
+    '--task-id', scope.task_id,
+    '--run-id', scope.run_id
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: workerEnv
+  });
+}
+
+function isSameScopedContinuation(result, scope) {
+  if (result.status !== 0 || result.signal) return false;
+  try {
+    const run = JSON.parse(String(result.stdout ?? '').trim())?.run;
+    const automation = run?.automation;
+    return automation?.continuation_required === true
+      && automation.controller_action === 'resume'
+      && ['session_id', 'journey_id', 'task_id', 'run_id'].every((key) => run?.[key] === scope[key]);
+  } catch {
+    return false;
+  }
+}
+
 export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = () => new Date() }) {
   const eligibility = evaluateSelfUpdateEligibility({ repoRoot, request, run });
   if (!eligibility.eligible) return { dispatched: false, eligibility };
@@ -351,11 +425,25 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
   const objective = buildSelfUpdateObjective({ request, eligibility });
   writeAtomically(objectivePath, objective);
 
-  const result = run(eligibility.brownie_bin, ['--json', 'run', '--file', objectivePath], {
+  const initialResult = run(eligibility.brownie_bin, ['--json', 'run', '--file', objectivePath], {
     cwd: repoRoot,
     encoding: 'utf8',
     env: eligibility.worker_env
   });
+  const continuationScope = appliedRecoveryContinuationScope(initialResult);
+  let result = initialResult;
+  let resumeAttempts = 0;
+  while (continuationScope && resumeAttempts < maxAppliedRecoveryResumes) {
+    result = resumeAppliedRecovery({
+      brownieBin: eligibility.brownie_bin,
+      repoRoot,
+      workerEnv: eligibility.worker_env,
+      run,
+      scope: continuationScope
+    });
+    resumeAttempts += 1;
+    if (!isSameScopedContinuation(result, continuationScope)) break;
+  }
   const outcome = selfUpdateOutcome(result);
   const record = {
     schema_version: 1,
@@ -365,6 +453,9 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
     exit_code: result.status,
     signal: result.signal ?? null,
     outcome: outcome.reason,
+    continuation: continuationScope
+      ? { attempted: true, scope: continuationScope, initial_exit_code: initialResult.status, resume_attempts: resumeAttempts, exhausted: resumeAttempts === maxAppliedRecoveryResumes && isSameScopedContinuation(result, continuationScope) }
+      : { attempted: false },
     stdout: String(result.stdout ?? '').slice(-12_000),
     stderr: String(result.stderr ?? '').slice(-12_000),
     dirty_brownie_files_preserved: eligibility.dirty_brownie_files
