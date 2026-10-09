@@ -135,7 +135,8 @@ test('loads only private LLM configuration into the preflight and recovery child
     'BROWNIE_LLM_API_KEY=test-only-key',
     'BROWNIE_LLM_ALLOW_PROVIDER_ACCESS=true',
     'BROWNIE_LLM_STRICT=true',
-    'BROWNIE_CLI_RUN_MODE_ID=read-only'
+    'BROWNIE_CLI_RUN_MODE_ID=read-only',
+    'BROWNIE_RUNTIME_PATH=target/debug/brownie-runtime'
   ].join('\n'));
   const invocations = [];
   const result = dispatchSelfUpdate({
@@ -155,6 +156,7 @@ test('loads only private LLM configuration into the preflight and recovery child
     assert.equal(invocation.options.env.BROWNIE_LLM_PROVIDER, 'openai-compatible');
     assert.equal(invocation.options.env.BROWNIE_LLM_ALLOW_PROVIDER_ACCESS, 'true');
     assert.equal(invocation.options.env.BROWNIE_CLI_RUN_MODE_ID, 'implementer');
+    assert.equal(invocation.options.env.BROWNIE_RUNTIME_PATH, path.join(repo, 'target/debug/brownie-runtime'));
   }
   assert.doesNotMatch(JSON.stringify(result), /test-only-key/u);
 });

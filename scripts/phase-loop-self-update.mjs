@@ -251,14 +251,19 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
     return requestFailure('non_brownie_workspace_changes_present', { non_brownie_dirty_files: nonBrownieDirtyFiles, diagnostic });
   }
 
+  const providerEnvironment = privateProviderEnvironment(repoRoot);
   const brownieBin = process.env.BROWNIE_BIN || path.join(repoRoot, 'target/debug/brownie');
   if (!fs.existsSync(brownieBin)) return requestFailure('brownie_binary_missing', { brownie_bin: brownieBin, diagnostic });
-  const brownieRuntimeBin = process.env.BROWNIE_RUNTIME_PATH || path.join(repoRoot, 'target/debug/brownie-runtime');
-  const providerEnvironment = privateProviderEnvironment(repoRoot);
   if (!providerEnvironment.ok) {
+    const brownieRuntimeBin = process.env.BROWNIE_RUNTIME_PATH || path.join(repoRoot, 'target/debug/brownie-runtime');
     return providerFailure(providerEnvironment.reason, brownieRuntimeBin, diagnostic);
   }
   const workerEnv = recoveryWorkerEnvironment(providerEnvironment);
+  const configuredRuntimeBin = workerEnv.BROWNIE_RUNTIME_PATH || path.join(repoRoot, 'target/debug/brownie-runtime');
+  const brownieRuntimeBin = path.isAbsolute(configuredRuntimeBin)
+    ? configuredRuntimeBin
+    : path.resolve(repoRoot, configuredRuntimeBin);
+  workerEnv.BROWNIE_RUNTIME_PATH = brownieRuntimeBin;
   const provider = implementationProviderEligibility({ repoRoot, brownieRuntimeBin, diagnostic, run, workerEnv });
   if (!provider.eligible) return provider;
 
