@@ -142,6 +142,34 @@ function writeAtomically(filePath, contents) {
   fs.renameSync(temporary, filePath);
 }
 
+function selfUpdateOutcome(result) {
+  if (result.status !== 0) return { ok: false, reason: 'process_exit_nonzero' };
+  if (result.signal) return { ok: false, reason: 'process_signaled' };
+
+  let payload;
+  try {
+    payload = JSON.parse(String(result.stdout ?? '').trim());
+  } catch {
+    return { ok: false, reason: 'cli_json_invalid' };
+  }
+
+  const automation = payload?.automation ?? payload?.run?.automation;
+  if (payload?.ok !== true || !automation || typeof automation !== 'object') {
+    return { ok: false, reason: 'cli_outcome_missing' };
+  }
+  if (automation.terminal_failure === true) {
+    return { ok: false, reason: 'cli_terminal_failure' };
+  }
+  if (automation.continuation_required === true) {
+    return { ok: false, reason: 'cli_continuation_required' };
+  }
+  if (automation.blocked === true) return { ok: false, reason: 'cli_blocked' };
+  if (automation.completed !== true || automation.status !== 'completed' || automation.controller_action !== 'stop') {
+    return { ok: false, reason: 'cli_outcome_not_completed' };
+  }
+  return { ok: true, reason: 'completed' };
+}
+
 export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = () => new Date() }) {
   const eligibility = evaluateSelfUpdateEligibility({ repoRoot, request, run });
   if (!eligibility.eligible) return { dispatched: false, eligibility };
@@ -173,6 +201,7 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
     encoding: 'utf8',
     env: { ...process.env, PHASE_LOOP_SELF_UPDATE_ACTIVE: '1' }
   });
+  const outcome = selfUpdateOutcome(result);
   const record = {
     schema_version: 1,
     kind: 'brownie_phase_loop_self_update_dispatch',
@@ -180,19 +209,20 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
     objective_path: path.relative(repoRoot, objectivePath),
     exit_code: result.status,
     signal: result.signal ?? null,
+    outcome: outcome.reason,
     stdout: String(result.stdout ?? '').slice(-12_000),
     stderr: String(result.stderr ?? '').slice(-12_000),
     dirty_brownie_files_preserved: eligibility.dirty_brownie_files
   };
   writeAtomically(resultPath, `${JSON.stringify(record, null, 2)}\n`);
   const previousFailures = retry.entry?.failed_attempts ?? 0;
-  const failedAttempts = result.status === 0 ? 0 : previousFailures + 1;
-  const nextRetryAt = result.status === 0
+  const failedAttempts = outcome.ok ? 0 : previousFailures + 1;
+  const nextRetryAt = outcome.ok
     ? null
     : new Date(now().getTime() + retryDelayMs(failedAttempts)).toISOString();
   retry.state.fingerprints[retry.fingerprint] = {
     fingerprint: retry.fingerprint,
-    status: result.status === 0 ? 'succeeded' : 'failed',
+    status: outcome.ok ? 'succeeded' : 'failed',
     request_sha256: crypto.createHash('sha256').update(request.trim()).digest('hex'),
     failed_attempts: failedAttempts,
     max_attempts: maxAttemptsPerFingerprint,
@@ -200,12 +230,13 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
     retry_after: nextRetryAt,
     last_result_path: path.relative(repoRoot, resultPath),
     last_exit_code: result.status,
-    exhausted: result.status !== 0 && failedAttempts >= maxAttemptsPerFingerprint
+    last_outcome: outcome.reason,
+    exhausted: !outcome.ok && failedAttempts >= maxAttemptsPerFingerprint
   };
   persistRetryState(repoRoot, retry.state);
   return {
     dispatched: true,
-    ok: result.status === 0,
+    ok: outcome.ok,
     objective_path: record.objective_path,
     result_path: path.relative(repoRoot, resultPath),
     exit_code: result.status,
@@ -214,7 +245,7 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
       failed_attempts: failedAttempts,
       max_attempts: maxAttemptsPerFingerprint,
       retry_after: nextRetryAt,
-      exhausted: result.status !== 0 && failedAttempts >= maxAttemptsPerFingerprint
+      exhausted: !outcome.ok && failedAttempts >= maxAttemptsPerFingerprint
     },
     diagnostic: eligibility.diagnostic
   };

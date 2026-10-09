@@ -6,6 +6,18 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { buildSelfUpdateObjective, dispatchSelfUpdate, evaluateSelfUpdateEligibility } from './phase-loop-self-update.mjs';
 
+const completedOutcome = JSON.stringify({
+  ok: true,
+  automation: {
+    status: 'completed',
+    controller_action: 'stop',
+    completed: true,
+    blocked: false,
+    continuation_required: false,
+    terminal_failure: false
+  }
+});
+
 function makeRepo() {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-self-update-'));
   fs.mkdirSync(path.join(repo, '.brownie/private/phase-loop'), { recursive: true });
@@ -50,7 +62,7 @@ test('dispatches Brownie through an immutable private objective and records the 
     run(command, args, options) {
       if (command === 'git') return spawnSync(command, args, options);
       invocation = { command, args, options };
-      return { status: 0, stdout: '{"ok":true}', stderr: '' };
+      return { status: 0, stdout: completedOutcome, stderr: '' };
     }
   });
   assert.equal(result.dispatched, true, JSON.stringify(result));
@@ -58,6 +70,41 @@ test('dispatches Brownie through an immutable private objective and records the 
   assert.deepEqual(invocation.args.slice(0, 3), ['--json', 'run', '--file']);
   assert.equal(fs.existsSync(path.join(repo, result.objective_path)), true);
   assert.equal(fs.existsSync(path.join(repo, result.result_path)), true);
+});
+
+test('treats exit-zero terminal and continuation outcomes as failed self-updates', () => {
+  const repo = makeRepo();
+  const terminalFailure = dispatchSelfUpdate({
+    repoRoot: repo,
+    request: 'Repair controller policy contradiction.',
+    now: () => new Date('2026-10-09T00:00:00.000Z'),
+    run(command, args, options) {
+      if (command === 'git') return spawnSync(command, args, options);
+      return {
+        status: 0,
+        stdout: JSON.stringify({ ok: true, automation: { status: 'terminal_failure', controller_action: 'stop', completed: false, blocked: true, continuation_required: false, terminal_failure: true } }),
+        stderr: ''
+      };
+    }
+  });
+  assert.equal(terminalFailure.ok, false);
+  assert.equal(terminalFailure.retry.failed_attempts, 1);
+
+  const continuation = dispatchSelfUpdate({
+    repoRoot: repo,
+    request: 'Repair a distinct controller policy contradiction.',
+    now: () => new Date('2026-10-09T00:00:00.000Z'),
+    run(command, args, options) {
+      if (command === 'git') return spawnSync(command, args, options);
+      return {
+        status: 0,
+        stdout: JSON.stringify({ ok: true, automation: { status: 'continuation_required', controller_action: 'resume', completed: false, blocked: false, continuation_required: true, terminal_failure: false } }),
+        stderr: ''
+      };
+    }
+  });
+  assert.equal(continuation.ok, false);
+  assert.equal(continuation.retry.failed_attempts, 1);
 });
 
 test('backs off failed recovery implementers and exhausts only the same failure fingerprint', () => {
