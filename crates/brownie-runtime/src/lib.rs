@@ -3166,7 +3166,9 @@ fn run_has_duplicate_workspace_read_denial(events: &[LedgerEvent]) -> bool {
 fn is_recoverable_workspace_read_denial_for_followup(event: &LedgerEvent) -> bool {
     matches!(
         event.kind,
-        LedgerEventKind::ToolIntentRejected | LedgerEventKind::ToolExecutionDenied
+        LedgerEventKind::ToolIntentRejected
+            | LedgerEventKind::ToolIntentDenied
+            | LedgerEventKind::ToolExecutionDenied
     ) && event
         .payload
         .as_ref()
@@ -3189,13 +3191,15 @@ fn is_recoverable_workspace_read_denial_for_followup(event: &LedgerEvent) -> boo
 }
 
 fn is_duplicate_workspace_read_denial(event: &LedgerEvent) -> bool {
-    event.kind == LedgerEventKind::ToolExecutionDenied
-        && event
-            .payload
-            .as_ref()
-            .and_then(|payload| payload.get("tool_id"))
-            .and_then(Value::as_str)
-            == Some(WORKSPACE_READ_TOOL_ID)
+    matches!(
+        event.kind,
+        LedgerEventKind::ToolIntentDenied | LedgerEventKind::ToolExecutionDenied
+    ) && event
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("tool_id"))
+        .and_then(Value::as_str)
+        == Some(WORKSPACE_READ_TOOL_ID)
         && event
             .payload
             .as_ref()
@@ -3290,6 +3294,25 @@ fn task_goal_requires_workspace_write_proposal(goal: &str) -> bool {
 #[cfg(test)]
 mod workspace_edit_completion_gate_tests {
     use super::*;
+
+    #[test]
+    fn tool_intent_denied_read_budget_is_recoverable_for_followup() {
+        let event = brownie_store::LedgerEvent {
+            event_id: "event_read_denied".to_string(),
+            task_id: "task_read_denied".to_string(),
+            run_id: "run_read_denied".to_string(),
+            kind: LedgerEventKind::ToolIntentDenied,
+            timestamp: "2026-10-09T00:00:00Z".to_string(),
+            payload: Some(json!({
+                "tool_id": WORKSPACE_READ_TOOL_ID,
+                "reason": "Additional workspace.read is not progress after the phase-loop read budget is exhausted"
+            })),
+            payload_envelope: None,
+        };
+
+        assert!(is_recoverable_workspace_read_denial_for_followup(&event));
+        assert!(is_duplicate_workspace_read_denial(&event));
+    }
 
     #[test]
     fn overwrite_increment_goal_requires_workspace_write_proposal() {
