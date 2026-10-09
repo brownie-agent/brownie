@@ -66,6 +66,62 @@ function requestFailure(reason, extra = {}) {
   return { eligible: false, reason, ...extra };
 }
 
+function selfUpdateTargetPaths(request) {
+  const targetLine = request
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith('Allowed paths:'));
+  if (!targetLine) return [];
+  return [...new Set([...targetLine.matchAll(/`([^`]+)`/gu)]
+    .map((match) => match[1].trim())
+    .filter((candidate) => candidate.length > 0
+      && !path.isAbsolute(candidate)
+      && !candidate.split('/').includes('..')))].sort();
+}
+
+function privateProviderEnvironment(repoRoot) {
+  const envPath = path.join(repoRoot, '.brownie', 'private', 'llm.env');
+  let text;
+  try {
+    text = fs.readFileSync(envPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true, source: 'process_environment', values: {} };
+    return { ok: false, reason: 'private_provider_env_unreadable' };
+  }
+  const values = {};
+  for (const rawLine of text.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = /^([A-Z][A-Z0-9_]*)=(.*)$/u.exec(line);
+    if (!match) return { ok: false, reason: 'private_provider_env_invalid' };
+    const [, key, rawValue] = match;
+    if (!(/^(BROWNIE_(?:LLM|CLI|RUNTIME)_)[A-Z0-9_]*$/u.test(key) || key === 'OPENAI_API_KEY')) {
+      return { ok: false, reason: 'private_provider_env_key_forbidden' };
+    }
+    const value = rawValue.trim();
+    if ((value.startsWith('"') && !value.endsWith('"'))
+      || (value.startsWith("'") && !value.endsWith("'"))) {
+      return { ok: false, reason: 'private_provider_env_invalid' };
+    }
+    values[key] = (value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'"))
+      ? value.slice(1, -1)
+      : value;
+  }
+  return { ok: true, source: 'private_provider_environment', values };
+}
+
+function recoveryWorkerEnvironment(providerEnvironment) {
+  return {
+    ...process.env,
+    ...providerEnvironment.values,
+    PHASE_LOOP_SELF_UPDATE_ACTIVE: '1',
+    // This must be assigned after the private file is read: a private or
+    // inherited read-only mode must not downgrade a recovery write task.
+    BROWNIE_CLI_RUN_MODE_ID: 'implementer'
+  };
+}
+
 function selfUpdateStatePath(repoRoot) {
   return path.join(repoRoot, '.brownie/private/phase-loop/self-update/retry-state.json');
 }
@@ -119,7 +175,7 @@ function providerFailure(reason, brownieRuntimeBin, diagnostic, detail = null) {
   });
 }
 
-function implementationProviderEligibility({ repoRoot, brownieRuntimeBin, diagnostic, run }) {
+function implementationProviderEligibility({ repoRoot, brownieRuntimeBin, diagnostic, run, workerEnv }) {
   if (!fs.existsSync(brownieRuntimeBin)) {
     return providerFailure('runtime_binary_missing', brownieRuntimeBin, diagnostic);
   }
@@ -127,7 +183,7 @@ function implementationProviderEligibility({ repoRoot, brownieRuntimeBin, diagno
     cwd: repoRoot,
     encoding: 'utf8',
     input: '{"jsonrpc":"2.0","id":1,"method":"llm.status"}\n',
-    env: { ...process.env, BROWNIE_CLI_RUN_MODE_ID: 'implementer' }
+    env: workerEnv
   });
   if (result.status !== 0 || result.signal) {
     return providerFailure('runtime_status_unavailable', brownieRuntimeBin, diagnostic);
@@ -167,6 +223,12 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
   if (Buffer.byteLength(request, 'utf8') > maxRequestBytes) {
     return requestFailure('self_update_request_too_large', { max_request_bytes: maxRequestBytes });
   }
+  const targetPaths = selfUpdateTargetPaths(request);
+  if (targetPaths.length === 0) {
+    return requestFailure('self_update_targets_missing', {
+      required_request_field: 'Allowed paths: `workspace-relative/path`'
+    });
+  }
 
   const diagnostic = diagnosePhaseLoop({ repoRoot, write: false });
   const status = diagnostic.phase_loop?.status;
@@ -185,23 +247,35 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
   const brownieBin = process.env.BROWNIE_BIN || path.join(repoRoot, 'target/debug/brownie');
   if (!fs.existsSync(brownieBin)) return requestFailure('brownie_binary_missing', { brownie_bin: brownieBin, diagnostic });
   const brownieRuntimeBin = process.env.BROWNIE_RUNTIME_PATH || path.join(repoRoot, 'target/debug/brownie-runtime');
-  const provider = implementationProviderEligibility({ repoRoot, brownieRuntimeBin, diagnostic, run });
+  const providerEnvironment = privateProviderEnvironment(repoRoot);
+  if (!providerEnvironment.ok) {
+    return providerFailure(providerEnvironment.reason, brownieRuntimeBin, diagnostic);
+  }
+  const workerEnv = recoveryWorkerEnvironment(providerEnvironment);
+  const provider = implementationProviderEligibility({ repoRoot, brownieRuntimeBin, diagnostic, run, workerEnv });
   if (!provider.eligible) return provider;
 
-  return {
+  const eligibility = {
     eligible: true,
     brownie_bin: brownieBin,
     brownie_runtime_bin: brownieRuntimeBin,
     implementation_provider: provider.implementation_provider,
+    provider_environment: providerEnvironment.source,
+    target_paths: targetPaths,
     dirty_brownie_files: dirty.files,
     diagnostic
   };
+  // Keep credentials out of CLI/diagnostic JSON while making preflight and
+  // dispatch use the same immutable child environment.
+  Object.defineProperty(eligibility, 'worker_env', { value: workerEnv, enumerable: false });
+  return eligibility;
 }
 
 export function buildSelfUpdateObjective({ request, eligibility }) {
   const issueCodes = (eligibility.diagnostic?.issues ?? []).map((issue) => issue.code).join(', ') || 'none';
   const status = eligibility.diagnostic?.phase_loop?.status ?? 'unknown';
-  return `# Brownie controller self-update recovery\n\nYou are the dedicated Brownie recovery implementer. The normal phase loop is stopped; do not restart it and do not edit .brownie/todo.md or .brownie/todo-breakdown.md.\n\n## Observed controller state\n\n- status: ${status}\n- diagnostic issue codes: ${issueCodes}\n- preserved Brownie state files: ${(eligibility.dirty_brownie_files ?? []).join(', ') || '<none>'}\n\n## Recovery request\n\n${request.trim()}\n\n## Required outcome\n\n1. Implement only the minimum controller/runtime change that removes the diagnosed contradiction.\n2. Add a regression test that proves the recovery path works and retain the denial test for the unsafe path.\n3. Run the smallest relevant tests and report exact commands/results.\n4. Do not stage, overwrite, revert, or delete pre-existing .brownie/ changes.\n5. Do not restart the normal phase loop. Finish with a concise summary suitable for a brownie-agent-authored PR.\n`;
+  const targetPaths = eligibility.target_paths ?? [];
+  return `# Brownie controller self-update recovery\n\nYou are the dedicated Brownie recovery implementer. The normal phase loop is stopped. Runtime permissions and the bounded target contract below override this request.\n\n## Observed controller state\n\n- status: ${status}\n- diagnostic issue codes: ${issueCodes}\n- preserved Brownie state files: ${(eligibility.dirty_brownie_files ?? []).join(', ') || '<none>'}\n\n## Selected TODO\n\n- [ ] phase-loop-self-update: Patch only ${targetPaths.map((target) => `\`${target}\``).join(' and ')}.\n  Route: implementation.\n  Source TODO: phase-loop-self-update.\n  Depends on: <none>.\n  Completion condition: the diagnosed controller contradiction is removed without changing operational state.\n  Forbidden changes: do not edit \`.brownie/todo.md\`, \`.brownie/todo-breakdown.md\`, or any pre-existing \`.brownie/**\` state.\n  Verification: run the smallest targeted regression tests for the changed file.\n\n## Recovery request\n\n${request.trim()}\n\n## Required outcome\n\n1. Implement only the minimum controller/runtime change that removes the diagnosed contradiction.\n2. Add a regression test that proves the recovery path works and retain the denial test for the unsafe path.\n3. Run the smallest relevant tests and report exact commands/results.\n4. Do not stage, overwrite, revert, or delete pre-existing .brownie/ changes.\n5. Do not restart the normal phase loop. Finish with a concise summary suitable for a brownie-agent-authored PR.\n`;
 }
 
 function writeAtomically(filePath, contents) {
@@ -268,14 +342,7 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
   const result = run(eligibility.brownie_bin, ['--json', 'run', '--file', objectivePath], {
     cwd: repoRoot,
     encoding: 'utf8',
-    // Self-update is a repair write path.  Never inherit a caller's read-only
-    // mode because that would turn an apparently dispatched recovery into a
-    // no-op; runtime policy remains authoritative over this mode hint.
-    env: {
-      ...process.env,
-      PHASE_LOOP_SELF_UPDATE_ACTIVE: '1',
-      BROWNIE_CLI_RUN_MODE_ID: 'implementer'
-    }
+    env: eligibility.worker_env
   });
   const outcome = selfUpdateOutcome(result);
   const record = {

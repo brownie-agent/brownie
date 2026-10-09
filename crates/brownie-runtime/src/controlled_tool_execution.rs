@@ -3241,6 +3241,15 @@ pub(super) fn todo_md_workspace_write_rejection_reason(
             "Selected TODO `Forbidden changes:` forbids writing this path; choose the bounded target file or fail closed.",
         );
     }
+    let patch_only_paths = patch_only_paths_from_goal(&record.goal);
+    if !is_todo_workspace_path(path)
+        && !patch_only_paths.is_empty()
+        && !patch_only_paths.iter().any(|allowed| allowed == path)
+    {
+        return Some(
+            "implementation_target_violation: Selected TODO `Patch only` permits a different bounded target path; fail closed.",
+        );
+    }
     let decomposition_only = selected_todo_requires_decomposition_only(&record.goal);
     if !is_todo_workspace_path(path) {
         if decomposition_only {
@@ -7758,6 +7767,41 @@ mod mcp_approval_lock_tests {
             &record,
             &json!({
                 "path": "scripts/allowed.mjs",
+                "operation": "patch_file",
+                "old_text": "old",
+                "new_text": "new"
+            }),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn selected_todo_patch_only_rejects_unrelated_workspace_write_path() {
+        let mut record = test_task_record();
+        record.goal = "# Brownie controller self-update recovery\n\n## Selected TODO\n\n- [ ] phase-loop-self-update: Patch only `scripts/phase-loop-self-update.mjs`.\n  Route: implementation.\n"
+            .to_string();
+
+        let reason = todo_md_workspace_write_rejection_reason(
+            &record,
+            &json!({
+                "path": "README.md",
+                "operation": "patch_file",
+                "old_text": "old",
+                "new_text": "new"
+            }),
+        );
+
+        assert_eq!(
+            reason,
+            Some(
+                "implementation_target_violation: Selected TODO `Patch only` permits a different bounded target path; fail closed."
+            )
+        );
+
+        assert!(todo_md_workspace_write_rejection_reason(
+            &record,
+            &json!({
+                "path": "scripts/phase-loop-self-update.mjs",
                 "operation": "patch_file",
                 "old_text": "old",
                 "new_text": "new"
