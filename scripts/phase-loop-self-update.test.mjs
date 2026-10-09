@@ -82,6 +82,19 @@ test('refuses self-update when user source changes are present', () => {
   assert.equal(eligibility.reason, 'non_brownie_workspace_changes_present');
 });
 
+test('preserves nested Brownie runtime state without treating it as source drift', () => {
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'crates/brownie-runtime'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'crates/brownie-runtime/Cargo.toml'), '[package]\nname = "fixture"\n');
+  execFileSync('git', ['add', 'crates/brownie-runtime/Cargo.toml'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'track runtime fixture'], { cwd: repo, stdio: 'ignore' });
+  fs.mkdirSync(path.join(repo, 'crates/brownie-runtime/.brownie'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'crates/brownie-runtime/.brownie/ledger.jsonl'), '{}\n');
+  const eligibility = evaluateSelfUpdateEligibility({ repoRoot: repo, request: recoveryRequest() });
+  assert.equal(eligibility.eligible, true, JSON.stringify(eligibility));
+  assert.ok(eligibility.dirty_brownie_files.includes('crates/brownie-runtime/.brownie/'));
+});
+
 test('refuses self-update when a renamed source file is hidden by a .brownie path', () => {
   const repo = makeRepo();
   fs.mkdirSync(path.join(repo, 'src'), { recursive: true });

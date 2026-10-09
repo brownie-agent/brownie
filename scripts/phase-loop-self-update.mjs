@@ -62,6 +62,13 @@ function gitDirtyFiles(repoRoot, run = spawnSync) {
   };
 }
 
+function isBrownieManagedPath(file) {
+  return file === '.brownie'
+    || file.startsWith('.brownie/')
+    || file.endsWith('/.brownie')
+    || file.includes('/.brownie/');
+}
+
 function requestFailure(reason, extra = {}) {
   return { eligible: false, reason, ...extra };
 }
@@ -239,7 +246,7 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
 
   const dirty = gitDirtyFiles(repoRoot, run);
   if (!dirty.ok) return requestFailure('git_status_unavailable', { diagnostic });
-  const nonBrownieDirtyFiles = dirty.files.filter((file) => !file.startsWith('.brownie/'));
+  const nonBrownieDirtyFiles = dirty.files.filter((file) => !isBrownieManagedPath(file));
   if (nonBrownieDirtyFiles.length > 0) {
     return requestFailure('non_brownie_workspace_changes_present', { non_brownie_dirty_files: nonBrownieDirtyFiles, diagnostic });
   }
