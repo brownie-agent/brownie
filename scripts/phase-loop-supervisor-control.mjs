@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { diagnosePhaseLoop } from './phase-loop-supervisor-diagnose.mjs';
+import { dispatchSelfUpdate } from './phase-loop-self-update.mjs';
 import { loadTodoState } from './phase-loop-todo-state.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -16,7 +17,8 @@ function parseArgs(argv) {
     repo: defaultRepoRoot,
     write: true,
     repair: true,
-    start: false
+    start: false,
+    selfUpdateRequest: null
   };
   for (let index = 2; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -36,6 +38,8 @@ function parseArgs(argv) {
       args.start = true;
     } else if (arg === '--no-start') {
       args.start = false;
+    } else if (arg === '--self-update-request') {
+      args.selfUpdateRequest = argv[++index];
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -1806,7 +1810,34 @@ export function controlPhaseLoop(options = {}) {
   const terminalClaimRecoveryBlocked = terminalNoEligibleClaimRepair.reason === 'workspace_changed_or_dirty_not_archiving_claim';
   const postReplanClaimArchivalFailed = postReplanStaleActiveClaimRepair.attempted
     && postReplanStaleActiveClaimRepair.ok === false;
-  const start = postRepair.attempted && !postRepair.ok
+  // A controller self-update is a distinct Brownie run.  It is intentionally
+  // dispatched before, and instead of, restarting the normal supervisor: the
+  // worker may change the controller/runtime that selected the stopped state.
+  // Starting the old controller in parallel would reintroduce the same loop.
+  const selfUpdateDispatcher = options.selfUpdateDispatcher ?? dispatchSelfUpdate;
+  const selfUpdateRequested = typeof options.selfUpdateRequest === 'string';
+  const selfUpdate = selfUpdateRequested
+    ? selfUpdateDispatcher({ repoRoot, request: options.selfUpdateRequest })
+    : { dispatched: false, reason: 'self_update_not_requested' };
+  const start = selfUpdateRequested && !selfUpdate.dispatched
+    ? {
+        attempted: false,
+        reason: 'self_update_request_not_dispatched_not_starting',
+        self_update: selfUpdate
+      }
+    : selfUpdate.dispatched
+    ? {
+        attempted: false,
+        reason: selfUpdate.ok
+          ? 'self_update_dispatched_requires_review_and_delivery'
+          : 'self_update_failed_not_starting',
+        self_update: selfUpdate
+      }
+    : selfUpdate.retry?.reason === 'self_update_retry_backoff_active'
+      ? { attempted: false, reason: 'self_update_retry_backoff_active_not_starting', self_update: selfUpdate }
+      : selfUpdate.retry?.reason === 'self_update_retry_budget_exhausted'
+        ? { attempted: false, reason: 'self_update_retry_budget_exhausted_not_starting', self_update: selfUpdate }
+    : postRepair.attempted && !postRepair.ok
     ? { attempted: false, reason: 'post_repair_validation_failed', validation: postRepair }
     : postReplanClaimArchivalFailed
       ? {
@@ -1849,6 +1880,7 @@ export function controlPhaseLoop(options = {}) {
       bounded_leaf_apply_rejection: boundedLeafApplyRejectionRepair,
       post_repair_validation: postRepair
     },
+    self_update: selfUpdate,
     start,
     final_summary: final.summary,
     final_phase_loop: final.phase_loop,
@@ -1862,7 +1894,8 @@ if (process.argv[1] === __filename) {
     repoRoot: args.repo,
     write: args.write,
     repair: args.repair,
-    start: args.start
+    start: args.start,
+    selfUpdateRequest: args.selfUpdateRequest
   });
   console.log(JSON.stringify(result, null, 2));
   process.exit(result.final_summary.healthy ? 0 : 1);

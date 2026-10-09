@@ -25,21 +25,21 @@
     "crates/brownie-runtime/src/verification_recovery.rs"
   ],
   "thresholds": {
-    "lib_rs_production_line_ceiling": 15839,
-    "lib_rs_test_line_ceiling": 53374
+    "lib_rs_production_line_ceiling": 15905,
+    "lib_rs_test_line_ceiling": 53696
   },
   "metrics": {
     "files": {
       "crates/brownie-runtime/src/lib.rs": {
-        "line_count": 69213,
+        "line_count": 69601,
         "public_items": 3,
-        "private_items": 529,
-        "production_line_count": 15839,
-        "test_line_count": 53374,
-        "state_mutation_mentions": 312,
-        "durable_write_mentions": 232,
-        "permission_decision_mentions": 202,
-        "recovery_mentions": 2263,
+        "private_items": 531,
+        "production_line_count": 15905,
+        "test_line_count": 53696,
+        "state_mutation_mentions": 313,
+        "durable_write_mentions": 233,
+        "permission_decision_mentions": 234,
+        "recovery_mentions": 2266,
         "rpc_dispatch_mentions": 90,
         "approval_mentions": 540,
         "mcp_mentions": 600,
@@ -61,13 +61,13 @@
         "diagnostics_mentions": 0
       },
       "crates/brownie-runtime/src/controlled_tool_execution.rs": {
-        "line_count": 8005,
+        "line_count": 8049,
         "public_items": 74,
         "private_items": 119,
         "state_mutation_mentions": 47,
         "durable_write_mentions": 47,
-        "permission_decision_mentions": 102,
-        "recovery_mentions": 82,
+        "permission_decision_mentions": 105,
+        "recovery_mentions": 83,
         "rpc_dispatch_mentions": 0,
         "approval_mentions": 228,
         "mcp_mentions": 368,
@@ -201,7 +201,7 @@
         "diagnostics_mentions": 0
       },
       "crates/brownie-runtime/src/proposal_apply.rs": {
-        "line_count": 6443,
+        "line_count": 6432,
         "public_items": 4,
         "private_items": 46,
         "state_mutation_mentions": 6,
@@ -386,7 +386,7 @@
     "runtime_release_ready remains false until remaining blockers and owner decisions close",
     "raw prompt/provider response/file content/absolute path/canonical path/secret/environment values/process output are not decomposition evidence"
   ],
-  "updated_at": "2026-09-12T00:00:00Z",
+  "updated_at": "2026-10-09T00:00:00Z",
   "notes": [
     "RRP-8.3 updated module metrics after mandatory clippy gate cleanup; runtime-module-decomposition closure status remains unchanged.",
     "RRP-8.3 updated module metrics after release gate evidence semantics and clippy cleanup; module-decomposition closure status remains unchanged.",
@@ -401,7 +401,8 @@
     "PR pending: runtime module metrics refreshed after Brownie-owned TODO decomposition parser/proposal recovery work; runtime_release_ready remains false.",
     "PR pending: runtime module metrics refreshed after protected workspace.read denial recovery routing; runtime_release_ready remains false and broader extraction remains a later dedicated refactor.",
     "PR #458 updated runtime-module-decomposition metrics after phase-loop TODO decomposition hardening and long prompt mock request handling; closure status remains unchanged.",
-    "PR #458 follow-up updated runtime-module-decomposition metrics after review-thread fixes for TODO repair hunk validation; closure status remains unchanged."
+    "PR #458 follow-up updated runtime-module-decomposition metrics after review-thread fixes for TODO repair hunk validation; closure status remains unchanged.",
+    "PR #566 updates runtime-module-decomposition metrics and bounded ceilings after fail-closed phase-loop self-update recovery hardening; Runtime authority remains in Rust and closure status is unchanged."
   ],
   "history": [
     "PR #462 updated runtime-module-decomposition metrics after Brownie loop harness and protected-read recovery hardening; closure status remains unchanged."
