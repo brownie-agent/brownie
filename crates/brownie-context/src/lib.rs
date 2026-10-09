@@ -1624,7 +1624,7 @@ impl BdkExecutionState {
                 "request exactly one workspace.write patch_file for `.brownie/todo.md`; prefer input `hunks:[{old_text,new_text,occurrence},...]`; for self-source repair use tiny complete-line hunks; for duplicate-only repair use only the exact duplicate block provided in the focused repair context as old_text, set new_text to an empty string, and set occurrence:2; do not invent TODO block text or include Queue protocol, Base Phase Loop Prompt, unrelated headings, or implementation files"
             }
             Self::OversizedWriteRecovery => {
-                "do not retry the oversized workspace.write. Request exactly one small workspace.write patch_file for `.brownie/todo.md`: old_text must be the full selected TODO block, and new_text must contain exactly one smaller unchecked leaf TODO under 1200 characters. The leaf must use a new unique TODO id and include `Route:`, `Source TODO:` referencing the selected TODO id, `Depends on:`, `Completion condition:`, `Forbidden changes:`, and `Verification:`. The leaf must name at most one target file and one verification command. new_text must not contain the selected TODO first line, selected TODO id, the original broad TODO title, multiple TODO items, or implementation patch content"
+                "do not repeat the oversized workspace.write. Reuse completed workspace.read evidence and request exactly one workspace.write patch_file for the named target with one complete hunk; keep the whole fenced JSON under about 1200 characters and the input below the parser limit. If no complete bounded target hunk is visible, request exactly one workspace.write patch_file for `.brownie/todo.md`: old_text must be the full selected TODO block, and new_text must contain exactly one smaller unchecked leaf TODO under 1200 characters. The leaf must use a new unique TODO id and include `Route:`, `Source TODO:` referencing the selected TODO id, `Depends on:`, `Completion condition:`, `Forbidden changes:`, and `Verification:`. The leaf must name at most one target file and one verification command. new_text must not contain the selected TODO first line, selected TODO id, the original broad TODO title, multiple TODO items, or implementation patch content"
             }
             Self::DecomposeTodo => {
                 "request exactly one workspace.write patch_file to the live TODO queue (`.brownie/todo.md` unless the selected queue is legacy `todo.md`). old_text must be the full selected TODO block exactly as shown under `## Selected TODO`. new_text must contain only 1-2 short unchecked leaf TODOs under 1800 total characters. Each leaf must use this multi-line shape exactly: first line `- [ ] E-...: Patch only `path` ...:` or `- [ ] E-...: Blocker: ...`, then separate indented lines starting `Route:`, `Source TODO:`, `Depends on:`, `Completion condition:`, `Forbidden changes:`, and `Verification:`. Never copy the selected TODO first line, selected TODO id, `TODO-decompose-...`, or the broad source TODO title into new_text. Do not target any later TODO, do not keep the selected decomposition item pending, and do not use only the first line as old_text"
@@ -1651,7 +1651,7 @@ impl BdkExecutionState {
                 "repair the TODO queue before implementation work; use the smallest visible exact old_text/new_text hunk and avoid large replacement JSON"
             }
             Self::OversizedWriteRecovery => {
-                "the previous workspace.write input exceeded parser limits; one short leaf TODO is progress, while multiple leaves, implementation patch content, repeating the large patch, or keeping the selected broad TODO pending is no progress"
+                "the previous workspace.write input exceeded parser limits; one smaller complete target hunk based on completed read evidence, or one short leaf TODO only when the target hunk is not visible, is progress. Multiple writes, repeating the large patch, or keeping the selected broad TODO pending is no progress"
             }
             Self::DecomposeTodo => {
                 "split the selected TODO shown in `## Selected TODO` only; new leaf TODOs replace the selected item. Repeating the selected TODO text, keeping `TODO-decompose-...`, jumping to a later queue item, or using partial old_text is no progress"
@@ -1682,9 +1682,11 @@ fn infer_bdk_execution_state(
         return BdkExecutionState::TodoQueueRepair;
     }
     if tool_intent_summary.iter().any(|entry| {
-        entry.contains("workspace.write: rejected")
+        (entry.contains("workspace.write: rejected")
             && (entry.contains("code=input_too_large")
-                || entry.contains("input exceeds parser size limit"))
+                || entry.contains("input exceeds parser size limit")))
+            || entry.contains("code=block_too_large")
+            || entry.contains("code=missing_closing_fence")
     }) {
         return BdkExecutionState::OversizedWriteRecovery;
     }
@@ -2310,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_builder_redirects_oversized_workspace_write_to_todo_decomposition() {
+    fn prompt_builder_retries_oversized_workspace_write_with_bounded_hunk() {
         let context_window = ContextWindowSummary::empty();
         let prompt = PromptBuilder::build(PromptBuildInput {
             task_id: "task_1".into(),
@@ -2344,16 +2346,14 @@ mod tests {
             .contains("state: oversized_write_recovery"));
         assert!(prompt.messages[1]
             .content
-            .contains("do not retry the oversized workspace.write"));
+            .contains("do not repeat the oversized workspace.write"));
+        assert!(prompt.messages[1].content.contains("one complete hunk"));
         assert!(prompt.messages[1]
             .content
-            .contains("new_text must contain exactly one smaller unchecked leaf TODO"));
+            .contains("under about 1200 characters"));
         assert!(prompt.messages[1]
             .content
-            .contains("new_text must not contain the selected TODO first line"));
-        assert!(prompt.messages[1]
-            .content
-            .contains("Source TODO:` referencing the selected TODO id"));
+            .contains("If no complete bounded target hunk is visible"));
         assert!(prompt.messages[1].content.contains("new unique TODO id"));
     }
 

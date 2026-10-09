@@ -454,6 +454,7 @@ const TASK_RUN_CONTEXT_BUDGET_MIN_PROMPT_CHARS: usize = 128;
 const TASK_RUN_CONTEXT_BUDGET_MAX_PROMPT_CHARS: usize = 1_000_000;
 const TASK_RUN_CONTEXT_BUDGET_MAX_LEDGER_EVENTS: usize = 64;
 const TASK_RUN_CONTEXT_BUDGET_MAX_SELECTED_INDEX_CHARS: usize = MAX_WORKSPACE_READ_BYTES;
+const MAX_WORKSPACE_WRITE_PARSER_REJECTIONS: usize = 3;
 const METHOD_MODE_LIST: &str = "mode.list";
 const METHOD_MODE_GET: &str = "mode.get";
 const METHOD_MODEPACK_ACTIVATE: &str = "modepack.activate";
@@ -2658,6 +2659,8 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
             Err(error) => return error_response(id, -32603, &format!("internal error: {error}")),
         };
         let mut followup_attempts = 0;
+        let task_requires_workspace_write =
+            task_goal_requires_workspace_write_proposal(&running.goal);
         loop {
             let second_pass_response_index = followup_events
                 .iter()
@@ -2672,13 +2675,10 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
             });
             let latest_workspace_write_rejection_index =
                 followup_events.iter().rposition(|event| {
-                    event.kind == LedgerEventKind::ToolIntentRejected
-                        && event
-                            .payload
-                            .as_ref()
-                            .and_then(|payload| payload.get("tool_id"))
-                            .and_then(Value::as_str)
-                            == Some(WORKSPACE_WRITE_TOOL_ID)
+                    is_recoverable_workspace_write_rejection_for_followup(
+                        event,
+                        task_requires_workspace_write,
+                    )
                 });
             let latest_workspace_read_rejection_index = followup_events
                 .iter()
@@ -2706,6 +2706,34 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                 && !followup_events
                     .iter()
                     .any(|event| event.kind == LedgerEventKind::WorkspacePatchProposed);
+            let workspace_write_parser_rejection_count = followup_events
+                .iter()
+                .filter(|event| {
+                    is_recoverable_workspace_write_rejection_for_followup(
+                        event,
+                        task_requires_workspace_write,
+                    )
+                })
+                .count();
+            if followup_write_missing
+                && workspace_write_parser_rejection_count >= MAX_WORKSPACE_WRITE_PARSER_REJECTIONS
+            {
+                if let Err(error) = store.tasks().append_task_event_with_payload(
+                    &running,
+                    LedgerEventKind::ToolExecutionFailed,
+                    Some(json!({
+                        "tool_id": WORKSPACE_WRITE_TOOL_ID,
+                        "status": "Failed",
+                        "operation": "workspace_write_parser_repair_exhausted",
+                        "reason": format!(
+                            "workspace.write parser recovery exhausted after {workspace_write_parser_rejection_count}/{MAX_WORKSPACE_WRITE_PARSER_REJECTIONS} rejected attempts"
+                        ),
+                    })),
+                ) {
+                    return error_response(id, -32603, &format!("internal error: {error}"));
+                }
+                break;
+            }
             if followup_write_missing
                 && task_goal_enforces_workspace_read_budget_before_write(&running.goal)
                 && workspace_read_completed_count(&followup_events) >= 2
@@ -2953,6 +2981,10 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
         .filter(|event| {
             event.kind == LedgerEventKind::ToolIntentRejected
                 && !is_recoverable_workspace_read_denial_for_followup(event)
+                && !is_recoverable_workspace_write_rejection_for_followup(
+                    event,
+                    task_goal_requires_workspace_write_proposal(&running.goal),
+                )
         })
         .count();
     if task_goal_requires_tool_intent(&running.goal)
@@ -3210,6 +3242,23 @@ fn is_duplicate_workspace_read_denial(event: &LedgerEvent) -> bool {
                     || reason.contains("Additional workspace.read is not progress")
                     || reason.contains("Repair feedback already embeds previous workspace.read")
             })
+}
+
+fn is_recoverable_workspace_write_rejection_for_followup(
+    event: &LedgerEvent,
+    task_requires_workspace_write: bool,
+) -> bool {
+    if event.kind != LedgerEventKind::ToolIntentRejected || !task_requires_workspace_write {
+        return false;
+    }
+    let Some(payload) = event.payload.as_ref() else {
+        return false;
+    };
+    let code = payload.get("code").and_then(Value::as_str);
+    let tool_id = payload.get("tool_id").and_then(Value::as_str);
+    (matches!(code, Some("input_too_large")) && tool_id == Some(WORKSPACE_WRITE_TOOL_ID))
+        || (matches!(code, Some("block_too_large" | "missing_closing_fence"))
+            && tool_id == Some("<parse-error>"))
 }
 
 fn run_has_workspace_read_failure(events: &[LedgerEvent]) -> bool {
@@ -63874,11 +63923,27 @@ mod phase_2_3_tests {
     fn spawn_mock_many(
         bodies: Vec<&'static str>,
     ) -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
-        spawn_mock_many_with_models(bodies, None)
+        spawn_mock_many_owned(bodies.into_iter().map(str::to_string).collect())
     }
 
     fn spawn_mock_many_with_models(
         bodies: Vec<&'static str>,
+        expected_models: Option<Vec<&'static str>>,
+    ) -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
+        spawn_mock_many_owned_with_models(
+            bodies.into_iter().map(str::to_string).collect(),
+            expected_models,
+        )
+    }
+
+    fn spawn_mock_many_owned(
+        bodies: Vec<String>,
+    ) -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
+        spawn_mock_many_owned_with_models(bodies, None)
+    }
+
+    fn spawn_mock_many_owned_with_models(
+        bodies: Vec<String>,
         expected_models: Option<Vec<&'static str>>,
     ) -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -63944,6 +64009,31 @@ content-length: {}
             observed
         });
         (format!("http://{addr}/v1"), handle)
+    }
+
+    fn mock_tool_intent_response(tool_id: &str, reason: &str, input: Value) -> String {
+        let content = format!(
+            "```brownie-tool-intent\n{}\n```",
+            json!({
+                "tool_requests": [{
+                    "tool_id": tool_id,
+                    "reason": reason,
+                    "input": input,
+                }],
+            })
+        );
+        json!({ "choices": [{ "message": { "content": content } }] }).to_string()
+    }
+
+    fn mock_unclosed_tool_intent_response() -> String {
+        json!({
+            "choices": [{
+                "message": {
+                    "content": "```brownie-tool-intent\n{}"
+                }
+            }]
+        })
+        .to_string()
     }
 
     #[test]
@@ -64434,6 +64524,265 @@ content-length: {}
         assert_eq!(proposal["payload"]["path"], ".brownie/todo.md");
         assert_eq!(proposal["payload"]["operation"], "patch_file");
         assert_eq!(proposal["payload"]["validation_status"], "Valid");
+    }
+
+    #[test]
+    fn openai_task_run_recovers_from_oversized_workspace_write_with_bounded_hunk() {
+        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
+        std::fs::write(
+            temp.path().join("scripts/release-gate.mjs"),
+            "export const gate = true;\n",
+        )
+        .expect("release gate");
+        let oversized_write = mock_tool_intent_response(
+            WORKSPACE_WRITE_TOOL_ID,
+            "Attempt an oversized patch.",
+            json!({
+                "path": "scripts/release-gate.mjs",
+                "operation": "patch_file",
+                "old_text": "export const gate = true;\n",
+                "new_text": "x".repeat(4_200),
+            }),
+        );
+        let bounded_write = mock_tool_intent_response(
+            WORKSPACE_WRITE_TOOL_ID,
+            "Apply one bounded gate hunk.",
+            json!({
+                "path": "scripts/release-gate.mjs",
+                "operation": "patch_file",
+                "old_text": "export const gate = true;\n",
+                "new_text": "export const gate = false;\n",
+            }),
+        );
+        let (base_url, handle) = spawn_mock_many_owned(vec![
+            mock_tool_intent_response(
+                WORKSPACE_READ_TOOL_ID,
+                "Read the named target before patching.",
+                json!({ "path": "scripts/release-gate.mjs" }),
+            ),
+            oversized_write,
+            bounded_write,
+        ]);
+        write_mock_config(temp.path(), &base_url);
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
+        std::env::set_var("BROWNIE_TEST_LLM_API_KEY", "test-key");
+        std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
+
+        let start = parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"goal":"Patch scripts/release-gate.mjs by changing gate to false.","mode_id":"implementer"}}"#,
+        )
+        .result
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap();
+        let run_id = start["run_id"].as_str().unwrap();
+        let run = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"task.run","params":{{"task_id":"{task_id}"}}}}"#
+        ));
+        assert!(run.error.is_none(), "run error: {:?}", run.error);
+        let run_result = run.result.expect("run result");
+        assert_eq!(run_result["status"], "Completed");
+        assert_eq!(run_result["agent_loop"]["final_state"], "Completed");
+
+        let observed = handle.join().unwrap();
+        assert_eq!(observed.len(), 3);
+        let retry_prompt = observed[2]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("retry prompt");
+        assert!(retry_prompt.contains("state: oversized_write_recovery"));
+        assert!(retry_prompt.contains("one complete hunk"));
+        assert!(retry_prompt.contains("under about 1200 characters"));
+
+        let events = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"run.events","params":{{"run_id":"{run_id}"}}}}"#
+        ))
+        .result
+        .unwrap();
+        let event_list = events["events"].as_array().unwrap();
+        assert!(event_list.iter().any(|event| {
+            event["kind"] == "ToolIntentRejected"
+                && event["payload"]["tool_id"] == WORKSPACE_WRITE_TOOL_ID
+                && event["payload"]["code"] == "input_too_large"
+        }));
+        let proposal = event_list
+            .iter()
+            .find(|event| event["kind"] == "WorkspacePatchProposed")
+            .expect("bounded workspace patch proposal");
+        assert_eq!(proposal["payload"]["path"], "scripts/release-gate.mjs");
+        assert_eq!(proposal["payload"]["operation"], "patch_file");
+        assert_eq!(proposal["payload"]["validation_status"], "Valid");
+    }
+
+    #[test]
+    fn openai_task_run_recovers_from_unclosed_workspace_write_intent_with_bounded_hunk() {
+        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
+        std::fs::write(
+            temp.path().join("scripts/release-gate.mjs"),
+            "export const gate = true;\n",
+        )
+        .expect("release gate");
+        let (base_url, handle) = spawn_mock_many_owned(vec![
+            mock_tool_intent_response(
+                WORKSPACE_READ_TOOL_ID,
+                "Read the named target before patching.",
+                json!({ "path": "scripts/release-gate.mjs" }),
+            ),
+            mock_unclosed_tool_intent_response(),
+            mock_tool_intent_response(
+                WORKSPACE_WRITE_TOOL_ID,
+                "Apply one bounded gate hunk.",
+                json!({
+                    "path": "scripts/release-gate.mjs",
+                    "operation": "patch_file",
+                    "old_text": "export const gate = true;\n",
+                    "new_text": "export const gate = false;\n",
+                }),
+            ),
+        ]);
+        write_mock_config(temp.path(), &base_url);
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
+        std::env::set_var("BROWNIE_TEST_LLM_API_KEY", "test-key");
+        std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
+
+        let start = parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"goal":"Patch scripts/release-gate.mjs by changing gate to false.","mode_id":"implementer"}}"#,
+        )
+        .result
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap();
+        let run_id = start["run_id"].as_str().unwrap();
+        let run = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"task.run","params":{{"task_id":"{task_id}"}}}}"#
+        ));
+        assert!(run.error.is_none(), "run error: {:?}", run.error);
+        let run_result = run.result.expect("run result");
+        assert_eq!(run_result["status"], "Completed");
+        assert_eq!(run_result["agent_loop"]["final_state"], "Completed");
+
+        let observed = handle.join().unwrap();
+        assert_eq!(observed.len(), 3);
+        let retry_prompt = observed[2]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("retry prompt");
+        assert!(retry_prompt.contains("state: oversized_write_recovery"));
+
+        let events = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"run.events","params":{{"run_id":"{run_id}"}}}}"#
+        ))
+        .result
+        .unwrap();
+        let event_list = events["events"].as_array().unwrap();
+        assert!(event_list.iter().any(|event| {
+            event["kind"] == "ToolIntentRejected"
+                && event["payload"]["tool_id"] == "<parse-error>"
+                && event["payload"]["code"] == "missing_closing_fence"
+        }));
+        assert!(event_list.iter().any(|event| {
+            event["kind"] == "WorkspacePatchProposed"
+                && event["payload"]["validation_status"] == "Valid"
+        }));
+    }
+
+    #[test]
+    fn openai_task_run_stops_after_repeated_oversized_workspace_write_rejections() {
+        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
+        std::fs::write(
+            temp.path().join("scripts/release-gate.mjs"),
+            "export const gate = true;\n",
+        )
+        .expect("release gate");
+        let oversized_write = || {
+            mock_tool_intent_response(
+                WORKSPACE_WRITE_TOOL_ID,
+                "Repeat an oversized patch.",
+                json!({
+                    "path": "scripts/release-gate.mjs",
+                    "operation": "patch_file",
+                    "old_text": "export const gate = true;\n",
+                    "new_text": "x".repeat(4_200),
+                }),
+            )
+        };
+        let (base_url, handle) = spawn_mock_many_owned(vec![
+            mock_tool_intent_response(
+                WORKSPACE_READ_TOOL_ID,
+                "Read the named target before patching.",
+                json!({ "path": "scripts/release-gate.mjs" }),
+            ),
+            oversized_write(),
+            oversized_write(),
+            oversized_write(),
+        ]);
+        write_mock_config(temp.path(), &base_url);
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
+        std::env::set_var("BROWNIE_TEST_LLM_API_KEY", "test-key");
+        std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
+
+        let start = parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"goal":"Patch scripts/release-gate.mjs by changing gate to false.","mode_id":"implementer"}}"#,
+        )
+        .result
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap();
+        let run_id = start["run_id"].as_str().unwrap();
+        let run = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"task.run","params":{{"task_id":"{task_id}"}}}}"#
+        ));
+        assert!(run.error.is_none(), "run error: {:?}", run.error);
+        let run_result = run.result.expect("run result");
+        assert_eq!(run_result["status"], "Failed");
+        assert_eq!(run_result["agent_loop"]["final_state"], "Failed");
+
+        let observed = handle.join().unwrap();
+        assert_eq!(observed.len(), 4);
+        let events = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"run.events","params":{{"run_id":"{run_id}"}}}}"#
+        ))
+        .result
+        .unwrap();
+        let event_list = events["events"].as_array().unwrap();
+        assert_eq!(
+            event_list
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "ToolIntentRejected"
+                        && event["payload"]["tool_id"] == WORKSPACE_WRITE_TOOL_ID
+                        && event["payload"]["code"] == "input_too_large"
+                })
+                .count(),
+            MAX_WORKSPACE_WRITE_PARSER_REJECTIONS
+        );
+        let exhaustion = event_list
+            .iter()
+            .find(|event| {
+                event["kind"] == "ToolExecutionFailed"
+                    && event["payload"]["operation"] == "workspace_write_parser_repair_exhausted"
+            })
+            .expect("parser repair exhaustion event");
+        assert!(exhaustion["payload"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(&format!(
+                "{MAX_WORKSPACE_WRITE_PARSER_REJECTIONS}/{MAX_WORKSPACE_WRITE_PARSER_REJECTIONS}"
+            ))));
+        assert!(!event_list
+            .iter()
+            .any(|event| event["kind"] == "WorkspacePatchProposed"));
     }
 
     #[test]
