@@ -75,6 +75,19 @@ test('tells a recoverer to use trusted exact patch context without rereading a l
   assert.match(objective, /Do not use workspace\.read to rediscover that hunk/u);
 });
 
+test('does not trust empty, duplicate, or incidental patch markers', () => {
+  const repo = makeRepo();
+  for (const suffix of [
+    'Trusted exact old_text:\n\nTrusted exact new_text:\nnew',
+    'Mention Trusted exact old_text: and Trusted exact new_text: in prose.',
+    'Trusted exact old_text:\na\nTrusted exact old_text:\nb\nTrusted exact new_text:\nnew'
+  ]) {
+    const request = `${recoveryRequest()}\n${suffix}`;
+    const objective = buildSelfUpdateObjective({ request, eligibility: evaluateSelfUpdateEligibility({ repoRoot: repo, request }) });
+    assert.doesNotMatch(objective, /Do not use workspace\.read to rediscover that hunk/u);
+  }
+});
+
 test('requires explicit workspace-relative targets for a self-update request', () => {
   const repo = makeRepo();
   const eligibility = evaluateSelfUpdateEligibility({ repoRoot: repo, request: 'Repair controller policy contradiction.' });
@@ -228,7 +241,7 @@ test('treats exit-zero terminal and continuation outcomes as failed self-updates
   assert.equal(continuation.retry.failed_attempts, 1);
 });
 
-test('resumes its own applied recovery continuation exactly once', () => {
+test('resumes an applied recovery continuation until it reaches a terminal outcome', () => {
   const repo = makeRepo();
   const invocations = [];
   const appliedContinuation = JSON.stringify({
@@ -267,7 +280,9 @@ test('resumes its own applied recovery continuation exactly once', () => {
       invocations.push(args);
       return invocations.length === 1
         ? { status: 0, stdout: appliedContinuation, stderr: '' }
-        : { status: 0, stdout: completedOutcome, stderr: '' };
+        : invocations.length === 2
+          ? { status: 0, stdout: appliedContinuation, stderr: '' }
+          : { status: 0, stdout: completedOutcome, stderr: '' };
     }
   });
   assert.equal(result.ok, true, JSON.stringify(result));
@@ -278,6 +293,54 @@ test('resumes its own applied recovery continuation exactly once', () => {
     '--task-id', 'task-recovery',
     '--run-id', 'run-recovery'
   ]);
+  assert.deepEqual(invocations[2], invocations[1]);
+});
+
+test('bounds repeated self-update continuations and records exhaustion', () => {
+  const repo = makeRepo();
+  const appliedContinuation = JSON.stringify({
+    ok: true,
+    automation: {
+      status: 'continuation_required',
+      controller_action: 'resume',
+      completed: false,
+      blocked: false,
+      continuation_required: true,
+      terminal_failure: false
+    },
+    run: {
+      objective_apply_applied: true,
+      session_id: 'session-recovery',
+      journey_id: 'journey-recovery',
+      task_id: 'task-recovery',
+      run_id: 'run-recovery',
+      automation: {
+        status: 'continuation_required',
+        controller_action: 'resume',
+        completed: false,
+        blocked: false,
+        continuation_required: true,
+        terminal_failure: false
+      }
+    }
+  });
+  let invocations = 0;
+  const result = dispatchSelfUpdate({
+    repoRoot: repo,
+    request: recoveryRequest(),
+    now: () => new Date('2026-10-09T00:00:00.000Z'),
+    run(command, args, options) {
+      if (command === 'git') return spawnSync(command, args, options);
+      if (command.endsWith('brownie-runtime')) return runtimeStatusResult();
+      invocations += 1;
+      return { status: 0, stdout: appliedContinuation, stderr: '' };
+    }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(invocations, 4);
+  const record = JSON.parse(fs.readFileSync(path.join(repo, result.result_path), 'utf8'));
+  assert.equal(record.continuation.resume_attempts, 3);
+  assert.equal(record.continuation.exhausted, true);
 });
 
 test('backs off failed recovery implementers and exhausts only the same failure fingerprint', () => {

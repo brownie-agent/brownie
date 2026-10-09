@@ -13,6 +13,21 @@ const maxRequestBytes = 12_000;
 const maxAttemptsPerFingerprint = 3;
 const retryBaseDelayMs = 60_000;
 const retryMaxDelayMs = 30 * 60_000;
+const maxAppliedRecoveryResumes = 3;
+
+function hasUnambiguousTrustedPatchContext(request) {
+  const oldHeadings = [...request.matchAll(/^Trusted exact old_text:\s*$/gmu)];
+  const newHeadings = [...request.matchAll(/^Trusted exact new_text:\s*$/gmu)];
+  if (oldHeadings.length !== 1 || newHeadings.length !== 1) return false;
+
+  const oldStart = oldHeadings[0].index + oldHeadings[0][0].length;
+  const newStart = newHeadings[0].index + newHeadings[0][0].length;
+  if (oldStart >= newHeadings[0].index) return false;
+
+  const oldText = request.slice(oldStart, newHeadings[0].index).trim();
+  const newText = request.slice(newStart).trim();
+  return oldText.length > 0 && newText.length > 0;
+}
 
 function parseArgs(argv) {
   const args = { repo: defaultRepoRoot, dispatch: false, request: null };
@@ -287,8 +302,7 @@ export function buildSelfUpdateObjective({ request, eligibility }) {
   const issueCodes = (eligibility.diagnostic?.issues ?? []).map((issue) => issue.code).join(', ') || 'none';
   const status = eligibility.diagnostic?.phase_loop?.status ?? 'unknown';
   const targetPaths = eligibility.target_paths ?? [];
-  const hasTrustedPatchContext = /Trusted exact old_text:/u.test(request)
-    && /Trusted exact new_text:/u.test(request);
+  const hasTrustedPatchContext = hasUnambiguousTrustedPatchContext(request);
   const trustedPatchInstruction = hasTrustedPatchContext
     ? 'The recovery request supplies an exact trusted patch context. Do not use workspace.read to rediscover that hunk; emit the compact workspace.write patch_file directly so a large target file cannot truncate the recovery context.\n\n'
     : '';
@@ -372,6 +386,19 @@ function resumeAppliedRecovery({ brownieBin, repoRoot, workerEnv, run, scope }) 
   });
 }
 
+function isSameScopedContinuation(result, scope) {
+  if (result.status !== 0 || result.signal) return false;
+  try {
+    const run = JSON.parse(String(result.stdout ?? '').trim())?.run;
+    const automation = run?.automation;
+    return automation?.continuation_required === true
+      && automation.controller_action === 'resume'
+      && ['session_id', 'journey_id', 'task_id', 'run_id'].every((key) => run?.[key] === scope[key]);
+  } catch {
+    return false;
+  }
+}
+
 export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = () => new Date() }) {
   const eligibility = evaluateSelfUpdateEligibility({ repoRoot, request, run });
   if (!eligibility.eligible) return { dispatched: false, eligibility };
@@ -404,15 +431,19 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
     env: eligibility.worker_env
   });
   const continuationScope = appliedRecoveryContinuationScope(initialResult);
-  const result = continuationScope
-    ? resumeAppliedRecovery({
+  let result = initialResult;
+  let resumeAttempts = 0;
+  while (continuationScope && resumeAttempts < maxAppliedRecoveryResumes) {
+    result = resumeAppliedRecovery({
       brownieBin: eligibility.brownie_bin,
       repoRoot,
       workerEnv: eligibility.worker_env,
       run,
       scope: continuationScope
-    })
-    : initialResult;
+    });
+    resumeAttempts += 1;
+    if (!isSameScopedContinuation(result, continuationScope)) break;
+  }
   const outcome = selfUpdateOutcome(result);
   const record = {
     schema_version: 1,
@@ -423,7 +454,7 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
     signal: result.signal ?? null,
     outcome: outcome.reason,
     continuation: continuationScope
-      ? { attempted: true, scope: continuationScope, initial_exit_code: initialResult.status }
+      ? { attempted: true, scope: continuationScope, initial_exit_code: initialResult.status, resume_attempts: resumeAttempts, exhausted: resumeAttempts === maxAppliedRecoveryResumes && isSameScopedContinuation(result, continuationScope) }
       : { attempted: false },
     stdout: String(result.stdout ?? '').slice(-12_000),
     stderr: String(result.stderr ?? '').slice(-12_000),
