@@ -338,18 +338,19 @@ function appliedRecoveryContinuationScope(result) {
   } catch {
     return null;
   }
-  const automation = payload?.run?.automation;
+  const run = payload?.run;
+  const automation = run?.automation;
   if (!automation
     || automation.continuation_required !== true
     || automation.controller_action !== 'resume'
-    || automation.objective_apply_applied !== true) {
+    || run?.objective_apply_applied !== true) {
     return null;
   }
   const scope = {
-    session_id: automation.session_id,
-    journey_id: automation.journey_id,
-    task_id: automation.task_id,
-    run_id: automation.run_id
+    session_id: run.session_id,
+    journey_id: run.journey_id,
+    task_id: run.task_id,
+    run_id: run.run_id
   };
   return Object.values(scope).every((value) => typeof value === 'string' && value.trim().length > 0)
     ? scope

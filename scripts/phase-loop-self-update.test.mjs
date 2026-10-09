@@ -242,18 +242,18 @@ test('resumes its own applied recovery continuation exactly once', () => {
       terminal_failure: false
     },
     run: {
+      objective_apply_applied: true,
+      session_id: 'session-recovery',
+      journey_id: 'journey-recovery',
+      task_id: 'task-recovery',
+      run_id: 'run-recovery',
       automation: {
         status: 'continuation_required',
         controller_action: 'resume',
         completed: false,
         blocked: false,
         continuation_required: true,
-        terminal_failure: false,
-        objective_apply_applied: true,
-        session_id: 'session-recovery',
-        journey_id: 'journey-recovery',
-        task_id: 'task-recovery',
-        run_id: 'run-recovery'
+        terminal_failure: false
       }
     }
   });
