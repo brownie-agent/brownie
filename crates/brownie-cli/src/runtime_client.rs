@@ -5007,7 +5007,9 @@ mod tests {
         )
         .unwrap());
         assert!(!objective_scope_allows_proposal_path(Some(objective), "README.md").unwrap());
-        assert!(!objective_scope_allows_proposal_path(Some(objective), ".brownie/todo.md").unwrap());
+        assert!(
+            !objective_scope_allows_proposal_path(Some(objective), ".brownie/todo.md").unwrap()
+        );
     }
 
     #[test]
