@@ -3614,6 +3614,10 @@ fn todo_repair_text_rejection_reason(
             return Some("TODO repair patch must replace the existing corrupt TODO block, not append new leaf ids; include the whole duplicate block in old_text or remove duplicates without adding new ids.");
         }
     }
+    todo_repair_leaf_integrity_rejection_reason(&leaf_blocks)
+}
+
+fn todo_repair_leaf_integrity_rejection_reason(leaf_blocks: &[&str]) -> Option<&'static str> {
     let mut ids = HashSet::new();
     for leaf in leaf_blocks {
         let Some(id) = todo_block_id_from_text(leaf) else {
@@ -3725,6 +3729,11 @@ fn todo_decomposition_workspace_write_rejection_reason(
         return Some(
             "TODO decomposition must replace the broad item with one or more unchecked leaf TODOs.",
         );
+    }
+    if record.goal.contains("## Previous Repair Feedback") {
+        if let Some(reason) = todo_repair_leaf_integrity_rejection_reason(&leaf_blocks) {
+            return Some(reason);
+        }
     }
     if let Some(first_line) = selected_first_line.as_deref() {
         if new_text.contains(first_line) {
@@ -8123,6 +8132,31 @@ mod mcp_approval_lock_tests {
         );
 
         assert!(reason.is_none(), "{reason:?}");
+    }
+
+    #[test]
+    fn decompose_todo_with_repair_feedback_rejects_duplicate_leaf_ids() {
+        let mut record = test_task_record();
+        let selected = "- [ ] E-23a-replan: Patch only `.brownie/todo.md` to split a stalled leaf:\n  Route: todo-decomposition.\n  Source TODO: E-23a-target-01.\n  Depends on: <none>.\n  Completion condition: replace the stalled leaf with executable children.\n  Forbidden changes: do not edit implementation files.\n  Verification: run `pnpm --workspace-root guard:todo-decomposition`.\n";
+        record.goal = format!(
+            "# Brownie Phase Loop Effective Prompt\n\n## BDK Execution Packet\n\n- state: `decompose_todo`\n\n## Previous Repair Feedback\n\n- repair_reason: `todo_decomposition_guard_failed_after_todo_apply`\n\n## Selected TODO\n\n{selected}"
+        );
+        let leaf = "- [ ] E-23a-target-01-impl: Patch only `scripts/release-local-artifact.mjs`:\n  Route: implementation.\n  Source TODO: E-23a-replan.\n  Depends on: <none>.\n  Completion condition: the bounded producer change is implemented.\n  Forbidden changes: do not edit unrelated files.\n  Verification: run `pnpm --workspace-root release:local-artifact:test`.\n";
+
+        let reason = todo_md_workspace_write_rejection_reason(
+            &record,
+            &json!({
+                "path": ".brownie/todo.md",
+                "operation": "patch_file",
+                "old_text": selected,
+                "new_text": format!("{leaf}{leaf}")
+            }),
+        );
+
+        assert_eq!(
+            reason,
+            Some("TODO repair patch must not create duplicate unchecked TODO ids.")
+        );
     }
 
     #[test]
