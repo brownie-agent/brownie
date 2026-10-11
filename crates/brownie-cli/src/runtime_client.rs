@@ -321,7 +321,11 @@ impl RuntimeClient {
                 RuntimeRequestClass::ObjectiveExecution,
             )?;
             validate_headless_continue_once_result(&result)?;
-            result
+            // A scoped resume may re-expose a durable authorization/preflight
+            // checkpoint after the original task has terminalized. Keep apply
+            // in the existing CLI-controlled inspect/events/apply path rather
+            // than asking the runtime to apply from the checkpoint itself.
+            self.follow_objective_proposal_apply_route_if_available(result, None)?
         };
         if json_output {
             return json_result("resume", "resume", cli_resume_payload(&result)?);
