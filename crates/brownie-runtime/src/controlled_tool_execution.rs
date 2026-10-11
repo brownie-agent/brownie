@@ -3525,6 +3525,15 @@ fn todo_md_write_looks_like_decomposition_attempt(input: &Value) -> bool {
 
 fn selected_todo_requires_decomposition_only(goal: &str) -> bool {
     let goal_lower = goal.to_ascii_lowercase();
+    // A supervisor repair packet can accompany a deliberately selected
+    // decomposition turn. The explicit BDK state is authoritative here;
+    // otherwise the generic repair guard routes the required TODO replacement
+    // through its duplicate-removal validator and rejects every new leaf.
+    if goal_lower.contains("- state: `decompose_todo`")
+        || goal_lower.contains("- state: decompose_todo")
+    {
+        return true;
+    }
     if goal_lower.contains("## previous repair feedback")
         || goal_lower.contains("repair_reason:")
         || goal_lower.contains("repair_hint:")
@@ -3533,14 +3542,12 @@ fn selected_todo_requires_decomposition_only(goal: &str) -> bool {
     {
         return false;
     }
-    if goal_lower.contains("- state: `decompose_todo`")
-        || goal_lower.contains("- state: decompose_todo")
-        || (!goal_lower.contains("source todo:")
-            && (goal_lower.contains("todo.md") || goal_lower.contains("todo queue"))
-            && (goal_lower.contains("decompos")
-                || goal_lower.contains("split")
-                || goal_lower.contains("細分化")
-                || goal_lower.contains("分割")))
+    if !goal_lower.contains("source todo:")
+        && (goal_lower.contains("todo.md") || goal_lower.contains("todo queue"))
+        && (goal_lower.contains("decompos")
+            || goal_lower.contains("split")
+            || goal_lower.contains("細分化")
+            || goal_lower.contains("分割"))
     {
         return true;
     }
@@ -8095,6 +8102,27 @@ mod mcp_approval_lock_tests {
         );
 
         assert!(reason.is_none());
+    }
+
+    #[test]
+    fn decompose_todo_with_repair_feedback_allows_new_leaf_ids() {
+        let mut record = test_task_record();
+        let selected = "- [ ] E-23a-replan: Patch only `.brownie/todo.md` to split a stalled leaf:\n  Route: todo-decomposition.\n  Source TODO: E-23a-target-01.\n  Depends on: <none>.\n  Completion condition: replace the stalled leaf with executable children.\n  Forbidden changes: do not edit implementation files.\n  Verification: run `pnpm --workspace-root guard:todo-decomposition`.\n";
+        record.goal = format!(
+            "# Brownie Phase Loop Effective Prompt\n\n## BDK Execution Packet\n\n- state: `decompose_todo`\n\n## Previous Repair Feedback\n\n- repair_reason: `supervisor_repeated_leaf_failure_requires_todo_contract_replan`\n\n## Selected TODO\n\n{selected}"
+        );
+
+        let reason = todo_md_workspace_write_rejection_reason(
+            &record,
+            &json!({
+                "path": ".brownie/todo.md",
+                "operation": "patch_file",
+                "old_text": selected,
+                "new_text": "- [ ] E-23a-target-01-impl: Patch only `scripts/release-local-artifact.mjs`:\n  Route: implementation.\n  Source TODO: E-23a-replan.\n  Depends on: <none>.\n  Completion condition: the bounded producer change is implemented.\n  Forbidden changes: do not edit unrelated files.\n  Verification: run `pnpm --workspace-root release:local-artifact:test`.\n- [ ] E-23a-target-01-test: Patch only `scripts/release-local-artifact.test.mjs`:\n  Route: implementation.\n  Source TODO: E-23a-replan.\n  Depends on: E-23a-target-01-impl.\n  Completion condition: the bounded producer behavior is covered.\n  Forbidden changes: do not edit unrelated files.\n  Verification: run `pnpm --workspace-root release:local-artifact:test`.\n"
+            }),
+        );
+
+        assert!(reason.is_none(), "{reason:?}");
     }
 
     #[test]
