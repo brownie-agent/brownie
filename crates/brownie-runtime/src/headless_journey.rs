@@ -20,14 +20,17 @@ fn headless_run_drive_has_explicit_modepack_target(params: &HeadlessRunDrivePara
     headless_run_drive_explicit_modepack_target_count(params) > 0
 }
 
-fn headless_run_drive_should_scope_normal_continuation(params: &HeadlessRunDriveParams) -> bool {
+fn headless_run_drive_should_scope_normal_continuation(
+    params: &HeadlessRunDriveParams,
+    defer_journey_closure_for_preflight: bool,
+) -> bool {
     !headless_run_drive_has_explicit_modepack_target(params)
         && params.product_continuation_admission_target.is_none()
         && params.product_continuation_run_target.is_none()
         && params.product_continuation_derived_target.is_none()
         && params.parent_join_run_target.is_none()
         && params.journey_route_resume.is_none()
-        && params.journey_closure.is_none()
+        && (params.journey_closure.is_none() || defer_journey_closure_for_preflight)
         && params.product_evidence_derivation.is_none()
         && params.selected_product_gap_closure.is_none()
         && params.product_completion_decision.is_none()
@@ -4847,7 +4850,27 @@ pub(super) fn handle_headless_run_drive(
         };
         start_progress
     };
-    if let Some(plan) = journey_closure_plan.as_ref() {
+    let defer_journey_closure_for_preflight = match journey_closure_plan.as_ref() {
+        Some(plan) => {
+            let scope = HeadlessContinueScope {
+                session_id: Some(plan.journey_checkpoint.session_id.clone()),
+                session_id_prefix: None,
+                journey_id: Some(plan.journey_checkpoint.journey_id.clone()),
+                task_id: Some(plan.journey_checkpoint.task_id.clone()),
+                run_id: Some(plan.journey_checkpoint.run_id.clone()),
+                latest_matching_session: false,
+            };
+            match headless_continue_has_resumable_authorized_preflight(&store, &scope) {
+                Ok(resumable) => resumable,
+                Err(message) => return error_response(id, -32602, &message),
+            }
+        }
+        None => false,
+    };
+    if let Some(plan) = journey_closure_plan
+        .as_ref()
+        .filter(|_| !defer_journey_closure_for_preflight)
+    {
         let post_tasks = match store.tasks().list_tasks() {
             Ok(tasks) => tasks,
             Err(error) => return error_response(id, -32603, &format!("internal error: {error}")),
@@ -5023,8 +5046,10 @@ pub(super) fn handle_headless_run_drive(
     let mut next_action = "inspect_progress_overview".to_string();
     let mut next_route = None;
     let mut post_progress = Some(start_progress.clone());
-    let scoped_normal_continuation = if headless_run_drive_should_scope_normal_continuation(&params)
-    {
+    let scoped_normal_continuation = if headless_run_drive_should_scope_normal_continuation(
+        &params,
+        defer_journey_closure_for_preflight,
+    ) {
         active_journey_checkpoint.as_ref().map(|checkpoint| {
             json!({
                 "session_id": checkpoint.session_id.clone(),

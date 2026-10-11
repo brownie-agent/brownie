@@ -749,15 +749,10 @@ pub(super) fn headless_continue_objective_proposal_authorization_preflight_repla
     )
 }
 
-/// Re-exposes a persisted, still-valid authorization/preflight result to a scoped
-/// resume. This deliberately does not apply a proposal: the CLI must continue
-/// through its existing inspect/events/apply validation path.
-pub(super) fn headless_continue_authorized_preflight_resume_result(
+fn headless_continue_resumable_authorized_preflight_checkpoints(
     store: &BrownieStore,
-    progress_overview: &TaskListProgressOverview,
-    params: &HeadlessContinueOnceParams,
     scope: &HeadlessContinueScope,
-) -> Result<Option<HeadlessContinueOnceResult>, String> {
+) -> Result<Vec<HeadlessObjectiveProposalAuthorizationPreflightCheckpoint>, String> {
     let mut checkpoints = Vec::new();
     for checkpoint in store
         .list_headless_objective_proposal_authorization_preflight_checkpoints()
@@ -804,6 +799,36 @@ pub(super) fn headless_continue_authorized_preflight_resume_result(
             checkpoints.push(checkpoint);
         }
     }
+    Ok(checkpoints)
+}
+
+/// Determines whether a scoped journey has exactly one durable preflight checkpoint
+/// that may be resumed. This has no apply side effect and is used to prevent a
+/// terminal journey closure from hiding an explicit controlled-apply route.
+pub(super) fn headless_continue_has_resumable_authorized_preflight(
+    store: &BrownieStore,
+    scope: &HeadlessContinueScope,
+) -> Result<bool, String> {
+    let checkpoints = headless_continue_resumable_authorized_preflight_checkpoints(store, scope)?;
+    if checkpoints.len() > 1 && !scope.latest_matching_session {
+        return Err(
+            "invalid params: continuation_scope matched multiple authorized objective proposal preflight checkpoints; use latest_matching_session or an exact selector".to_string(),
+        );
+    }
+    Ok(!checkpoints.is_empty())
+}
+
+/// Re-exposes a persisted, still-valid authorization/preflight result to a scoped
+/// resume. This deliberately does not apply a proposal: the CLI must continue
+/// through its existing inspect/events/apply validation path.
+pub(super) fn headless_continue_authorized_preflight_resume_result(
+    store: &BrownieStore,
+    progress_overview: &TaskListProgressOverview,
+    params: &HeadlessContinueOnceParams,
+    scope: &HeadlessContinueScope,
+) -> Result<Option<HeadlessContinueOnceResult>, String> {
+    let mut checkpoints =
+        headless_continue_resumable_authorized_preflight_checkpoints(store, scope)?;
     if checkpoints.is_empty() {
         return Ok(None);
     }
