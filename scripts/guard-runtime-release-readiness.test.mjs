@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -530,6 +532,20 @@ test('builds live safety readiness evidence snapshot from tracked repository pat
   assert.equal(snapshot.evidence_id, 'runtime-safety-readiness-evidence-invalidation-v1');
   assert(snapshot.tracked_paths.includes('crates/brownie-runtime/src/lib.rs'));
   assert.match(snapshot.tracked_fingerprint, /^sha256:[a-f0-9]{64}$/);
+});
+
+test('production audit safety readiness evidence matches the live snapshot', () => {
+  const repoRoot = path.resolve(import.meta.dirname, '..');
+  const audit = JSON.parse(
+    fs.readFileSync(
+      path.join(repoRoot, 'docs/architecture/runtime-release-readiness-audit.json'),
+      'utf8'
+    )
+  );
+  assert.deepEqual(audit.safety_readiness_evidence_invalidation, {
+    status: 'implemented_sufficient',
+    ...buildSafetyReadinessEvidenceSnapshot(repoRoot)
+  });
 });
 
 test('accepts canonical Runtime boundary contract', () => {
