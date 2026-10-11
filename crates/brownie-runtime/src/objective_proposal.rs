@@ -749,15 +749,10 @@ pub(super) fn headless_continue_objective_proposal_authorization_preflight_repla
     )
 }
 
-/// Re-exposes a persisted, still-valid authorization/preflight result to a scoped
-/// resume. This deliberately does not apply a proposal: the CLI must continue
-/// through its existing inspect/events/apply validation path.
-pub(super) fn headless_continue_authorized_preflight_resume_result(
+fn headless_continue_resumable_authorized_preflight_checkpoints(
     store: &BrownieStore,
-    progress_overview: &TaskListProgressOverview,
-    params: &HeadlessContinueOnceParams,
     scope: &HeadlessContinueScope,
-) -> Result<Option<HeadlessContinueOnceResult>, String> {
+) -> Result<Vec<HeadlessObjectiveProposalAuthorizationPreflightCheckpoint>, String> {
     let mut checkpoints = Vec::new();
     for checkpoint in store
         .list_headless_objective_proposal_authorization_preflight_checkpoints()
@@ -804,6 +799,71 @@ pub(super) fn headless_continue_authorized_preflight_resume_result(
             checkpoints.push(checkpoint);
         }
     }
+    Ok(checkpoints)
+}
+
+/// Returns the explicit controlled-apply route for one scoped, durable preflight
+/// checkpoint without recording a continuation decision or applying the proposal.
+pub(super) fn headless_continue_authorized_preflight_resume_route(
+    store: &BrownieStore,
+    progress_overview: &TaskListProgressOverview,
+    scope: &HeadlessContinueScope,
+) -> Result<Option<HeadlessContinueRoute>, String> {
+    let mut checkpoints =
+        headless_continue_resumable_authorized_preflight_checkpoints(store, scope)?;
+    if checkpoints.is_empty() {
+        return Ok(None);
+    }
+    if scope.latest_matching_session {
+        checkpoints.sort_by(|left, right| {
+            (
+                left.post_aggregate_sequence,
+                left.session_id.as_str(),
+                left.journey_id.as_str(),
+                left.continuation_id.as_str(),
+            )
+                .cmp(&(
+                    right.post_aggregate_sequence,
+                    right.session_id.as_str(),
+                    right.journey_id.as_str(),
+                    right.continuation_id.as_str(),
+                ))
+        });
+    } else if checkpoints.len() > 1 {
+        return Err(
+            "invalid params: continuation_scope matched multiple authorized objective proposal preflight checkpoints; use latest_matching_session or an exact selector".to_string(),
+        );
+    }
+    let authorization_result = checkpoints
+        .pop()
+        .expect("non-empty authorization/preflight checkpoint list")
+        .result;
+    Ok(Some(HeadlessContinueRoute {
+        kind: HeadlessContinueRouteKind::ApplyAuthorizedObjectiveProposalExplicitly,
+        reason: "Recovered a scoped, authorized, and still-valid objective proposal preflight checkpoint; controlled apply remains an explicit next step.".to_string(),
+        task_id: Some(authorization_result.task_id),
+        run_id: Some(authorization_result.run_id),
+        proposal_id: Some(authorization_result.proposal_id),
+        apply_id: None,
+        failure_fingerprint: None,
+        apply_fingerprint: Some(authorization_result.authorization_preflight_fingerprint),
+        progress_fingerprint: Some(progress_overview.source_fingerprint.clone()),
+        aggregate_sequence: Some(progress_overview.aggregate_sequence),
+        next_action: "apply_authorized_objective_proposal".to_string(),
+    }))
+}
+
+/// Re-exposes a persisted, still-valid authorization/preflight result to a scoped
+/// resume. This deliberately does not apply a proposal: the CLI must continue
+/// through its existing inspect/events/apply validation path.
+pub(super) fn headless_continue_authorized_preflight_resume_result(
+    store: &BrownieStore,
+    progress_overview: &TaskListProgressOverview,
+    params: &HeadlessContinueOnceParams,
+    scope: &HeadlessContinueScope,
+) -> Result<Option<HeadlessContinueOnceResult>, String> {
+    let mut checkpoints =
+        headless_continue_resumable_authorized_preflight_checkpoints(store, scope)?;
     if checkpoints.is_empty() {
         return Ok(None);
     }

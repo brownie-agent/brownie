@@ -324,6 +324,7 @@ use objective_proposal::{
     handle_headless_continue_objective_proposal_apply,
     handle_headless_continue_objective_proposal_authorization_preflight,
     headless_continue_authorized_preflight_resume_result,
+    headless_continue_authorized_preflight_resume_route,
     headless_continue_objective_proposal_apply_replay_result,
     headless_continue_objective_proposal_authorization_preflight_replay_result,
     headless_objective_proposal_candidate_outcome, objective_proposal_candidate_route,
