@@ -3249,6 +3249,10 @@ fn objective_scoped_target_paths(objective: &str) -> Result<Vec<String>, Runtime
         "Patch only `",
         "Replace only `",
         "Create or update only `",
+        // Objectives also use the direct-target form: "In `path` only, ...".
+        // Treat it as an apply boundary so a model cannot redirect a bounded
+        // repair into an unrelated workspace write.
+        "In `",
     ] {
         let mut rest = objective;
         while let Some(start) = rest.find(marker) {
@@ -4992,6 +4996,19 @@ fn render_truncation(output: &mut String, label: &str, len: usize, limit: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn objective_scope_recognizes_direct_target_only_clause() {
+        let objective = "In `scripts/release-local-artifact.mjs` only, restore the export.";
+
+        assert!(objective_scope_allows_proposal_path(
+            Some(objective),
+            "scripts/release-local-artifact.mjs"
+        )
+        .unwrap());
+        assert!(!objective_scope_allows_proposal_path(Some(objective), "README.md").unwrap());
+        assert!(!objective_scope_allows_proposal_path(Some(objective), ".brownie/todo.md").unwrap());
+    }
 
     #[test]
     fn boundary_names_runtime_authority_without_policy_copy() {
