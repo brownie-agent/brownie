@@ -323,6 +323,7 @@ use modepack::*;
 use objective_proposal::{
     handle_headless_continue_objective_proposal_apply,
     handle_headless_continue_objective_proposal_authorization_preflight,
+    headless_continue_authorized_preflight_resume_result,
     headless_continue_objective_proposal_apply_replay_result,
     headless_continue_objective_proposal_authorization_preflight_replay_result,
     headless_objective_proposal_candidate_outcome, objective_proposal_candidate_route,
@@ -28441,6 +28442,31 @@ modes:
             .expect("checkpoint");
         assert_eq!(checkpoint.proposal_id, proposal_id);
 
+        // A prefix scope must select the greatest aggregate sequence, rather
+        // than the lexicographically first persisted checkpoint.
+        let mut newer_checkpoint = checkpoint.clone();
+        newer_checkpoint.continuation_id = "m56.auth.preflight.newer".to_string();
+        newer_checkpoint.decision_id = "headless_decision_m56_auth_newer".to_string();
+        newer_checkpoint.session_id = "m56.auth.newer".to_string();
+        newer_checkpoint.journey_id = "m56.auth.newer.1".to_string();
+        newer_checkpoint.result.session_id = newer_checkpoint.session_id.clone();
+        newer_checkpoint.result.journey_id = newer_checkpoint.journey_id.clone();
+        newer_checkpoint.post_aggregate_sequence += 1;
+        store
+            .write_headless_objective_proposal_authorization_preflight_checkpoint(&newer_checkpoint)
+            .expect("write newer checkpoint");
+        let latest = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":30,"method":"headless.continue_once","params":{{"authorize":true,"continuation_id":"m56.auth.resume.latest","expected_progress_fingerprint":"{}","expected_aggregate_sequence":{},"continuation_scope":{{"session_id_prefix":"m56.auth","latest_matching_session":true}}}}}}"#,
+            progress["progress_fingerprint"].as_str().expect("fingerprint"),
+            progress["aggregate_sequence"].as_u64().expect("sequence"),
+        ))
+        .result
+        .expect("latest scoped preflight resume");
+        assert_eq!(
+            latest["continuation_id"], "m56.auth.preflight.newer",
+            "latest_matching_session must choose the newest matching checkpoint"
+        );
+
         let replay = parse_line(&continue_request.to_string())
             .result
             .expect("authorization replay");
@@ -28457,6 +28483,42 @@ modes:
         );
         let events_after_replay = store.tasks().read_ledger_events(&run_id).expect("events");
         assert_eq!(events_after_replay.len(), events.len());
+
+        // A later resume has no runnable task, but it must not discard a scoped,
+        // authorized preflight checkpoint or apply it implicitly.
+        store
+            .tasks()
+            .update_task_status(
+                candidate["task_id"].as_str().expect("task id"),
+                TaskStatus::Failed,
+                LedgerEventKind::TaskFailed,
+            )
+            .expect("terminalize task");
+        let current_progress = parse_line(r#"{"jsonrpc":"2.0","id":3,"method":"task.list"}"#)
+            .result
+            .expect("current progress")["progress_overview"]
+            .clone();
+        let resumed = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"headless.continue_once","params":{{"authorize":true,"continuation_id":"m56.auth.resume","expected_progress_fingerprint":"{}","expected_aggregate_sequence":{},"continuation_scope":{{"session_id":"m56.auth"}}}}}}"#,
+            current_progress["source_fingerprint"].as_str().expect("fingerprint"),
+            current_progress["aggregate_sequence"].as_u64().expect("sequence"),
+        ))
+        .result
+        .expect("scoped preflight resume");
+        assert_eq!(resumed["status"], "task_executed");
+        assert_eq!(resumed["replayed"], true);
+        assert_eq!(
+            resumed["next_route"]["kind"],
+            "apply_authorized_objective_proposal_explicitly"
+        );
+        assert!(resumed["proposal_apply_result"].is_null());
+        assert!(resumed["objective_proposal_authorization_preflight_result"]
+            .get("content")
+            .is_none());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("README.md")).expect("readme"),
+            "original README"
+        );
 
         std::env::remove_var("BROWNIE_WORKSPACE_ROOT");
         clear_llm_env_for_test();
@@ -28991,6 +29053,31 @@ modes:
             std::fs::read_to_string(temp.path().join("README.md")).expect("readme"),
             "drifted README"
         );
+
+        // Applying a proposal consumes only its matching preflight checkpoint.
+        // A later scoped resume must not route that checkpoint back to apply.
+        store
+            .tasks()
+            .update_task_status(
+                candidate["task_id"].as_str().expect("task id"),
+                TaskStatus::Failed,
+                LedgerEventKind::TaskFailed,
+            )
+            .expect("terminalize applied task");
+        let current_progress = parse_line(r#"{"jsonrpc":"2.0","id":9,"method":"task.list"}"#)
+            .result
+            .expect("current progress")["progress_overview"]
+            .clone();
+        let resumed = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"headless.continue_once","params":{{"authorize":true,"continuation_id":"m56.apply.resume.after-consumption","expected_progress_fingerprint":"{}","expected_aggregate_sequence":{},"continuation_scope":{{"session_id":"m56.apply"}}}}}}"#,
+            current_progress["source_fingerprint"].as_str().expect("fingerprint"),
+            current_progress["aggregate_sequence"].as_u64().expect("sequence"),
+        ))
+        .result
+        .expect("resume after consumed preflight");
+        assert_eq!(resumed["status"], "no_eligible_task");
+        assert_eq!(resumed["candidate_count"], 0);
+        assert!(resumed["objective_proposal_authorization_preflight_result"].is_null());
 
         std::env::remove_var("BROWNIE_WORKSPACE_ROOT");
         clear_llm_env_for_test();

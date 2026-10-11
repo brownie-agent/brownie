@@ -1642,6 +1642,18 @@ pub(super) fn handle_headless_continue_once(
     candidate_task_ids.sort();
     let candidate_count = candidate_task_ids.len();
     let Some(selected_task_id) = candidate_task_ids.first().cloned() else {
+        if let Some(scope) = params.continuation_scope.as_ref() {
+            match headless_continue_authorized_preflight_resume_result(
+                &store,
+                &progress_overview,
+                &params,
+                scope,
+            ) {
+                Ok(Some(result)) => return result_response(id, json!(result)),
+                Ok(None) => {}
+                Err(message) => return error_response(id, -32602, &message),
+            }
+        }
         let next_route = headless_continue_route_no_eligible(
             "No created or queued task is currently eligible for headless continuation.",
             &progress_overview,

@@ -25,19 +25,19 @@
     "crates/brownie-runtime/src/verification_recovery.rs"
   ],
   "thresholds": {
-    "lib_rs_production_line_ceiling": 15905,
-    "lib_rs_test_line_ceiling": 53696
+    "lib_rs_production_line_ceiling": 15906,
+    "lib_rs_test_line_ceiling": 53782
   },
   "metrics": {
     "files": {
       "crates/brownie-runtime/src/lib.rs": {
-        "line_count": 69601,
+        "line_count": 69688,
         "public_items": 3,
         "private_items": 531,
-        "production_line_count": 15905,
-        "test_line_count": 53696,
-        "state_mutation_mentions": 313,
-        "durable_write_mentions": 233,
+        "production_line_count": 15906,
+        "test_line_count": 53782,
+        "state_mutation_mentions": 316,
+        "durable_write_mentions": 234,
         "permission_decision_mentions": 234,
         "recovery_mentions": 2266,
         "rpc_dispatch_mentions": 90,
@@ -75,7 +75,7 @@
         "diagnostics_mentions": 14
       },
       "crates/brownie-runtime/src/headless_continue.rs": {
-        "line_count": 6692,
+        "line_count": 6704,
         "public_items": 20,
         "private_items": 36,
         "state_mutation_mentions": 17,
@@ -145,17 +145,17 @@
         "diagnostics_mentions": 0
       },
       "crates/brownie-runtime/src/objective_proposal.rs": {
-        "line_count": 1446,
-        "public_items": 7,
-        "private_items": 23,
+        "line_count": 1613,
+        "public_items": 8,
+        "private_items": 24,
         "state_mutation_mentions": 3,
         "durable_write_mentions": 3,
         "permission_decision_mentions": 0,
         "recovery_mentions": 4,
         "rpc_dispatch_mentions": 0,
-        "approval_mentions": 38,
+        "approval_mentions": 40,
         "mcp_mentions": 0,
-        "product_dod_mentions": 4,
+        "product_dod_mentions": 5,
         "diagnostics_mentions": 0
       },
       "crates/brownie-runtime/src/objective_verification.rs": {
@@ -386,7 +386,7 @@
     "runtime_release_ready remains false until remaining blockers and owner decisions close",
     "raw prompt/provider response/file content/absolute path/canonical path/secret/environment values/process output are not decomposition evidence"
   ],
-  "updated_at": "2026-10-09T00:00:00Z",
+  "updated_at": "2026-10-12T00:00:00Z",
   "notes": [
     "RRP-8.3 updated module metrics after mandatory clippy gate cleanup; runtime-module-decomposition closure status remains unchanged.",
     "RRP-8.3 updated module metrics after release gate evidence semantics and clippy cleanup; module-decomposition closure status remains unchanged.",
@@ -403,7 +403,8 @@
     "PR #458 updated runtime-module-decomposition metrics after phase-loop TODO decomposition hardening and long prompt mock request handling; closure status remains unchanged.",
     "PR #458 follow-up updated runtime-module-decomposition metrics after review-thread fixes for TODO repair hunk validation; closure status remains unchanged.",
     "PR #566 updates runtime-module-decomposition metrics and bounded ceilings after fail-closed phase-loop self-update recovery hardening; Runtime authority remains in Rust and closure status is unchanged.",
-    "PR pending: controlled-tool execution metrics refreshed for the one-target exact-context reread exception and validated oversized-leaf TODO replacement; module-decomposition closure status remains unchanged."
+    "PR pending: controlled-tool execution metrics refreshed for the one-target exact-context reread exception and validated oversized-leaf TODO replacement; module-decomposition closure status remains unchanged.",
+    "PR #597 refreshes measured Runtime metrics and bounded lib.rs ceilings after fail-closed objective-proposal resume and direct-target scope recovery; ownership boundaries and Runtime authority remain unchanged."
   ],
   "history": [
     "PR #462 updated runtime-module-decomposition metrics after Brownie loop harness and protected-read recovery hardening; closure status remains unchanged."

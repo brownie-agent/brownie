@@ -749,6 +749,173 @@ pub(super) fn headless_continue_objective_proposal_authorization_preflight_repla
     )
 }
 
+/// Re-exposes a persisted, still-valid authorization/preflight result to a scoped
+/// resume. This deliberately does not apply a proposal: the CLI must continue
+/// through its existing inspect/events/apply validation path.
+pub(super) fn headless_continue_authorized_preflight_resume_result(
+    store: &BrownieStore,
+    progress_overview: &TaskListProgressOverview,
+    params: &HeadlessContinueOnceParams,
+    scope: &HeadlessContinueScope,
+) -> Result<Option<HeadlessContinueOnceResult>, String> {
+    let mut checkpoints = Vec::new();
+    for checkpoint in store
+        .list_headless_objective_proposal_authorization_preflight_checkpoints()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+    {
+        let result = &checkpoint.result;
+        let matches_scope = result.status == "authorized_preflight_ready"
+            && result.validation_status == "Valid"
+            && result.approval_status == "Approved"
+            && !result.preflight_snapshot.stale
+            && result.apply_plan.status == "Ready"
+            && scope
+                .session_id
+                .as_ref()
+                .map(|session_id| checkpoint.session_id == *session_id)
+                .unwrap_or(true)
+            && scope
+                .session_id_prefix
+                .as_ref()
+                .map(|prefix| checkpoint.session_id.starts_with(prefix))
+                .unwrap_or(true)
+            && scope
+                .journey_id
+                .as_ref()
+                .map(|journey_id| checkpoint.journey_id == *journey_id)
+                .unwrap_or(true)
+            && scope
+                .task_id
+                .as_ref()
+                .map(|task_id| result.task_id == *task_id)
+                .unwrap_or(true)
+            && scope
+                .run_id
+                .as_ref()
+                .map(|run_id| result.run_id == *run_id)
+                .unwrap_or(true);
+        if matches_scope
+            && !objective_proposal_authorization_preflight_was_successfully_applied(
+                store,
+                &checkpoint,
+            )?
+        {
+            checkpoints.push(checkpoint);
+        }
+    }
+    if checkpoints.is_empty() {
+        return Ok(None);
+    }
+    if scope.latest_matching_session {
+        checkpoints.sort_by(|left, right| {
+            (
+                left.post_aggregate_sequence,
+                left.session_id.as_str(),
+                left.journey_id.as_str(),
+                left.continuation_id.as_str(),
+            )
+                .cmp(&(
+                    right.post_aggregate_sequence,
+                    right.session_id.as_str(),
+                    right.journey_id.as_str(),
+                    right.continuation_id.as_str(),
+                ))
+        });
+    } else if checkpoints.len() > 1 {
+        return Err(
+            "invalid params: continuation_scope matched multiple authorized objective proposal preflight checkpoints; use latest_matching_session or an exact selector".to_string(),
+        );
+    }
+    let checkpoint = checkpoints
+        .pop()
+        .expect("non-empty authorization/preflight checkpoint list");
+    let mut authorization_result = checkpoint.result;
+    authorization_result.replayed = true;
+    let next_route = HeadlessContinueRoute {
+        kind: HeadlessContinueRouteKind::ApplyAuthorizedObjectiveProposalExplicitly,
+        reason: "Recovered a scoped, authorized, and still-valid objective proposal preflight checkpoint; controlled apply remains an explicit next step.".to_string(),
+        task_id: Some(authorization_result.task_id.clone()),
+        run_id: Some(authorization_result.run_id.clone()),
+        proposal_id: Some(authorization_result.proposal_id.clone()),
+        apply_id: None,
+        failure_fingerprint: None,
+        apply_fingerprint: Some(authorization_result.authorization_preflight_fingerprint.clone()),
+        progress_fingerprint: Some(progress_overview.source_fingerprint.clone()),
+        aggregate_sequence: Some(progress_overview.aggregate_sequence),
+        next_action: "apply_authorized_objective_proposal".to_string(),
+    };
+    Ok(Some(HeadlessContinueOnceResult {
+        status: HeadlessContinueOnceStatus::TaskExecuted,
+        decision_id: Some(checkpoint.decision_id),
+        continuation_id: Some(checkpoint.continuation_id),
+        selected_task_id: None,
+        selected_run_id: None,
+        candidate_count: 1,
+        expected_progress_fingerprint: params.expected_progress_fingerprint.clone(),
+        expected_aggregate_sequence: params.expected_aggregate_sequence,
+        current_progress_fingerprint: progress_overview.source_fingerprint.clone(),
+        current_aggregate_sequence: progress_overview.aggregate_sequence,
+        post_progress_fingerprint: Some(checkpoint.post_progress_fingerprint),
+        post_aggregate_sequence: Some(checkpoint.post_aggregate_sequence),
+        stale: false,
+        replayed: true,
+        task_run_result: None,
+        proposal_apply_result: None,
+        objective_proposal_authorization_preflight_result: Some(authorization_result),
+        objective_apply_verification_result: None,
+        objective_completion_acceptance_result: None,
+        llm_provider_failure_retry_admission: None,
+        product_continuation_admission: None,
+        modepack_select_registry_update_result: None,
+        modepack_fetch_candidate_result: None,
+        modepack_verify_candidate_provenance_result: None,
+        modepack_approve_candidate_result: None,
+        modepack_replace_active_result: None,
+        modepack_rollback_active_result: None,
+        next_route: Some(next_route),
+        max_steps: None,
+        step_count: None,
+        executed_count: None,
+        replayed_count: None,
+        stop_reason: None,
+        steps: Vec::new(),
+        next_action: "apply_authorized_objective_proposal".to_string(),
+    }))
+}
+
+/// A preflight checkpoint is single-use once its exact proposal has a durable,
+/// successful controlled-apply record. Its static approval and preflight fields
+/// intentionally remain immutable audit evidence, so they are not sufficient to
+/// decide whether the checkpoint can still be resumed.
+fn objective_proposal_authorization_preflight_was_successfully_applied(
+    store: &BrownieStore,
+    checkpoint: &HeadlessObjectiveProposalAuthorizationPreflightCheckpoint,
+) -> Result<bool, String> {
+    let events = store
+        .tasks()
+        .read_ledger_events(&checkpoint.result.run_id)
+        .map_err(|error| error.to_string())?;
+    Ok(events.iter().any(|event| {
+        if event.kind != LedgerEventKind::WorkspacePatchApplyResultRecorded {
+            return false;
+        }
+        let Some(payload) = sanitize_ledger_payload(event.payload.clone()) else {
+            return false;
+        };
+        payload.get("proposal_id").and_then(Value::as_str)
+            == Some(checkpoint.result.proposal_id.as_str())
+            && payload
+                .get("authorization_consumed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && payload
+                .get("applied")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }))
+}
+
 fn headless_continue_objective_proposal_authorization_preflight(
     store: &BrownieStore,
     progress_overview: &TaskListProgressOverview,

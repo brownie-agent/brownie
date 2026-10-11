@@ -940,6 +940,39 @@ impl BrownieStore {
         }
     }
 
+    pub fn list_headless_objective_proposal_authorization_preflight_checkpoints(
+        &self,
+    ) -> Result<Vec<HeadlessObjectiveProposalAuthorizationPreflightCheckpoint>> {
+        self.ensure_durable_schema()?;
+        let root = self.workspace_state_dir().join(HEADLESS_CONTINUATIONS_DIR);
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", root.display()))
+            }
+        };
+        let prefix = "objective-proposal-authorization-preflight-";
+        let mut checkpoints = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| format!("failed to read {}", root.display()))?;
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if !file_name.starts_with(prefix) || !file_name.ends_with(".json") {
+                continue;
+            }
+            let path = entry.path();
+            let body = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let checkpoint: HeadlessObjectiveProposalAuthorizationPreflightCheckpoint =
+                serde_json::from_str(&body)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+            checkpoints.push(checkpoint);
+        }
+        checkpoints.sort_by(|left, right| left.continuation_id.cmp(&right.continuation_id));
+        Ok(checkpoints)
+    }
+
     pub fn write_headless_objective_proposal_authorization_preflight_checkpoint(
         &self,
         checkpoint: &HeadlessObjectiveProposalAuthorizationPreflightCheckpoint,
