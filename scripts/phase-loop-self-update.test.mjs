@@ -388,6 +388,41 @@ test('refuses a self-update when the explicit preservation list is incomplete or
   }
 });
 
+test('refuses a target nested below an explicitly preserved untracked directory', () => {
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'dirty'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'dirty/target.mjs'), 'preserve me\n');
+  const request = 'Repair controller policy contradiction.\nAllowed paths: `dirty/target.mjs`.\nPreserve dirty paths: `dirty/`.';
+  const eligibility = evaluateSelfUpdateEligibility({ repoRoot: repo, request });
+  assert.equal(eligibility.eligible, false, JSON.stringify(eligibility));
+  assert.equal(eligibility.reason, 'non_brownie_workspace_changes_present');
+});
+
+test('recovers a trusted dirty target beside an explicitly preserved source file', () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'scripts/phase-loop-self-update.mjs'), 'prefix\nold\n');
+  fs.writeFileSync(path.join(repo, 'user-change.txt'), 'preserve me\n');
+  const request = `${recoveryRequest('Recover a trusted target beside preserved source state.')}\nPreserve dirty paths: \`user-change.txt\`.\n\nTrusted exact old_text:\nold\n\nTrusted exact new_text:\nnew\n\nTrusted verification commands:\n- \`cargo fmt --check\``;
+  const result = dispatchSelfUpdate({
+    repoRoot: repo,
+    request,
+    now: () => new Date('2026-10-12T00:00:00.000Z'),
+    run(command, args, options) {
+      if (command === 'git') return spawnSync(command, args, options);
+      if (command.endsWith('brownie-runtime')) return runtimeStatusResult();
+      if (command.endsWith('brownie')) {
+        return { status: 0, stdout: JSON.stringify({ ok: true, automation: { status: 'terminal_failure', controller_action: 'stop', completed: false, blocked: true, continuation_required: false, terminal_failure: true } }), stderr: '' };
+      }
+      assert.equal(command, 'cargo');
+      assert.deepEqual(args, ['fmt', '--check']);
+      return { status: 0, stdout: 'ok', stderr: '' };
+    }
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(fs.readFileSync(path.join(repo, 'scripts/phase-loop-self-update.mjs'), 'utf8'), 'prefix\nnew\n');
+  assert.equal(fs.readFileSync(path.join(repo, 'user-change.txt'), 'utf8'), 'preserve me\n');
+});
+
 test('preserves nested Brownie runtime state without treating it as source drift', () => {
   const repo = makeRepo();
   fs.mkdirSync(path.join(repo, 'crates/brownie-runtime'), { recursive: true });

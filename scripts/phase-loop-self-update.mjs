@@ -155,6 +155,10 @@ function selfUpdateTargetPaths(request) {
       && !candidate.split('/').includes('..')))].sort();
 }
 
+function normalizedPath(candidate) {
+  return candidate.replace(/\/+$/u, '');
+}
+
 function preservedDirtyPaths(request) {
   const preservedLine = request
     .split(/\r?\n/u)
@@ -162,7 +166,7 @@ function preservedDirtyPaths(request) {
     .find((line) => line.startsWith('Preserve dirty paths:'));
   if (!preservedLine) return [];
   return [...new Set([...preservedLine.matchAll(/`([^`]+)`/gu)]
-    .map((match) => match[1].trim())
+    .map((match) => normalizedPath(match[1].trim()))
     .filter((candidate) => candidate.length > 0
       && !path.isAbsolute(candidate)
       && !candidate.split('/').includes('..')))].sort();
@@ -170,6 +174,10 @@ function preservedDirtyPaths(request) {
 
 function samePaths(left, right) {
   return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
+function pathsOverlap(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 function privateProviderEnvironment(repoRoot) {
@@ -332,18 +340,26 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
 
   const dirty = gitDirtyFiles(repoRoot, run);
   if (!dirty.ok) return requestFailure('git_status_unavailable', { diagnostic });
-  const nonBrownieDirtyFiles = dirty.files.filter((file) => !isBrownieManagedPath(file)).sort();
+  const nonBrownieDirtyFiles = dirty.files
+    .filter((file) => !isBrownieManagedPath(file))
+    .map(normalizedPath)
+    .sort();
+  const declaredPreservedDirtyFiles = preservedDirtyPaths(request);
+  const declaredPreservationIsSafe = declaredPreservedDirtyFiles.length > 0
+    && declaredPreservedDirtyFiles.every((file) => nonBrownieDirtyFiles.includes(file))
+    && declaredPreservedDirtyFiles.every((file) => targetPaths.every((target) => !pathsOverlap(file, target)));
+  const dirtyFilesOutsideDeclaredPreservation = nonBrownieDirtyFiles
+    .filter((file) => !declaredPreservedDirtyFiles.includes(file));
   const trustedContext = trustedExactPatchContext(request);
   const trustedTargetDirtyOnly = isTrustedDirtyTargetOnly({
     repoRoot,
     targetPaths,
     context: trustedContext,
-    files: nonBrownieDirtyFiles
+    files: dirtyFilesOutsideDeclaredPreservation
   });
-  const declaredPreservedDirtyFiles = preservedDirtyPaths(request);
   const explicitlyPreservedDirtyFiles = nonBrownieDirtyFiles.length > 0
     && samePaths(nonBrownieDirtyFiles, declaredPreservedDirtyFiles)
-    && declaredPreservedDirtyFiles.every((file) => !targetPaths.includes(file));
+    && declaredPreservationIsSafe;
   if (nonBrownieDirtyFiles.length > 0 && !trustedTargetDirtyOnly && !explicitlyPreservedDirtyFiles) {
     return requestFailure('non_brownie_workspace_changes_present', { non_brownie_dirty_files: nonBrownieDirtyFiles, diagnostic });
   }
@@ -372,7 +388,7 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
     provider_environment: providerEnvironment.source,
     target_paths: targetPaths,
     dirty_brownie_files: dirty.files,
-    preserved_dirty_source_files: explicitlyPreservedDirtyFiles ? declaredPreservedDirtyFiles : [],
+    preserved_dirty_source_files: declaredPreservationIsSafe ? declaredPreservedDirtyFiles : [],
     trusted_target_dirty_only: trustedTargetDirtyOnly,
     diagnostic
   };
@@ -705,7 +721,10 @@ export function dispatchSelfUpdate({ repoRoot, request, run = spawnSync, now = (
         repoRoot,
         targetPaths: eligibility.target_paths,
         context: trustedContext,
-        files: currentDirty.files.filter((file) => !isBrownieManagedPath(file))
+        files: currentDirty.files
+          .filter((file) => !isBrownieManagedPath(file))
+          .map(normalizedPath)
+          .filter((file) => !(eligibility.preserved_dirty_source_files ?? []).includes(file))
       })
       : null;
     const sourceTreeStillClean = currentDirty.ok
