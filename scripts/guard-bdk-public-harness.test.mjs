@@ -1,10 +1,23 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { validateBdkPublicHarness } from './guard-bdk-public-harness.mjs';
 
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
 test('current public harness adapter contract is valid', () => {
   assert.deepEqual(validateBdkPublicHarness(), []);
+});
+
+test('public trajectory contract registers nonterminal repair feedback', () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, 'docs/architecture/bdk-trajectory.schema.json'), 'utf8'));
+  const eventTypes = schema.properties.events.items.properties.type.enum;
+  assert(eventTypes.includes('todo.repair_feedback'));
+  const adapter = fs.readFileSync(path.join(repoRoot, 'docs/architecture/bdk-public-harness-adapter.md'), 'utf8');
+  assert(adapter.includes('`todo.repair_feedback`'));
 });
 
 test('rejects missing Patch only targets in TODO leaves', () => {

@@ -24,6 +24,7 @@ const requiredEventTypes = [
   'progress.classified',
   'todo.completed',
   'todo.replanned',
+  'todo.repair_feedback',
   'todo.blocked'
 ];
 
