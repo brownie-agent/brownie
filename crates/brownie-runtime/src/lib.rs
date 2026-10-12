@@ -2683,6 +2683,9 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                         task_requires_workspace_write,
                     )
                 });
+            let latest_invalid_workspace_patch_proposal_index = followup_events
+                .iter()
+                .rposition(is_recoverable_invalid_workspace_patch_proposal_for_followup);
             let latest_workspace_read_rejection_index = followup_events
                 .iter()
                 .rposition(is_recoverable_workspace_read_denial_for_followup);
@@ -2705,6 +2708,13 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                 (Some(response_index), Some(rejection_index)) => rejection_index > response_index,
                 _ => false,
             };
+            let followup_invalid_workspace_patch_proposal_available = match (
+                second_pass_response_index,
+                latest_invalid_workspace_patch_proposal_index,
+            ) {
+                (Some(response_index), Some(proposal_index)) => proposal_index > response_index,
+                _ => false,
+            };
             // A parsed proposal is not edit evidence when the runtime rejected
             // it. Base the follow-up decision on an accepted proposal so a
             // bounded policy repair can correct TODO decomposition provenance.
@@ -2721,7 +2731,7 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                     is_recoverable_workspace_write_rejection_for_followup(
                         event,
                         task_requires_workspace_write,
-                    )
+                    ) || is_recoverable_invalid_workspace_patch_proposal_for_followup(event)
                 })
                 .count();
             if followup_write_missing
@@ -2772,6 +2782,7 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                 && (followup_read_result_available
                     || followup_rejected_write_available
                     || followup_rejected_read_available
+                    || followup_invalid_workspace_patch_proposal_available
                     || (no_workspace_write_proposal
                         && workspace_read_completed_count(&followup_events) > 0));
             if !followup_needs_workspace_write || followup_attempts >= 5 {
@@ -3304,6 +3315,22 @@ fn is_valid_workspace_patch_proposal_event(event: &LedgerEvent) -> bool {
             == Some("Valid")
 }
 
+fn is_recoverable_invalid_workspace_patch_proposal_for_followup(event: &LedgerEvent) -> bool {
+    event.kind == LedgerEventKind::WorkspacePatchProposed
+        && event
+            .payload
+            .as_ref()
+            .is_some_and(|payload| {
+                payload.get("validation_status").and_then(Value::as_str) == Some("Invalid")
+                    && payload
+                        .get("validation_reason")
+                        .and_then(Value::as_str)
+                        == Some(
+                            "Patch old_text matches inside a word; include the full line or surrounding context.",
+                        )
+            })
+}
+
 fn should_run_second_pass_for_events(events: &[LedgerEvent], goal: &str) -> bool {
     events
         .iter()
@@ -3317,6 +3344,9 @@ fn should_run_second_pass_for_events(events: &[LedgerEvent], goal: &str) -> bool
                 task_goal_requires_workspace_write_proposal(goal),
             )
         })
+        || events
+            .iter()
+            .any(is_recoverable_invalid_workspace_patch_proposal_for_followup)
 }
 
 fn task_goal_enforces_workspace_read_budget_before_write(goal: &str) -> bool {
@@ -65105,6 +65135,83 @@ content-length: {}
         let run_result = run.result.expect("run result");
         assert_eq!(run_result["status"], "Completed");
         assert_eq!(handle.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn openai_workspace_edit_task_retries_invalid_patch_with_line_context() {
+        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
+        std::fs::write(
+            temp.path().join("scripts/release-gate.mjs"),
+            "export const gatekeeper = true;\n",
+        )
+        .expect("release gate");
+        let (base_url, handle) = spawn_mock_many(vec![
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.read\",\"reason\":\"Read target before editing.\",\"input\":{\"path\":\"scripts/release-gate.mjs\"}}]}\n```"}}]}"#,
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.write\",\"reason\":\"Patch with insufficient context.\",\"input\":{\"path\":\"scripts/release-gate.mjs\",\"operation\":\"patch_file\",\"old_text\":\"gate\",\"new_text\":\"enabled\"}}]}\n```"}}]}"#,
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.write\",\"reason\":\"Patch using the full line from the read result.\",\"input\":{\"path\":\"scripts/release-gate.mjs\",\"operation\":\"patch_file\",\"old_text\":\"export const gatekeeper = true;\\n\",\"new_text\":\"export const gatekeeper = false;\\n\"}}]}\n```"}}]}"#,
+        ]);
+        write_mock_config(temp.path(), &base_url);
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
+        std::env::set_var("BROWNIE_TEST_LLM_API_KEY", "test-key");
+        std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
+
+        let start = parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"goal":"Patch scripts/release-gate.mjs by changing gate to false.","mode_id":"implementer"}}"#,
+        )
+        .result
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap();
+        let run = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"task.run","params":{{"task_id":"{task_id}"}}}}"#
+        ));
+        assert!(run.error.is_none(), "run error: {:?}", run.error);
+        let run_result = run.result.expect("run result");
+        assert_eq!(
+            run_result["status"], "Completed",
+            "run result: {run_result}"
+        );
+        assert_eq!(handle.join().unwrap().len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("scripts/release-gate.mjs")).unwrap(),
+            "export const gatekeeper = true;\n"
+        );
+    }
+
+    #[test]
+    fn openai_workspace_edit_task_admits_first_pass_invalid_patch_for_repair() {
+        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
+        std::fs::write(
+            temp.path().join("scripts/release-gate.mjs"),
+            "export const gatekeeper = true;\n",
+        )
+        .expect("release gate");
+        let (base_url, handle) = spawn_mock_many(vec![
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.write\",\"reason\":\"Patch with insufficient context.\",\"input\":{\"path\":\"scripts/release-gate.mjs\",\"operation\":\"patch_file\",\"old_text\":\"gate\",\"new_text\":\"enabled\"}}]}\n```"}}]}"#,
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.write\",\"reason\":\"Repair with the full line.\",\"input\":{\"path\":\"scripts/release-gate.mjs\",\"operation\":\"patch_file\",\"old_text\":\"export const gatekeeper = true;\\n\",\"new_text\":\"export const gatekeeper = false;\\n\"}}]}\n```"}}]}"#,
+        ]);
+        write_mock_config(temp.path(), &base_url);
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
+        std::env::set_var("BROWNIE_TEST_LLM_API_KEY", "test-key");
+        std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
+
+        let start = parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"goal":"Patch scripts/release-gate.mjs by changing gate to false.","mode_id":"implementer"}}"#,
+        )
+        .result
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap();
+        let run = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"task.run","params":{{"task_id":"{task_id}"}}}}"#
+        ));
+        assert!(run.error.is_none(), "run error: {:?}", run.error);
+        assert_eq!(run.result.expect("run result")["status"], "Completed");
+        assert_eq!(handle.join().unwrap().len(), 2);
     }
 
     #[test]
