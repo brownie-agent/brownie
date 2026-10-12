@@ -3269,6 +3269,9 @@ fn is_duplicate_workspace_read_denial(event: &LedgerEvent) -> bool {
                 reason.contains("Duplicate workspace.read")
                     || reason.contains("Additional workspace.read is not progress")
                     || reason.contains("Repair feedback already embeds previous workspace.read")
+                    || (reason.contains("Selected TODO says to patch only")
+                        && reason.contains("is not progress")
+                        && reason.contains("request workspace.write"))
             })
 }
 
@@ -3448,6 +3451,7 @@ mod workspace_edit_completion_gate_tests {
         };
 
         assert!(is_recoverable_workspace_read_denial_for_followup(&denied));
+        assert!(is_duplicate_workspace_read_denial(&denied));
         assert!(should_run_second_pass_for_events(
             &[denied],
             "Patch only scripts/release-local-artifact.mjs."
