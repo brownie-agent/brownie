@@ -2844,7 +2844,10 @@ pub(super) fn append_todo_decomposition_blocker_after_read_only_stall(
         return Ok(());
     };
     if is_concrete_product_ready_leaf_todo(&block) {
-        if !is_runtime_refinable_product_ready_leaf_todo(&block) && !repair_preview_read_denied {
+        if !is_runtime_refinable_product_ready_leaf_todo(&block)
+            && !repair_preview_read_denied
+            && !duplicate_workspace_read_denied
+        {
             return Ok(());
         }
         if !read_budget_exhausted && !duplicate_workspace_read_denied && !workspace_read_failed {
@@ -2853,8 +2856,11 @@ pub(super) fn append_todo_decomposition_blocker_after_read_only_stall(
     }
     let current_head = latest_git_status_current_head(store, record)?;
     let release_evidence_blocked = run_has_release_evidence_blocker_inputs(store, record)?;
-    let new_text =
+    let mut new_text =
         todo_decomposition_replacement(&block, current_head.as_deref(), release_evidence_blocked);
+    if block.old_text == new_text && duplicate_workspace_read_denied {
+        new_text = scoped_read_stall_recovery_replacement(&block);
+    }
     if block.old_text == new_text {
         return Ok(());
     }
@@ -2932,8 +2938,9 @@ fn run_has_todo_decomposition_stall(
     let second_pass_seen = events
         .iter()
         .any(|event| event.kind == LedgerEventKind::SecondPassLlmResponseReceived);
-    if (duplicate_workspace_read_denied || workspace_read_failed || read_budget_exhausted)
-        && selected_todo_first_line_from_goal(&record.goal).is_some()
+    if duplicate_workspace_read_denied
+        || ((workspace_read_failed || read_budget_exhausted)
+            && selected_todo_first_line_from_goal(&record.goal).is_some())
     {
         return Ok(true);
     }
@@ -3089,7 +3096,6 @@ fn first_unchecked_todo_block(todo: &str) -> Option<TodoBlock> {
         .map(|(prefix, _)| prefix.trim())
         .filter(|prefix| {
             !prefix.is_empty()
-                && prefix.len() <= 24
                 && prefix
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -3131,7 +3137,6 @@ fn todo_block_by_first_line(todo: &str, selected_first_line: &str) -> Option<Tod
                 .map(|(prefix, _)| prefix.trim())
                 .filter(|prefix| {
                     !prefix.is_empty()
-                        && prefix.len() <= 24
                         && prefix
                             .chars()
                             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -3197,6 +3202,38 @@ fn todo_decomposition_replacement(
         );
     }
     block.old_text.clone()
+}
+
+fn scoped_read_stall_recovery_replacement(block: &TodoBlock) -> String {
+    let parent_id = normalized_parent_todo_id(block).unwrap_or_else(|| "TODO".to_string());
+    let mut targets = Vec::new();
+    for value in backticked_values(&block.old_text) {
+        let looks_like_path = value.contains('/')
+            || value.starts_with('.')
+            || (value.contains('.') && !value.chars().any(char::is_whitespace));
+        if looks_like_path && !targets.contains(&value) {
+            targets.push(value);
+        }
+    }
+    if targets.is_empty() {
+        return block.old_text.clone();
+    }
+    targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let child_id = format!("{parent_id}-read-context-recovery-{:02}", index + 1);
+            let dependency = if index == 0 {
+                "<none>".to_string()
+            } else {
+                format!("{parent_id}-read-context-recovery-{:02}", index)
+            };
+            format!(
+                "- [ ] {child_id}: Recover exact context and implement the bounded {parent_id} target `{target}`:\n  Route: implementation.\n  Source TODO: {}\n  Depends on: {dependency}.\n  Completion condition: read only `{target}` if needed, then emit one bounded workspace.write proposal for `{target}`; if the target cannot be safely changed, record the exact blocker.\n  Forbidden changes: do not read sibling files, do not edit unrelated files, and do not claim Product Ready.\n  Verification: inspect the target-file proposal and record a concrete blocker if the target cannot be safely changed.\n",
+                block.title.trim()
+            )
+        })
+        .collect()
 }
 
 fn is_concrete_product_ready_leaf_todo(block: &TodoBlock) -> bool {
@@ -7554,6 +7591,90 @@ mod mcp_approval_lock_tests {
         assert_eq!(payload["path"], ".brownie/todo.md");
         assert_eq!(payload["operation"], "patch_file");
         assert_eq!(payload["validation_status"], "Valid");
+    }
+
+    #[test]
+    fn scoped_read_denial_can_refine_live_todo_when_task_goal_omits_selected_todo() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = BrownieStore::new(temp.path());
+        let selected_todo = "- [ ] E-23a-release-artifact-portable-archive-target-01: Patch only `scripts/release-local-artifact.mjs`:\n  Route: implementation.\n  Completion condition: create the bounded portable archive slice.\n";
+        std::fs::create_dir_all(temp.path().join(".brownie")).expect("brownie dir");
+        std::fs::write(temp.path().join(".brownie/todo.md"), selected_todo).expect("todo");
+        let mut record = test_task_record();
+        record.run_id = "run_scoped_read_denial_without_selected_todo".to_string();
+        record.goal =
+            "Patch the assigned workspace target with a workspace.write proposal.".to_string();
+        store
+            .tasks()
+            .append_task_event_with_payload(
+                &record,
+                LedgerEventKind::ToolIntentDenied,
+                Some(json!({
+                    "allowed": false,
+                    "input_summary": {"field_count": 1, "has_path": true},
+                    "tool_id": WORKSPACE_READ_TOOL_ID,
+                    "reason": "Selected TODO says to patch only `scripts/release-local-artifact.mjs`; reading `scripts/release-local-artifact.test.mjs` is not progress. Use the existing target-file context and request workspace.write.",
+                    "request_reason": "Recover exact schema context for the selected target.",
+                    "required_action": "ReadWorkspace",
+                })),
+            )
+            .expect("append denial");
+
+        append_todo_decomposition_blocker_after_read_only_stall(
+            &store,
+            &record,
+            &write_policy(),
+            true,
+            false,
+        )
+        .expect("synthesize live TODO follow-up");
+
+        let events = store
+            .tasks()
+            .read_ledger_events(&record.run_id)
+            .expect("events");
+        let proposal = events
+            .iter()
+            .find(|event| event.kind == LedgerEventKind::WorkspacePatchProposed)
+            .unwrap_or_else(|| panic!("expected workspace patch proposal, events={events:#?}"));
+        let payload = proposal.payload.as_ref().expect("proposal payload");
+        assert_eq!(payload["path"], ".brownie/todo.md");
+        assert_eq!(payload["validation_status"], "Valid");
+        assert!(payload["patch_new_text"]
+            .as_str()
+            .expect("new text")
+            .contains(
+                "E-23a-release-artifact-portable-archive-target-01-read-context-recovery-01"
+            ));
+    }
+
+    #[test]
+    fn scoped_read_stall_recovery_preserves_every_parent_target() {
+        let block = TodoBlock {
+            id: Some("E-23a-release-artifact-portable-archive-target-01".to_string()),
+            title: "E-23a-release-artifact-portable-archive-target-01: Update portable release archive inputs".to_string(),
+            old_text: "- [ ] E-23a-release-artifact-portable-archive-target-01: Update `scripts/release-local-artifact.mjs`, `scripts/release-local-artifact.test.mjs`, `package.json`, and `.github/workflows/release.yml`.\n".to_string(),
+        };
+
+        let replacement = scoped_read_stall_recovery_replacement(&block);
+
+        for target in [
+            "scripts/release-local-artifact.mjs",
+            "scripts/release-local-artifact.test.mjs",
+            "package.json",
+            ".github/workflows/release.yml",
+        ] {
+            assert!(
+                replacement.contains(target),
+                "missing {target}: {replacement}"
+            );
+        }
+        assert!(replacement.contains(
+            "E-23a-release-artifact-portable-archive-target-01-read-context-recovery-01"
+        ));
+        assert!(replacement.contains(
+            "E-23a-release-artifact-portable-archive-target-01-read-context-recovery-04"
+        ));
     }
 
     #[test]
