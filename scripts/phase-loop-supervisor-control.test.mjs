@@ -941,6 +941,12 @@ test('recovers a terminal generated replan to its bounded implementation source'
     todo_id: 'E-23a-release-artifact-portable-archive-leaf-01',
     selected_todo_first_line: sourceTodo.split('\n')[0]
   })}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-terminal-replan',
+    status: 'in_progress',
+    selected_todo: replanTodo,
+    queue_generation: 42
+  });
 
   const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
   const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
@@ -950,6 +956,11 @@ test('recovers a terminal generated replan to its bounded implementation source'
   assert.match(todo, /E-23a-release-artifact-portable-archive-leaf-01/u);
   assert.doesNotMatch(todo, new RegExp(replanId, 'u'));
   assert.equal(feedback.semantic_repair_policy.mode, 'force_bounded_leaf_target_patch');
+  assert.equal(fs.existsSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/current.json')), false);
+  assert.match(feedback.archived_claim_path, /^\.brownie\/private\/phase-loop\/todo-claims\/terminal-stalled-replan-/u);
+  const archivedClaim = JSON.parse(fs.readFileSync(path.join(repo, feedback.archived_claim_path), 'utf8'));
+  assert.equal(archivedClaim.archive_reason, 'terminal_stalled_replan_recovery');
+  assert.equal(archivedClaim.superseded_replan_todo_id, replanId);
   assert.deepEqual(feedback.semantic_repair_policy.selected_patch_targets, [
     'scripts/release-local-artifact.mjs',
     'scripts/release-local-artifact.test.mjs'

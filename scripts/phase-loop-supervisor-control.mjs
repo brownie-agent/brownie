@@ -1059,6 +1059,7 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
   const blockedPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/blocked.jsonl');
   const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
   if (!fs.existsSync(todoPath)) {
     return { attempted: true, ok: false, reason: 'todo_missing' };
   }
@@ -1088,6 +1089,31 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   ));
   fs.writeFileSync(blockedPath, retainedBlocked.map((record) => `${JSON.stringify(record, Object.keys(record).sort())}\n`).join(''), { encoding: 'utf8', mode: 0o600 });
   fsyncFileAndParent(blockedPath);
+  // The selected replan is being removed from the queue.  Retain its claim as
+  // an audit record, but never let it survive as current: a later claim pass
+  // otherwise refreshes the old snapshot and resurrects the removed replan.
+  let archivedClaimPath = null;
+  const activeClaim = readJsonOrNull(claimPath);
+  if (activeClaim?.claim_id && todoIdFromFirstLine(activeClaim.selected_todo) === selectedId) {
+    const stamp = new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
+    const archivePath = path.join(
+      repoRoot,
+      '.brownie/private/phase-loop/todo-claims',
+      `terminal-stalled-replan-${stamp}.json`
+    );
+    const archivedClaim = {
+      ...activeClaim,
+      archived_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
+      archived_by: 'phase-loop-supervisor-control',
+      archive_reason: 'terminal_stalled_replan_recovery',
+      superseded_replan_todo_id: selectedId,
+      restored_source_todo_id: sourceId
+    };
+    fs.writeFileSync(archivePath, `${JSON.stringify(archivedClaim, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fs.unlinkSync(claimPath);
+    fsyncFileAndParent(archivePath);
+    archivedClaimPath = path.relative(repoRoot, archivePath);
+  }
   const patchScope = sourceBlock.first_line ?? sourceBlock.block.split('\n')[0] ?? '';
   const patchTargets = [...patchScope.matchAll(/`([^`]+)`/gu)].map((match) => match[1]);
   const feedback = {
@@ -1099,6 +1125,7 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
     selected_todo: sourceBlock.block,
     selected_todo_first_line: sourceBlock.first_line,
     superseded_replan_todo_id: selectedId,
+    archived_claim_path: archivedClaimPath,
     repair_hint: 'The generated TODO replan ended without a workspace.write proposal. Do not recreate or edit the TODO queue. Emit exactly one compact workspace.write patch_file for a selected target, or report one concrete blocker.',
     semantic_repair_policy: {
       mode: 'force_bounded_leaf_target_patch',
@@ -1117,7 +1144,7 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
     changed: true,
     source_todo_id: sourceId,
     removed_replan_todo_id: selectedId,
-    paths: ['.brownie/todo.md', ...(breakdownRemoved.length > 0 ? ['.brownie/todo-breakdown.md'] : []), '.brownie/private/phase-loop/todo-claims/blocked.jsonl', '.brownie/private/phase-loop/todo-claims/repair-feedback.json']
+    paths: ['.brownie/todo.md', ...(breakdownRemoved.length > 0 ? ['.brownie/todo-breakdown.md'] : []), '.brownie/private/phase-loop/todo-claims/blocked.jsonl', ...(archivedClaimPath ? [archivedClaimPath, '.brownie/private/phase-loop/todo-claims/current.json'] : []), '.brownie/private/phase-loop/todo-claims/repair-feedback.json']
   };
 }
 
