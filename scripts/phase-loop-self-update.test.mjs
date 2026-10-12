@@ -366,6 +366,28 @@ test('refuses self-update when user source changes are present', () => {
   assert.equal(eligibility.reason, 'non_brownie_workspace_changes_present');
 });
 
+test('allows a self-update only when every unrelated dirty source path is explicitly preserved', () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'user-change.txt'), 'preserve me\n');
+  const request = `${recoveryRequest()}\nPreserve dirty paths: \`user-change.txt\`.`;
+  const eligibility = evaluateSelfUpdateEligibility({ repoRoot: repo, request });
+  assert.equal(eligibility.eligible, true, JSON.stringify(eligibility));
+  assert.deepEqual(eligibility.preserved_dirty_source_files, ['user-change.txt']);
+});
+
+test('refuses a self-update when the explicit preservation list is incomplete or targets a dirty source', () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'user-change.txt'), 'preserve me\n');
+  for (const request of [
+    `${recoveryRequest()}\nPreserve dirty paths: \`other.txt\`.`,
+    'Repair controller policy contradiction.\nAllowed paths: `user-change.txt`.\nPreserve dirty paths: `user-change.txt`.'
+  ]) {
+    const eligibility = evaluateSelfUpdateEligibility({ repoRoot: repo, request });
+    assert.equal(eligibility.eligible, false, JSON.stringify(eligibility));
+    assert.equal(eligibility.reason, 'non_brownie_workspace_changes_present');
+  }
+});
+
 test('preserves nested Brownie runtime state without treating it as source drift', () => {
   const repo = makeRepo();
   fs.mkdirSync(path.join(repo, 'crates/brownie-runtime'), { recursive: true });

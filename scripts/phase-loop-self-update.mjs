@@ -155,6 +155,23 @@ function selfUpdateTargetPaths(request) {
       && !candidate.split('/').includes('..')))].sort();
 }
 
+function preservedDirtyPaths(request) {
+  const preservedLine = request
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith('Preserve dirty paths:'));
+  if (!preservedLine) return [];
+  return [...new Set([...preservedLine.matchAll(/`([^`]+)`/gu)]
+    .map((match) => match[1].trim())
+    .filter((candidate) => candidate.length > 0
+      && !path.isAbsolute(candidate)
+      && !candidate.split('/').includes('..')))].sort();
+}
+
+function samePaths(left, right) {
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
 function privateProviderEnvironment(repoRoot) {
   const envPath = path.join(repoRoot, '.brownie', 'private', 'llm.env');
   let text;
@@ -315,7 +332,7 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
 
   const dirty = gitDirtyFiles(repoRoot, run);
   if (!dirty.ok) return requestFailure('git_status_unavailable', { diagnostic });
-  const nonBrownieDirtyFiles = dirty.files.filter((file) => !isBrownieManagedPath(file));
+  const nonBrownieDirtyFiles = dirty.files.filter((file) => !isBrownieManagedPath(file)).sort();
   const trustedContext = trustedExactPatchContext(request);
   const trustedTargetDirtyOnly = isTrustedDirtyTargetOnly({
     repoRoot,
@@ -323,7 +340,11 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
     context: trustedContext,
     files: nonBrownieDirtyFiles
   });
-  if (nonBrownieDirtyFiles.length > 0 && !trustedTargetDirtyOnly) {
+  const declaredPreservedDirtyFiles = preservedDirtyPaths(request);
+  const explicitlyPreservedDirtyFiles = nonBrownieDirtyFiles.length > 0
+    && samePaths(nonBrownieDirtyFiles, declaredPreservedDirtyFiles)
+    && declaredPreservedDirtyFiles.every((file) => !targetPaths.includes(file));
+  if (nonBrownieDirtyFiles.length > 0 && !trustedTargetDirtyOnly && !explicitlyPreservedDirtyFiles) {
     return requestFailure('non_brownie_workspace_changes_present', { non_brownie_dirty_files: nonBrownieDirtyFiles, diagnostic });
   }
 
@@ -351,6 +372,7 @@ export function evaluateSelfUpdateEligibility({ repoRoot, request, run = spawnSy
     provider_environment: providerEnvironment.source,
     target_paths: targetPaths,
     dirty_brownie_files: dirty.files,
+    preserved_dirty_source_files: explicitlyPreservedDirtyFiles ? declaredPreservedDirtyFiles : [],
     trusted_target_dirty_only: trustedTargetDirtyOnly,
     diagnostic
   };
