@@ -188,7 +188,7 @@
       "scripts/guard-runtime-release-readiness.mjs",
       "scripts/rrp3-process-loss-recovery-e2e.mjs"
     ],
-    "tracked_fingerprint": "sha256:e330bfc6a36f5a20f6ce4ba670d2d2b6005fa920247743083418b3fe45fd8b77",
+    "tracked_fingerprint": "sha256:602ce6f85bc1e933b74163b86c20eb8929fd3514814496abf24913ed78742a01",
     "status": "implemented_sufficient"
   },
   "owner_decisions": [
