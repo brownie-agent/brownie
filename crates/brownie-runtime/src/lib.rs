@@ -3230,6 +3230,9 @@ fn is_recoverable_workspace_read_denial_for_followup(event: &LedgerEvent) -> boo
                 reason.contains("Duplicate workspace.read")
                     || reason.contains("Additional workspace.read is not progress")
                     || reason.contains("Repair feedback already embeds previous workspace.read")
+                    || (reason.contains("Selected TODO says to patch only")
+                        && reason.contains("is not progress")
+                        && reason.contains("request workspace.write"))
                     || reason
                         .contains("workspace.read input.path targets a protected workspace path")
                     || reason.contains("reading protected workspace paths is not allowed")
@@ -3305,6 +3308,9 @@ fn should_run_second_pass_for_events(events: &[LedgerEvent], goal: &str) -> bool
     events
         .iter()
         .any(|event| event.kind == LedgerEventKind::ToolExecutionCompleted)
+        || events
+            .iter()
+            .any(is_recoverable_workspace_read_denial_for_followup)
         || events.iter().any(|event| {
             is_recoverable_workspace_write_rejection_for_followup(
                 event,
@@ -3394,6 +3400,28 @@ mod workspace_edit_completion_gate_tests {
 
         assert!(is_recoverable_workspace_read_denial_for_followup(&event));
         assert!(is_duplicate_workspace_read_denial(&event));
+    }
+
+    #[test]
+    fn scoped_workspace_read_denial_admits_second_pass_repair() {
+        let denied = brownie_store::LedgerEvent {
+            event_id: "event_scoped_read_denied".to_string(),
+            task_id: "task_scoped_read_denied".to_string(),
+            run_id: "run_scoped_read_denied".to_string(),
+            kind: LedgerEventKind::ToolIntentDenied,
+            timestamp: "2026-10-12T00:00:00Z".to_string(),
+            payload: Some(json!({
+                "tool_id": WORKSPACE_READ_TOOL_ID,
+                "reason": "Selected TODO says to patch only `scripts/release-local-artifact.mjs`; reading `scripts/release-local-artifact.test.mjs` is not progress. Use the existing target-file context and request workspace.write."
+            })),
+            payload_envelope: None,
+        };
+
+        assert!(is_recoverable_workspace_read_denial_for_followup(&denied));
+        assert!(should_run_second_pass_for_events(
+            &[denied],
+            "Patch only scripts/release-local-artifact.mjs."
+        ));
     }
 
     #[test]
