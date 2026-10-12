@@ -3344,6 +3344,9 @@ fn should_run_second_pass_for_events(events: &[LedgerEvent], goal: &str) -> bool
                 task_goal_requires_workspace_write_proposal(goal),
             )
         })
+        || events
+            .iter()
+            .any(is_recoverable_invalid_workspace_patch_proposal_for_followup)
 }
 
 fn task_goal_enforces_workspace_read_budget_before_write(goal: &str) -> bool {
@@ -65175,6 +65178,40 @@ content-length: {}
             std::fs::read_to_string(temp.path().join("scripts/release-gate.mjs")).unwrap(),
             "export const gatekeeper = true;\n"
         );
+    }
+
+    #[test]
+    fn openai_workspace_edit_task_admits_first_pass_invalid_patch_for_repair() {
+        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
+        std::fs::write(
+            temp.path().join("scripts/release-gate.mjs"),
+            "export const gatekeeper = true;\n",
+        )
+        .expect("release gate");
+        let (base_url, handle) = spawn_mock_many(vec![
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.write\",\"reason\":\"Patch with insufficient context.\",\"input\":{\"path\":\"scripts/release-gate.mjs\",\"operation\":\"patch_file\",\"old_text\":\"gate\",\"new_text\":\"enabled\"}}]}\n```"}}]}"#,
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.write\",\"reason\":\"Repair with the full line.\",\"input\":{\"path\":\"scripts/release-gate.mjs\",\"operation\":\"patch_file\",\"old_text\":\"export const gatekeeper = true;\\n\",\"new_text\":\"export const gatekeeper = false;\\n\"}}]}\n```"}}]}"#,
+        ]);
+        write_mock_config(temp.path(), &base_url);
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
+        std::env::set_var("BROWNIE_TEST_LLM_API_KEY", "test-key");
+        std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
+
+        let start = parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"goal":"Patch scripts/release-gate.mjs by changing gate to false.","mode_id":"implementer"}}"#,
+        )
+        .result
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap();
+        let run = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"task.run","params":{{"task_id":"{task_id}"}}}}"#
+        ));
+        assert!(run.error.is_none(), "run error: {:?}", run.error);
+        assert_eq!(run.result.expect("run result")["status"], "Completed");
+        assert_eq!(handle.join().unwrap().len(), 2);
     }
 
     #[test]
