@@ -2704,10 +2704,16 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                 (Some(response_index), Some(rejection_index)) => rejection_index > response_index,
                 _ => false,
             };
+            // A parsed proposal is not edit evidence when the runtime rejected
+            // it. Base the follow-up decision on an accepted proposal so a
+            // bounded policy repair can correct TODO decomposition provenance.
+            let no_workspace_write_proposal = !followup_events
+                .iter()
+                .any(|event| event.kind == LedgerEventKind::WorkspacePatchProposed);
             let followup_write_missing = task_goal_requires_workspace_write_proposal(&running.goal)
                 && !followup_events
                     .iter()
-                    .any(|event| event.kind == LedgerEventKind::WorkspacePatchProposed);
+                    .any(is_valid_workspace_patch_proposal_event);
             let workspace_write_parser_rejection_count = followup_events
                 .iter()
                 .filter(|event| {
@@ -2765,7 +2771,8 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                 && (followup_read_result_available
                     || followup_rejected_write_available
                     || followup_rejected_read_available
-                    || task_goal_requires_workspace_write_proposal(&running.goal));
+                    || (no_workspace_write_proposal
+                        && workspace_read_completed_count(&followup_events) > 0));
             if !followup_needs_workspace_write || followup_attempts >= 5 {
                 break;
             }
@@ -3265,6 +3272,8 @@ fn is_recoverable_workspace_write_rejection_for_followup(
     (matches!(code, Some("input_too_large")) && tool_id == Some(WORKSPACE_WRITE_TOOL_ID))
         || (matches!(code, Some("block_too_large" | "missing_closing_fence"))
             && tool_id == Some("<parse-error>"))
+        || (code == Some("todo_md_write_denied_for_implementation_todo")
+            && tool_id == Some(WORKSPACE_WRITE_TOOL_ID))
 }
 
 fn run_has_workspace_read_failure(events: &[LedgerEvent]) -> bool {
@@ -3367,6 +3376,37 @@ mod workspace_edit_completion_gate_tests {
 
         assert!(is_recoverable_workspace_read_denial_for_followup(&event));
         assert!(is_duplicate_workspace_read_denial(&event));
+    }
+
+    #[test]
+    fn rejected_todo_decomposition_write_is_recoverable_and_not_valid_edit_evidence() {
+        let rejected = brownie_store::LedgerEvent {
+            event_id: "event_todo_write_rejected".to_string(),
+            task_id: "task_todo_write_rejected".to_string(),
+            run_id: "run_todo_write_rejected".to_string(),
+            kind: LedgerEventKind::ToolIntentRejected,
+            timestamp: "2026-10-12T00:00:00Z".to_string(),
+            payload: Some(json!({
+                "tool_id": WORKSPACE_WRITE_TOOL_ID,
+                "code": "todo_md_write_denied_for_implementation_todo",
+                "reason": "Every TODO decomposition leaf `Source TODO:` must reference the selected parent TODO."
+            })),
+            payload_envelope: None,
+        };
+        let proposed = brownie_store::LedgerEvent {
+            event_id: "event_invalid_todo_write".to_string(),
+            task_id: rejected.task_id.clone(),
+            run_id: rejected.run_id.clone(),
+            kind: LedgerEventKind::WorkspacePatchProposed,
+            timestamp: rejected.timestamp.clone(),
+            payload: Some(json!({ "validation_status": "Invalid" })),
+            payload_envelope: None,
+        };
+
+        assert!(is_recoverable_workspace_write_rejection_for_followup(
+            &rejected, true
+        ));
+        assert!(!is_valid_workspace_patch_proposal_event(&proposed));
     }
 
     #[test]
