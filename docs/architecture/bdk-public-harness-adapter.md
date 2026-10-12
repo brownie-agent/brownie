@@ -43,6 +43,8 @@ Required event families:
 - `progress.classified`
 - `todo.completed`
 - `todo.replanned`
+- `todo.repair_feedback` (nonterminal feedback; valid only for a partial
+  trajectory evaluation while the controller prepares the next bounded run)
 - `todo.blocked`
 
 The event stream is the durable unit for analysis. Human-readable logs remain
@@ -71,11 +73,11 @@ The public-harness-compatible state machine is:
 todo.claimed
   -> workflow.routed
   -> skill.selected
-  -> tool.read | tool.write_proposed | todo.replanned | todo.blocked
+  -> tool.read | tool.write_proposed | todo.replanned | todo.repair_feedback | todo.blocked
   -> tool.write_applied
   -> verification.run
   -> progress.classified
-  -> todo.completed | todo.replanned | todo.blocked
+  -> todo.completed | todo.replanned | todo.repair_feedback | todo.blocked
 ```
 
 Every transition must name the active TODO id and active claim id. A run that

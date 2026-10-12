@@ -54,6 +54,28 @@ test('rejects actionable terminal events as repair-required outcomes', () => {
   assert(result.failures.some((failure) => failure.class === 'actionable_terminal_event'));
 });
 
+test('accepts a repair-feedback-only trajectory in partial mode', () => {
+  const result = evaluateBdkPublicHarnessTrajectory([
+    record('todo.claimed'),
+    record('workflow.routed'),
+    record('skill.selected'),
+    record('todo.repair_feedback', { reason: 'verified_noop_dirty_baseline_repair_feedback_recorded' })
+  ], { allowPartial: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.terminal_event_count, 0);
+});
+
+test('does not treat repair feedback as a substitute for a strict terminal event', () => {
+  const result = evaluateBdkPublicHarnessTrajectory([
+    record('todo.claimed'),
+    record('workflow.routed'),
+    record('skill.selected'),
+    record('todo.repair_feedback', { reason: 'verified_noop_dirty_baseline_repair_feedback_recorded' })
+  ]);
+  assert.equal(result.ok, false);
+  assert(result.failures.some((failure) => failure.class === 'terminal_event_missing'));
+});
+
 test('keeps restored mutation failures within the public blocked-event contract', () => {
   const result = evaluateBdkPublicHarnessTrajectory([
     record('todo.claimed'),

@@ -156,7 +156,7 @@ PY
     printf '%s task_ledger_transition_failed run=%s event=%s\n' "$(now_utc)" "$run_stamp" "$ledger_event_type" >> "$SUPERVISOR_LOG"
   fi
   case "$event_type" in
-    todo.completed|todo.replanned|todo.blocked)
+    todo.completed|todo.replanned|todo.blocked|todo.repair_feedback)
       evaluate_bdk_public_harness_feedback "$run_stamp" "$event_type" || true
       ;;
   esac
@@ -170,9 +170,13 @@ evaluate_bdk_public_harness_feedback() {
   if [ ! -f "$trajectory_path" ] || [ ! -f "$ROOT_DIR/scripts/bdk-public-harness-evaluate.mjs" ]; then
     return 0
   fi
+  local partial_args=()
+  if [ "$terminal_event" = "todo.repair_feedback" ]; then
+    partial_args=(--allow-partial)
+  fi
   output="$(
     cd "$ROOT_DIR" || exit 70
-    node scripts/bdk-public-harness-evaluate.mjs --trajectory "$trajectory_path" --output "$BDK_HARNESS_FEEDBACK_FILE" 2>&1
+    node scripts/bdk-public-harness-evaluate.mjs --trajectory "$trajectory_path" --output "$BDK_HARNESS_FEEDBACK_FILE" "${partial_args[@]}" 2>&1
   )"
   local status=$?
   if [ "$status" -ne 0 ]; then
@@ -12009,7 +12013,7 @@ PY
     write_repair_feedback "$run_stamp" "$verified_noop_feedback" "$stdout_log" "$stderr_log" || true
     if printf '%s' "$pre_guard_verified_noop_output" | grep -Eq 'dirty_baseline_(syntax_check|verification)_failed'; then
       printf '%s %s; continuing into Brownie repair with embedded feedback instead of repeating pre-guard verified-noop.\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
-      write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"verified_noop_dirty_baseline_repair_feedback_recorded"}'
+      write_bdk_trajectory_event "$run_stamp" "todo.repair_feedback" '{"reason":"verified_noop_dirty_baseline_repair_feedback_recorded"}' "todo.replanned"
     else
       printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
       write_status "no_progress" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
