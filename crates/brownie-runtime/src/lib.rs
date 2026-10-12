@@ -2757,12 +2757,16 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                 }
                 break;
             }
-            if !(followup_read_result_available
-                || followup_rejected_write_available
-                || followup_rejected_read_available)
-                || !followup_write_missing
-                || followup_attempts >= 5
-            {
+            // A permitted read is context acquisition, not a failed attempt to
+            // edit. Keep the bounded task alive while its write proposal is
+            // missing, even when the immediate follow-up is plain language.
+            // Parser rejection and read-budget paths above remain fail-closed.
+            let followup_needs_workspace_write = followup_write_missing
+                && (followup_read_result_available
+                    || followup_rejected_write_available
+                    || followup_rejected_read_available
+                    || task_goal_requires_workspace_write_proposal(&running.goal));
+            if !followup_needs_workspace_write || followup_attempts >= 5 {
                 break;
             }
             followup_attempts += 1;
@@ -64957,6 +64961,42 @@ content-length: {}
         assert!(
             patch_new_text.contains("E-08b: Fail closed on supply-chain scan and network failures")
         );
+    }
+
+    #[test]
+    fn openai_workspace_edit_task_retries_after_read_only_followup_until_write_proposal() {
+        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
+        std::fs::write(
+            temp.path().join("scripts/release-gate.mjs"),
+            "export const gate = true;\n",
+        )
+        .expect("release gate");
+        let (base_url, handle) = spawn_mock_many(vec![
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.read\",\"reason\":\"Read target before editing.\",\"input\":{\"path\":\"scripts/release-gate.mjs\"}}]}\n```"}}]}"#,
+            r#"{"choices":[{"message":{"content":"I have the file context and will now prepare the bounded patch."}}]}"#,
+            r#"{"choices":[{"message":{"content":"```brownie-tool-intent\n{\"tool_requests\":[{\"tool_id\":\"workspace.write\",\"reason\":\"Patch the bounded target.\",\"input\":{\"path\":\"scripts/release-gate.mjs\",\"operation\":\"patch_file\",\"old_text\":\"export const gate = true;\\n\",\"new_text\":\"export const gate = false;\\n\"}}]}\n```"}}]}"#,
+        ]);
+        write_mock_config(temp.path(), &base_url);
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
+        std::env::set_var("BROWNIE_TEST_LLM_API_KEY", "test-key");
+        std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
+
+        let start = parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"goal":"Patch scripts/release-gate.mjs by changing gate to false.","mode_id":"implementer"}}"#,
+        )
+        .result
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap();
+        let run = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"task.run","params":{{"task_id":"{task_id}"}}}}"#
+        ));
+        assert!(run.error.is_none(), "run error: {:?}", run.error);
+        let run_result = run.result.expect("run result");
+        assert_eq!(run_result["status"], "Completed");
+        assert_eq!(handle.join().unwrap().len(), 3);
     }
 
     #[test]
