@@ -13150,6 +13150,39 @@ PY
         no_progress_supervisor_status=$?
         set -e
         printf '%s run=%s no_progress_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$no_progress_supervisor_status" "${no_progress_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
+        # Supervisor diagnostics may remain non-healthy because they observe the
+        # no-progress status written above.  The recovery feedback is the
+        # authoritative, atomic proof that this specific migration succeeded.
+        if python3 - "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    feedback = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+
+# The integrated controller has atomically retired the generated replan and
+# selected a bounded successor.  This is progress, not a retry of the failed
+# runtime task; returning 76 here would make the outer supervisor stop before
+# it can claim that successor.
+if (
+    feedback.get("kind") == "phase_loop_terminal_stalled_replan_recovery"
+    and feedback.get("superseded_replan_todo_id")
+    and feedback.get("selected_todo")
+    and feedback.get("semantic_repair_policy", {}).get("mode") == "force_bounded_leaf_target_patch"
+):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+        then
+          detail="Integrated supervisor recovered the terminal replan and selected a bounded successor; continuing with a fresh claim. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+          write_status "replanned" "$detail" "$run_id" "0" "0"
+          printf '%s run=%s terminal_stalled_replan_recovery_continued=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+          write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"terminal_stalled_replan_recovery_continued"}'
+          return 0
+        fi
         printf '%s run=%s exit=%s recovery=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$exit_code" "$recovery_hint" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
         write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"no_progress"}'
         return 76
