@@ -375,6 +375,42 @@ test('does not carry a no-progress ledger streak across a changed progress finge
   assert.equal(result.repair.failure_ledger_summary.should_replan, false, JSON.stringify(result, null, 2));
 });
 
+test('does not pair an invalid patch with no-progress from a prior fingerprint epoch', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'stopped', run_id: 'run-fingerprint-epoch-reset', consecutive_failures: 0
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'continuation_required', same_progress_count: 0, run_stamp: '20261008T000200Z',
+    last_progress_fingerprint: 'sha256:current-repair-epoch',
+    progress_projection: {
+      cli_status: 'routed_explicit_action', closure: 'routed_explicit_action',
+      claim_id: 'claim-fingerprint-epoch-reset', selected_todo: runtimeEvidenceTodo
+    }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-fingerprint-epoch-reset', status: 'claimed', selected_todo: runtimeEvidenceTodo
+  });
+  const ledgerPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  const events = [
+    { event_id: 'prior-no-progress', kind: 'no_progress', progress_fingerprint: 'sha256:before-repair-epoch' },
+    { event_id: 'current-invalid-patch', kind: 'invalid_patch', progress_fingerprint: 'sha256:current-repair-epoch' }
+  ].map((event, index) => JSON.stringify({
+    schema_version: 1, record_type: 'phase_loop_failure_event', observed_at: `2026-10-08T00:2${index}:00Z`,
+    todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02',
+    selected_todo_first_line: runtimeEvidenceTodo.split('\n')[0], status_run_id: `epoch-run-${index}`,
+    progress_run_stamp: `epoch-stamp-${index}`, same_progress_count: 1, ...event
+  })).join('\n');
+  fs.writeFileSync(ledgerPath, `${events}\n`);
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.failure_ledger_summary.same_fingerprint_no_progress_count, 0);
+  assert.equal(result.repair.failure_ledger_summary.same_fingerprint_invalid_patch_count, 1);
+  assert.equal(result.repair.failure_ledger_summary.should_replan, false, JSON.stringify(result, null, 2));
+});
+
 test('anchors bounded-leaf rejection feedback to the active claim identity', () => {
   const repo = makeRepo();
   writeTodo(repo);

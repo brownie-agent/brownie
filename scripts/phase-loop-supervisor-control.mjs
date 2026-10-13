@@ -500,6 +500,9 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   const sameFingerprintInvalidPatchCount = sameFingerprintEvents
     .filter((entry) => entry?.kind === 'invalid_patch')
     .length;
+  const noProgressCountForEpoch = progressFingerprint
+    ? sameFingerprintNoProgressCount
+    : (counts.no_progress ?? 0);
   const invalidPatchCountForEpoch = progressFingerprint
     ? sameFingerprintInvalidPatchCount
     : (counts.invalid_patch ?? 0);
@@ -507,7 +510,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   const repairableInvalidPatch = invalidPatchNeedsExactContextRepair(diagnostic.invalid_patch);
   const invalidPatchWithRepeatedNoProgress = codes.has('invalid_workspace_write_patch_repeated') && progressSameCount >= 2 && !repairableInvalidPatch;
   const semanticFailureWithRepeatedNoProgress = codes.has('verification_failure_requires_semantic_repair') && progressSameCount >= 2;
-  const invalidPatchThenNoProgress = invalidPatchCountForEpoch >= 1 && (counts.no_progress ?? 0) >= 1 && !repairableInvalidPatch;
+  const invalidPatchThenNoProgress = invalidPatchCountForEpoch >= 1 && noProgressCountForEpoch >= 1 && !repairableInvalidPatch;
   // Claim migration/rebaseline can legitimately reset progress-state's local
   // counter.  Preserve convergence across those boundaries by counting
   // no-progress events for the same TODO in the durable failure ledger.
