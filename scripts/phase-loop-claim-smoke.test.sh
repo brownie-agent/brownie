@@ -4,7 +4,11 @@ set -eu
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHASE_LOOP="$REPO_ROOT/phase-loop.sh"
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
-PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-25}"
+# A fresh CI worker may spend more than 25 seconds in the first `run-once`
+# preparing the temporary Git workspace and Node helpers.  Keep an explicit
+# per-invocation bound, but leave enough headroom for that cold path; the
+# suite-wide watchdog below remains the final hang safeguard.
+PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-45}"
 
 (
   sleep "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS"
