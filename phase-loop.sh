@@ -7903,9 +7903,14 @@ PY
 archive_stale_todo_claim() {
   local run_stamp="$1"
   local archive_path="$TODO_CLAIM_DIR/stale-$run_stamp.json"
+  local archive_suffix=1
   if [ ! -f "$TODO_CLAIM_FILE" ]; then
     return 0
   fi
+  while [ -e "$archive_path" ]; do
+    archive_path="$TODO_CLAIM_DIR/stale-$run_stamp-$archive_suffix.json"
+    archive_suffix=$((archive_suffix + 1))
+  done
   python3 - "$TODO_CLAIM_FILE" "$archive_path" "$run_stamp" "$(now_utc)" <<'PY'
 import json
 import os
@@ -8841,12 +8846,21 @@ claim_first_pending_todo() {
     return 76
   fi
   if active_todo_claim_exists; then
-    CLAIM_CREATED_THIS_RUN=0
-    refresh_active_todo_claim_from_live_queue "$run_stamp"
-    if active_todo_claim_exists; then
-      queue_generation="$(active_claim_queue_generation)"
-      write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$queue_generation" "$run_stamp"
-      return 0
+    # A stalled claim can remain syntactically fresh after its TODO has been
+    # recorded in the blocked ledger.  Never resume it: preserve the claim as
+    # an audit artifact and route selection back through the blocked-aware
+    # evaluator so its decomposition leaf can make progress.
+    if selected_todo_was_stably_blocked; then
+      archive_stale_todo_claim "$run_stamp"
+      CLAIM_REPLACED_BLOCKED=1
+    else
+      CLAIM_CREATED_THIS_RUN=0
+      refresh_active_todo_claim_from_live_queue "$run_stamp"
+      if active_todo_claim_exists; then
+        queue_generation="$(active_claim_queue_generation)"
+        write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$queue_generation" "$run_stamp"
+        return 0
+      fi
     fi
   fi
 
@@ -11369,6 +11383,7 @@ run_brownie_once() {
   local active_target_path active_target_snapshot active_target_syntax_output active_target_syntax_status
   local use_resume=0
   local CLAIM_CREATED_THIS_RUN=0
+  local CLAIM_REPLACED_BLOCKED=0
   started_at="$(now_utc)"
   run_stamp="$(date -u +"%Y%m%dT%H%M%SZ")"
   stdout_log="$RUN_DIR/$run_stamp.stdout.log"
@@ -11544,6 +11559,12 @@ PY
       write_status "blocked" "$detail" "$run_stamp" "75" "${CONSECUTIVE_FAILURES:-0}"
       return 75
     fi
+  fi
+  if [ "$CLAIM_REPLACED_BLOCKED" -eq 1 ]; then
+    # The archived claim's resume route and target snapshot belong only to the
+    # displaced TODO. Start the replacement with its own prompt and baseline.
+    use_resume=0
+    active_target_snapshot=""
   fi
   write_bdk_trajectory_event "$run_stamp" "todo.claimed" '{"source":"phase-loop"}'
   if selected_todo_was_stably_blocked; then
