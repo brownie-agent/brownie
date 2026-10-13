@@ -1879,6 +1879,45 @@ test('repairs only guard-reported derived child ledger entries for a recorded st
   assert.equal(result.repair.post_repair_validation.ok, true, JSON.stringify(result, null, 2));
 });
 
+test('migrates legacy child-only derived ledgers into the recorded parent replan', () => {
+  const repo = makeRepo();
+  const parentId = `E-21c-replan-stalled-leaf-${'f'.repeat(12)}`;
+  const childId = `${parentId}-leaf-01`;
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `- [ ] ${childId}: Patch only \`scripts/guard-runtime-operational-evidence.test.mjs\`:\n  Route: implementation.\n  Source TODO: ${parentId}.\n  Depends on: <none>.\n  Completion condition: child ledger migration preserves executable verification and dependency metadata.\n  Forbidden changes: do not weaken guards/tests.\n  Verification: run \`pnpm --workspace-root release:runtime-operational-evidence:test\`.\n`);
+  fs.writeFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `# Breakdown\n\n## TODO-repair-${parentId}\n\nParent TODO: E-21c-runtime-operational-evidence-impl-2-target-02\n\nDependency graph:\n- ${parentId}: <none>\n\nVerification ledger:\n- ${parentId}: run \`pnpm --workspace-root guard:todo-decomposition\`\n\nQuality rubric:\n- ${parentId}: recorded replan\n\n## TODO-repair-${childId}\n\nParent TODO: ${parentId}\n\nDependency graph:\n- ${childId}: <none>\n\nVerification ledger:\n- ${childId}: run \`pnpm --workspace-root release:runtime-operational-evidence:test\`\n\nQuality rubric:\n- ${childId}: bounded derived leaf remains traceable to its recorded stalled replan.\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', { status: 'no_progress', run_id: 'legacy-ledger', consecutive_failures: 0, detail: 'recovery required' });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', { classification: 'no_progress', same_progress_count: 1, progress_projection: { selected_todo: runtimeEvidenceTodo } });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const breakdown = fs.readFileSync(path.join(repo, '.brownie/todo-breakdown.md'), 'utf8');
+  const records = readTrackedBreakdownReplanRecords(repo);
+
+  assert.equal(result.repair.legacy_derived_breakdown_ledger_migration.ok, true, JSON.stringify(result, null, 2));
+  assert.match(breakdown, new RegExp(`TODO-repair-${parentId}[\\s\\S]*- ${childId}:`, 'u'));
+  assert.doesNotMatch(breakdown, new RegExp(`TODO-repair-${childId}`, 'u'));
+  assert.deepEqual(records.find((record) => record.parent_todo_id === parentId)?.generated_child_ids, [childId]);
+  assert.match(result.repair.legacy_derived_breakdown_ledger_migration.archive_path, /recovery-archives\//u);
+  assert.equal(result.repair.post_repair_validation.ok, true, JSON.stringify(result, null, 2));
+});
+
+test('fails closed when a legacy child-only ledger lacks a required tracked field', () => {
+  const repo = makeRepo();
+  const parentId = `E-21c-replan-stalled-leaf-${'a'.repeat(12)}`;
+  const childId = `${parentId}-leaf-01`;
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `- [ ] ${childId}: Patch only \`scripts/guard-runtime-operational-evidence.test.mjs\`:\n  Route: implementation.\n  Source TODO: ${parentId}.\n  Depends on: <none>.\n  Completion condition: child ledger migration preserves executable verification and dependency metadata.\n  Forbidden changes: do not weaken guards/tests.\n  Verification: run \`pnpm --workspace-root release:runtime-operational-evidence:test\`.\n`);
+  fs.writeFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `# Breakdown\n\n## TODO-repair-${parentId}\n\nParent TODO: E-21c-runtime-operational-evidence-impl-2-target-02\n\nDependency graph:\n- ${parentId}: <none>\n\nVerification ledger:\n- ${parentId}: run \`pnpm --workspace-root guard:todo-decomposition\`\n\nQuality rubric:\n- ${parentId}: recorded replan\n\n## TODO-repair-${childId}\n\nParent TODO: ${parentId}\n\nDependency graph:\n- ${childId}: <none>\n\nVerification ledger:\n- ${childId}: run \`pnpm --workspace-root release:runtime-operational-evidence:test\`\n\nQuality rubric:\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', { status: 'no_progress', run_id: 'malformed-legacy-ledger', consecutive_failures: 0, detail: 'recovery required' });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', { classification: 'no_progress', same_progress_count: 1, progress_projection: { selected_todo: runtimeEvidenceTodo } });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const breakdown = fs.readFileSync(path.join(repo, '.brownie/todo-breakdown.md'), 'utf8');
+
+  assert.equal(result.repair.legacy_derived_breakdown_ledger_migration.ok, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.legacy_derived_breakdown_ledger_migration.reason, 'legacy_derived_ledger_not_migratable');
+  assert.match(breakdown, new RegExp(`TODO-repair-${childId}`, 'u'));
+  assert.doesNotMatch(breakdown, /undefined/u);
+});
+
 test('repairs generated TODO leaf prefix and breakdown ledger after decomposition guard rejection', () => {
   const repo = makeRepo();
   writeTodo(repo);
