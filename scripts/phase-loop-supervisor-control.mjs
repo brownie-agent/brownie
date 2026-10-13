@@ -1092,12 +1092,14 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   if (!isStalledLeafReplanId(selectedId)
     && replanFeedback?.kind === 'phase_loop_todo_contract_replan_feedback') {
     const feedbackSourceId = todoIdFromFirstLine(replanFeedback.selected_todo_first_line);
-    const matchingReplan = todoBlocks(todoText).find((block) => {
-      const candidateId = todoIdFromBlock(block.block);
-      return isStalledLeafReplanId(candidateId)
-        && sourceTodoFromBlock(block.block) === feedbackSourceId;
-    });
-    selectedId = todoIdFromBlock(matchingReplan?.block) ?? selectedId;
+    if (feedbackSourceId === selectedId) {
+      const matchingReplan = todoBlocks(todoText).find((block) => {
+        const candidateId = todoIdFromBlock(block.block);
+        return isStalledLeafReplanId(candidateId)
+          && sourceTodoFromBlock(block.block) === feedbackSourceId;
+      });
+      selectedId = todoIdFromBlock(matchingReplan?.block) ?? selectedId;
+    }
   }
   if (!terminalNoProposal || !isStalledLeafReplanId(selectedId)) {
     return { attempted: false, reason: 'terminal_stalled_replan_not_reported' };
