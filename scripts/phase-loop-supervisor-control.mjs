@@ -1062,12 +1062,18 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
 // limited to a live implementation leaf with an explicit Patch only target.
 function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   const selected = diagnostic.progress?.selected_todo ?? {};
-  const selectedId = selected.id ?? todoIdFromFirstLine(selected.first_line);
+  let selectedId = selected.id ?? todoIdFromFirstLine(selected.first_line);
+  const projection = diagnostic.progress?.progress_projection ?? {};
+  const projectionStatus = projection.cli_status ?? diagnostic.progress?.projection_status;
+  const projectionStopClass = projection.stop_class
+    ?? projection.stop_reason
+    ?? diagnostic.progress?.projection_stop_class;
   const terminalNoProposal = diagnostic.phase_loop?.status === 'no_progress'
-    && String(diagnostic.phase_loop?.detail ?? '').includes('objective_apply_stalled');
-  if (!terminalNoProposal || !isStalledLeafReplanId(selectedId)) {
-    return { attempted: false, reason: 'terminal_stalled_replan_not_reported' };
-  }
+    && (
+      String(diagnostic.phase_loop?.detail ?? '').includes('objective_apply_stalled')
+      || projectionStopClass === 'terminal_failure'
+      || projectionStatus === 'no_eligible_task'
+    );
 
   const todoPath = path.join(repoRoot, '.brownie/todo.md');
   const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
@@ -1078,6 +1084,25 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
     return { attempted: true, ok: false, reason: 'todo_missing' };
   }
   const todoText = fs.readFileSync(todoPath, 'utf8');
+  const replanFeedback = readJsonOrNull(feedbackPath);
+  // A terminal no_eligible_task projection selects the source leaf after the
+  // worker has already exhausted its generated replan.  Use only the durable
+  // replan feedback's exact source binding to rediscover that replan; never
+  // infer one from an unrelated TODO in the queue.
+  if (!isStalledLeafReplanId(selectedId)
+    && replanFeedback?.kind === 'phase_loop_todo_contract_replan_feedback') {
+    const feedbackSourceId = todoIdFromFirstLine(replanFeedback.selected_todo_first_line);
+    const matchingReplan = todoBlocks(todoText).find((block) => {
+      const candidateId = todoIdFromBlock(block.block);
+      return isStalledLeafReplanId(candidateId)
+        && sourceTodoFromBlock(block.block) === feedbackSourceId;
+    });
+    selectedId = todoIdFromBlock(matchingReplan?.block) ?? selectedId;
+  }
+  if (!terminalNoProposal || !isStalledLeafReplanId(selectedId)) {
+    return { attempted: false, reason: 'terminal_stalled_replan_not_reported' };
+  }
+
   const replanBlock = todoBlocks(todoText).find((block) => todoIdFromBlock(block.block) === selectedId);
   const sourceId = sourceTodoFromBlock(replanBlock?.block);
   const sourceBlock = todoBlocks(todoText).find((block) => todoIdFromBlock(block.block) === sourceId);

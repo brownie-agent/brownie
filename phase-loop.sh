@@ -170,14 +170,17 @@ evaluate_bdk_public_harness_feedback() {
   if [ ! -f "$trajectory_path" ] || [ ! -f "$ROOT_DIR/scripts/bdk-public-harness-evaluate.mjs" ]; then
     return 0
   fi
-  local partial_args=()
   if [ "$terminal_event" = "todo.repair_feedback" ]; then
-    partial_args=(--allow-partial)
+    output="$(
+      cd "$ROOT_DIR" || exit 70
+      node scripts/bdk-public-harness-evaluate.mjs --trajectory "$trajectory_path" --output "$BDK_HARNESS_FEEDBACK_FILE" --allow-partial 2>&1
+    )"
+  else
+    output="$(
+      cd "$ROOT_DIR" || exit 70
+      node scripts/bdk-public-harness-evaluate.mjs --trajectory "$trajectory_path" --output "$BDK_HARNESS_FEEDBACK_FILE" 2>&1
+    )"
   fi
-  output="$(
-    cd "$ROOT_DIR" || exit 70
-    node scripts/bdk-public-harness-evaluate.mjs --trajectory "$trajectory_path" --output "$BDK_HARNESS_FEEDBACK_FILE" "${partial_args[@]}" 2>&1
-  )"
   local status=$?
   if [ "$status" -ne 0 ]; then
     printf '%s bdk_harness_feedback_failed run=%s terminal_event=%s status=%s output=%s feedback=%s\n' "$(now_utc)" "$run_stamp" "$terminal_event" "$status" "$output" "$BDK_HARNESS_FEEDBACK_FILE" >> "$SUPERVISOR_LOG"

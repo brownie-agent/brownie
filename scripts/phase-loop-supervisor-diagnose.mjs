@@ -1103,6 +1103,7 @@ export function diagnosePhaseLoop(options = {}) {
       selected_todo: selected,
       projection_status: progressProjection.cli_status ?? null,
       projection_closure: progressProjection.closure ?? null,
+      projection_stop_class: progressProjection.stop_class ?? progressProjection.stop_reason ?? null,
       stdout_log: stdoutLog,
       stderr_log: stderrLog,
       stdout_tail: stdoutTail,
