@@ -1631,6 +1631,77 @@ function maybeRepairMissingDerivedBreakdownLedger(repoRoot, diagnostic) {
   return { attempted: true, ok: true, changed: true, paths: ['.brownie/todo-breakdown.md'], repaired_todo_ids: repaired };
 }
 
+// Normalize the short-lived ledger layout emitted by the first recovery
+// implementation. A child-specific repair section satisfies the decomposition
+// guard but is not a parent-to-child replan record, so queue integrity cannot
+// reconstruct the supersession relationship. Preserve its source in an
+// archive, then move only live stalled-replan children into their parent.
+function maybeMigrateLegacyDerivedBreakdownLedger(repoRoot) {
+  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
+  if (!fs.existsSync(todoPath) || !fs.existsSync(breakdownPath)) {
+    return { attempted: false, reason: 'todo_or_breakdown_missing' };
+  }
+  const todoText = fs.readFileSync(todoPath, 'utf8');
+  const originalBreakdown = fs.readFileSync(breakdownPath, 'utf8');
+  let breakdownText = originalBreakdown;
+  const migrations = [];
+  for (const candidate of todoBlocks(todoText)) {
+    const id = todoIdFromBlock(candidate.block);
+    const parentId = sourceTodoFromBlock(candidate.block);
+    if (!id || !isStalledLeafReplanId(parentId)) continue;
+    const parentHeading = `## TODO-repair-${parentId}`;
+    const childHeading = `## TODO-repair-${id}`;
+    const parentStart = breakdownText.indexOf(parentHeading);
+    const childStart = breakdownText.indexOf(childHeading);
+    if (parentStart < 0 || childStart < 0) continue;
+    const childEndNext = breakdownText.indexOf('\n## ', childStart + childHeading.length);
+    const childEnd = childEndNext < 0 ? breakdownText.length : childEndNext;
+    const childSection = breakdownText.slice(childStart, childEnd);
+    const dependencies = childSection.match(new RegExp(`^- ${id}: (.+?)\\s*$`, 'mu'))?.[1];
+    const verification = childSection.match(new RegExp(`^Verification ledger:\\n- ${id}: (.+?)\\s*$`, 'mu'))?.[1];
+    const quality = childSection.match(new RegExp(`^Quality rubric:\\n- ${id}: (.+?)\\s*$`, 'mu'))?.[1];
+    if (!dependencies || !verification || !quality) {
+      return { attempted: true, ok: false, reason: 'legacy_derived_ledger_not_migratable', todo_id: id, parent_todo_id: parentId };
+    }
+    const parentEndNext = breakdownText.indexOf('\n## ', parentStart + parentHeading.length);
+    const parentEnd = parentEndNext < 0 ? breakdownText.length : parentEndNext;
+    let parentSection = breakdownText.slice(parentStart, parentEnd);
+    const appendLedgerLine = (label, line) => {
+      const listStart = parentSection.indexOf(`${label}\n`);
+      if (listStart < 0) return false;
+      const nextBlankLine = parentSection.indexOf('\n\n', listStart + label.length + 1);
+      const listEnd = nextBlankLine < 0 ? parentSection.trimEnd().length : nextBlankLine;
+      if (parentSection.includes(`\n${line}\n`)) return false;
+      parentSection = `${parentSection.slice(0, listEnd)}\n${line}${parentSection.slice(listEnd)}`;
+      return true;
+    };
+    const moved = appendLedgerLine('Dependency graph:', `- ${id}: ${dependencies}`)
+      && appendLedgerLine('Verification ledger:', `- ${id}: ${verification}`)
+      && appendLedgerLine('Quality rubric:', `- ${id}: ${quality}`);
+    if (!moved) {
+      return { attempted: true, ok: false, reason: 'legacy_derived_ledger_not_migratable', todo_id: id, parent_todo_id: parentId };
+    }
+    const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z');
+    parentSection = `${parentSection.trimEnd()}\n\n- ${timestamp}: Supervisor migrated the legacy child-only ledger entry into this parent replan record.\n`;
+    breakdownText = `${breakdownText.slice(0, parentStart)}${parentSection}${breakdownText.slice(parentEnd)}`;
+    const refreshedChildStart = breakdownText.indexOf(childHeading);
+    const refreshedChildEndNext = breakdownText.indexOf('\n## ', refreshedChildStart + childHeading.length);
+    const refreshedChildEnd = refreshedChildEndNext < 0 ? breakdownText.length : refreshedChildEndNext;
+    breakdownText = `${breakdownText.slice(0, refreshedChildStart)}${breakdownText.slice(refreshedChildEnd).replace(/^\n/, '')}`;
+    migrations.push({ todo_id: id, parent_todo_id: parentId });
+  }
+  if (migrations.length === 0) return { attempted: false, reason: 'no_legacy_derived_ledger_sections' };
+  const archiveDir = path.join(repoRoot, '.brownie/private/phase-loop/recovery-archives');
+  fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  const archivePath = path.join(archiveDir, `legacy-derived-breakdown-ledger-${new Date().toISOString().replace(/[:.]/gu, '-')}.md`);
+  fs.writeFileSync(archivePath, originalBreakdown, { encoding: 'utf8', mode: 0o600 });
+  fsyncFileAndParent(archivePath);
+  fs.writeFileSync(breakdownPath, `${breakdownText.trimEnd()}\n`, { encoding: 'utf8', mode: 0o600 });
+  fsyncFileAndParent(breakdownPath);
+  return { attempted: true, ok: true, changed: true, paths: ['.brownie/todo-breakdown.md'], archive_path: path.relative(repoRoot, archivePath), migrations };
+}
+
 function maybeWriteTodoContractReplanFeedback(repoRoot, diagnostic, ledgerSummary) {
   if (!ledgerSummary?.should_replan) {
     return {
@@ -1995,9 +2066,15 @@ export function controlPhaseLoop(options = {}) {
   const missingDerivedBreakdownLedgerRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : maybeRepairMissingDerivedBreakdownLedger(repoRoot, afterDerivedTodoPrefixRepair);
-  const afterRepair = missingDerivedBreakdownLedgerRepair.attempted && missingDerivedBreakdownLedgerRepair.ok
+  const afterMissingDerivedBreakdownLedgerRepair = missingDerivedBreakdownLedgerRepair.attempted && missingDerivedBreakdownLedgerRepair.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterDerivedTodoPrefixRepair;
+  const legacyDerivedBreakdownLedgerMigration = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : maybeMigrateLegacyDerivedBreakdownLedger(repoRoot);
+  const afterRepair = legacyDerivedBreakdownLedgerMigration.attempted && legacyDerivedBreakdownLedgerMigration.ok
+    ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
+    : afterMissingDerivedBreakdownLedgerRepair;
   const nonLiveTodoResidueRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : maybeRepairNonLiveTodoResidue(repoRoot, afterRepair);
@@ -2103,6 +2180,7 @@ export function controlPhaseLoop(options = {}) {
     todo_contract: todoContractRepair,
     derived_todo_prefix_ledger: derivedTodoPrefixRepair,
     missing_derived_breakdown_ledger: missingDerivedBreakdownLedgerRepair,
+    legacy_derived_breakdown_ledger_migration: legacyDerivedBreakdownLedgerMigration,
     todo_contract_replan: todoContractReplanRepair,
     stalled_todo_blocked: stalledTodoBlocked,
     stalled_todo_decomposition: stalledTodoDecomposition,
@@ -2184,6 +2262,7 @@ export function controlPhaseLoop(options = {}) {
       todo_contract: todoContractRepair,
       derived_todo_prefix_ledger: derivedTodoPrefixRepair,
       missing_derived_breakdown_ledger: missingDerivedBreakdownLedgerRepair,
+      legacy_derived_breakdown_ledger_migration: legacyDerivedBreakdownLedgerMigration,
       todo_contract_replan: todoContractReplanRepair,
       stalled_todo_blocked: stalledTodoBlocked,
       stalled_todo_decomposition: stalledTodoDecomposition,
