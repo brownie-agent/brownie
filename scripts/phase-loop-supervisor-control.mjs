@@ -493,11 +493,21 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   const sameFingerprintNoProgressCount = sameFingerprintEvents
     .filter((entry) => entry?.kind === 'no_progress')
     .length;
+  // Invalid patch events are only evidence of an exhausted repair path when
+  // they belong to the current progress projection.  A durable ledger also
+  // contains superseded attempts; using those alone would turn a newly
+  // instructed repair into an unrelated TODO-contract replan.
+  const sameFingerprintInvalidPatchCount = sameFingerprintEvents
+    .filter((entry) => entry?.kind === 'invalid_patch')
+    .length;
+  const invalidPatchCountForEpoch = progressFingerprint
+    ? sameFingerprintInvalidPatchCount
+    : (counts.invalid_patch ?? 0);
   const codes = issueCodes(diagnostic);
   const repairableInvalidPatch = invalidPatchNeedsExactContextRepair(diagnostic.invalid_patch);
   const invalidPatchWithRepeatedNoProgress = codes.has('invalid_workspace_write_patch_repeated') && progressSameCount >= 2 && !repairableInvalidPatch;
   const semanticFailureWithRepeatedNoProgress = codes.has('verification_failure_requires_semantic_repair') && progressSameCount >= 2;
-  const invalidPatchThenNoProgress = (counts.invalid_patch ?? 0) >= 1 && (counts.no_progress ?? 0) >= 1 && !repairableInvalidPatch;
+  const invalidPatchThenNoProgress = invalidPatchCountForEpoch >= 1 && (counts.no_progress ?? 0) >= 1 && !repairableInvalidPatch;
   // Claim migration/rebaseline can legitimately reset progress-state's local
   // counter.  Preserve convergence across those boundaries by counting
   // no-progress events for the same TODO in the durable failure ledger.
@@ -508,7 +518,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     invalidPatchWithRepeatedNoProgress ||
     semanticFailureWithRepeatedNoProgress ||
     invalidPatchThenNoProgress ||
-    ((counts.invalid_patch ?? 0) >= 2 && !repairableInvalidPatch) ||
+    (invalidPatchCountForEpoch >= 2 && !repairableInvalidPatch) ||
     (counts.semantic_verification_failure ?? 0) >= 2 ||
     (counts.semantic_verification_stalled ?? 0) >= 1 ||
     codes.has('semantic_verification_repair_stalled')
@@ -525,7 +535,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
       replanReason = 'semantic_failure_with_repeated_no_progress';
     } else if (invalidPatchThenNoProgress) {
       replanReason = 'invalid_patch_followed_by_no_progress';
-    } else if ((counts.invalid_patch ?? 0) >= 2) {
+    } else if (invalidPatchCountForEpoch >= 2) {
       replanReason = 'same_todo_invalid_patch_threshold';
     } else if ((counts.semantic_verification_failure ?? 0) >= 2 || (counts.semantic_verification_stalled ?? 0) >= 1) {
       replanReason = 'same_todo_semantic_verification_threshold';
@@ -548,6 +558,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     counts,
     current_progress_fingerprint: progressFingerprint,
     same_fingerprint_no_progress_count: sameFingerprintNoProgressCount,
+    same_fingerprint_invalid_patch_count: sameFingerprintInvalidPatchCount,
     repairable_invalid_patch: repairableInvalidPatch,
     should_replan: shouldReplan,
     replan_reason: replanReason,
