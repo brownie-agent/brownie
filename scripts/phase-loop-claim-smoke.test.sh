@@ -2145,6 +2145,7 @@ printf 'base prompt\n' > "$repair_feedback_prompt"
 cat > "$repair_feedback_todo" <<'EOF'
 - [ ] E-repair: Patch only `scripts/release-runtime-operational-evidence.mjs` to generate satisfied soak evidence.
   Route: implementation.
+  Source TODO: E-repair-parent.
   Completion condition: generated satisfied soak evidence has all required stateful steps from a bounded Runtime fixture, not version-only repetition.
   Verification: run `pnpm --workspace-root guard:runtime-operational-evidence:test`.
 EOF
@@ -2164,7 +2165,7 @@ cat > "$repair_feedback_state/todo-claims/current.json" <<'EOF'
   "queue_generation": 1,
   "run_stamp": "20260913T000000Z",
   "schema_version": 1,
-  "selected_todo": "- [ ] E-repair: Patch only `scripts/release-runtime-operational-evidence.mjs` to generate satisfied soak evidence.\n  Route: implementation.\n  Completion condition: generated satisfied soak evidence has all required stateful steps from a bounded Runtime fixture, not version-only repetition.\n  Verification: run `pnpm --workspace-root guard:runtime-operational-evidence:test`.",
+  "selected_todo": "- [ ] E-repair: Patch only `scripts/release-runtime-operational-evidence.mjs` to generate satisfied soak evidence.\n  Route: implementation.\n  Source TODO: E-repair-parent.\n  Completion condition: generated satisfied soak evidence has all required stateful steps from a bounded Runtime fixture, not version-only repetition.\n  Verification: run `pnpm --workspace-root guard:runtime-operational-evidence:test`.",
   "status": "in_progress"
 }
 EOF
@@ -2179,6 +2180,9 @@ cat > "$repair_feedback_state/todo-claims/repair-feedback.json" <<'EOF'
     "completed": false,
     "expected": "sections.soak_test.status=satisfied",
     "reason": "semantic_completion_not_satisfied",
+    "workspace_read_previews": [
+      "workspace.read: completed path=scripts/release-runtime-operational-evidence.mjs preview=export const operationalEvidence = {};"
+    ],
     "results": [
       {
         "command": "pnpm --workspace-root guard:runtime-operational-evidence:test",
@@ -2261,6 +2265,8 @@ assert "state: `verify_or_repair`" in prompt, prompt
 assert "## Previous Repair Feedback" in prompt, prompt
 assert "semantic_completion_not_satisfied" in prompt, prompt
 assert "sections.soak_test.status=satisfied" in prompt, prompt
+assert "leaf_required_next_tool_policy: the next tool must be `workspace.write` for `scripts/release-runtime-operational-evidence.mjs`" in prompt, prompt
+assert "leaf_initial_read_policy" not in prompt, prompt
 PY
 
 contract_replan_feedback_state="$(mktemp -d)"
