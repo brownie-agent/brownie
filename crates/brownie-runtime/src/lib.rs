@@ -15654,7 +15654,47 @@ fn preview_tool_output(content: &str) -> String {
 }
 
 fn preview_workspace_read_output(content: &str) -> String {
-    preview_tool_output_with_limit(content, 8 * 1024)
+    const MAX_BYTES: usize = 900;
+    const TRUNCATION_MARKER: &str = "\n[truncated: head and tail retained]\n";
+    if content.len() <= MAX_BYTES {
+        return content.to_string();
+    }
+
+    let retained_bytes = MAX_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+    let head_budget = retained_bytes / 2;
+    let tail_budget = retained_bytes - head_budget;
+    format!(
+        "{}{}{}",
+        utf8_prefix_within_bytes(content, head_budget),
+        TRUNCATION_MARKER,
+        utf8_suffix_within_bytes(content, tail_budget),
+    )
+}
+
+fn utf8_prefix_within_bytes(content: &str, max_bytes: usize) -> &str {
+    if content.len() <= max_bytes {
+        return content;
+    }
+    let mut end = 0;
+    for (index, character) in content.char_indices() {
+        let next_end = index + character.len_utf8();
+        if next_end > max_bytes {
+            break;
+        }
+        end = next_end;
+    }
+    &content[..end]
+}
+
+fn utf8_suffix_within_bytes(content: &str, max_bytes: usize) -> &str {
+    if content.len() <= max_bytes {
+        return content;
+    }
+    let mut start = content.len().saturating_sub(max_bytes);
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    &content[start..]
 }
 
 fn preview_tool_output_with_limit(content: &str, max_chars: usize) -> String {
@@ -16059,6 +16099,34 @@ mod tests {
 
     pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
     const TEST_MODEPACK_PINNED_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn bounds_workspace_read_context_for_followup_writes() {
+        let content = format!("head\n{}\ntail\n", "界".repeat(8 * 1024));
+        let preview = preview_workspace_read_output(&content);
+
+        assert!(preview.len() <= 900);
+        assert!(preview.starts_with("head\n"));
+        assert!(preview.contains("[truncated: head and tail retained]"));
+        assert!(preview.ends_with("tail\n"));
+
+        let intent = serde_json::json!({
+            "tool_requests": [{
+                "tool_id": "workspace.write",
+                "reason": "Apply bounded repair.",
+                "input": {
+                    "path": "docs/example.md",
+                    "operation": "patch_file",
+                    "old_text": preview,
+                    "new_text": preview,
+                },
+            }],
+        });
+        let assistant_content = format!("```brownie-tool-intent\n{intent}\n```");
+        let parsed = brownie_tools::ToolIntentParser::parse_assistant_content(&assistant_content);
+        assert_eq!(parsed.requests.len(), 1);
+        assert!(parsed.rejected.is_empty());
+    }
 
     pub(super) fn parse_line(line: &str) -> JsonRpcResponse<Value> {
         serde_json::from_str(&handle_jsonrpc_input_line(line).expect("response line"))
