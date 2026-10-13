@@ -1574,6 +1574,63 @@ History:
   };
 }
 
+// A TODO decomposition apply may create bounded child leaves before its
+// matching breakdown ledger is written.  Repair only the exact leaf ids the
+// guard reports, and only when they remain children of an already-recorded
+// stalled replan.  This keeps the recovery scoped and auditable.
+function maybeRepairMissingDerivedBreakdownLedger(repoRoot, diagnostic) {
+  const errorText = (diagnostic.issues ?? [])
+    .flatMap((issue) => Array.isArray(issue.errors) ? issue.errors : [])
+    .join('\n');
+  const missingIds = [...errorText.matchAll(/todo-breakdown\.md: missing derived leaf TODO id ([A-Za-z0-9_-]+)/gu)]
+    .map((match) => match[1]);
+  if (missingIds.length === 0) return { attempted: false, reason: 'no_missing_derived_breakdown_ledger' };
+  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
+  if (!fs.existsSync(todoPath) || !fs.existsSync(breakdownPath)) {
+    return { attempted: true, ok: false, reason: 'todo_or_breakdown_missing' };
+  }
+  const todoText = fs.readFileSync(todoPath, 'utf8');
+  let breakdownText = fs.readFileSync(breakdownPath, 'utf8');
+  const repaired = [];
+  for (const id of missingIds) {
+    const block = todoBlocks(todoText).find((candidate) => todoIdFromBlock(candidate.block) === id);
+    const parentId = sourceTodoFromBlock(block?.block);
+    if (!block || !isStalledLeafReplanId(parentId) || !breakdownText.includes(`## TODO-repair-${parentId}`)) {
+      return { attempted: true, ok: false, reason: 'missing_leaf_is_not_bound_to_recorded_replan', todo_id: id, parent_todo_id: parentId };
+    }
+    const dependencies = block.block.match(/^\s*Depends on:\s*(.+?)\.?\s*$/mu)?.[1] ?? '<none>';
+    const verification = block.block.match(/^\s*Verification:\s*(.+?)\s*$/mu)?.[1] ?? 'run `pnpm --workspace-root guard:todo-decomposition`';
+    const heading = `## TODO-repair-${parentId}`;
+    const sectionStart = breakdownText.indexOf(heading);
+    const nextSection = breakdownText.indexOf('\n## ', sectionStart + heading.length);
+    const sectionEnd = nextSection < 0 ? breakdownText.length : nextSection;
+    let parentSection = breakdownText.slice(sectionStart, sectionEnd);
+    const appendLedgerLine = (label, line) => {
+      const listStart = parentSection.indexOf(`${label}\n`);
+      if (listStart < 0) return false;
+      const nextBlankLine = parentSection.indexOf('\n\n', listStart + label.length + 1);
+      const listEnd = nextBlankLine < 0 ? parentSection.trimEnd().length : nextBlankLine;
+      if (parentSection.includes(`\n${line}\n`)) return false;
+      parentSection = `${parentSection.slice(0, listEnd)}\n${line}${parentSection.slice(listEnd)}`;
+      return true;
+    };
+    const tracked = appendLedgerLine('Dependency graph:', `- ${id}: ${dependencies}`)
+      && appendLedgerLine('Verification ledger:', `- ${id}: ${verification}`)
+      && appendLedgerLine('Quality rubric:', `- ${id}: bounded derived leaf remains traceable to its recorded stalled replan.`);
+    if (!tracked) {
+      return { attempted: true, ok: false, reason: 'recorded_replan_section_not_appendable', todo_id: id, parent_todo_id: parentId };
+    }
+    const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z');
+    parentSection = `${parentSection.trimEnd()}\n\n- ${timestamp}: Supervisor restored the missing derived-leaf ledger entry after TODO decomposition guard rejection.\n`;
+    breakdownText = `${breakdownText.slice(0, sectionStart)}${parentSection}${breakdownText.slice(sectionEnd)}`;
+    repaired.push(id);
+  }
+  fs.writeFileSync(breakdownPath, `${breakdownText.trimEnd()}\n`, { encoding: 'utf8', mode: 0o600 });
+  fsyncFileAndParent(breakdownPath);
+  return { attempted: true, ok: true, changed: true, paths: ['.brownie/todo-breakdown.md'], repaired_todo_ids: repaired };
+}
+
 function maybeWriteTodoContractReplanFeedback(repoRoot, diagnostic, ledgerSummary) {
   if (!ledgerSummary?.should_replan) {
     return {
@@ -1932,9 +1989,15 @@ export function controlPhaseLoop(options = {}) {
   const derivedTodoPrefixRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : maybeRepairDerivedTodoPrefixAndLedger(repoRoot, afterTodoContractRepair);
-  const afterRepair = derivedTodoPrefixRepair.attempted && derivedTodoPrefixRepair.ok
+  const afterDerivedTodoPrefixRepair = derivedTodoPrefixRepair.attempted && derivedTodoPrefixRepair.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterTodoContractRepair;
+  const missingDerivedBreakdownLedgerRepair = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : maybeRepairMissingDerivedBreakdownLedger(repoRoot, afterDerivedTodoPrefixRepair);
+  const afterRepair = missingDerivedBreakdownLedgerRepair.attempted && missingDerivedBreakdownLedgerRepair.ok
+    ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
+    : afterDerivedTodoPrefixRepair;
   const nonLiveTodoResidueRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : maybeRepairNonLiveTodoResidue(repoRoot, afterRepair);
@@ -2039,6 +2102,7 @@ export function controlPhaseLoop(options = {}) {
     todo_queue_integrity: queueIntegrityRepair,
     todo_contract: todoContractRepair,
     derived_todo_prefix_ledger: derivedTodoPrefixRepair,
+    missing_derived_breakdown_ledger: missingDerivedBreakdownLedgerRepair,
     todo_contract_replan: todoContractReplanRepair,
     stalled_todo_blocked: stalledTodoBlocked,
     stalled_todo_decomposition: stalledTodoDecomposition,
@@ -2119,6 +2183,7 @@ export function controlPhaseLoop(options = {}) {
       todo_queue_integrity: queueIntegrityRepair,
       todo_contract: todoContractRepair,
       derived_todo_prefix_ledger: derivedTodoPrefixRepair,
+      missing_derived_breakdown_ledger: missingDerivedBreakdownLedgerRepair,
       todo_contract_replan: todoContractReplanRepair,
       stalled_todo_blocked: stalledTodoBlocked,
       stalled_todo_decomposition: stalledTodoDecomposition,

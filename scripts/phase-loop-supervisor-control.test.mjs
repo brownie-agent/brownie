@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { controlPhaseLoop } from './phase-loop-supervisor-control.mjs';
+import { readTrackedBreakdownReplanRecords } from './phase-loop-todo-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1856,6 +1857,26 @@ test('workspace supervisor-control script restarts after safe repair by default'
     packageJson.scripts['phase-loop:supervisor-control'],
     'node scripts/phase-loop-supervisor-control.mjs --repair --start'
   );
+});
+
+test('repairs only guard-reported derived child ledger entries for a recorded stalled replan', () => {
+  const repo = makeRepo();
+  const parentId = `E-21c-replan-stalled-leaf-${'e'.repeat(12)}`;
+  const childId = `${parentId}-leaf-01`;
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `- [ ] ${childId}: Patch only \`scripts/guard-runtime-operational-evidence.test.mjs\`:\n  Route: implementation.\n  Source TODO: ${parentId}.\n  Depends on: <none>.\n  Completion condition: child ledger entry is restored with executable verification and dependency metadata.\n  Forbidden changes: do not weaken guards/tests.\n  Verification: run \`pnpm --workspace-root release:runtime-operational-evidence:test\`.\n`);
+  fs.writeFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `# Breakdown\n\n## TODO-repair-${parentId}\n\nParent TODO: E-21c-runtime-operational-evidence-impl-2-target-02\n\nDependency graph:\n- ${parentId}: <none>\n\nVerification ledger:\n- ${parentId}: run \`pnpm --workspace-root guard:todo-decomposition\`\n\nQuality rubric:\n- ${parentId}: recorded replan\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', { status: 'no_progress', run_id: 'missing-ledger', consecutive_failures: 0, detail: 'guard failed' });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', { classification: 'no_progress', same_progress_count: 1, progress_projection: { selected_todo: runtimeEvidenceTodo } });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const breakdown = fs.readFileSync(path.join(repo, '.brownie/todo-breakdown.md'), 'utf8');
+  const records = readTrackedBreakdownReplanRecords(repo);
+
+  assert.equal(result.repair.missing_derived_breakdown_ledger.ok, true, JSON.stringify(result, null, 2));
+  assert.match(breakdown, new RegExp(`TODO-repair-${parentId}[\\s\\S]*- ${childId}:`, 'u'));
+  assert.doesNotMatch(breakdown, new RegExp(`TODO-repair-${childId}`, 'u'));
+  assert.deepEqual(records.find((record) => record.parent_todo_id === parentId)?.generated_child_ids, [childId]);
+  assert.equal(result.repair.post_repair_validation.ok, true, JSON.stringify(result, null, 2));
 });
 
 test('repairs generated TODO leaf prefix and breakdown ledger after decomposition guard rejection', () => {
