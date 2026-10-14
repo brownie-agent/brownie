@@ -1908,6 +1908,8 @@ assert "verification_already_passed" not in verified_noop_source, verified_noop_
 assert "selected_todo_dirty_baseline_verified_completion" in verified_noop_source, verified_noop_source
 assert "selected_scopes_dirty_at_baseline" in verified_noop_source, verified_noop_source
 assert "dirty_baseline_verification_command_not_allowed" in verified_noop_source, verified_noop_source
+assert "selected_todo_dirty_baseline_requires_semantic_repair" in verified_noop_source, verified_noop_source
+assert "raise SystemExit(1)" in verified_noop_source, verified_noop_source
 assert "semantic_wiring_already_present_without_verification_commands" in verified_noop_source, verified_noop_source
 PY
 
