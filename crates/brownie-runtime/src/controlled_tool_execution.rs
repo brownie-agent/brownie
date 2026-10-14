@@ -3528,6 +3528,11 @@ fn workspace_read_intent_runtime_rejection_reason(
         || (task_goal_enforces_workspace_read_budget_before_write(&record.goal)
             && run_workspace_read_count_without_write_proposal(store, record)? >= 2)
     {
+        if let Some(offset_bytes) = truncated_workspace_read_next_offset(store, record, input)? {
+            return Ok(Some(format!(
+                "The prior workspace.read range was truncated. Do not repeat it: request exactly one workspace.read for the same path with input.offset_bytes={offset_bytes}, then request workspace.write using that range and its content_sha256."
+            )));
+        }
         return Ok(Some(
             "Additional workspace.read is not progress after the phase-loop read budget is exhausted; use the existing Tool Execution output_preview/content_sha256 and request workspace.write or record a concrete blocker."
                 .to_string(),
@@ -4157,17 +4162,73 @@ fn run_has_workspace_read_for_same_path_without_write_proposal(
     {
         return Ok(false);
     }
+    let requested_offset = input
+        .get("offset_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Ok(events.iter().any(|event| {
         event.kind == LedgerEventKind::ToolExecutionCompleted
             && event.payload.as_ref().is_some_and(|payload| {
                 payload.get("tool_id").and_then(Value::as_str) == Some(WORKSPACE_READ_TOOL_ID)
-                    && payload
-                        .get("output_preview")
-                        .and_then(Value::as_str)
-                        .is_some_and(|preview| {
-                            preview.starts_with(&format!("[workspace.read path={path} "))
-                        })
+                    && workspace_read_payload_matches_path_and_offset(
+                        payload,
+                        path,
+                        requested_offset,
+                    )
             })
+    }))
+}
+
+fn workspace_read_payload_matches_path_and_offset(
+    payload: &Value,
+    path: &str,
+    offset_bytes: u64,
+) -> bool {
+    if payload.get("path").and_then(Value::as_str) == Some(path) {
+        return payload
+            .get("offset_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == offset_bytes;
+    }
+    offset_bytes == 0
+        && payload
+            .get("output_preview")
+            .and_then(Value::as_str)
+            .is_some_and(|preview| preview.starts_with(&format!("[workspace.read path={path} ")))
+}
+
+fn truncated_workspace_read_next_offset(
+    store: &BrownieStore,
+    record: &brownie_protocol::TaskRecord,
+    input: &Value,
+) -> anyhow::Result<Option<u64>> {
+    let Some(path) = input.get("path").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let requested_offset = input
+        .get("offset_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let events = store.tasks().read_ledger_events(&record.run_id)?;
+    Ok(events.iter().rev().find_map(|event| {
+        let payload = event.payload.as_ref()?;
+        (event.kind == LedgerEventKind::ToolExecutionCompleted
+            && payload.get("tool_id").and_then(Value::as_str) == Some(WORKSPACE_READ_TOOL_ID)
+            && workspace_read_payload_matches_path_and_offset(payload, path, requested_offset)
+            && payload.get("truncated").and_then(Value::as_bool) == Some(true))
+        .then(|| {
+            payload
+                .get("bytes_end")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    payload
+                        .get("bytes_read")
+                        .and_then(Value::as_u64)
+                        .map(|bytes_read| requested_offset.saturating_add(bytes_read))
+                })
+        })
+        .flatten()
     }))
 }
 
@@ -6615,13 +6676,18 @@ pub(super) fn tool_execution_ledger_payload(result: &brownie_tools::ToolExecutio
                 .and_then(Value::as_u64)
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "<unknown>".to_string());
+            let offset_bytes = result
+                .output
+                .get("offset_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             let content_sha256 = result
                 .output
                 .get("content_sha256")
                 .and_then(Value::as_str)
                 .unwrap_or("<unknown>");
             format!(
-                "[workspace.read path={path} bytes_total={bytes_total} content_sha256={content_sha256}]\n{}",
+                "[workspace.read path={path} offset_bytes={offset_bytes} bytes_total={bytes_total} content_sha256={content_sha256}]\n{}",
                 preview_workspace_read_output(content)
             )
         } else {
@@ -6631,6 +6697,11 @@ pub(super) fn tool_execution_ledger_payload(result: &brownie_tools::ToolExecutio
     }
     if let Some(bytes_read) = result.output.get("bytes_read") {
         payload.insert("bytes_read".to_string(), bytes_read.clone());
+    }
+    for key in ["path", "offset_bytes", "bytes_end", "bytes_total"] {
+        if let Some(value) = result.output.get(key) {
+            payload.insert(key.to_string(), value.clone());
+        }
     }
     if let Some(truncated) = result.output.get("truncated") {
         payload.insert("truncated".to_string(), truncated.clone());
@@ -7814,6 +7885,49 @@ mod mcp_approval_lock_tests {
         );
 
         assert!(reason.is_none());
+    }
+
+    #[test]
+    fn truncated_leaf_read_requires_a_new_offset_instead_of_repeating_the_range() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = BrownieStore::new(temp.path());
+        let mut record = test_task_record();
+        record.run_id = "run_truncated_range_retry".to_string();
+        record.goal = "# Brownie Phase Loop Effective Prompt\n\n## Selected TODO\n\n- [ ] E-23a-release-artifact-portable-archive-leaf-01: Patch only `scripts/release-local-artifact.mjs`.\n  Route: implementation.\n".to_string();
+        store
+            .tasks()
+            .append_task_event_with_payload(
+                &record,
+                LedgerEventKind::ToolExecutionCompleted,
+                Some(json!({
+                    "tool_id": WORKSPACE_READ_TOOL_ID,
+                    "status": "Completed",
+                    "path": "scripts/release-local-artifact.mjs",
+                    "offset_bytes": 0,
+                    "bytes_read": 65536,
+                    "bytes_end": 65536,
+                    "bytes_total": 131072,
+                    "truncated": true,
+                })),
+            )
+            .expect("append read event");
+
+        let repeated = workspace_read_intent_runtime_rejection_reason(
+            &store,
+            &record,
+            &json!({"path": "scripts/release-local-artifact.mjs"}),
+        )
+        .expect("reason")
+        .expect("repeat must be rejected");
+        assert!(repeated.contains("offset_bytes=65536"));
+
+        let ranged = workspace_read_intent_runtime_rejection_reason(
+            &store,
+            &record,
+            &json!({"path": "scripts/release-local-artifact.mjs", "offset_bytes": 65536}),
+        )
+        .expect("reason");
+        assert!(ranged.is_none());
     }
 
     #[test]
