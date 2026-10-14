@@ -1118,6 +1118,42 @@ test('recovers a terminal no-eligible generated replan projected onto its bounde
   assert.equal(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl'), 'utf8'), '');
 });
 
+test('recovers a live generated replan after semantic verification feedback replaces its replan feedback', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const sourceTodo = runtimeEvidenceTodo;
+  const sourceId = 'E-21c-runtime-operational-evidence-impl-2-target-02';
+  const replanId = `E-21c-replan-stalled-leaf-${'e'.repeat(12)}`;
+  const replanTodo = `- [ ] ${replanId}: Patch only \`.brownie/todo.md\` and \`.brownie/todo-breakdown.md\` to replan stalled Brownie TODO leaf into implementable child TODOs:\n  Route: todo-decomposition.\n  Source TODO: ${sourceId}.\n  Depends on: <none>.\n  Completion condition: stalled TODO is superseded.\n  Forbidden changes: do not weaken guards/tests.\n  Verification: run \`pnpm --workspace-root guard:todo-decomposition\`.`;
+  fs.appendFileSync(path.join(repo, '.brownie/todo.md'), `\n${replanTodo}\n`);
+  fs.appendFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `\n## TODO-repair-${replanId}\n\nParent TODO: ${sourceId}\n\nDependency graph:\n- ${replanId}: <none>\n\nVerification ledger:\n- ${replanId}: run \`pnpm --workspace-root guard:todo-decomposition\`\n\nQuality rubric:\n- ${replanId}: bounded recovery replan\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress', run_id: 'semantic-feedback-replan', consecutive_failures: 1,
+    detail: 'runtime terminal task failed without a workspace.write proposal'
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 2,
+    selected_todo: { id: sourceId, first_line: sourceTodo.split('\n')[0], route: 'implementation' },
+    progress_projection: { cli_status: 'no_eligible_task', stop_class: 'terminal_failure', selected_todo: sourceTodo }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
+    kind: 'phase_loop_semantic_verification_repair_feedback',
+    selected_todo_first_line: sourceTodo.split('\n')[0],
+    reason: 'dirty_baseline_verification_failed'
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+  const feedback = JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8'));
+
+  assert.equal(result.repair.terminal_stalled_replan_recovery.ok, true, JSON.stringify(result, null, 2));
+  assert.doesNotMatch(todo, new RegExp(replanId, 'u'));
+  assert.equal(feedback.semantic_repair_policy.mode, 'force_bounded_leaf_target_patch');
+  assert.deepEqual(feedback.semantic_repair_policy.selected_patch_targets, [
+    'scripts/guard-runtime-operational-evidence.test.mjs'
+  ]);
+});
+
 test('does not recover a replan when terminal projection and durable feedback select different source leaves', () => {
   const repo = makeRepo();
   writeTodo(repo);
@@ -1126,8 +1162,10 @@ test('does not recover a replan when terminal projection and durable feedback se
   const projectedSourceId = 'E-21c-different-terminal-leaf-target-01';
   const projectedTodo = `- [ ] ${projectedSourceId}: Patch only \`scripts/guard-runtime-operational-evidence.test.mjs\`:\n  Route: implementation.`;
   const replanId = `E-21c-replan-stalled-leaf-${'d'.repeat(12)}`;
+  const projectedReplanId = `E-21c-replan-stalled-leaf-${'f'.repeat(12)}`;
   const replanTodo = `- [ ] ${replanId}: Patch only \`.brownie/todo.md\` and \`.brownie/todo-breakdown.md\` to replan stalled Brownie TODO leaf into implementable child TODOs:\n  Route: todo-decomposition.\n  Source TODO: ${sourceId}.\n  Depends on: <none>.\n  Completion condition: stalled TODO is superseded.\n  Forbidden changes: do not weaken guards/tests.\n  Verification: run \`pnpm --workspace-root guard:todo-decomposition\`.`;
-  fs.appendFileSync(path.join(repo, '.brownie/todo.md'), `\n${replanTodo}\n`);
+  const projectedReplanTodo = `- [ ] ${projectedReplanId}: Patch only \`.brownie/todo.md\` and \`.brownie/todo-breakdown.md\` to replan stalled Brownie TODO leaf into implementable child TODOs:\n  Route: todo-decomposition.\n  Source TODO: ${projectedSourceId}.\n  Depends on: <none>.\n  Completion condition: stalled TODO is superseded.\n  Forbidden changes: do not weaken guards/tests.\n  Verification: run \`pnpm --workspace-root guard:todo-decomposition\`.`;
+  fs.appendFileSync(path.join(repo, '.brownie/todo.md'), `\n${projectedTodo}\n\n${replanTodo}\n\n${projectedReplanTodo}\n`);
   fs.appendFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `\n## TODO-repair-${replanId}\n\nParent TODO: ${sourceId}\n\nDependency graph:\n- ${replanId}: <none>\n\nVerification ledger:\n- ${replanId}: run \`pnpm --workspace-root guard:todo-decomposition\`\n\nQuality rubric:\n- ${replanId}: bounded recovery replan\n`);
   writeJson(repo, '.brownie/private/phase-loop/status.json', {
     status: 'no_progress', run_id: 'mismatched-terminal-replan', consecutive_failures: 0,
@@ -1147,6 +1185,7 @@ test('does not recover a replan when terminal projection and durable feedback se
 
   assert.equal(result.repair.terminal_stalled_replan_recovery.attempted, false, JSON.stringify(result, null, 2));
   assert.match(todo, new RegExp(replanId, 'u'));
+  assert.match(todo, new RegExp(projectedReplanId, 'u'));
 });
 
 test('does not inherit completion from Source TODO lineage', () => {
