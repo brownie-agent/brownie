@@ -25,16 +25,16 @@
     "crates/brownie-runtime/src/verification_recovery.rs"
   ],
   "thresholds": {
-    "lib_rs_production_line_ceiling": 16093,
+    "lib_rs_production_line_ceiling": 16097,
     "lib_rs_test_line_ceiling": 53923
   },
   "metrics": {
     "files": {
       "crates/brownie-runtime/src/lib.rs": {
-        "line_count": 70016,
+        "line_count": 70020,
         "public_items": 3,
         "private_items": 535,
-        "production_line_count": 16093,
+        "production_line_count": 16097,
         "test_line_count": 53923,
         "state_mutation_mentions": 316,
         "durable_write_mentions": 234,
@@ -61,11 +61,11 @@
         "diagnostics_mentions": 0
       },
       "crates/brownie-runtime/src/controlled_tool_execution.rs": {
-        "line_count": 8315,
+        "line_count": 8429,
         "public_items": 74,
-        "private_items": 121,
-        "state_mutation_mentions": 48,
-        "durable_write_mentions": 48,
+        "private_items": 123,
+        "state_mutation_mentions": 49,
+        "durable_write_mentions": 49,
         "permission_decision_mentions": 109,
         "recovery_mentions": 92,
         "rpc_dispatch_mentions": 0,
