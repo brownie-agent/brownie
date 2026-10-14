@@ -662,9 +662,11 @@ function appendStalledTodoBlockedRecord(repoRoot, diagnostic, ledgerSummary) {
     .join('\n\n');
   const queueFingerprint = crypto.createHash('sha256').update(queueMaterial).digest('hex');
   const selectedHash = crypto.createHash('sha256').update(selectedBlock).digest('hex');
+  const controllerFingerprint = phaseLoopControllerFingerprint(repoRoot);
   const existing = fs.existsSync(blockedPath) ? readJsonl(blockedPath) : [];
   const alreadyRecorded = existing.some((record) => (
     record?.block_reason === 'stalled_leaf_contract_replan' &&
+    record?.controller_fingerprint === controllerFingerprint &&
     (
       record?.selected_todo_first_line === firstLine ||
       record?.selected_todo_sha256 === selectedHash
@@ -683,7 +685,7 @@ function appendStalledTodoBlockedRecord(repoRoot, diagnostic, ledgerSummary) {
     claim_id: claim?.claim_id ?? diagnostic.verification_failure?.claim_id ?? diagnostic.invalid_patch?.claim_id ?? '',
     queue_generation: claim?.queue_generation ?? null,
     queue_fingerprint: queueFingerprint,
-    controller_fingerprint: phaseLoopControllerFingerprint(repoRoot),
+    controller_fingerprint: controllerFingerprint,
     todo_id: ledgerSummary.todo_id,
     selected_todo_sha256: selectedHash,
     selected_todo_first_line: firstLine
