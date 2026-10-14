@@ -574,7 +574,9 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   // Do not infer a verification command for old ledger rows.  Instead, make
   // the rebaseline explicit: repeated legacy failures on the same target
   // require a decomposition before another leaf can claim that contract.
-  const legacyTargetScopeRebaselineRequired = legacyScopeEvents.length >= 1 && sameScopeEvents.length >= 1;
+  const legacyTargetScopeRebaselineRequired = Boolean(currentEvent)
+    && legacyScopeEvents.length >= 1
+    && sameScopeEvents.length >= 1;
   const shouldReplan = (
     progressSameCount >= 3 ||
     repeatedNoProgressInLedger ||
