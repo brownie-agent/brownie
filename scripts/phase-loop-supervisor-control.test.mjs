@@ -371,6 +371,62 @@ test('does not aggregate a replacement leaf with a different verification contra
   assert.equal(result.repair.failure_ledger_summary.target_scope_event_count, 1);
 });
 
+test('rebaselines repeated legacy target failures without inferring their verification command', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const firstLine = runtimeEvidenceTodo.split('\n')[0];
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress', run_id: 'run-legacy-scope', consecutive_failures: 1
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1, run_stamp: '20261008T030000Z', last_progress_fingerprint: 'sha256:legacy-scope-fingerprint',
+    progress_projection: { cli_status: 'no_eligible_task', claim_id: 'claim-legacy-scope', selected_todo: runtimeEvidenceTodo }
+  });
+  const ledgerPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  fs.writeFileSync(ledgerPath, [0, 1].map((index) => JSON.stringify({
+    schema_version: 1, record_type: 'phase_loop_failure_event', event_id: `legacy-scope-${index}`,
+    observed_at: `2026-10-08T00:3${index}:00Z`, todo_id: `E-21c-legacy-leaf-${index}`,
+    selected_todo_first_line: firstLine, kind: 'no_progress', progress_fingerprint: 'sha256:legacy-scope-fingerprint',
+    status_run_id: `legacy-scope-${index}`, progress_run_stamp: `legacy-scope-${index}`
+  })).join('\n') + '\n');
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.failure_ledger_summary.replan_reason, 'legacy_target_scope_rebaseline_required');
+  assert.equal(result.repair.failure_ledger_summary.legacy_target_scope_event_count, 2);
+  assert.equal(result.repair.todo_contract_replan.ok, true, JSON.stringify(result, null, 2));
+});
+
+test('does not rebaseline legacy scope history when the latest run succeeded', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const firstLine = runtimeEvidenceTodo.split('\n')[0];
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'last_run_succeeded', run_id: 'run-success', consecutive_failures: 0
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1, run_stamp: '20261008T040000Z', last_progress_fingerprint: 'sha256:success-preserves-todo',
+    progress_projection: { cli_status: 'no_eligible_task', claim_id: 'claim-success', selected_todo: runtimeEvidenceTodo }
+  });
+  const ledgerPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  fs.writeFileSync(ledgerPath, [
+    { event_id: 'legacy-success', todo_id: 'E-21c-legacy-success', verification_command: null },
+    { event_id: 'modern-success', todo_id: 'E-21c-modern-success', verification_command: 'run `pnpm --workspace-root release:runtime-operational-evidence:test`.' }
+  ].map((entry) => JSON.stringify({
+    schema_version: 1, record_type: 'phase_loop_failure_event', observed_at: '2026-10-08T00:40:00Z',
+    ...entry, selected_todo_first_line: firstLine, target_scope_key: 'scripts/guard-runtime-operational-evidence.test.mjs',
+    kind: 'no_progress', status_run_id: entry.event_id, progress_run_stamp: entry.event_id,
+    progress_fingerprint: 'sha256:success-preserves-todo'
+  })).join('\n') + '\n');
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.failure_ledger.attempted, false);
+  assert.equal(result.repair.failure_ledger_summary.should_replan, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.todo_contract_replan.attempted, false);
+  assert.equal(fs.existsSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json')), false);
+});
+
 test('does not start when post-replan stale claim archival fails', () => {
   const repo = makeRepo();
   writeTodo(repo);
