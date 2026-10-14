@@ -498,19 +498,24 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   }
   const ledgerPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
   const ledger = readJsonl(ledgerPath);
+  // A controller upgrade can add audit fields to an event whose stable ID was
+  // already recorded.  Overlay the freshly observed event in memory instead
+  // of appending a duplicate failure or mutating the historical JSONL row.
+  const currentEvent = currentEventResult?.event ?? null;
   const events = [
-    ...ledger,
-    currentEventResult?.event && !ledger.some((entry) => entry?.event_id === currentEventResult.event.event_id)
-      ? currentEventResult.event
+    ...ledger.map((entry) => entry?.event_id === currentEvent?.event_id ? { ...entry, ...currentEvent } : entry),
+    currentEvent && !ledger.some((entry) => entry?.event_id === currentEvent.event_id)
+      ? currentEvent
       : null
   ].filter(Boolean);
   const sameTodoEvents = events
     .filter((entry) => entry?.todo_id === todoId)
     .slice(-12);
+  const progressFingerprint = diagnostic.progress?.last_progress_fingerprint ?? null;
   const currentTargetScope = targetScopeKey(firstLine);
-  const currentEvent = currentEventResult?.event
+  const observedCurrentEvent = currentEvent
     ?? [...events].reverse().find((entry) => entry?.todo_id === todoId && entry?.selected_todo_first_line === firstLine);
-  const currentVerification = currentEvent?.verification_command ?? '';
+  const currentVerification = observedCurrentEvent?.verification_command ?? '';
   const sameScopeEvents = currentTargetScope && currentVerification
     ? events.filter((entry) => (
       (entry?.target_scope_key || targetScopeKey(entry?.selected_todo_first_line)) === currentTargetScope
@@ -518,12 +523,18 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     )).slice(-24)
     : [];
   const sameScopeTodoIds = new Set(sameScopeEvents.map((entry) => entry?.todo_id).filter(Boolean));
+  const legacyScopeEvents = currentTargetScope && currentVerification
+    ? events.filter((entry) => (
+      (entry?.target_scope_key || targetScopeKey(entry?.selected_todo_first_line)) === currentTargetScope
+      && !entry?.verification_command
+      && entry?.progress_fingerprint === progressFingerprint
+    )).slice(-24)
+    : [];
   const counts = sameTodoEvents.reduce((acc, entry) => {
     acc[entry.kind] = (acc[entry.kind] ?? 0) + 1;
     return acc;
   }, {});
   const progressSameCount = Number(diagnostic.progress?.same_progress_count ?? 0);
-  const progressFingerprint = diagnostic.progress?.last_progress_fingerprint ?? null;
   // A durable ledger spans claim migrations, but prior failures must only
   // contribute to the current streak when they describe the same unchanged
   // progress projection.  A changed fingerprint is evidence of progress and
@@ -560,10 +571,15 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   // new leaf id for the same patch target.  Require multiple leaf identities
   // and failure observations so unrelated one-off work remains schedulable.
   const repeatedTargetScopeFailure = sameScopeTodoIds.size >= 2 && sameScopeEvents.length >= 3;
+  // Do not infer a verification command for old ledger rows.  Instead, make
+  // the rebaseline explicit: repeated legacy failures on the same target
+  // require a decomposition before another leaf can claim that contract.
+  const legacyTargetScopeRebaselineRequired = legacyScopeEvents.length >= 1 && sameScopeEvents.length >= 1;
   const shouldReplan = (
     progressSameCount >= 3 ||
     repeatedNoProgressInLedger ||
     repeatedTargetScopeFailure ||
+    legacyTargetScopeRebaselineRequired ||
     invalidPatchWithRepeatedNoProgress ||
     semanticFailureWithRepeatedNoProgress ||
     invalidPatchThenNoProgress ||
@@ -580,6 +596,8 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
       replanReason = 'same_todo_no_progress_ledger_threshold';
     } else if (repeatedTargetScopeFailure) {
       replanReason = 'same_target_scope_replan_leaf_threshold';
+    } else if (legacyTargetScopeRebaselineRequired) {
+      replanReason = 'legacy_target_scope_rebaseline_required';
     } else if (invalidPatchWithRepeatedNoProgress) {
       replanReason = 'invalid_patch_with_repeated_no_progress';
     } else if (semanticFailureWithRepeatedNoProgress) {
@@ -611,6 +629,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     verification_command: currentVerification || null,
     target_scope_event_count: sameScopeEvents.length,
     target_scope_distinct_todo_count: sameScopeTodoIds.size,
+    legacy_target_scope_event_count: legacyScopeEvents.length,
     current_progress_fingerprint: progressFingerprint,
     same_fingerprint_no_progress_count: sameFingerprintNoProgressCount,
     same_fingerprint_invalid_patch_count: sameFingerprintInvalidPatchCount,
