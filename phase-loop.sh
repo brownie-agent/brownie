@@ -2395,7 +2395,19 @@ if selected_scopes and len(selected_scopes_dirty_at_baseline) == len(selected_sc
             "stderr_tail": sanitized_process_tail(completed.stderr),
         })
         if completed.returncode != 0:
-            print(json.dumps({"completed": False, "reason": "dirty_baseline_verification_failed", "results": results}, sort_keys=True))
+            # A dirty selected target can be the defect the active implementation
+            # leaf is meant to repair.  It is not evidence of completion, but it
+            # must not prevent Brownie from receiving the leaf and fixing it.
+            # Preserve the failure as auditable diagnostic data.  The caller
+            # recognizes this exit status, records repair feedback, and then
+            # invokes Brownie for the normal leaf execution path.
+            print(json.dumps({
+                "completed": False,
+                "operation": "selected_todo_dirty_baseline_requires_semantic_repair",
+                "reason": "dirty_baseline_verification_failed",
+                "selected_scopes_dirty_at_baseline": selected_scopes_dirty_at_baseline,
+                "results": results,
+            }, sort_keys=True), file=sys.stderr)
             raise SystemExit(1)
     print(json.dumps({
         "completed": True,
