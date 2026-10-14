@@ -423,6 +423,11 @@ todo_first_pending_item() {
   if [ ! -f "$PHASE_LOOP_TODO" ]; then
     return 0
   fi
+  if phase_loop_delegation_pending; then
+    # Fail closed: repeated identical contracts require a separately auditable
+    # brownie-agent acknowledgement, not another generated replan leaf.
+    return 0
+  fi
   local contract_replan_item
   contract_replan_item="$(todo_contract_replan_feedback_pending_item 2>/dev/null || true)"
   if [ -n "$contract_replan_item" ]; then
@@ -430,6 +435,30 @@ todo_first_pending_item() {
     return 0
   fi
   node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" select --todo "$PHASE_LOOP_TODO" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" --blocked "$TODO_BLOCKED_FILE" --controller-fingerprint "$(phase_loop_controller_fingerprint)"
+}
+
+phase_loop_delegation_pending() {
+  if [ ! -f "$TODO_REPAIR_FEEDBACK_FILE" ]; then
+    return 1
+  fi
+  python3 - "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
+import json
+import pathlib
+import sys
+try:
+    feedback = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+delegation = feedback.get("delegation") if isinstance(feedback.get("delegation"), dict) else {}
+pending = (
+    feedback.get("completed") is not True
+    and feedback.get("kind") == "phase_loop_delegation_pending"
+    and delegation.get("required_actor") == "brownie-agent"
+    and delegation.get("acknowledgement_required") is True
+    and delegation.get("status") == "pending"
+)
+raise SystemExit(0 if pending else 1)
+PY
 }
 
 todo_contract_replan_feedback_pending_item() {

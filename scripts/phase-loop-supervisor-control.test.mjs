@@ -335,13 +335,14 @@ test('escalates repeated target-and-verification contracts across replan leaf id
   })).join('\n') + '\n');
 
   const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
-  const blocked = fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl'), 'utf8')
-    .trim().split('\n').map((line) => JSON.parse(line));
+  const feedback = JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8'));
 
   assert.equal(result.repair.failure_ledger_summary.replan_reason, 'same_target_scope_replan_leaf_threshold');
   assert.equal(result.repair.failure_ledger_summary.target_scope_distinct_todo_count, 3);
-  assert.equal(blocked[0].target_scope_key, targetScope);
-  assert.equal(blocked[0].verification_command, verification);
+  assert.equal(result.repair.delegation_pending.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.todo_contract_replan.reason, 'delegation_pending_blocks_same_scope_replan');
+  assert.equal(feedback.kind, 'phase_loop_delegation_pending');
+  assert.equal(feedback.delegation.required_actor, 'brownie-agent');
 });
 
 test('does not aggregate a replacement leaf with a different verification contract', () => {
