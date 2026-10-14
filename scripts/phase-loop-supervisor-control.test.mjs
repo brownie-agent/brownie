@@ -307,6 +307,70 @@ test('preserves repeated no-progress across claim migrations in the failure ledg
   );
 });
 
+test('escalates repeated target-and-verification contracts across replan leaf ids', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const firstLine = runtimeEvidenceTodo.split('\n')[0];
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress', run_id: 'run-scope-threshold', consecutive_failures: 1
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1, run_stamp: '20261008T010000Z',
+    progress_projection: { cli_status: 'no_eligible_task', claim_id: 'claim-scope', selected_todo: runtimeEvidenceTodo }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-scope', status: 'claimed', selected_todo: runtimeEvidenceTodo
+  });
+  const ledgerPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  const targetScope = 'scripts/guard-runtime-operational-evidence.test.mjs';
+  const verification = 'run `pnpm --workspace-root release:runtime-operational-evidence:test`.';
+  fs.writeFileSync(ledgerPath, [
+    'E-21c-runtime-operational-evidence-impl-2-target-01',
+    'E-21c-runtime-operational-evidence-impl-2-target-02-prior'
+  ].map((todo_id, index) => JSON.stringify({
+    schema_version: 1, record_type: 'phase_loop_failure_event', event_id: `scope-${index}`,
+    observed_at: `2026-10-08T00:1${index}:00Z`, todo_id,
+    selected_todo_first_line: firstLine, target_scope_key: targetScope, verification_command: verification,
+    kind: 'invalid_patch', status_run_id: `prior-scope-${index}`, progress_run_stamp: `prior-scope-${index}`
+  })).join('\n') + '\n');
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const blocked = fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl'), 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line));
+
+  assert.equal(result.repair.failure_ledger_summary.replan_reason, 'same_target_scope_replan_leaf_threshold');
+  assert.equal(result.repair.failure_ledger_summary.target_scope_distinct_todo_count, 3);
+  assert.equal(blocked[0].target_scope_key, targetScope);
+  assert.equal(blocked[0].verification_command, verification);
+});
+
+test('does not aggregate a replacement leaf with a different verification contract', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const firstLine = runtimeEvidenceTodo.split('\n')[0];
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress', run_id: 'run-different-verification', consecutive_failures: 1
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1, run_stamp: '20261008T020000Z',
+    progress_projection: { cli_status: 'no_eligible_task', claim_id: 'claim-different-verification', selected_todo: runtimeEvidenceTodo }
+  });
+  const ledgerPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  fs.writeFileSync(ledgerPath, [0, 1].map((index) => JSON.stringify({
+    schema_version: 1, record_type: 'phase_loop_failure_event', event_id: `different-verification-${index}`,
+    observed_at: `2026-10-08T00:2${index}:00Z`, todo_id: `E-21c-prior-leaf-${index}`,
+    selected_todo_first_line: firstLine,
+    target_scope_key: 'scripts/guard-runtime-operational-evidence.test.mjs',
+    verification_command: 'run `pnpm --workspace-root release:runtime-operational-evidence:integration:test`.',
+    kind: 'invalid_patch', status_run_id: `prior-different-${index}`, progress_run_stamp: `prior-different-${index}`
+  })).join('\n') + '\n');
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.failure_ledger_summary.should_replan, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.failure_ledger_summary.target_scope_event_count, 1);
+});
+
 test('does not start when post-replan stale claim archival fails', () => {
   const repo = makeRepo();
   writeTodo(repo);

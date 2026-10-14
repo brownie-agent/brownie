@@ -283,6 +283,30 @@ function todoIdFromFirstLine(firstLine) {
     ?.trim() || null;
 }
 
+function targetScopeKey(todoText) {
+  const firstLine = todoFirstLine(todoText);
+  if (!firstLine) {
+    return '';
+  }
+  const match = firstLine.match(/(?:Patch only|Create only)\s+(.+?)(?::|$)/u);
+  if (!match) {
+    return '';
+  }
+  const targets = [...match[1].matchAll(/`([^`\n]+)`/gu)]
+    .map((entry) => entry[1].trim())
+    .filter(Boolean)
+    .sort();
+  return targets.join('|');
+}
+
+function verificationCommand(todoText) {
+  if (typeof todoText !== 'string') {
+    return '';
+  }
+  const line = todoText.split('\n').map((entry) => entry.trim()).find((entry) => entry.startsWith('Verification:'));
+  return line?.slice('Verification:'.length).trim() ?? '';
+}
+
 function liveUncheckedTodoIds(todoText) {
   const ids = new Set();
   const pattern = /^(?:[-*]|\d+[.)])\s+\[\s\]\s+([^:\n]+):/gm;
@@ -400,6 +424,10 @@ function appendFailureLedgerEvent(repoRoot, diagnostic) {
     };
   }
   const ledgerPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+  const selectedBlock = fs.existsSync(todoPath)
+    ? todoBlocks(fs.readFileSync(todoPath, 'utf8')).find((candidate) => candidate.first_line === firstLine)?.block ?? firstLine
+    : firstLine;
   const claimId = diagnostic.verification_failure?.claim_id
     ?? diagnostic.invalid_patch?.claim_id
     ?? diagnostic.apply_rejection?.claim_id
@@ -411,6 +439,8 @@ function appendFailureLedgerEvent(repoRoot, diagnostic) {
     observed_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
     todo_id: todoId,
     selected_todo_first_line: firstLine,
+    target_scope_key: targetScopeKey(selectedBlock),
+    verification_command: verificationCommand(selectedBlock),
     kind,
     status: diagnostic.phase_loop?.status ?? null,
     status_run_id: diagnostic.phase_loop?.run_id ?? null,
@@ -477,6 +507,17 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   const sameTodoEvents = events
     .filter((entry) => entry?.todo_id === todoId)
     .slice(-12);
+  const currentTargetScope = targetScopeKey(firstLine);
+  const currentEvent = currentEventResult?.event
+    ?? [...events].reverse().find((entry) => entry?.todo_id === todoId && entry?.selected_todo_first_line === firstLine);
+  const currentVerification = currentEvent?.verification_command ?? '';
+  const sameScopeEvents = currentTargetScope && currentVerification
+    ? events.filter((entry) => (
+      (entry?.target_scope_key || targetScopeKey(entry?.selected_todo_first_line)) === currentTargetScope
+      && entry?.verification_command === currentVerification
+    )).slice(-24)
+    : [];
+  const sameScopeTodoIds = new Set(sameScopeEvents.map((entry) => entry?.todo_id).filter(Boolean));
   const counts = sameTodoEvents.reduce((acc, entry) => {
     acc[entry.kind] = (acc[entry.kind] ?? 0) + 1;
     return acc;
@@ -515,9 +556,14 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   // counter.  Preserve convergence across those boundaries by counting
   // no-progress events for the same TODO in the durable failure ledger.
   const repeatedNoProgressInLedger = sameFingerprintNoProgressCount >= 3;
+  // Replans must not evade the durable repair boundary merely by minting a
+  // new leaf id for the same patch target.  Require multiple leaf identities
+  // and failure observations so unrelated one-off work remains schedulable.
+  const repeatedTargetScopeFailure = sameScopeTodoIds.size >= 2 && sameScopeEvents.length >= 3;
   const shouldReplan = (
     progressSameCount >= 3 ||
     repeatedNoProgressInLedger ||
+    repeatedTargetScopeFailure ||
     invalidPatchWithRepeatedNoProgress ||
     semanticFailureWithRepeatedNoProgress ||
     invalidPatchThenNoProgress ||
@@ -532,6 +578,8 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
       replanReason = 'same_todo_no_progress_threshold';
     } else if (repeatedNoProgressInLedger) {
       replanReason = 'same_todo_no_progress_ledger_threshold';
+    } else if (repeatedTargetScopeFailure) {
+      replanReason = 'same_target_scope_replan_leaf_threshold';
     } else if (invalidPatchWithRepeatedNoProgress) {
       replanReason = 'invalid_patch_with_repeated_no_progress';
     } else if (semanticFailureWithRepeatedNoProgress) {
@@ -559,6 +607,10 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
       observed_at: entry.observed_at
     })),
     counts,
+    target_scope_key: currentTargetScope || null,
+    verification_command: currentVerification || null,
+    target_scope_event_count: sameScopeEvents.length,
+    target_scope_distinct_todo_count: sameScopeTodoIds.size,
     current_progress_fingerprint: progressFingerprint,
     same_fingerprint_no_progress_count: sameFingerprintNoProgressCount,
     same_fingerprint_invalid_patch_count: sameFingerprintInvalidPatchCount,
@@ -662,6 +714,8 @@ function appendStalledTodoBlockedRecord(repoRoot, diagnostic, ledgerSummary) {
     .join('\n\n');
   const queueFingerprint = crypto.createHash('sha256').update(queueMaterial).digest('hex');
   const selectedHash = crypto.createHash('sha256').update(selectedBlock).digest('hex');
+  const selectedTargetScope = targetScopeKey(selectedBlock);
+  const selectedVerification = verificationCommand(selectedBlock);
   const controllerFingerprint = phaseLoopControllerFingerprint(repoRoot);
   const existing = fs.existsSync(blockedPath) ? readJsonl(blockedPath) : [];
   const alreadyRecorded = existing.some((record) => (
@@ -688,7 +742,9 @@ function appendStalledTodoBlockedRecord(repoRoot, diagnostic, ledgerSummary) {
     controller_fingerprint: controllerFingerprint,
     todo_id: ledgerSummary.todo_id,
     selected_todo_sha256: selectedHash,
-    selected_todo_first_line: firstLine
+    selected_todo_first_line: firstLine,
+    target_scope_key: selectedTargetScope || null,
+    verification_command: selectedVerification || null
   };
   fs.mkdirSync(path.dirname(blockedPath), { recursive: true, mode: 0o700 });
   fs.appendFileSync(blockedPath, `${JSON.stringify(record, Object.keys(record).sort())}\n`, { encoding: 'utf8', mode: 0o600 });
@@ -1746,6 +1802,7 @@ function maybeWriteTodoContractReplanFeedback(repoRoot, diagnostic, ledgerSummar
       'Do not repeat the same workspace.write patch and do not keep trying to satisfy an impossible single-target contract.',
       'First decide whether the selected TODO is too narrow for its verification and completion condition.',
       'If the allowed patch target cannot satisfy the failed verification semantically, patch .brownie/todo.md and .brownie/todo-breakdown.md to replace this leaf with implementable child leaves that preserve the parent intent.',
+      'A replacement leaf must materially differ in its patch target scope or verification command; do not mint a new leaf id for the same target-and-verification contract.',
       'Use separate implementation and test/evidence leaves when production code and tests must both change.',
       'Do not weaken guards/tests, do not invent release evidence values, and do not declare Runtime Product Ready.'
     ].join(' '),
@@ -1755,6 +1812,7 @@ function maybeWriteTodoContractReplanFeedback(repoRoot, diagnostic, ledgerSummar
       must_not_only_make_checks_green: true,
       must_not_weaken_guards_or_tests: true,
       must_not_repeat_failed_patch_or_same_leaf_attempt: true,
+      must_materially_change_target_scope_or_verification: true,
       allowed_next_actions: [
         'inspect selected TODO contract and failed verification',
         'patch .brownie/todo.md and .brownie/todo-breakdown.md to replace the selected leaf when its target scope is insufficient',
