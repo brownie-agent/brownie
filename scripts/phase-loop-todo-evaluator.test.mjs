@@ -236,6 +236,37 @@ test('skips stalled replan blocked IDs across queue fingerprints regardless of T
   assert(selected.startsWith('- [ ] E-22b-replan-stalled-leaf-4030af97e57f:'), selected);
 });
 
+test('rejects a replan leaf that only changes its id, but permits a materially different verification route', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const repeated = `- [ ] E-23a-release-artifact-portable-archive-leaf-02: Patch only \`scripts/release-local-artifact.mjs\`:
+  Route: implementation.
+  Source TODO: E-23a-replan-stalled-leaf-parent.
+  Depends on: <none>.
+  Completion condition: archive is portable.
+  Forbidden changes: do not weaken checks.
+  Verification: run \`pnpm --workspace-root release:portable-archive:test\`.`;
+  const distinct = `- [ ] E-23a-release-artifact-portable-archive-leaf-03: Patch only \`scripts/release-local-artifact.mjs\`:
+  Route: implementation.
+  Source TODO: E-23a-replan-stalled-leaf-parent.
+  Depends on: <none>.
+  Completion condition: archive is portable with an independently exercised verifier.
+  Forbidden changes: do not weaken checks.
+  Verification: run \`pnpm --workspace-root release:portable-archive:integration:test\`.`;
+  const queue = `${repeated}\n${distinct}`;
+  fs.writeFileSync(blocked, `${JSON.stringify({
+    block_reason: 'stalled_leaf_contract_replan',
+    controller_fingerprint: 'current-controller',
+    selected_todo_first_line: repeated.split('\n')[0],
+    target_scope_key: 'scripts/release-local-artifact.mjs',
+    verification_command: 'run \`pnpm --workspace-root release:portable-archive:test\`'
+  })}\n`);
+
+  const selected = selectFirstSchedulableTodo(queue, { blockedPath: blocked, controllerFingerprint: 'current-controller' });
+
+  assert.equal(selected, distinct);
+});
+
 test('retries a stalled TODO after the controller fingerprint changes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');

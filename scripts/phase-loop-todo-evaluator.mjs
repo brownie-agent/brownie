@@ -77,6 +77,15 @@ function boundedScopes(block) {
   return [...match[1].matchAll(/`([^`\n]+)`/g)].map((entry) => entry[1]);
 }
 
+function targetScopeKey(block) {
+  return boundedScopes(block).map((scope) => scope.trim()).filter(Boolean).sort().join('|');
+}
+
+function verificationCommand(block) {
+  const line = block.split('\n').map((entry) => entry.trim()).find((entry) => entry.startsWith('Verification:'));
+  return line?.slice('Verification:'.length).trim() ?? '';
+}
+
 export function isExplicitBlockerTodo(block) {
   if (!block || typeof block !== 'string') {
     return false;
@@ -206,7 +215,8 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
       currentControllerHashes: new Set(),
       currentControllerFirstLines: new Set(),
       stableIds: new Set(),
-      stablePrefixes: new Set()
+      stablePrefixes: new Set(),
+      stableScopeContracts: new Set()
     };
   }
   const hashes = new Set();
@@ -215,6 +225,7 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
   const currentControllerFirstLines = new Set();
   const stableIds = new Set();
   const stablePrefixes = new Set();
+  const stableScopeContracts = new Set();
   for (const line of fs.readFileSync(blockedPath, 'utf8').split('\n')) {
     if (!line.trim()) {
       continue;
@@ -243,6 +254,9 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
         const matchesController = !controllerFingerprint || record.controller_fingerprint === controllerFingerprint;
         if (blockedId && stalledLeafContractReplan && matchesController) {
           stableIds.add(blockedId);
+          if (typeof record.target_scope_key === 'string' && record.target_scope_key && typeof record.verification_command === 'string' && record.verification_command) {
+            stableScopeContracts.add(`${record.target_scope_key}\u0000${record.verification_command}`);
+          }
           continue;
         }
         if (
@@ -265,7 +279,7 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
       // Ignore corrupt historical blocked entries; the phase-loop guard remains fail-closed elsewhere.
     }
   }
-  return { hashes, firstLines, currentControllerHashes, currentControllerFirstLines, stableIds, stablePrefixes };
+  return { hashes, firstLines, currentControllerHashes, currentControllerFirstLines, stableIds, stablePrefixes, stableScopeContracts };
 }
 
 export function selectFirstSchedulableTodo(text, options = {}) {
@@ -339,6 +353,14 @@ export function selectFirstSchedulableTodo(text, options = {}) {
       // A blocked record is not completion evidence. Dependents remain blocked
       // until the shared TODO state marks this id completed or resolves a
       // superseded parent through all of its generated children.
+      dependencyBlockedIds.add(id);
+      continue;
+    }
+    const scopeContract = `${targetScopeKey(block)}\u0000${verificationCommand(block)}`;
+    if (isDerivedLeaf(block) && blocked.stableScopeContracts.has(scopeContract)) {
+      // A replan may change IDs, but it must change the actual work contract.
+      // Otherwise the scheduler would repeatedly retry the same target and
+      // verification path while presenting it as new work.
       dependencyBlockedIds.add(id);
       continue;
     }
