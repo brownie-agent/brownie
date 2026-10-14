@@ -166,7 +166,16 @@ impl WorkspaceReadExecutor {
         relative_path: &str,
         max_bytes: usize,
     ) -> anyhow::Result<ToolExecutionResult> {
-        match Self::try_read(workspace_root, relative_path, max_bytes) {
+        Self::read_from_offset(workspace_root, relative_path, 0, max_bytes)
+    }
+
+    pub fn read_from_offset(
+        workspace_root: &Path,
+        relative_path: &str,
+        offset_bytes: usize,
+        max_bytes: usize,
+    ) -> anyhow::Result<ToolExecutionResult> {
+        match Self::try_read(workspace_root, relative_path, offset_bytes, max_bytes) {
             Ok(result) => Ok(result),
             Err(error) => Ok(ToolExecutionResult {
                 tool_id: WORKSPACE_READ_TOOL_ID.to_string(),
@@ -179,6 +188,7 @@ impl WorkspaceReadExecutor {
     fn try_read(
         workspace_root: &Path,
         relative_path: &str,
+        offset_bytes: usize,
         max_bytes: usize,
     ) -> anyhow::Result<ToolExecutionResult> {
         if relative_path.trim().is_empty() {
@@ -233,11 +243,21 @@ impl WorkspaceReadExecutor {
 
         let bytes = fs::read(&canonical_target)
             .with_context(|| format!("failed to read {}", relative_path))?;
-        let truncated = bytes.len() > max_bytes;
-        let read_len = bytes.len().min(max_bytes);
-        let content = std::str::from_utf8(&bytes[..read_len])
-            .context("workspace.read supports UTF-8 text files only")?
-            .to_string();
+        let text =
+            std::str::from_utf8(&bytes).context("workspace.read supports UTF-8 text files only")?;
+        if offset_bytes > bytes.len() {
+            bail!("workspace.read offset_bytes must not exceed the file length");
+        }
+        let mut start = offset_bytes;
+        while start < bytes.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = start.saturating_add(max_bytes).min(bytes.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let content = text[start..end].to_string();
+        let truncated = end < bytes.len();
 
         Ok(ToolExecutionResult {
             tool_id: WORKSPACE_READ_TOOL_ID.to_string(),
@@ -247,7 +267,9 @@ impl WorkspaceReadExecutor {
                 "content": content,
                 "content_sha256": sha256_fingerprint(&bytes),
                 "truncated": truncated,
-                "bytes_read": read_len,
+                "offset_bytes": start,
+                "bytes_read": end.saturating_sub(start),
+                "bytes_end": end,
                 "bytes_total": bytes.len(),
             }),
         })
@@ -340,7 +362,22 @@ impl ToolExecutor {
                         output: json!({ "reason": "workspace.read input.path must be a string." }),
                     });
                 };
-                WorkspaceReadExecutor::read(workspace_root, path, MAX_WORKSPACE_READ_BYTES)
+                let offset_bytes = match workspace_read_offset_bytes(&request.input) {
+                    Ok(offset) => offset,
+                    Err(reason) => {
+                        return Ok(ToolExecutionResult {
+                            tool_id: request.tool_id,
+                            status: ToolExecutionStatus::Failed,
+                            output: json!({ "reason": reason }),
+                        })
+                    }
+                };
+                WorkspaceReadExecutor::read_from_offset(
+                    workspace_root,
+                    path,
+                    offset_bytes,
+                    MAX_WORKSPACE_READ_BYTES,
+                )
             }
             CODEBASE_INDEX_SELECTION_READ_TOOL_ID => Ok(ToolExecutionResult {
                 tool_id: request.tool_id,
@@ -399,7 +436,22 @@ impl ToolExecutor {
                 output: json!({ "reason": "workspace.read input.path must be a string." }),
             });
         };
-        WorkspaceReadExecutor::read(workspace_root, path, MAX_WORKSPACE_READ_BYTES)
+        let offset_bytes = match workspace_read_offset_bytes(&request.input) {
+            Ok(offset) => offset,
+            Err(reason) => {
+                return Ok(ToolExecutionResult {
+                    tool_id: request.tool_id,
+                    status: ToolExecutionStatus::Failed,
+                    output: json!({ "reason": reason }),
+                })
+            }
+        };
+        WorkspaceReadExecutor::read_from_offset(
+            workspace_root,
+            path,
+            offset_bytes,
+            MAX_WORKSPACE_READ_BYTES,
+        )
     }
 }
 
@@ -4174,7 +4226,19 @@ fn preflight_workspace_read_input(input: &Value) -> Result<(), &'static str> {
     let Some(path) = input.get("path").and_then(Value::as_str) else {
         return Err("workspace.read input.path must be a string.");
     };
-    preflight_workspace_read_path(path)
+    preflight_workspace_read_path(path)?;
+    workspace_read_offset_bytes(input).map(|_| ())
+}
+
+fn workspace_read_offset_bytes(input: &Value) -> Result<usize, &'static str> {
+    let Some(value) = input.get("offset_bytes") else {
+        return Ok(0);
+    };
+    let Some(offset) = value.as_u64() else {
+        return Err("workspace.read input.offset_bytes must be a non-negative integer.");
+    };
+    usize::try_from(offset)
+        .map_err(|_| "workspace.read input.offset_bytes exceeds the runtime address space.")
 }
 
 fn preflight_verification_cargo_fmt_check_input(input: &Value) -> Result<(), &'static str> {
@@ -6266,6 +6330,29 @@ mod tests {
             result.output["content_sha256"],
             sha256_fingerprint("abcdef".as_bytes())
         );
+    }
+
+    #[test]
+    fn workspace_read_executor_reads_a_distinct_utf8_safe_range() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("large.log"), "abédef").expect("write");
+
+        let result = WorkspaceReadExecutor::read_from_offset(temp.path(), "large.log", 3, 3)
+            .expect("read result");
+
+        assert_eq!(result.status, ToolExecutionStatus::Completed);
+        assert_eq!(result.output["offset_bytes"], 4);
+        assert_eq!(result.output["content"], "def");
+        assert_eq!(result.output["bytes_end"], 7);
+        assert_eq!(result.output["truncated"], false);
+    }
+
+    #[test]
+    fn workspace_read_offset_input_rejects_non_integer_values() {
+        assert!(workspace_read_offset_bytes(&json!({"path": "README.md"})).is_ok());
+        assert!(workspace_read_offset_bytes(&json!({"offset_bytes": 12})).is_ok());
+        assert!(workspace_read_offset_bytes(&json!({"offset_bytes": -1})).is_err());
+        assert!(workspace_read_offset_bytes(&json!({"offset_bytes": "12"})).is_err());
     }
 
     #[test]
