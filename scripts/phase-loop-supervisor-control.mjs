@@ -508,8 +508,14 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     .filter((entry) => entry?.todo_id === todoId)
     .slice(-12);
   const currentTargetScope = targetScopeKey(firstLine);
-  const sameScopeEvents = currentTargetScope
-    ? events.filter((entry) => (entry?.target_scope_key || targetScopeKey(entry?.selected_todo_first_line)) === currentTargetScope).slice(-24)
+  const currentEvent = currentEventResult?.event
+    ?? [...events].reverse().find((entry) => entry?.todo_id === todoId && entry?.selected_todo_first_line === firstLine);
+  const currentVerification = currentEvent?.verification_command ?? '';
+  const sameScopeEvents = currentTargetScope && currentVerification
+    ? events.filter((entry) => (
+      (entry?.target_scope_key || targetScopeKey(entry?.selected_todo_first_line)) === currentTargetScope
+      && entry?.verification_command === currentVerification
+    )).slice(-24)
     : [];
   const sameScopeTodoIds = new Set(sameScopeEvents.map((entry) => entry?.todo_id).filter(Boolean));
   const counts = sameTodoEvents.reduce((acc, entry) => {
@@ -602,6 +608,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     })),
     counts,
     target_scope_key: currentTargetScope || null,
+    verification_command: currentVerification || null,
     target_scope_event_count: sameScopeEvents.length,
     target_scope_distinct_todo_count: sameScopeTodoIds.size,
     current_progress_fingerprint: progressFingerprint,
