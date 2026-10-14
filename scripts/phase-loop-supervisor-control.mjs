@@ -1165,19 +1165,26 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   const todoText = fs.readFileSync(todoPath, 'utf8');
   const replanFeedback = readJsonOrNull(feedbackPath);
   // A terminal no_eligible_task projection selects the source leaf after the
-  // worker has already exhausted its generated replan.  Use only the durable
-  // replan feedback's exact source binding to rediscover that replan; never
-  // infer one from an unrelated TODO in the queue.
-  if (!isStalledLeafReplanId(selectedId)
-    && replanFeedback?.kind === 'phase_loop_todo_contract_replan_feedback') {
-    const feedbackSourceId = todoIdFromFirstLine(replanFeedback.selected_todo_first_line);
-    if (feedbackSourceId === selectedId) {
-      const matchingReplan = todoBlocks(todoText).find((block) => {
-        const candidateId = todoIdFromBlock(block.block);
-        return isStalledLeafReplanId(candidateId)
-          && sourceTodoFromBlock(block.block) === feedbackSourceId;
-      });
-      selectedId = todoIdFromBlock(matchingReplan?.block) ?? selectedId;
+  // worker has already exhausted its generated replan.  A later semantic
+  // verification packet can legitimately replace the original replan packet,
+  // so derive the association from the live queue as well as from durable
+  // feedback.  Require exactly one matching live replan to avoid recovering
+  // an unrelated source leaf.
+  if (!isStalledLeafReplanId(selectedId)) {
+    const feedbackSourceId = replanFeedback?.kind === 'phase_loop_todo_contract_replan_feedback'
+      ? todoIdFromFirstLine(replanFeedback.selected_todo_first_line)
+      : null;
+    // A durable replan packet is an exact source binding.  If it disagrees
+    // with the terminal projection, leave both records untouched rather than
+    // inferring a different replan from the queue.
+    const sourceId = feedbackSourceId ?? selectedId;
+    const matchingReplans = todoBlocks(todoText).filter((block) => {
+      const candidateId = todoIdFromBlock(block.block);
+      return isStalledLeafReplanId(candidateId)
+        && sourceTodoFromBlock(block.block) === sourceId;
+    });
+    if ((feedbackSourceId === null || feedbackSourceId === selectedId) && matchingReplans.length === 1) {
+      selectedId = todoIdFromBlock(matchingReplans[0].block) ?? selectedId;
     }
   }
   if (!terminalNoProposal || !isStalledLeafReplanId(selectedId)) {
