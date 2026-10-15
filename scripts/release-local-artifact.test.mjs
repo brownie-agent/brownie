@@ -1,13 +1,49 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 
 import {
   buildPlanForTarget,
+  createPortableArchive,
   releaseArtifactBuildTimeoutMs,
   releaseArtifactSetupTimeoutMs,
   releaseArtifactSmokeTimeoutMs,
   releaseArtifactSmokeArgs
 } from './release-local-artifact.mjs';
+
+test('portable archive contains relocatable evidence and executable payloads', () => {
+  const outFull = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-release-archive-test-'));
+  const entries = ['brownie', 'brownie-runtime', 'SHA256SUMS', 'artifact-evidence.json', 'smoke-evidence.json'];
+  fs.writeFileSync(path.join(outFull, 'brownie'), 'cli');
+  fs.writeFileSync(path.join(outFull, 'brownie-runtime'), 'runtime');
+  fs.chmodSync(path.join(outFull, 'brownie'), 0o755);
+  fs.chmodSync(path.join(outFull, 'brownie-runtime'), 0o755);
+  const digest = (name) => `sha256:${crypto.createHash('sha256').update(fs.readFileSync(path.join(outFull, name))).digest('hex')}`;
+  fs.writeFileSync(path.join(outFull, 'SHA256SUMS'), 'stale  .brownie/release-evidence/artifacts/darwin-arm64/brownie\n');
+  fs.writeFileSync(path.join(outFull, 'artifact-evidence.json'), JSON.stringify({ artifact: { path: 'old', sha256: digest('brownie') }, runtime_companion: { path: 'old-runtime', sha256: digest('brownie-runtime') } }));
+  fs.writeFileSync(path.join(outFull, 'smoke-evidence.json'), JSON.stringify({ artifact_path: 'old' }));
+  const archive = createPortableArchive({ outFull, target: 'darwin-arm64', entries });
+  assert.ok(fs.existsSync(archive.path));
+  const extracted = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-release-extract-test-'));
+  if (process.platform === 'win32') {
+    assert.equal(spawnSync('powershell.exe', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${archive.path.replace(/'/g, "''")}' -DestinationPath '${extracted.replace(/'/g, "''")}' -Force`]).status, 0);
+  } else {
+    assert.equal(spawnSync('tar', ['-xzf', archive.path, '-C', extracted]).status, 0);
+  }
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(path.join(extracted, 'brownie')).mode & 0o111, 0o111);
+    assert.equal(fs.statSync(path.join(extracted, 'brownie-runtime')).mode & 0o111, 0o111);
+  }
+  assert.equal(JSON.parse(fs.readFileSync(path.join(extracted, 'artifact-evidence.json'))).artifact.path, 'brownie');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(extracted, 'smoke-evidence.json'))).artifact_path, 'brownie');
+  const sums = Object.fromEntries(fs.readFileSync(path.join(extracted, 'SHA256SUMS'), 'utf8').trim().split('\n').map((line) => line.split(/  /u).reverse()));
+  assert.equal(sums.brownie, digest('brownie').replace('sha256:', ''));
+  assert.equal(sums['brownie-runtime'], digest('brownie-runtime').replace('sha256:', ''));
+});
 
 test('release build and toolchain setup have CI-safe time budgets', () => {
   assert(releaseArtifactBuildTimeoutMs >= 10 * 60_000);

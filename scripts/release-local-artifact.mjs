@@ -169,7 +169,7 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function createPortableArchive({ outFull, target, entries }) {
+export function createPortableArchive({ outFull, target, entries }) {
   const archiveName = `brownie-${target}.${process.platform === 'win32' ? 'zip' : 'tar.gz'}`;
   const archivePath = path.join(outFull, archiveName);
   const missing = entries.filter((entry) => !fs.existsSync(path.join(outFull, entry)));
