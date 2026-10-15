@@ -473,6 +473,12 @@ function appendFailureLedgerEvent(repoRoot, diagnostic) {
     progress_classification: diagnostic.progress?.classification ?? null,
     progress_run_stamp: diagnostic.progress?.run_stamp ?? null,
     progress_fingerprint: diagnostic.progress?.last_progress_fingerprint ?? null,
+    // Persist the projection's stop class so terminal failures can be counted
+    // independently from ordinary no-progress observations after claim
+    // migrations or controller restarts.
+    projection_stop_class: diagnostic.progress?.projection_stop_class
+      ?? diagnostic.progress?.progress_projection?.stop_class
+      ?? null,
     same_progress_count: Number(diagnostic.progress?.same_progress_count ?? 0),
     claim_id: claimId,
     issue_codes: [...issueCodes(diagnostic)].sort()
@@ -600,11 +606,18 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   // A terminal runtime failure with several durable observations for exactly
   // one target is not a replan problem: restarting the same leaf would feed
   // the same malformed or non-actionable tool response back into the runner.
-  // Escalate it to an implementer handoff before it can become an unbounded
-  // retry loop.
-  const repeatedTerminalFailureOnSingleTarget = diagnostic.progress?.projection_stop_class === 'terminal_failure'
+  // Count only terminal observations in the current progress epoch; generic
+  // no-progress history must not create a false implementation handoff.
+  const currentProjectionStopClass = diagnostic.progress?.projection_stop_class
+    ?? diagnostic.progress?.progress_projection?.stop_class
+    ?? null;
+  const terminalScopeEventsForEpoch = sameScopeEvents.filter((entry) => (
+    entry?.projection_stop_class === 'terminal_failure'
+    && (!progressFingerprint || entry?.progress_fingerprint === progressFingerprint)
+  ));
+  const repeatedTerminalFailureOnSingleTarget = currentProjectionStopClass === 'terminal_failure'
     && sameScopeTodoIds.size === 1
-    && sameScopeEvents.length >= 3;
+    && terminalScopeEventsForEpoch.length >= 3;
   // Do not infer a verification command for old ledger rows.  Instead, make
   // the rebaseline explicit: repeated legacy failures on the same target
   // require a decomposition before another leaf can claim that contract.
@@ -627,14 +640,17 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   );
   let replanReason = 'threshold_not_met';
   if (shouldReplan) {
-    if (progressSameCount >= 3) {
+    if (repeatedTerminalFailureOnSingleTarget) {
+      // This must take precedence over generic no-progress thresholds: a
+      // reproduced terminal failure needs an implementer handoff, not another
+      // generated replan of the same leaf.
+      replanReason = 'same_target_scope_terminal_failure_threshold';
+    } else if (progressSameCount >= 3) {
       replanReason = 'same_todo_no_progress_threshold';
     } else if (repeatedNoProgressInLedger) {
       replanReason = 'same_todo_no_progress_ledger_threshold';
     } else if (repeatedTargetScopeFailure) {
       replanReason = 'same_target_scope_replan_leaf_threshold';
-    } else if (repeatedTerminalFailureOnSingleTarget) {
-      replanReason = 'same_target_scope_terminal_failure_threshold';
     } else if (legacyTargetScopeRebaselineRequired) {
       replanReason = 'legacy_target_scope_rebaseline_required';
     } else if (invalidPatchWithRepeatedNoProgress) {
@@ -668,6 +684,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     verification_command: currentVerification || null,
     target_scope_event_count: sameScopeEvents.length,
     target_scope_distinct_todo_count: sameScopeTodoIds.size,
+    terminal_target_scope_event_count: terminalScopeEventsForEpoch.length,
     repeated_terminal_failure_on_single_target: repeatedTerminalFailureOnSingleTarget,
     legacy_target_scope_event_count: legacyScopeEvents.length,
     current_progress_fingerprint: progressFingerprint,

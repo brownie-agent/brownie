@@ -385,6 +385,7 @@ test('delegates repeated terminal runtime failure for one target instead of rest
   });
   writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
     classification: 'no_progress', same_progress_count: 1, run_stamp: '20261008T015000Z',
+    last_progress_fingerprint: 'terminal-epoch',
     progress_projection: {
       cli_status: 'no_eligible_task', stop_class: 'terminal_failure',
       claim_id: 'claim-terminal', selected_todo: runtimeEvidenceTodo
@@ -400,7 +401,8 @@ test('delegates repeated terminal runtime failure for one target instead of rest
     schema_version: 1, record_type: 'phase_loop_failure_event', event_id: `terminal-${index}`,
     observed_at: `2026-10-08T00:3${index}:00Z`, todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02',
     selected_todo_first_line: firstLine, target_scope_key: targetScope, verification_command: verification,
-    kind: 'no_progress', status_run_id: `terminal-run-${index}`, progress_run_stamp: `terminal-run-${index}`
+    kind: 'no_progress', status_run_id: `terminal-run-${index}`, progress_run_stamp: `terminal-run-${index}`,
+    progress_fingerprint: 'terminal-epoch', projection_stop_class: 'terminal_failure'
   })).join('\n') + '\n');
 
   const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
@@ -408,8 +410,45 @@ test('delegates repeated terminal runtime failure for one target instead of rest
 
   assert.equal(result.repair.failure_ledger_summary.replan_reason, 'same_target_scope_terminal_failure_threshold');
   assert.equal(result.repair.failure_ledger_summary.repeated_terminal_failure_on_single_target, true);
+  assert.equal(result.repair.failure_ledger_summary.terminal_target_scope_event_count, 3);
   assert.equal(result.repair.delegation_pending.ok, true, JSON.stringify(result, null, 2));
   assert.equal(feedback.kind, 'phase_loop_delegation_pending');
+});
+
+test('does not delegate a terminal failure from mixed no-progress history', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const firstLine = runtimeEvidenceTodo.split('\n')[0];
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress', run_id: 'run-mixed-terminal-history', consecutive_failures: 1
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1, last_progress_fingerprint: 'terminal-epoch',
+    progress_projection: {
+      cli_status: 'no_eligible_task', stop_class: 'terminal_failure',
+      claim_id: 'claim-mixed-terminal', selected_todo: runtimeEvidenceTodo
+    }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-mixed-terminal', status: 'claimed', selected_todo: runtimeEvidenceTodo
+  });
+  const ledgerPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  const targetScope = 'scripts/guard-runtime-operational-evidence.test.mjs';
+  const verification = 'run `pnpm --workspace-root release:runtime-operational-evidence:test`.';
+  fs.writeFileSync(ledgerPath, [0, 1].map((index) => JSON.stringify({
+    schema_version: 1, record_type: 'phase_loop_failure_event', event_id: `mixed-${index}`,
+    observed_at: `2026-10-08T01:0${index}:00Z`, todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02',
+    selected_todo_first_line: firstLine, target_scope_key: targetScope, verification_command: verification,
+    kind: 'no_progress', status_run_id: `mixed-run-${index}`, progress_run_stamp: `mixed-run-${index}`,
+    progress_fingerprint: 'terminal-epoch', projection_stop_class: 'no_progress'
+  })).join('\n') + '\n');
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.failure_ledger_summary.repeated_terminal_failure_on_single_target, false);
+  assert.equal(result.repair.failure_ledger_summary.terminal_target_scope_event_count, 1);
+  assert.notEqual(result.repair.failure_ledger_summary.replan_reason, 'same_target_scope_terminal_failure_threshold');
+  assert.notEqual(result.repair.delegation_pending.ok, true, JSON.stringify(result, null, 2));
 });
 
 test('does not aggregate a replacement leaf with a different verification contract', () => {
