@@ -1293,11 +1293,44 @@ function pruneDependsOn(todoText, idsToRemove) {
         return line;
       }
       const nextValue = remaining.length > 0 ? remaining.join(', ') : '<none>';
-      pruned.push({ from: raw, to: nextValue });
+      pruned.push({
+        from: raw,
+        to: nextValue,
+        pruned_dependency_ids: dependencies.filter((dependency) => idsToRemove.has(dependency))
+      });
       return `${prefix}${nextValue}${trailing}`;
     }
   );
   return { text, changed: pruned.length > 0, pruned };
+}
+
+function writeCompletedDependencyRebaselineReceipt(repoRoot, { beforeTodoText, afterTodoText, prunedDependencyLines, completedIds }) {
+  const completedPrunes = (prunedDependencyLines ?? []).filter((entry) => (
+    Array.isArray(entry.pruned_dependency_ids) &&
+    entry.pruned_dependency_ids.length > 0 &&
+    entry.pruned_dependency_ids.every((dependency) => completedIds.has(dependency))
+  ));
+  if (completedPrunes.length === 0) {
+    return null;
+  }
+  const directory = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/dependency-rebaselines');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const timestamp = new Date().toISOString();
+  const receipt = {
+    schema_version: 1,
+    record_type: 'completed_dependency_pruned_rebaseline',
+    generated_at: timestamp,
+    controller: 'phase-loop-supervisor-control',
+    todo_path: '.brownie/todo.md',
+    before_todo_sha256: crypto.createHash('sha256').update(beforeTodoText).digest('hex'),
+    after_todo_sha256: crypto.createHash('sha256').update(afterTodoText).digest('hex'),
+    pruned_dependency_lines: completedPrunes
+  };
+  const stamp = timestamp.replace(/[-:.]/gu, '').replace(/Z$/u, 'Z');
+  const receiptPath = path.join(directory, `${stamp}-${crypto.createHash('sha256').update(JSON.stringify(receipt)).digest('hex').slice(0, 12)}.json`);
+  fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  fsyncFileAndParent(receiptPath);
+  return path.relative(repoRoot, receiptPath);
 }
 
 function removeBreakdownRepairSections(breakdownText, idsToRemove) {
@@ -1367,6 +1400,12 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
   const prunedDepends = pruneDependsOn(removedBlocks.text, idsToRemove);
   fs.writeFileSync(todoPath, prunedDepends.text, { encoding: 'utf8', mode: 0o600 });
   fsyncFileAndParent(todoPath);
+  const dependencyRebaselineReceipt = writeCompletedDependencyRebaselineReceipt(repoRoot, {
+    beforeTodoText: todoText,
+    afterTodoText: prunedDepends.text,
+    prunedDependencyLines: prunedDepends.pruned,
+    completedIds
+  });
 
   let breakdownRemoved = [];
   if (fs.existsSync(breakdownPath)) {
@@ -1383,10 +1422,11 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
     attempted: true,
     ok: true,
     changed: true,
-    paths: ['.brownie/todo.md', ...(breakdownRemoved.length > 0 ? ['.brownie/todo-breakdown.md'] : [])],
+    paths: ['.brownie/todo.md', ...(breakdownRemoved.length > 0 ? ['.brownie/todo-breakdown.md'] : []), ...(dependencyRebaselineReceipt ? [dependencyRebaselineReceipt] : [])],
     removed_todo_ids: removedBlocks.removed,
     invalidated_completion_record_count: todoState.invalidatedCompletionRecords.length,
     pruned_dependency_lines: prunedDepends.pruned,
+    dependency_rebaseline_receipt: dependencyRebaselineReceipt,
     removed_breakdown_sections: breakdownRemoved,
     reasons
   };

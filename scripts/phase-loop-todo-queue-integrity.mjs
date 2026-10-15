@@ -306,6 +306,27 @@ export function validateTodoQueueIntegrity({ todoBefore, todoAfter, completedTod
     const drift = contractDrift(beforeBlock, afterBlock);
     if (drift.length > 0) {
       changedTodoIds.push(id);
+      const beforeDependencies = lineValue(beforeBlock, 'Depends on')
+        .split(/\s*,\s*/u).map((entry) => entry.trim()).filter((entry) => entry && entry !== '<none>');
+      const afterDependencyValue = lineValue(afterBlock, 'Depends on');
+      const afterDependencies = afterDependencyValue
+        .split(/\s*,\s*/u).map((entry) => entry.trim()).filter((entry) => entry && entry !== '<none>');
+      if (
+        drift.length === 1
+        && drift[0] === 'depends_on'
+        && afterDependencyValue === '<none>'
+        && afterDependencies.length === 0
+        && beforeDependencies.length > 0
+        && beforeDependencies.every((dependency) => completedIds.has(dependency))
+      ) {
+        warnings.push({
+          code: 'completed_dependency_pruned_rebaseline',
+          message: 'A live TODO dependency was pruned only because every referenced prerequisite has durable completion evidence.',
+          todo_id: id,
+          pruned_dependency_ids: beforeDependencies
+        });
+        continue;
+      }
       errors.push({
         code: 'todo_contract_drift',
         message: 'A surviving TODO changed protected contract fields before claim selection.',

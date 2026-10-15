@@ -78,15 +78,20 @@ test('allows a TODO checked in the live queue to serve as durable completion evi
   assert(result.completed_todo_ids.includes('E-20a-golden-journey-workspace-mutation'));
 });
 
-test('rejects dependent TODO dependency rewrite even when prerequisite is completed', () => {
+test('allows pruning every completed prerequisite from a dependent TODO and records a rebaseline warning', () => {
   const result = validateTodoQueueIntegrity({
     todoBefore: queue(e20a, e20b),
     todoAfter: queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.')),
     completedTodoIds: ['E-20a-golden-journey-workspace-mutation']
   });
 
-  assert.equal(result.valid, false);
-  assert(result.errors.some((error) => error.code === 'todo_contract_drift' && error.todo_id === 'E-20b-stateful-soak-real-workload'));
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.deepEqual(result.warnings.find((warning) => warning.code === 'completed_dependency_pruned_rebaseline'), {
+    code: 'completed_dependency_pruned_rebaseline',
+    message: 'A live TODO dependency was pruned only because every referenced prerequisite has durable completion evidence.',
+    todo_id: 'E-20b-stateful-soak-real-workload',
+    pruned_dependency_ids: ['E-20a-golden-journey-workspace-mutation']
+  });
 });
 
 test('rejects removing a TODO without completion evidence', () => {
@@ -363,7 +368,7 @@ test('rejects completed TODO reappearing as an unchecked live queue item', () =>
   )), JSON.stringify(result.errors));
 });
 
-test('rejects dependency pruning across a three-item queue', () => {
+test('allows dependency pruning across a three-item queue only when the removed prerequisite is completed', () => {
   const result = validateTodoQueueIntegrity({
     todoBefore: queue(e20a, e20b, e20c),
     todoAfter: queue(
@@ -373,11 +378,41 @@ test('rejects dependency pruning across a three-item queue', () => {
     completedTodoIds: ['E-20a-golden-journey-workspace-mutation']
   });
 
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert(result.warnings.some((warning) => warning.code === 'completed_dependency_pruned_rebaseline'));
+});
+
+test('rejects partial dependency pruning even when one prerequisite is completed', () => {
+  const multiDependency = e20c.replace(
+    'Depends on: E-20b-stateful-soak-real-workload.',
+    'Depends on: E-20a-golden-journey-workspace-mutation, E-20b-stateful-soak-real-workload.'
+  );
+  const result = validateTodoQueueIntegrity({
+    todoBefore: queue(e20a, e20b, multiDependency),
+    todoAfter: queue(
+      e20a,
+      e20b,
+      multiDependency.replace('E-20a-golden-journey-workspace-mutation, ', '')
+    ),
+    completedTodoIds: ['E-20a-golden-journey-workspace-mutation']
+  });
+
   assert.equal(result.valid, false);
   assert(result.errors.some((error) => error.code === 'todo_contract_drift' && error.drift.includes('depends_on')));
 });
 
-test('CLI rejects dirty queue contract drift against HEAD', () => {
+test('rejects a blank dependency value when rebaselining a completed prerequisite', () => {
+  const result = validateTodoQueueIntegrity({
+    todoBefore: queue(e20a, e20b),
+    todoAfter: queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on:')),
+    completedTodoIds: ['E-20a-golden-journey-workspace-mutation']
+  });
+
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'todo_contract_drift' && error.drift.includes('depends_on')));
+});
+
+test('CLI accepts completed-dependency rebaseline against HEAD and emits an audit warning', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-queue-integrity-'));
   fs.mkdirSync(path.join(tmp, '.brownie/private/phase-loop/todo-completions'), { recursive: true });
   fs.writeFileSync(path.join(tmp, '.brownie/todo.md'), queue(e20a, e20b));
@@ -393,13 +428,14 @@ test('CLI rejects dirty queue contract drift against HEAD', () => {
     queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'))
   );
 
-  assert.throws(() => {
-    execFileSync('node', [path.resolve('scripts/phase-loop-todo-queue-integrity.mjs'), '--repo', tmp, '--todo', '.brownie/todo.md'], {
-      cwd: path.resolve('.'),
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-  }, /todo_contract_drift/);
+  const output = execFileSync('node', [path.resolve('scripts/phase-loop-todo-queue-integrity.mjs'), '--repo', tmp, '--todo', '.brownie/todo.md'], {
+    cwd: path.resolve('.'),
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  const result = JSON.parse(output);
+  assert.equal(result.valid, true, output);
+  assert(result.warnings.some((warning) => warning.code === 'completed_dependency_pruned_rebaseline'));
 });
 
 test('CLI accepts parent TODO superseded by children when durable replan record exists', () => {

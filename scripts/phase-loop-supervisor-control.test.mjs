@@ -1212,6 +1212,10 @@ Parent TODO: E-21c-runtime-operational-evidence-impl-2-target-02
   assert.match(todo, /Depends on: <none>/u);
   assert.match(todo, /E-21c-runtime-operational-evidence-impl-2-target-03/u);
   assert.doesNotMatch(breakdown, /TODO-repair-E-21c-replan-stalled-leaf-/u);
+  assert.ok(result.repair.non_live_todo_residue.dependency_rebaseline_receipt, JSON.stringify(result, null, 2));
+  const receipt = JSON.parse(fs.readFileSync(path.join(repo, result.repair.non_live_todo_residue.dependency_rebaseline_receipt), 'utf8'));
+  assert.equal(receipt.record_type, 'completed_dependency_pruned_rebaseline');
+  assert.deepEqual(receipt.pruned_dependency_lines[0].pruned_dependency_ids, ['E-21c-runtime-operational-evidence-impl-2-target-02']);
   assert.equal(result.repair.post_repair_validation.ok, true, JSON.stringify(result, null, 2));
 });
 
