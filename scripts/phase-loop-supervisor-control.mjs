@@ -632,13 +632,16 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   // one target is not a replan problem: restarting the same leaf would feed
   // the same malformed or non-actionable tool response back into the runner.
   // Count only terminal observations; generic no-progress history must not
-  // create a false implementation handoff.  The durable scope remains across
-  // progress fingerprints because each matching run artifact proves that the
-  // controller reached the same terminal class rather than merely retrying.
+  // create a false implementation handoff.  Fingerprinted records stay in
+  // their progress epoch; only genuine legacy rows without a fingerprint may
+  // be reclassified from immutable run evidence across that boundary.
   const currentProjectionStopClass = diagnostic.progress?.projection_stop_class
     ?? diagnostic.progress?.progress_projection?.stop_class
     ?? null;
-  const terminalScopeEvents = sameScopeEvents.filter((entry) => entry?.projection_stop_class === 'terminal_failure');
+  const terminalScopeEvents = sameScopeEvents.filter((entry) => (
+    entry?.projection_stop_class === 'terminal_failure'
+    && (!entry?.progress_fingerprint || !progressFingerprint || entry.progress_fingerprint === progressFingerprint)
+  ));
   const repeatedTerminalFailureOnSingleTarget = currentProjectionStopClass === 'terminal_failure'
     && sameScopeTodoIds.size === 1
     && terminalScopeEvents.length >= 3;

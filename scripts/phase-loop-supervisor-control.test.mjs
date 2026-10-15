@@ -466,7 +466,7 @@ test('rebaselines legacy terminal failures only from matching run stdout evidenc
     schema_version: 1, record_type: 'phase_loop_failure_event', event_id: `legacy-terminal-${index}`,
     todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02', selected_todo_first_line: firstLine,
     target_scope_key: targetScope, verification_command: verification, kind: 'no_progress',
-    status_run_id: `run_a${index}b${index}`, progress_run_stamp: `20261008T01010${index}Z`
+    status_run_id: `run_a${index}b${index}`, progress_run_stamp: `20261008T01010${index}Z`, progress_fingerprint: null
   }));
   fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl'), `${rows.map(JSON.stringify).join('\n')}\n`);
   for (const row of rows) {
