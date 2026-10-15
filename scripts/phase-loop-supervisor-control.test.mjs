@@ -99,6 +99,90 @@ Quality rubric:
   execFileSync('git', ['commit', '-m', 'todo fixture'], { cwd: repo, stdio: 'ignore' });
 }
 
+test('reconciles an acknowledged reviewed merged delegation into a durable completion receipt', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const mergedCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
+    schema_version: 1,
+    kind: 'phase_loop_delegation_pending',
+    completed: false,
+    selected_todo: runtimeEvidenceTodo,
+    delegation: {
+      required_actor: 'brownie-agent',
+      status: 'acknowledged',
+      issue_or_pr_url: 'https://github.com/globalpocket/brownie/pull/999',
+      acknowledged_at: '2026-10-15T00:00:00Z',
+      implementation_commit_or_blocker: mergedCommit
+    },
+    verification: {
+      reviewed_by: 'globalpocket',
+      all_ci_checks_passed: true
+    }
+  });
+
+  const result = controlPhaseLoop({
+    repoRoot: repo,
+    write: false,
+    repair: true,
+    start: false,
+    delegationProvenanceVerifier(_repoRoot, pullRequestUrl, commit) {
+      assert.equal(pullRequestUrl, 'https://github.com/globalpocket/brownie/pull/999');
+      assert.equal(commit, mergedCommit);
+      return { ok: true };
+    }
+  });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+  const feedback = JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8'));
+  const completion = JSON.parse(fs.readFileSync(path.join(repo, result.repair.acknowledged_delegation_reconciliation.completion_path), 'utf8'));
+
+  assert.equal(result.repair.acknowledged_delegation_reconciliation.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.non_live_todo_residue.ok, true, JSON.stringify(result, null, 2));
+  assert.doesNotMatch(todo, /E-21c-runtime-operational-evidence-impl-2-target-02/u);
+  assert.equal(feedback.completed, true);
+  assert.equal(completion.selected_todo_id, 'E-21c-runtime-operational-evidence-impl-2-target-02');
+  assert.equal(completion.implementation_commit, mergedCommit);
+});
+
+test('fails closed when acknowledged delegation lacks independently reviewable merge evidence', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
+    schema_version: 1,
+    kind: 'phase_loop_delegation_pending',
+    completed: false,
+    selected_todo: runtimeEvidenceTodo,
+    delegation: {
+      required_actor: 'brownie-agent',
+      status: 'acknowledged',
+      issue_or_pr_url: 'https://github.com/globalpocket/brownie/pull/999',
+      acknowledged_at: '2026-10-15T00:00:00Z',
+      implementation_commit_or_blocker: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim()
+    },
+    verification: {
+      reviewed_by: 'globalpocket',
+      all_ci_checks_passed: true
+    }
+  });
+
+  const result = controlPhaseLoop({
+    repoRoot: repo,
+    write: false,
+    repair: true,
+    start: false,
+    delegationProvenanceVerifier() {
+      return { ok: false, reason: 'delegation_pull_request_provenance_mismatch' };
+    }
+  });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+
+  assert.equal(
+    result.repair.acknowledged_delegation_reconciliation.reason,
+    'delegation_pull_request_provenance_mismatch'
+  );
+  assert.match(todo, /E-21c-runtime-operational-evidence-impl-2-target-02/u);
+});
+
 test('dispatches a requested self-update instead of restarting the stale supervisor', () => {
   const repo = makeRepo();
   writeTodo(repo);
