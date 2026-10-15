@@ -15,10 +15,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x64
+            archive_name: brownie-linux-x64.tar.gz
           - os: macos-latest
             target: darwin-arm64
+            archive_name: brownie-darwin-arm64.tar.gz
           - os: windows-latest
             target: win32-x64
+            archive_name: brownie-win32-x64.zip
 
     steps:
       - name: Checkout source
@@ -69,6 +72,10 @@ jobs:
         run: |
           pnpm --workspace-root release:supply-chain-artifact-evidence
           pnpm --workspace-root guard:supply-chain-artifact-evidence
+
+      - name: Verify portable release archive
+        shell: bash
+        run: test -s ".brownie/release-evidence/artifacts/${{ matrix.target }}/${{ matrix.archive_name }}"
 
       - name: Run release gate contract guard
         run: pnpm --workspace-root guard:release-gate
