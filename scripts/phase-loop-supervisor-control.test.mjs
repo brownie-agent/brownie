@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { controlPhaseLoop } from './phase-loop-supervisor-control.mjs';
+import { controlPhaseLoop, inspectDelegationFeedback } from './phase-loop-supervisor-control.mjs';
 import { readTrackedBreakdownReplanRecords } from './phase-loop-todo-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -64,6 +64,20 @@ function writeJson(repo, relativePath, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
+
+test('delegation feedback parsing preserves acknowledgements and fails closed on malformed state', () => {
+  const repo = makeRepo();
+  const feedbackPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  fs.writeFileSync(feedbackPath, '{not-json');
+  assert.equal(inspectDelegationFeedback(feedbackPath).state, 'unreadable');
+
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
+    kind: 'phase_loop_delegation_pending',
+    completed: false,
+    delegation: { status: 'acknowledged', required_actor: 'brownie-agent' }
+  });
+  assert.equal(inspectDelegationFeedback(feedbackPath).state, 'acknowledged');
+});
 
 function writeTodo(repo) {
   fs.mkdirSync(path.join(repo, '.brownie'), { recursive: true });
@@ -343,6 +357,23 @@ test('escalates repeated target-and-verification contracts across replan leaf id
   assert.equal(result.repair.todo_contract_replan.reason, 'delegation_pending_blocks_same_scope_replan');
   assert.equal(feedback.kind, 'phase_loop_delegation_pending');
   assert.equal(feedback.delegation.required_actor, 'brownie-agent');
+
+  feedback.delegation.status = 'acknowledged';
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', feedback);
+  const acknowledged = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const preserved = JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8'));
+
+  assert.equal(acknowledged.repair.delegation_pending.reason, 'delegation_acknowledgement_preserved');
+  assert.equal(acknowledged.repair.semantic_verification.reason, 'delegation_pending_takes_precedence');
+  assert.equal(acknowledged.repair.invalid_patch.reason, 'delegation_pending_takes_precedence');
+  assert.equal(preserved.delegation.status, 'acknowledged');
+
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), '{truncated');
+  const malformed = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(malformed.repair.delegation_pending.reason, 'delegation_feedback_unreadable_fail_closed');
+  assert.equal(malformed.repair.semantic_verification.reason, 'delegation_pending_takes_precedence');
+  assert.equal(malformed.repair.invalid_patch.reason, 'delegation_pending_takes_precedence');
 });
 
 test('does not aggregate a replacement leaf with a different verification contract', () => {

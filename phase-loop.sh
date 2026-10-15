@@ -448,7 +448,9 @@ import sys
 try:
     feedback = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 except Exception:
-    raise SystemExit(1)
+    # A malformed handoff record is evidence of an interrupted control-plane
+    # write. Fail closed: selection must not bypass an unknown delegation.
+    raise SystemExit(0)
 delegation = feedback.get("delegation") if isinstance(feedback.get("delegation"), dict) else {}
 pending = (
     feedback.get("completed") is not True
