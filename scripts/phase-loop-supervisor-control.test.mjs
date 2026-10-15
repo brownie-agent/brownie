@@ -451,6 +451,34 @@ test('does not delegate a terminal failure from mixed no-progress history', () =
   assert.notEqual(result.repair.delegation_pending.ok, true, JSON.stringify(result, null, 2));
 });
 
+test('rebaselines legacy terminal failures only from matching run stdout evidence', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const firstLine = runtimeEvidenceTodo.split('\n')[0];
+  const targetScope = 'scripts/guard-runtime-operational-evidence.test.mjs';
+  const verification = 'run `pnpm --workspace-root release:runtime-operational-evidence:test`.';
+  writeJson(repo, '.brownie/private/phase-loop/status.json', { status: 'stopped', run_id: 'run-terminal-2' });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1,
+    progress_projection: { stop_class: 'terminal_failure', selected_todo: runtimeEvidenceTodo }
+  });
+  const rows = [0, 1, 2].map((index) => ({
+    schema_version: 1, record_type: 'phase_loop_failure_event', event_id: `legacy-terminal-${index}`,
+    todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02', selected_todo_first_line: firstLine,
+    target_scope_key: targetScope, verification_command: verification, kind: 'no_progress',
+    status_run_id: `run_a${index}b${index}`, progress_run_stamp: `20261008T01010${index}Z`
+  }));
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl'), `${rows.map(JSON.stringify).join('\n')}\n`);
+  for (const row of rows) {
+    fs.mkdirSync(path.join(repo, '.brownie/private/phase-loop/runs'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/runs', `${row.progress_run_stamp}.stdout.log`), JSON.stringify({ automation: { run_id: row.status_run_id, stop_class: 'terminal_failure' } }));
+  }
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  assert.equal(result.repair.failure_ledger_summary.terminal_target_scope_event_count, 4);
+  assert.equal(result.repair.failure_ledger_summary.replan_reason, 'same_target_scope_terminal_failure_threshold');
+  assert.equal(result.repair.delegation_pending.ok, true, JSON.stringify(result, null, 2));
+});
+
 test('does not aggregate a replacement leaf with a different verification contract', () => {
   const repo = makeRepo();
   writeTodo(repo);

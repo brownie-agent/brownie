@@ -516,6 +516,27 @@ function appendFailureLedgerEvent(repoRoot, diagnostic) {
   }
 }
 
+function terminalStopClassFromRunEvidence(repoRoot, entry) {
+  const stamp = entry?.progress_run_stamp;
+  const runId = entry?.status_run_id;
+  if (!/^\d{8}T\d{6}Z$/u.test(stamp ?? '') || !/^run_[0-9a-f-]+$/u.test(runId ?? '')) {
+    return null;
+  }
+  const evidencePath = path.join(repoRoot, '.brownie/private/phase-loop/runs', `${stamp}.stdout.log`);
+  try {
+    const payload = JSON.parse(fs.readFileSync(evidencePath, 'utf8'));
+    const automation = payload?.automation ?? payload?.run?.automation ?? {};
+    const observedRunId = automation.run_id ?? payload?.run?.run_id ?? null;
+    const stopClass = automation.stop_class ?? payload?.run?.stop_class ?? null;
+    if (observedRunId !== runId || stopClass !== 'terminal_failure') {
+      return null;
+    }
+    return { projection_stop_class: 'terminal_failure', evidence_path: path.relative(repoRoot, evidencePath) };
+  } catch {
+    return null;
+  }
+}
+
 function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   const firstLine = selectedTodoBlock(diagnostic);
   const todoId = todoIdFromFirstLine(firstLine);
@@ -539,7 +560,11 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     currentEvent && !ledger.some((entry) => entry?.event_id === currentEvent.event_id)
       ? currentEvent
       : null
-  ].filter(Boolean);
+  ].filter(Boolean).map((entry) => {
+    if (entry?.projection_stop_class) return entry;
+    const evidence = terminalStopClassFromRunEvidence(repoRoot, entry);
+    return evidence ? { ...entry, ...evidence, stop_class_source: 'phase_loop_stdout_rebaseline' } : entry;
+  });
   const sameTodoEvents = events
     .filter((entry) => entry?.todo_id === todoId)
     .slice(-12);
@@ -606,18 +631,17 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   // A terminal runtime failure with several durable observations for exactly
   // one target is not a replan problem: restarting the same leaf would feed
   // the same malformed or non-actionable tool response back into the runner.
-  // Count only terminal observations in the current progress epoch; generic
-  // no-progress history must not create a false implementation handoff.
+  // Count only terminal observations; generic no-progress history must not
+  // create a false implementation handoff.  The durable scope remains across
+  // progress fingerprints because each matching run artifact proves that the
+  // controller reached the same terminal class rather than merely retrying.
   const currentProjectionStopClass = diagnostic.progress?.projection_stop_class
     ?? diagnostic.progress?.progress_projection?.stop_class
     ?? null;
-  const terminalScopeEventsForEpoch = sameScopeEvents.filter((entry) => (
-    entry?.projection_stop_class === 'terminal_failure'
-    && (!progressFingerprint || entry?.progress_fingerprint === progressFingerprint)
-  ));
+  const terminalScopeEvents = sameScopeEvents.filter((entry) => entry?.projection_stop_class === 'terminal_failure');
   const repeatedTerminalFailureOnSingleTarget = currentProjectionStopClass === 'terminal_failure'
     && sameScopeTodoIds.size === 1
-    && terminalScopeEventsForEpoch.length >= 3;
+    && terminalScopeEvents.length >= 3;
   // Do not infer a verification command for old ledger rows.  Instead, make
   // the rebaseline explicit: repeated legacy failures on the same target
   // require a decomposition before another leaf can claim that contract.
@@ -684,7 +708,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     verification_command: currentVerification || null,
     target_scope_event_count: sameScopeEvents.length,
     target_scope_distinct_todo_count: sameScopeTodoIds.size,
-    terminal_target_scope_event_count: terminalScopeEventsForEpoch.length,
+    terminal_target_scope_event_count: terminalScopeEvents.length,
     repeated_terminal_failure_on_single_target: repeatedTerminalFailureOnSingleTarget,
     legacy_target_scope_event_count: legacyScopeEvents.length,
     current_progress_fingerprint: progressFingerprint,
