@@ -246,6 +246,32 @@ function readJsonOrNull(filePath) {
   }
 }
 
+// A handoff record is control-plane state, not optional diagnostic output.
+// Do not treat a truncated record as absent: doing so would silently resume a
+// repeatedly failing claim without knowing whether an implementer accepted it.
+export function inspectDelegationFeedback(filePath) {
+  if (!fs.existsSync(filePath)) return { state: 'missing', feedback: null };
+  try {
+    const feedback = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (!feedback || typeof feedback !== 'object' || Array.isArray(feedback)) {
+      return { state: 'unreadable', feedback: null };
+    }
+    if (feedback.kind !== 'phase_loop_delegation_pending') {
+      return { state: 'other', feedback };
+    }
+    const delegation = feedback.delegation && typeof feedback.delegation === 'object'
+      ? feedback.delegation
+      : {};
+    if (feedback.completed === true || ['acknowledged', 'completed'].includes(delegation.status)) {
+      return { state: 'acknowledged', feedback };
+    }
+    if (delegation.status === 'pending') return { state: 'pending', feedback };
+    return { state: 'unreadable', feedback: null };
+  } catch {
+    return { state: 'unreadable', feedback: null };
+  }
+}
+
 function baselineDirtyWorkspace(repoRoot) {
   const files = new Set();
   for (const args of [
@@ -1877,6 +1903,58 @@ function maybeWriteTodoContractReplanFeedback(repoRoot, diagnostic, ledgerSummar
   }
 }
 
+function maybeWriteDelegationPendingFeedback(repoRoot, diagnostic, ledgerSummary) {
+  // Once multiple leaf identities fail against the same target and verification,
+  // another replan would conceal an implementation-handoff failure.
+  if (ledgerSummary?.replan_reason !== 'same_target_scope_replan_leaf_threshold') {
+    return { attempted: false, reason: ledgerSummary?.replan_reason ?? 'failure_ledger_threshold_not_met' };
+  }
+  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const existing = inspectDelegationFeedback(feedbackPath);
+  if (existing.state === 'unreadable') {
+    return { attempted: true, ok: false, reason: 'delegation_feedback_unreadable_fail_closed' };
+  }
+  if (existing.state === 'pending' || existing.state === 'acknowledged') {
+    return {
+      attempted: true,
+      ok: true,
+      preserved: true,
+      reason: existing.state === 'pending'
+        ? 'delegation_pending_already_recorded'
+        : 'delegation_acknowledgement_preserved'
+    };
+  }
+  const claim = readJsonOrNull(path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json'));
+  const selectedTodo = claim?.selected_todo ?? selectedTodoBlock(diagnostic);
+  const feedback = {
+    schema_version: 1,
+    kind: 'phase_loop_delegation_pending',
+    generated_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
+    completed: false,
+    reason: 'same_target_scope_failed_across_replan_leaves',
+    claim_id: claim?.claim_id ?? diagnostic.progress?.progress_projection?.claim_id ?? null,
+    selected_todo: selectedTodo,
+    selected_todo_first_line: todoFirstLine(selectedTodo),
+    failure_ledger_summary: ledgerSummary,
+    delegation: {
+      required_actor: 'brownie-agent',
+      acknowledgement_required: true,
+      required_evidence: ['issue_or_pr_url', 'acknowledged_at', 'implementation_commit_or_blocker'],
+      status: 'pending'
+    },
+    repair_hint: 'Do not create another TODO leaf with the same target scope and verification command. Record brownie-agent acknowledgement and implementation evidence before clearing this state.',
+    generated_by: 'phase-loop-supervisor-control'
+  };
+  try {
+    fs.mkdirSync(path.dirname(feedbackPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(feedbackPath, `${JSON.stringify(feedback, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fsyncFileAndParent(feedbackPath);
+    return { attempted: true, ok: true, path: path.relative(repoRoot, feedbackPath) };
+  } catch (error) {
+    return { attempted: true, ok: false, error: error?.message ?? String(error) };
+  }
+}
+
 function maybeWriteSemanticVerificationRepairFeedback(repoRoot, diagnostic) {
   const codes = issueCodes(diagnostic);
   if (!codes.has('verification_failure_requires_semantic_repair')) {
@@ -2198,10 +2276,15 @@ export function controlPhaseLoop(options = {}) {
   const terminalStalledReplanRecovery = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : maybeRecoverTerminalStalledReplan(repoRoot, afterTerminalNoEligibleClaimRepair);
+  const delegationPendingRepair = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : maybeWriteDelegationPendingFeedback(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary);
   const todoContractReplanRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
+      : delegationPendingRepair.attempted && delegationPendingRepair.ok
+        ? { attempted: false, reason: 'delegation_pending_blocks_same_scope_replan' }
       : terminalStalledReplanRecovery.attempted && terminalStalledReplanRecovery.ok
         ? { attempted: false, reason: 'terminal_stalled_replan_recovered_to_bounded_leaf' }
       : maybeWriteTodoContractReplanFeedback(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary);
@@ -2252,6 +2335,8 @@ export function controlPhaseLoop(options = {}) {
     ? { attempted: false, reason: 'repair_disabled' }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
+      : delegationPendingRepair.attempted
+      ? { attempted: false, reason: 'delegation_pending_takes_precedence' }
       : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
       ? { attempted: false, reason: 'todo_contract_replan_feedback_takes_precedence' }
       : maybeWriteSemanticVerificationRepairFeedback(repoRoot, afterResolvedRepairFeedback);
@@ -2259,6 +2344,8 @@ export function controlPhaseLoop(options = {}) {
     ? { attempted: false, reason: 'repair_disabled' }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
+      : delegationPendingRepair.attempted
+      ? { attempted: false, reason: 'delegation_pending_takes_precedence' }
       : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
       ? { attempted: false, reason: 'todo_contract_replan_feedback_takes_precedence' }
       : maybeWriteInvalidPatchRepairFeedback(repoRoot, afterResolvedRepairFeedback);
@@ -2277,6 +2364,7 @@ export function controlPhaseLoop(options = {}) {
     rejected_bounded_leaf_replan_residue: rejectedBoundedLeafReplanResidueRepair,
     stale_active_claim: staleActiveClaimRepair,
     terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
+    delegation_pending: delegationPendingRepair,
     semantic_verification: semanticVerificationRepair,
     invalid_patch: invalidPatchRepair,
     bounded_leaf_apply_rejection: boundedLeafApplyRejectionRepair,
@@ -2359,6 +2447,7 @@ export function controlPhaseLoop(options = {}) {
       rejected_bounded_leaf_replan_residue: rejectedBoundedLeafReplanResidueRepair,
       stale_active_claim: staleActiveClaimRepair,
       terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
+      delegation_pending: delegationPendingRepair,
       semantic_verification: semanticVerificationRepair,
       invalid_patch: invalidPatchRepair,
       bounded_leaf_apply_rejection: boundedLeafApplyRejectionRepair,
