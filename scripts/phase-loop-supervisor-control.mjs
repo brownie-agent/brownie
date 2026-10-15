@@ -597,6 +597,14 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   // new leaf id for the same patch target.  Require multiple leaf identities
   // and failure observations so unrelated one-off work remains schedulable.
   const repeatedTargetScopeFailure = sameScopeTodoIds.size >= 2 && sameScopeEvents.length >= 3;
+  // A terminal runtime failure with several durable observations for exactly
+  // one target is not a replan problem: restarting the same leaf would feed
+  // the same malformed or non-actionable tool response back into the runner.
+  // Escalate it to an implementer handoff before it can become an unbounded
+  // retry loop.
+  const repeatedTerminalFailureOnSingleTarget = diagnostic.progress?.projection_stop_class === 'terminal_failure'
+    && sameScopeTodoIds.size === 1
+    && sameScopeEvents.length >= 3;
   // Do not infer a verification command for old ledger rows.  Instead, make
   // the rebaseline explicit: repeated legacy failures on the same target
   // require a decomposition before another leaf can claim that contract.
@@ -607,6 +615,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     progressSameCount >= 3 ||
     repeatedNoProgressInLedger ||
     repeatedTargetScopeFailure ||
+    repeatedTerminalFailureOnSingleTarget ||
     legacyTargetScopeRebaselineRequired ||
     invalidPatchWithRepeatedNoProgress ||
     semanticFailureWithRepeatedNoProgress ||
@@ -624,6 +633,8 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
       replanReason = 'same_todo_no_progress_ledger_threshold';
     } else if (repeatedTargetScopeFailure) {
       replanReason = 'same_target_scope_replan_leaf_threshold';
+    } else if (repeatedTerminalFailureOnSingleTarget) {
+      replanReason = 'same_target_scope_terminal_failure_threshold';
     } else if (legacyTargetScopeRebaselineRequired) {
       replanReason = 'legacy_target_scope_rebaseline_required';
     } else if (invalidPatchWithRepeatedNoProgress) {
@@ -657,6 +668,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     verification_command: currentVerification || null,
     target_scope_event_count: sameScopeEvents.length,
     target_scope_distinct_todo_count: sameScopeTodoIds.size,
+    repeated_terminal_failure_on_single_target: repeatedTerminalFailureOnSingleTarget,
     legacy_target_scope_event_count: legacyScopeEvents.length,
     current_progress_fingerprint: progressFingerprint,
     same_fingerprint_no_progress_count: sameFingerprintNoProgressCount,
@@ -1904,9 +1916,13 @@ function maybeWriteTodoContractReplanFeedback(repoRoot, diagnostic, ledgerSummar
 }
 
 function maybeWriteDelegationPendingFeedback(repoRoot, diagnostic, ledgerSummary) {
-  // Once multiple leaf identities fail against the same target and verification,
-  // another replan would conceal an implementation-handoff failure.
-  if (ledgerSummary?.replan_reason !== 'same_target_scope_replan_leaf_threshold') {
+  // Replan churn across leaf identities and terminal failure of one leaf both
+  // require an auditable implementation handoff, not another generated retry.
+  const delegationReasons = new Set([
+    'same_target_scope_replan_leaf_threshold',
+    'same_target_scope_terminal_failure_threshold'
+  ]);
+  if (!delegationReasons.has(ledgerSummary?.replan_reason)) {
     return { attempted: false, reason: ledgerSummary?.replan_reason ?? 'failure_ledger_threshold_not_met' };
   }
   const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
