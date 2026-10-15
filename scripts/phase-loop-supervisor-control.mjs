@@ -538,8 +538,17 @@ function terminalStopClassFromRunEvidence(repoRoot, entry) {
 }
 
 function hasContiguousTerminalRunEvidence(repoRoot, terminalEvents) {
-  const stamps = terminalEvents.map((entry) => entry?.progress_run_stamp).filter((stamp) => /^\d{8}T\d{6}Z$/u.test(stamp));
+  const evidencedEvents = terminalEvents.filter((entry) => (
+    /^\d{8}T\d{6}Z$/u.test(entry?.progress_run_stamp ?? '')
+    && /^run_[0-9a-f-]+$/u.test(entry?.status_run_id ?? '')
+  ));
+  const stamps = evidencedEvents.map((entry) => entry.progress_run_stamp);
   if (stamps.length < 3) return false;
+  // Each ledger event must be bound to its own immutable stdout artifact.
+  // Interval logs alone are not evidence for a missing or mismatched run.
+  if (!evidencedEvents.every((entry) => terminalStopClassFromRunEvidence(repoRoot, entry)?.projection_stop_class === 'terminal_failure')) {
+    return false;
+  }
   const earliest = [...stamps].sort()[0];
   const latest = [...stamps].sort().at(-1);
   const runsDir = path.join(repoRoot, '.brownie/private/phase-loop/runs');
