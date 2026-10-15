@@ -537,6 +537,36 @@ function terminalStopClassFromRunEvidence(repoRoot, entry) {
   }
 }
 
+function hasContiguousTerminalRunEvidence(repoRoot, terminalEvents) {
+  const evidencedEvents = terminalEvents.filter((entry) => (
+    /^\d{8}T\d{6}Z$/u.test(entry?.progress_run_stamp ?? '')
+    && /^run_[0-9a-f-]+$/u.test(entry?.status_run_id ?? '')
+  ));
+  const stamps = evidencedEvents.map((entry) => entry.progress_run_stamp);
+  if (stamps.length < 3) return false;
+  // Each ledger event must be bound to its own immutable stdout artifact.
+  // Interval logs alone are not evidence for a missing or mismatched run.
+  if (!evidencedEvents.every((entry) => terminalStopClassFromRunEvidence(repoRoot, entry)?.projection_stop_class === 'terminal_failure')) {
+    return false;
+  }
+  const earliest = [...stamps].sort()[0];
+  const latest = [...stamps].sort().at(-1);
+  const runsDir = path.join(repoRoot, '.brownie/private/phase-loop/runs');
+  try {
+    const logs = fs.readdirSync(runsDir)
+      .filter((name) => /^\d{8}T\d{6}Z\.stdout\.log$/u.test(name))
+      .filter((name) => name.slice(0, 16) >= earliest && name.slice(0, 16) <= latest);
+    if (logs.length < 3) return false;
+    return logs.every((name) => {
+      const payload = JSON.parse(fs.readFileSync(path.join(runsDir, name), 'utf8'));
+      const automation = payload?.automation ?? payload?.run?.automation ?? {};
+      return (automation.stop_class ?? payload?.run?.stop_class) === 'terminal_failure';
+    });
+  } catch {
+    return false;
+  }
+}
+
 function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
   const firstLine = selectedTodoBlock(diagnostic);
   const todoId = todoIdFromFirstLine(firstLine);
@@ -642,9 +672,11 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     entry?.projection_stop_class === 'terminal_failure'
     && (!entry?.progress_fingerprint || !progressFingerprint || entry.progress_fingerprint === progressFingerprint)
   ));
+  const allTerminalScopeEvents = sameScopeEvents.filter((entry) => entry?.projection_stop_class === 'terminal_failure');
+  const contiguousTerminalEvidence = hasContiguousTerminalRunEvidence(repoRoot, allTerminalScopeEvents);
   const repeatedTerminalFailureOnSingleTarget = currentProjectionStopClass === 'terminal_failure'
     && sameScopeTodoIds.size === 1
-    && terminalScopeEvents.length >= 3;
+    && (terminalScopeEvents.length >= 3 || (allTerminalScopeEvents.length >= 3 && contiguousTerminalEvidence));
   // Do not infer a verification command for old ledger rows.  Instead, make
   // the rebaseline explicit: repeated legacy failures on the same target
   // require a decomposition before another leaf can claim that contract.
@@ -712,6 +744,8 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
     target_scope_event_count: sameScopeEvents.length,
     target_scope_distinct_todo_count: sameScopeTodoIds.size,
     terminal_target_scope_event_count: terminalScopeEvents.length,
+    terminal_target_scope_all_epoch_event_count: allTerminalScopeEvents.length,
+    contiguous_terminal_run_evidence: contiguousTerminalEvidence,
     repeated_terminal_failure_on_single_target: repeatedTerminalFailureOnSingleTarget,
     legacy_target_scope_event_count: legacyScopeEvents.length,
     current_progress_fingerprint: progressFingerprint,
