@@ -169,6 +169,62 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function createPortableArchive({ outFull, target, entries }) {
+  const archiveName = `brownie-${target}.${process.platform === 'win32' ? 'zip' : 'tar.gz'}`;
+  const archivePath = path.join(outFull, archiveName);
+  const missing = entries.filter((entry) => !fs.existsSync(path.join(outFull, entry)));
+  if (missing.length > 0) {
+    throw new Error(`Portable archive inputs are missing: ${missing.join(', ')}`);
+  }
+  const stagingRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-release-archive-'));
+  try {
+    for (const entry of entries) {
+      fs.copyFileSync(path.join(outFull, entry), path.join(stagingRoot, entry));
+    }
+    const artifactEvidencePath = path.join(stagingRoot, 'artifact-evidence.json');
+    const smokeEvidencePath = path.join(stagingRoot, 'smoke-evidence.json');
+    const artifactEvidence = JSON.parse(fs.readFileSync(artifactEvidencePath, 'utf8'));
+    const smokeEvidence = JSON.parse(fs.readFileSync(smokeEvidencePath, 'utf8'));
+    artifactEvidence.artifact.path = entries[0];
+    artifactEvidence.runtime_companion.path = entries[1];
+    smokeEvidence.artifact_path = entries[0];
+    fs.writeFileSync(artifactEvidencePath, `${JSON.stringify(artifactEvidence, null, 2)}\n`);
+    fs.writeFileSync(smokeEvidencePath, `${JSON.stringify(smokeEvidence, null, 2)}\n`);
+    fs.writeFileSync(
+      path.join(stagingRoot, 'SHA256SUMS'),
+      [
+        `${artifactEvidence.artifact.sha256.replace(/^sha256:/, '')}  ${entries[0]}`,
+        `${artifactEvidence.runtime_companion.sha256.replace(/^sha256:/, '')}  ${entries[1]}`
+      ].join('\n') + '\n'
+    );
+
+    const result = process.platform === 'win32'
+      ? run(stagingRoot, 'powershell.exe', [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Compress-Archive -LiteralPath ${entries.map((entry) => `'${path.join(stagingRoot, entry).replace(/'/g, "''")}'`).join(', ')} -DestinationPath '${archivePath.replace(/'/g, "''")}' -Force`
+      ], { timeoutMs: releaseArtifactBuildTimeoutMs })
+      : run(stagingRoot, 'tar', ['-czf', archivePath, ...entries], { timeoutMs: releaseArtifactBuildTimeoutMs });
+    if (!result.passed || !fs.existsSync(archivePath)) {
+      throw new Error(`Portable archive creation failed for ${target}\n${tailText(result.stderr || result.stdout)}`);
+    }
+    if (fs.statSync(archivePath).size === 0) {
+      throw new Error(`Portable archive is empty for ${target}: ${archiveName}`);
+    }
+    return {
+      path: archivePath,
+      name: archiveName,
+      sha256: sha256File(archivePath),
+      bytes: fs.statSync(archivePath).size,
+      entries
+    };
+  } finally {
+    fs.rmSync(stagingRoot, { recursive: true, force: true });
+  }
+}
+
 function assertNativeTargetMatchesRuntime(target) {
   const expected = {
     'darwin-arm64': ['darwin', 'arm64'],
@@ -346,11 +402,22 @@ export function buildLocalArtifact(options = {}) {
   );
   writeJson(resolveRepoRelative(repoRoot, normalizeRelativePath(path.join(outDir, 'artifact-evidence.json'))), artifactEvidence);
   writeJson(resolveRepoRelative(repoRoot, normalizeRelativePath(path.join(outDir, 'smoke-evidence.json'))), smokeEvidence);
+  const archive = createPortableArchive({
+    outFull,
+    target,
+    entries: [binaryName, buildPlan.runtimeName, 'SHA256SUMS', 'artifact-evidence.json', 'smoke-evidence.json']
+  });
 
   return {
     target,
     outDir,
     artifact: artifactEvidence.artifact,
+    archive: {
+      path: normalizeRelativePath(path.join(outDir, archive.name)),
+      sha256: archive.sha256,
+      bytes: archive.bytes,
+      entries: archive.entries
+    },
     smoke_status: smokeEvidence.status
   };
 }
