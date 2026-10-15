@@ -262,13 +262,156 @@ export function inspectDelegationFeedback(filePath) {
     const delegation = feedback.delegation && typeof feedback.delegation === 'object'
       ? feedback.delegation
       : {};
-    if (feedback.completed === true || ['acknowledged', 'completed'].includes(delegation.status)) {
+    if (feedback.completed === true) {
+      return { state: 'resolved', feedback };
+    }
+    if (['acknowledged', 'completed'].includes(delegation.status)) {
       return { state: 'acknowledged', feedback };
     }
     if (delegation.status === 'pending') return { state: 'pending', feedback };
     return { state: 'unreadable', feedback: null };
   } catch {
     return { state: 'unreadable', feedback: null };
+  }
+}
+
+function hasMergedCommit(repoRoot, commit) {
+  if (!/^[0-9a-f]{40}$/iu.test(commit)) {
+    return false;
+  }
+  try {
+    runTextCommand(repoRoot, 'git', ['merge-base', '--is-ancestor', commit, 'HEAD']);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function verifyDelegationPullRequestProvenance(repoRoot, pullRequestUrl, implementationCommit) {
+  const match = /^https:\/\/github\.com\/globalpocket\/brownie\/pull\/(\d+)$/u.exec(pullRequestUrl);
+  if (!match) {
+    return { ok: false, reason: 'delegation_pull_request_url_not_trusted' };
+  }
+  try {
+    const pullRequest = runJsonCommand(repoRoot, 'gh', [
+      'pr', 'view', match[1],
+      '--repo', 'globalpocket/brownie',
+      '--json', 'author,state,mergedAt,mergeCommit,commits,reviews,statusCheckRollup'
+    ]);
+    const commitIds = new Set([
+      pullRequest?.mergeCommit?.oid,
+      ...(Array.isArray(pullRequest?.commits) ? pullRequest.commits.map((commit) => commit?.oid) : [])
+    ].filter((oid) => typeof oid === 'string'));
+    const hasIndependentApproval = (pullRequest?.reviews ?? []).some((review) => (
+      review?.state === 'APPROVED'
+      && review?.author?.login === 'globalpocket'
+      && commitIds.has(review?.commit?.oid)
+    ));
+    const checks = Array.isArray(pullRequest?.statusCheckRollup) ? pullRequest.statusCheckRollup : [];
+    const checksPassed = checks.length > 0 && checks.every((check) => (
+      check?.status === 'COMPLETED' && check?.conclusion === 'SUCCESS'
+    ));
+    const valid = (
+      pullRequest?.author?.login === 'brownie-agent'
+      && pullRequest?.state === 'MERGED'
+      && typeof pullRequest?.mergedAt === 'string'
+      && commitIds.has(implementationCommit)
+      && hasIndependentApproval
+      && checksPassed
+    );
+    return valid
+      ? { ok: true, pull_request_number: Number(match[1]) }
+      : { ok: false, reason: 'delegation_pull_request_provenance_mismatch' };
+  } catch (error) {
+    return { ok: false, reason: 'delegation_pull_request_provenance_unavailable', error: error?.message ?? String(error) };
+  }
+}
+
+// An acknowledged handoff is not itself a completion: it must name a merged
+// brownie-agent delivery and globalpocket review. Once those durable facts are
+// present, materialize a completion receipt before pruning the matching queue
+// item. This prevents a merged fix from being selected again merely because a
+// stale controller claim still refers to the old TODO.
+function maybeReconcileAcknowledgedDelegation(repoRoot, provenanceVerifier) {
+  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const inspected = inspectDelegationFeedback(feedbackPath);
+  if (inspected.state === 'missing') return { attempted: false, reason: 'delegation_feedback_missing' };
+  if (inspected.state === 'resolved') return { attempted: false, reason: 'delegation_already_resolved' };
+  if (inspected.state === 'pending') return { attempted: false, reason: 'delegation_acknowledgement_pending' };
+  if (inspected.state !== 'acknowledged') return { attempted: false, reason: 'delegation_feedback_not_reconcilable_fail_closed' };
+
+  const feedback = inspected.feedback;
+  const delegation = feedback.delegation && typeof feedback.delegation === 'object' ? feedback.delegation : {};
+  const verification = feedback.verification && typeof feedback.verification === 'object' ? feedback.verification : {};
+  const selectedTodo = typeof feedback.selected_todo === 'string' ? feedback.selected_todo : '';
+  const selectedTodoId = todoIdFromFirstLine(selectedTodo);
+  const pullRequestUrl = typeof delegation.issue_or_pr_url === 'string' ? delegation.issue_or_pr_url.trim() : '';
+  const acknowledgedAt = typeof delegation.acknowledged_at === 'string' ? delegation.acknowledged_at.trim() : '';
+  const implementationCommit = typeof delegation.implementation_commit_or_blocker === 'string'
+    ? delegation.implementation_commit_or_blocker.trim()
+    : '';
+  const evidenceValid = (
+    delegation.required_actor === 'brownie-agent'
+    && /^https:\/\/github\.com\/globalpocket\/brownie\/pull\/\d+$/u.test(pullRequestUrl)
+    && !Number.isNaN(Date.parse(acknowledgedAt))
+    && verification.reviewed_by === 'globalpocket'
+    && verification.all_ci_checks_passed === true
+    && selectedTodoId
+    && hasMergedCommit(repoRoot, implementationCommit)
+  );
+  if (!evidenceValid) {
+    return { attempted: true, ok: false, reason: 'delegation_acknowledgement_evidence_invalid_fail_closed' };
+  }
+  const provenance = provenanceVerifier(repoRoot, pullRequestUrl, implementationCommit);
+  if (provenance?.ok !== true) {
+    return {
+      attempted: true,
+      ok: false,
+      reason: provenance?.reason ?? 'delegation_pull_request_provenance_invalid_fail_closed'
+    };
+  }
+
+  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+  const todoText = fs.existsSync(todoPath) ? fs.readFileSync(todoPath, 'utf8') : '';
+  if (!liveUncheckedTodoIds(todoText).has(selectedTodoId)) {
+    return { attempted: true, ok: false, reason: 'delegated_todo_not_live_fail_closed', todo_id: selectedTodoId };
+  }
+
+  const completionDirectory = path.join(repoRoot, '.brownie/private/phase-loop/todo-completions');
+  const completionPath = path.join(
+    completionDirectory,
+    `delegation-${selectedTodoId.replace(/[^A-Za-z0-9_.-]+/gu, '-')}-${implementationCommit}.json`
+  );
+  const receipt = {
+    schema_version: 1,
+    kind: 'phase_loop_delegation_completion',
+    selected_todo_id: selectedTodoId,
+    selected_todo_first_line: todoFirstLine(selectedTodo),
+    reason: 'acknowledged_delegation_merged_and_reviewed',
+    pull_request_url: pullRequestUrl,
+    implementation_commit: implementationCommit,
+    acknowledged_at: acknowledgedAt,
+    reviewed_by: verification.reviewed_by,
+    all_ci_checks_passed: true,
+    reconciled_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
+    generated_by: 'phase-loop-supervisor-control'
+  };
+  try {
+    fs.mkdirSync(completionDirectory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(completionPath, `${JSON.stringify(receipt, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    const completedFeedback = {
+      ...feedback,
+      completed: true,
+      resolved_at: receipt.reconciled_at,
+      resolution: 'merged_delegation_receipt_materialized',
+      completion_receipt_path: path.relative(repoRoot, completionPath)
+    };
+    fs.writeFileSync(feedbackPath, `${JSON.stringify(completedFeedback, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fsyncFileAndParent(completionPath);
+    fsyncFileAndParent(feedbackPath);
+    return { attempted: true, ok: true, todo_id: selectedTodoId, completion_path: path.relative(repoRoot, completionPath) };
+  } catch (error) {
+    return { attempted: true, ok: false, reason: 'delegation_reconciliation_write_failed', error: error?.message ?? String(error) };
   }
 }
 
@@ -2008,14 +2151,16 @@ function maybeWriteDelegationPendingFeedback(repoRoot, diagnostic, ledgerSummary
   if (existing.state === 'unreadable') {
     return { attempted: true, ok: false, reason: 'delegation_feedback_unreadable_fail_closed' };
   }
-  if (existing.state === 'pending' || existing.state === 'acknowledged') {
+  if (existing.state === 'pending' || existing.state === 'acknowledged' || existing.state === 'resolved') {
     return {
       attempted: true,
       ok: true,
       preserved: true,
       reason: existing.state === 'pending'
         ? 'delegation_pending_already_recorded'
-        : 'delegation_acknowledgement_preserved'
+        : existing.state === 'acknowledged'
+          ? 'delegation_acknowledgement_preserved'
+          : 'delegation_completion_preserved'
     };
   }
   const claim = readJsonOrNull(path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json'));
@@ -2300,6 +2445,12 @@ function maybeStartPhaseLoop(repoRoot, enabled, diagnostic) {
 
 export function controlPhaseLoop(options = {}) {
   const repoRoot = path.resolve(options.repoRoot ?? defaultRepoRoot);
+  const delegationProvenanceVerifier = options.delegationProvenanceVerifier
+    ?? ((_, pullRequestUrl, implementationCommit) => verifyDelegationPullRequestProvenance(
+      repoRoot,
+      pullRequestUrl,
+      implementationCommit
+    ));
   const initial = diagnosePhaseLoop({ repoRoot, write: options.write !== false });
   const failureLedger = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
@@ -2335,12 +2486,19 @@ export function controlPhaseLoop(options = {}) {
   const afterRepair = legacyDerivedBreakdownLedgerMigration.attempted && legacyDerivedBreakdownLedgerMigration.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterMissingDerivedBreakdownLedgerRepair;
-  const nonLiveTodoResidueRepair = options.repair === false
+  const acknowledgedDelegationReconciliation = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : maybeRepairNonLiveTodoResidue(repoRoot, afterRepair);
-  const afterResidueRepair = nonLiveTodoResidueRepair.attempted && nonLiveTodoResidueRepair.ok
+    : maybeReconcileAcknowledgedDelegation(repoRoot, delegationProvenanceVerifier);
+  const afterAcknowledgedDelegationReconciliation = acknowledgedDelegationReconciliation.attempted
+    && acknowledgedDelegationReconciliation.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterRepair;
+  const nonLiveTodoResidueRepair = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : maybeRepairNonLiveTodoResidue(repoRoot, afterAcknowledgedDelegationReconciliation);
+  const afterResidueRepair = nonLiveTodoResidueRepair.attempted && nonLiveTodoResidueRepair.ok
+    ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
+    : afterAcknowledgedDelegationReconciliation;
   const staleActiveClaimRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : maybeArchiveStaleActiveClaim(repoRoot, afterResidueRepair);
@@ -2458,6 +2616,7 @@ export function controlPhaseLoop(options = {}) {
     rejected_bounded_leaf_replan_residue: rejectedBoundedLeafReplanResidueRepair,
     stale_active_claim: staleActiveClaimRepair,
     terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
+    acknowledged_delegation_reconciliation: acknowledgedDelegationReconciliation,
     delegation_pending: delegationPendingRepair,
     semantic_verification: semanticVerificationRepair,
     invalid_patch: invalidPatchRepair,
@@ -2541,6 +2700,7 @@ export function controlPhaseLoop(options = {}) {
       rejected_bounded_leaf_replan_residue: rejectedBoundedLeafReplanResidueRepair,
       stale_active_claim: staleActiveClaimRepair,
       terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
+      acknowledged_delegation_reconciliation: acknowledgedDelegationReconciliation,
       delegation_pending: delegationPendingRepair,
       semantic_verification: semanticVerificationRepair,
       invalid_patch: invalidPatchRepair,
