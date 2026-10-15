@@ -401,6 +401,17 @@ test('rejects partial dependency pruning even when one prerequisite is completed
   assert(result.errors.some((error) => error.code === 'todo_contract_drift' && error.drift.includes('depends_on')));
 });
 
+test('rejects a blank dependency value when rebaselining a completed prerequisite', () => {
+  const result = validateTodoQueueIntegrity({
+    todoBefore: queue(e20a, e20b),
+    todoAfter: queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on:')),
+    completedTodoIds: ['E-20a-golden-journey-workspace-mutation']
+  });
+
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'todo_contract_drift' && error.drift.includes('depends_on')));
+});
+
 test('CLI accepts completed-dependency rebaseline against HEAD and emits an audit warning', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-queue-integrity-'));
   fs.mkdirSync(path.join(tmp, '.brownie/private/phase-loop/todo-completions'), { recursive: true });

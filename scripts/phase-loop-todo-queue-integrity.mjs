@@ -308,11 +308,13 @@ export function validateTodoQueueIntegrity({ todoBefore, todoAfter, completedTod
       changedTodoIds.push(id);
       const beforeDependencies = lineValue(beforeBlock, 'Depends on')
         .split(/\s*,\s*/u).map((entry) => entry.trim()).filter((entry) => entry && entry !== '<none>');
-      const afterDependencies = lineValue(afterBlock, 'Depends on')
+      const afterDependencyValue = lineValue(afterBlock, 'Depends on');
+      const afterDependencies = afterDependencyValue
         .split(/\s*,\s*/u).map((entry) => entry.trim()).filter((entry) => entry && entry !== '<none>');
       if (
         drift.length === 1
         && drift[0] === 'depends_on'
+        && afterDependencyValue === '<none>'
         && afterDependencies.length === 0
         && beforeDependencies.length > 0
         && beforeDependencies.every((dependency) => completedIds.has(dependency))
