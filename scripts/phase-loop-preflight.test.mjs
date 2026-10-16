@@ -89,6 +89,18 @@ test('rejects a TODO path outside the repository', () => {
   fs.rmSync(outsideTodo);
 });
 
+test('rejects an in-repository TODO symlink that resolves outside the repository', () => {
+  const repo = makeRepo();
+  const outsideTodo = path.join(os.tmpdir(), `brownie-outside-link-${Date.now()}.md`);
+  const linkedTodo = path.join(repo, '.brownie/todo-link.md');
+  fs.writeFileSync(outsideTodo, '- [ ] E-outside: Patch only `README.md`\n');
+  fs.symlinkSync(outsideTodo, linkedTodo);
+  const result = validatePhaseLoopPreflight({ repo, todo: linkedTodo, skipCommands: true });
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'required_file_outside_repository'), JSON.stringify(result.errors));
+  fs.rmSync(outsideTodo);
+});
+
 test('bounded implementation leaves are not instructed to re-split their TODO on missing patch context', () => {
   const prompt = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.md'), 'utf8');
   assert.match(prompt, /This is allowed only when the\s+selected TODO is not already a bounded leaf with explicit patch targets\./);
