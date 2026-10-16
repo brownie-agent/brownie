@@ -42,14 +42,48 @@ function parseArgs(argv) {
   return args;
 }
 
-function readText(repoRoot, relativePath, errors) {
+function requiredPathInRepository(repoRoot, requestedPath, errors) {
+  const lexicalRepoRoot = path.resolve(repoRoot);
+  const realRepoRoot = fs.realpathSync(repoRoot);
+  const resolvedPath = path.resolve(lexicalRepoRoot, requestedPath);
+  const relativePath = path.relative(lexicalRepoRoot, resolvedPath);
+  if (relativePath === '..' || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    errors.push({
+      code: 'required_file_outside_repository',
+      path: requestedPath,
+      message: `${requestedPath} must resolve inside the repository root.`
+    });
+    return null;
+  }
+  // Lexical containment is insufficient: readFileSync follows a symlink that
+  // can point outside the repository. Resolve existing files before reading.
+  if (fs.existsSync(resolvedPath)) {
+    const realPath = fs.realpathSync(resolvedPath);
+    const realRelativePath = path.relative(realRepoRoot, realPath);
+    if (realRelativePath === '..' || realRelativePath.startsWith(`..${path.sep}`) || path.isAbsolute(realRelativePath)) {
+      errors.push({
+        code: 'required_file_outside_repository',
+        path: requestedPath,
+        message: `${requestedPath} must resolve inside the repository root.`
+      });
+      return null;
+    }
+  }
+  return resolvedPath;
+}
+
+function readText(repoRoot, requestedPath, errors) {
+  const resolvedPath = requiredPathInRepository(repoRoot, requestedPath, errors);
+  if (!resolvedPath) {
+    return '';
+  }
   try {
-    return fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
+    return fs.readFileSync(resolvedPath, 'utf8');
   } catch (error) {
     errors.push({
       code: 'required_file_unreadable',
-      path: relativePath,
-      message: `${relativePath} must be readable: ${error.message}`
+      path: requestedPath,
+      message: `${requestedPath} must be readable: ${error.message}`
     });
     return '';
   }
