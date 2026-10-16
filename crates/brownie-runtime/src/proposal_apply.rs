@@ -35,8 +35,8 @@ const APPLY_APPROVAL_TTL_SECONDS: i64 = 15 * 60;
 // The controller treats the live TODO queue as executable control-plane state.
 // A proposal can be structurally valid while still creating an impossible leaf
 // (for example, `Create only` for a file that already exists) or a dependency
-// cycle.  Keep this preflight at the write boundary so every apply route,
-// including headless objective apply, fails closed before mutating the queue.
+// cycle. Keep this preflight at direct queue write boundaries, including
+// headless objective apply, so they fail closed before mutating the queue.
 fn todo_queue_post_apply_rejection_reason(
     workspace_root: &std::path::Path,
     path: &str,
@@ -58,11 +58,23 @@ fn todo_queue_post_apply_rejection_reason(
             continue;
         }
         let first_line = remainder.lines().next().unwrap_or_default();
-        for (directive, must_exist) in [("Patch only", true), ("Create only", false)] {
-            if !first_line.contains(directive) {
-                continue;
-            }
-            let mut fragments = first_line.split('`');
+        let directives = [("Patch only", true), ("Create only", false)];
+        let mut positions: Vec<(usize, &str, bool)> = directives
+            .iter()
+            .filter_map(|(directive, must_exist)| {
+                first_line
+                    .find(directive)
+                    .map(|position| (position, *directive, *must_exist))
+            })
+            .collect();
+        positions.sort_by_key(|(position, _, _)| *position);
+        for (index, (start, directive, must_exist)) in positions.iter().enumerate() {
+            let end = positions
+                .get(index + 1)
+                .map(|(position, _, _)| *position)
+                .unwrap_or(first_line.len());
+            let directive_targets = &first_line[start + directive.len()..end];
+            let mut fragments = directive_targets.split('`');
             while fragments.next().is_some() {
                 let Some(target) = fragments.next() else {
                     break;
@@ -74,10 +86,10 @@ fn todo_queue_post_apply_rejection_reason(
                     ));
                 }
                 let exists = workspace_root.join(target).is_file();
-                if must_exist && !exists {
+                if *must_exist && !exists {
                     return Some(format!("TODO queue preflight rejected `{id}`: Patch only target `{target}` does not exist."));
                 }
-                if !must_exist && exists {
+                if !*must_exist && exists {
                     return Some(format!("TODO queue preflight rejected `{id}`: Create only target `{target}` already exists; use Patch only."));
                 }
             }
@@ -6447,6 +6459,31 @@ pub(super) fn apply_proposal(
         None,
     ));
 
+    if let Some(reason) = todo_queue_post_apply_rejection_reason(
+        store.workspace_root(),
+        &proposal.path,
+        replacement_content,
+    ) {
+        apply_result.checklist.push(apply_result_check(
+            "todo_queue_post_apply_preflight",
+            "Fail",
+            Some(&reason),
+        ));
+        apply_result.apply_reason = reason;
+        return record_apply_result(
+            store,
+            &task,
+            &params.run_id,
+            &params.proposal_id,
+            apply_result,
+        );
+    }
+    apply_result.checklist.push(apply_result_check(
+        "todo_queue_post_apply_preflight",
+        "Pass",
+        None,
+    ));
+
     let expected_post_write_hash = format!("sha256:{}", hex_sha256(replacement_bytes));
     let outcome = atomic_replace_existing_file(&target_path, replacement_bytes);
     apply_result.temp_file_cleaned = outcome.temp_file_cleaned;
@@ -6599,6 +6636,16 @@ mod todo_queue_post_apply_tests {
     fn accepts_acyclic_patch_only_queue() {
         let root = temp_workspace();
         let candidate = "- [ ] E-23b-target-03: Patch only `package.json`\n  Depends on: <none>\n- [ ] E-23b-target-04: Patch only `.github/workflows/release.yml`\n  Depends on: E-23b-target-03\n";
+        assert!(
+            todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate).is_none()
+        );
+        std::fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn scopes_targets_to_their_own_create_or_patch_directive() {
+        let root = temp_workspace();
+        let candidate = "- [ ] E-23b-roundtrip: Create only `scripts/new-roundtrip.mjs`; Patch only `package.json` and `.github/workflows/release.yml`\n  Depends on: <none>\n";
         assert!(
             todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate).is_none()
         );
