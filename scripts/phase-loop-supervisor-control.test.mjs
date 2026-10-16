@@ -2322,6 +2322,51 @@ test('fails closed when a selected leaf disappears without durable completion ev
   assert.equal(result.start.reason, 'todo_contract_replan_failed_not_starting');
 });
 
+test('re-delegates retained selected-target integrity failures without accepting operational artifacts as progress', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', { status: 'no_progress', run_id: 'selected-target-only-artifacts' });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', workspace_changed: true,
+    progress_projection: { selected_todo: runtimeEvidenceTodo }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'selected-target-only-artifacts', status: 'in_progress', selected_todo: runtimeEvidenceTodo
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
+    claim_id: 'selected-target-only-artifacts', completed: false, reason: 'verification_output_unparseable', selected_todo_first_line: runtimeEvidenceTodo.split('\n')[0],
+    verification: { completed: false, raw_tail: 'selected_target_not_changed' }
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const feedback = JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8'));
+
+  assert.equal(result.repair.selected_target_redelegation.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.todo_contract_replan.reason, 'selected_target_redelegation_takes_precedence');
+  assert.equal(result.repair.semantic_verification.reason, 'selected_target_redelegation_takes_precedence');
+  assert.equal(feedback.kind, 'phase_loop_selected_target_redelegation_feedback');
+  assert.match(feedback.repair_hint, /Operational artifacts/u);
+});
+
+test('does not reuse retained selected-target evidence from a different active claim', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-b', status: 'in_progress', selected_todo: runtimeEvidenceTodo
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
+    claim_id: 'claim-a', completed: false, reason: 'verification_output_unparseable',
+    selected_todo_first_line: '- [ ] unrelated: Patch only `scripts/unrelated.mjs`.',
+    verification: { completed: false, raw_tail: 'selected_target_not_changed' }
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.selected_target_redelegation.attempted, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.selected_target_redelegation.reason, 'selected_target_not_changed_not_reported');
+});
+
 test('runs TODO guard after repair when diagnostic reports an existing TODO contract violation', () => {
   const repo = makeRepo();
   writeTodo(repo);
