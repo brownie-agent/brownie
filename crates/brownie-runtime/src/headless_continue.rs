@@ -2,7 +2,7 @@ use super::*;
 
 thread_local! {
     static HELD_HEADLESS_CONTINUATION_LOCKS: std::cell::RefCell<std::collections::BTreeSet<String>> =
-        std::cell::RefCell::new(std::collections::BTreeSet::new());
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 
 struct HeldHeadlessContinuationLock {

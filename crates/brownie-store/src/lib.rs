@@ -55,7 +55,7 @@ const DURABLE_STORE_SCHEMA_ID: &str = "brownie-runtime-durable-store";
 
 thread_local! {
     static HELD_HEADLESS_CONTINUATION_DECISION_LOCKS: std::cell::RefCell<std::collections::BTreeSet<String>> =
-        std::cell::RefCell::new(std::collections::BTreeSet::new());
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 const DURABLE_STORE_SCHEMA_MANIFEST_FORMAT_VERSION: u64 = 1;
 const DURABLE_STORE_SCHEMA_STATE_CURRENT: &str = "current";
