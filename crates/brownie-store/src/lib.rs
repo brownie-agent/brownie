@@ -5608,7 +5608,9 @@ impl TaskStore {
                 .open(&lock_path)
             {
                 Ok(mut file) => {
-                    writeln!(file, "{}", timestamp()?)
+                    writeln!(file, "pid={}", std::process::id())
+                        .context("failed to write headless continuation decision lock owner")?;
+                    writeln!(file, "created_at={}", timestamp()?)
                         .context("failed to write headless continuation decision lock")?;
                     return Ok(RunAdmissionLock { path: lock_path });
                 }
@@ -5617,6 +5619,7 @@ impl TaskStore {
                         .read_headless_continuation_decision(continuation_id)
                         .map(|decision| decision.is_some())
                         .unwrap_or(false)
+                        || headless_continuation_lock_owner_is_dead(&lock_path)
                         || fs::metadata(&lock_path)
                             .and_then(|metadata| metadata.modified())
                             .ok()
@@ -6012,6 +6015,30 @@ impl Drop for HeldHeadlessContinuationDecisionLock {
 
 fn headless_continuation_decision_lock_is_held(continuation_id: &str) -> bool {
     HELD_HEADLESS_CONTINUATION_DECISION_LOCKS.with(|held| held.borrow().contains(continuation_id))
+}
+
+#[cfg(unix)]
+fn headless_continuation_lock_owner_is_dead(lock_path: &Path) -> bool {
+    let Ok(body) = fs::read_to_string(lock_path) else {
+        return false;
+    };
+    let Some(pid) = body
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn headless_continuation_lock_owner_is_dead(_lock_path: &Path) -> bool {
+    false
 }
 
 #[derive(Debug)]
@@ -11460,6 +11487,27 @@ fn timestamp() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_headless_continuation_lock_owner_is_reclaimable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("continuation.lock");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("start short-lived owner");
+        let pid = child.id();
+        child.wait().expect("wait for owner exit");
+        fs::write(
+            &lock_path,
+            format!("pid={pid}\ncreated_at=1970-01-01T00:00:00Z\n"),
+        )
+        .expect("write lock owner");
+
+        assert!(headless_continuation_lock_owner_is_dead(&lock_path));
+    }
 
     #[test]
     fn concurrent_equivalent_headless_continuation_decisions_converge_on_one_checkpoint() {
