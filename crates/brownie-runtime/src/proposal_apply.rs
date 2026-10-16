@@ -46,11 +46,50 @@ fn todo_queue_post_apply_rejection_reason(
         return None;
     }
 
-    let blocks: Vec<&str> = candidate.split("- [ ] ").skip(1).collect();
+    // Keep this parser aligned with guard-todo-decomposition.mjs: queue items
+    // may use -, *, or numbered checkbox markers. Completed items are also
+    // delimiters, so an unchecked item's metadata cannot absorb the next item.
+    fn checkbox_item(line: &str) -> Option<(bool, &str)> {
+        let line = line.trim_start();
+        let remainder =
+            if let Some(remainder) = line.strip_prefix('-').or_else(|| line.strip_prefix('*')) {
+                remainder.trim_start()
+            } else {
+                let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+                let remainder = line.get(digits..)?;
+                let remainder = remainder
+                    .strip_prefix('.')
+                    .or_else(|| remainder.strip_prefix(')'))?;
+                remainder.trim_start()
+            };
+        let checkbox = remainder.strip_prefix('[')?;
+        let (state, title) = checkbox.split_once(']')?;
+        if state.len() != 1 || !matches!(state.as_bytes()[0], b' ' | b'x' | b'X') {
+            return None;
+        }
+        let before_title_len = title.len();
+        let title = title.trim_start_matches(char::is_whitespace);
+        if title.len() == before_title_len {
+            return None;
+        }
+        Some((state == " ", title))
+    }
+
+    let mut items: Vec<(bool, String)> = Vec::new();
+    for line in candidate.lines() {
+        if let Some((unchecked, _)) = checkbox_item(line) {
+            items.push((unchecked, line.to_string()));
+        } else if let Some((_, block)) = items.last_mut() {
+            block.push('\n');
+            block.push_str(line);
+        }
+    }
     let mut dependencies: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for block in blocks {
-        let Some((id, remainder)) = block.split_once(':') else {
+    for (_, block) in items.iter().filter(|(unchecked, _)| *unchecked) {
+        let Some((id, remainder)) = checkbox_item(block.lines().next().unwrap_or_default())
+            .and_then(|(_, title)| title.split_once(':'))
+        else {
             continue;
         };
         let id = id.trim();
@@ -61,10 +100,10 @@ fn todo_queue_post_apply_rejection_reason(
         let directives = [("Patch only", true), ("Create only", false)];
         let mut positions: Vec<(usize, &str, bool)> = directives
             .iter()
-            .filter_map(|(directive, must_exist)| {
+            .flat_map(|(directive, must_exist)| {
                 first_line
-                    .find(directive)
-                    .map(|position| (position, *directive, *must_exist))
+                    .match_indices(directive)
+                    .map(move |(position, _)| (position, *directive, *must_exist))
             })
             .collect();
         positions.sort_by_key(|(position, _, _)| *position);
@@ -102,7 +141,7 @@ fn todo_queue_post_apply_rejection_reason(
                     .map(|token| {
                         token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
                     })
-                    .filter(|token| token.starts_with("E-"))
+                    .filter(|token| !token.is_empty() && *token != "<none>")
                     .map(ToString::to_string)
                     .collect()
             })
@@ -6643,6 +6682,27 @@ mod todo_queue_post_apply_tests {
         let reason = todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate)
             .expect("cycle must be rejected");
         assert!(reason.contains("cyclic"));
+        std::fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn rejects_dependency_cycles_for_non_e_identifiers_and_star_markers() {
+        let root = temp_workspace();
+        let candidate = "* [ ] TODO-maintenance-a: Patch only `package.json`\n  Depends on: TODO-maintenance-b\n* [ ] TODO-maintenance-b: Patch only `.github/workflows/release.yml`\n  Depends on: TODO-maintenance-a\n";
+        let reason = todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate)
+            .expect("cycle must be rejected regardless of identifier prefix");
+        assert!(reason.contains("cyclic"));
+        std::fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn rejects_existing_create_only_target_for_numbered_checkbox_marker() {
+        let root = temp_workspace();
+        let candidate =
+            "1. [ ] TODO-release-contract: Create only `package.json`\n   Depends on: <none>\n";
+        let reason = todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate)
+            .expect("canonical numbered checkbox must be preflighted");
+        assert!(reason.contains("already exists"));
         std::fs::remove_dir_all(root).expect("cleanup workspace");
     }
 
