@@ -32,6 +32,112 @@ pub(super) fn handle_proposal_apply(id: Value, params: Option<Value>) -> JsonRpc
 
 const APPLY_APPROVAL_TTL_SECONDS: i64 = 15 * 60;
 
+// The controller treats the live TODO queue as executable control-plane state.
+// A proposal can be structurally valid while still creating an impossible leaf
+// (for example, `Create only` for a file that already exists) or a dependency
+// cycle.  Keep this preflight at the write boundary so every apply route,
+// including headless objective apply, fails closed before mutating the queue.
+fn todo_queue_post_apply_rejection_reason(
+    workspace_root: &std::path::Path,
+    path: &str,
+    candidate: &str,
+) -> Option<String> {
+    if path != ".brownie/todo.md" && path != "todo.md" {
+        return None;
+    }
+
+    let blocks: Vec<&str> = candidate.split("- [ ] ").skip(1).collect();
+    let mut dependencies: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for block in blocks {
+        let Some((id, remainder)) = block.split_once(':') else {
+            continue;
+        };
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let first_line = remainder.lines().next().unwrap_or_default();
+        for (directive, must_exist) in [("Patch only", true), ("Create only", false)] {
+            if !first_line.contains(directive) {
+                continue;
+            }
+            let mut fragments = first_line.split('`');
+            while fragments.next().is_some() {
+                let Some(target) = fragments.next() else {
+                    break;
+                };
+                let target = target.trim();
+                if target.is_empty() || target.starts_with('/') || target.contains("..") {
+                    return Some(format!(
+                        "TODO queue preflight rejected unsafe target `{target}`."
+                    ));
+                }
+                let exists = workspace_root.join(target).is_file();
+                if must_exist && !exists {
+                    return Some(format!("TODO queue preflight rejected `{id}`: Patch only target `{target}` does not exist."));
+                }
+                if !must_exist && exists {
+                    return Some(format!("TODO queue preflight rejected `{id}`: Create only target `{target}` already exists; use Patch only."));
+                }
+            }
+        }
+        let deps = block
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Depends on:"))
+            .map(|line| {
+                line.split(|ch: char| ch == ',' || ch.is_whitespace())
+                    .map(|token| {
+                        token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+                    })
+                    .filter(|token| token.starts_with("E-"))
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        dependencies.insert(id.to_string(), deps);
+    }
+
+    fn reaches_cycle(
+        current: &str,
+        graph: &std::collections::HashMap<String, Vec<String>>,
+        visiting: &mut std::collections::HashSet<String>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if !visiting.insert(current.to_string()) {
+            return true;
+        }
+        if let Some(next) = graph.get(current) {
+            for dependency in next {
+                if graph.contains_key(dependency)
+                    && !visited.contains(dependency)
+                    && reaches_cycle(dependency, graph, visiting, visited)
+                {
+                    return true;
+                }
+            }
+        }
+        visiting.remove(current);
+        visited.insert(current.to_string());
+        false
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    for id in dependencies.keys() {
+        if !visited.contains(id)
+            && reaches_cycle(
+                id,
+                &dependencies,
+                &mut std::collections::HashSet::new(),
+                &mut visited,
+            )
+        {
+            return Some("TODO queue preflight rejected a cyclic Depends on graph.".to_string());
+        }
+    }
+    None
+}
+
 fn apply_result_check(
     name: &str,
     status: &str,
@@ -1949,6 +2055,27 @@ fn apply_patch_file_proposal(
     };
     apply_result.checklist.push(apply_result_check(
         "patch_hunk_context_matches",
+        "Pass",
+        None,
+    ));
+
+    if let Some(reason) = todo_queue_post_apply_rejection_reason(
+        store.workspace_root(),
+        &proposal.path,
+        &replacement_content,
+    ) {
+        return deny_patch_file_apply(
+            store,
+            task,
+            params,
+            apply_result,
+            "todo_queue_post_apply_preflight",
+            "Fail",
+            &reason,
+        );
+    }
+    apply_result.checklist.push(apply_result_check(
+        "todo_queue_post_apply_preflight",
         "Pass",
         None,
     ));
@@ -6429,4 +6556,52 @@ pub(super) fn apply_proposal(
         &params.proposal_id,
         apply_result,
     )
+}
+
+#[cfg(test)]
+mod todo_queue_post_apply_tests {
+    use super::todo_queue_post_apply_rejection_reason;
+
+    fn temp_workspace() -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("brownie-todo-preflight-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".github/workflows")).expect("create workspace");
+        std::fs::write(root.join("package.json"), "{}\n").expect("write package");
+        std::fs::write(
+            root.join(".github/workflows/release.yml"),
+            "name: release\n",
+        )
+        .expect("write workflow");
+        root
+    }
+
+    #[test]
+    fn rejects_create_only_for_existing_target_before_todo_mutation() {
+        let root = temp_workspace();
+        let candidate = "- [ ] E-23b-target-03: Create only `package.json`\n  Depends on: <none>\n";
+        let reason = todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate)
+            .expect("existing target must be rejected");
+        assert!(reason.contains("already exists"));
+        std::fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn rejects_dependency_cycles_before_todo_mutation() {
+        let root = temp_workspace();
+        let candidate = "- [ ] E-23b-target-03: Patch only `package.json`\n  Depends on: E-23b-target-04\n- [ ] E-23b-target-04: Patch only `.github/workflows/release.yml`\n  Depends on: E-23b-target-03\n";
+        let reason = todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate)
+            .expect("cycle must be rejected");
+        assert!(reason.contains("cyclic"));
+        std::fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn accepts_acyclic_patch_only_queue() {
+        let root = temp_workspace();
+        let candidate = "- [ ] E-23b-target-03: Patch only `package.json`\n  Depends on: <none>\n- [ ] E-23b-target-04: Patch only `.github/workflows/release.yml`\n  Depends on: E-23b-target-03\n";
+        assert!(
+            todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate).is_none()
+        );
+        std::fs::remove_dir_all(root).expect("cleanup workspace");
+    }
 }
