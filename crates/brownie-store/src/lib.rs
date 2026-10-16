@@ -5615,24 +5615,10 @@ impl TaskStore {
                     return Ok(RunAdmissionLock { path: lock_path });
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    let should_reclaim = self
-                        .read_headless_continuation_decision(continuation_id)
-                        .map(|decision| decision.is_some())
-                        .unwrap_or(false)
-                        || headless_continuation_lock_owner_is_dead(&lock_path)
-                        || fs::metadata(&lock_path)
-                            .and_then(|metadata| metadata.modified())
-                            .ok()
-                            .and_then(|modified| modified.elapsed().ok())
-                            .is_some_and(|age| {
-                                age >= HEADLESS_CONTINUATION_DECISION_LOCK_STALE_AFTER
-                            });
-                    if should_reclaim {
-                        match fs::remove_file(&lock_path) {
-                            Ok(()) => continue,
-                            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                            Err(_) => {}
-                        }
+                    if self
+                        .reclaim_headless_continuation_decision_lock(&lock_path, continuation_id)?
+                    {
+                        continue;
                     }
                     thread::sleep(RUN_ADMISSION_LOCK_SLEEP);
                 }
@@ -5819,6 +5805,108 @@ impl TaskStore {
             RUN_ADMISSION_LOCK_RETRIES,
             lock_path.display()
         )
+    }
+
+    #[cfg(unix)]
+    fn reclaim_headless_continuation_decision_lock(
+        &self,
+        lock_path: &Path,
+        continuation_id: &str,
+    ) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(false),
+            Err(error) => {
+                return Err(error).context("failed to inspect headless continuation lock")
+            }
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+            ) {
+                return Ok(false);
+            }
+            return Err(error).context("failed to claim headless continuation lock");
+        }
+        let _claim = FlockGuard {
+            fd: file.as_raw_fd(),
+        };
+        let lock_metadata = file
+            .metadata()
+            .context("failed to inspect claimed headless continuation lock")?;
+        if !lock_metadata.is_file() {
+            return Ok(false);
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .context("failed to read claimed headless continuation lock")?;
+        let should_reclaim = self
+            .read_headless_continuation_decision(continuation_id)
+            .map(|decision| decision.is_some())
+            .unwrap_or(false)
+            || headless_continuation_lock_content_owner_is_dead(&contents)
+            || lock_metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= HEADLESS_CONTINUATION_DECISION_LOCK_STALE_AFTER);
+        if !should_reclaim {
+            return Ok(false);
+        }
+        let path_metadata = match fs::symlink_metadata(lock_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(error).context("failed to reinspect headless continuation lock")
+            }
+        };
+        if path_metadata.dev() != lock_metadata.dev() || path_metadata.ino() != lock_metadata.ino()
+        {
+            return Ok(false);
+        }
+        fs::remove_file(lock_path).context("failed to reclaim headless continuation lock")?;
+        if let Some(parent) = lock_path.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(unix))]
+    fn reclaim_headless_continuation_decision_lock(
+        &self,
+        lock_path: &Path,
+        continuation_id: &str,
+    ) -> Result<bool> {
+        let should_reclaim = self
+            .read_headless_continuation_decision(continuation_id)?
+            .is_some()
+            || fs::metadata(lock_path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= HEADLESS_CONTINUATION_DECISION_LOCK_STALE_AFTER);
+        if !should_reclaim {
+            return Ok(false);
+        }
+        match fs::remove_file(lock_path) {
+            Ok(())
+            | Err(std::io::Error {
+                kind: ErrorKind::NotFound,
+                ..
+            }) => Ok(true),
+            Err(error) => Err(error).context("failed to reclaim headless continuation lock"),
+        }
     }
 
     #[cfg(unix)]
@@ -6017,11 +6105,16 @@ fn headless_continuation_decision_lock_is_held(continuation_id: &str) -> bool {
     HELD_HEADLESS_CONTINUATION_DECISION_LOCKS.with(|held| held.borrow().contains(continuation_id))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn headless_continuation_lock_owner_is_dead(lock_path: &Path) -> bool {
     let Ok(body) = fs::read_to_string(lock_path) else {
         return false;
     };
+    headless_continuation_lock_content_owner_is_dead(&body)
+}
+
+#[cfg(unix)]
+fn headless_continuation_lock_content_owner_is_dead(body: &str) -> bool {
     let Some(pid) = body
         .lines()
         .find_map(|line| line.strip_prefix("pid="))
