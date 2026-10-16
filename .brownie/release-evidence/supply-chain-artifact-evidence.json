@@ -36,7 +36,7 @@
       "lockfiles": [
         {
           "path": "Cargo.lock",
-          "sha256": "sha256:15bb5e19c11fa1c2531fec7cef801bb8c7aec4def850cd2c24749c1d33d466b6"
+          "sha256": "sha256:c1537dc89ab48ada0a6fcd254751f855c4bd1be85f93936a80751d37ccdc0022"
         },
         {
           "path": "pnpm-lock.yaml",
