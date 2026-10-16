@@ -1,9 +1,42 @@
 use super::*;
 
+thread_local! {
+    static HELD_HEADLESS_CONTINUATION_LOCKS: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        std::cell::RefCell::new(std::collections::BTreeSet::new());
+}
+
+struct HeldHeadlessContinuationLock {
+    continuation_id: String,
+}
+
+impl HeldHeadlessContinuationLock {
+    fn acquire(continuation_id: &str) -> Self {
+        HELD_HEADLESS_CONTINUATION_LOCKS.with(|held| {
+            held.borrow_mut().insert(continuation_id.to_string());
+        });
+        Self {
+            continuation_id: continuation_id.to_string(),
+        }
+    }
+}
+
+impl Drop for HeldHeadlessContinuationLock {
+    fn drop(&mut self) {
+        HELD_HEADLESS_CONTINUATION_LOCKS.with(|held| {
+            held.borrow_mut().remove(&self.continuation_id);
+        });
+    }
+}
+
+fn headless_continuation_lock_is_held(continuation_id: &str) -> bool {
+    HELD_HEADLESS_CONTINUATION_LOCKS.with(|held| held.borrow().contains(continuation_id))
+}
+
 pub(super) fn handle_headless_continue_once(
     id: Value,
     params: Option<Value>,
 ) -> JsonRpcResponse<Value> {
+    let original_params = params.clone();
     let params: HeadlessContinueOnceParams = match parse_params(params) {
         Ok(params) => params,
         Err(message) => return error_response(id, -32602, &message),
@@ -1104,6 +1137,27 @@ pub(super) fn handle_headless_continue_once(
             -32602,
             "invalid params: selected_index_context is supported only for normal headless task continuation",
         );
+    }
+
+    if let Some(continuation_id) = params.continuation_id.as_deref() {
+        if !headless_continuation_lock_is_held(continuation_id) {
+            let store = match BrownieStore::from_env_or_cwd() {
+                Ok(store) => store,
+                Err(error) => {
+                    return error_response(id, -32603, &format!("internal error: {error}"));
+                }
+            };
+            return match store.tasks().with_headless_continuation_decision_lock(
+                continuation_id,
+                || {
+                    let _held = HeldHeadlessContinuationLock::acquire(continuation_id);
+                    Ok(handle_headless_continue_once(id.clone(), original_params))
+                },
+            ) {
+                Ok(response) => response,
+                Err(error) => error_response(id, -32603, &format!("internal error: {error}")),
+            };
+        }
     }
 
     let store = match BrownieStore::from_env_or_cwd() {

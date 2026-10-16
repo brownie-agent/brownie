@@ -52,6 +52,11 @@ const RUN_ADMISSION_LOCK_SLEEP: Duration = Duration::from_millis(10);
 const HEADLESS_OBJECTIVE_ADMISSION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5);
 const CODEBASE_INDEX_LOCK_STALE_AFTER_SECONDS: i64 = 30 * 60;
 const DURABLE_STORE_SCHEMA_ID: &str = "brownie-runtime-durable-store";
+
+thread_local! {
+    static HELD_HEADLESS_CONTINUATION_DECISION_LOCKS: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        std::cell::RefCell::new(std::collections::BTreeSet::new());
+}
 const DURABLE_STORE_SCHEMA_MANIFEST_FORMAT_VERSION: u64 = 1;
 const DURABLE_STORE_SCHEMA_STATE_CURRENT: &str = "current";
 const DURABLE_STORE_SCHEMA_STATE_MIGRATION_IN_PROGRESS: &str = "migration_in_progress";
@@ -4871,7 +4876,9 @@ impl TaskStore {
         &self,
         lookup: &HeadlessContinuationDecisionLookup,
     ) -> Result<()> {
-        let _lock = self.acquire_headless_continuation_decision_lock(&lookup.continuation_id)?;
+        let _lock = (!headless_continuation_decision_lock_is_held(&lookup.continuation_id))
+            .then(|| self.acquire_headless_continuation_decision_lock(&lookup.continuation_id))
+            .transpose()?;
         let path = self.headless_continuation_decision_path(&lookup.continuation_id);
         if let Some(existing) = self.read_headless_continuation_decision(&lookup.continuation_id)? {
             if existing == *lookup
@@ -5146,6 +5153,16 @@ impl TaskStore {
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let _lock = self.acquire_headless_objective_admission_lock(admission_id)?;
+        f()
+    }
+
+    pub fn with_headless_continuation_decision_lock<T>(
+        &self,
+        continuation_id: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _lock = self.acquire_headless_continuation_decision_lock(continuation_id)?;
+        let _held = HeldHeadlessContinuationDecisionLock::acquire(continuation_id);
         f()
     }
 
@@ -5972,6 +5989,33 @@ fn headless_continuation_decisions_have_same_effect(
         && left.expected_aggregate_sequence == right.expected_aggregate_sequence
         && left.candidate_count == right.candidate_count
         && left.policy_version == right.policy_version
+}
+
+struct HeldHeadlessContinuationDecisionLock {
+    continuation_id: String,
+}
+
+impl HeldHeadlessContinuationDecisionLock {
+    fn acquire(continuation_id: &str) -> Self {
+        HELD_HEADLESS_CONTINUATION_DECISION_LOCKS.with(|held| {
+            held.borrow_mut().insert(continuation_id.to_string());
+        });
+        Self {
+            continuation_id: continuation_id.to_string(),
+        }
+    }
+}
+
+impl Drop for HeldHeadlessContinuationDecisionLock {
+    fn drop(&mut self) {
+        HELD_HEADLESS_CONTINUATION_DECISION_LOCKS.with(|held| {
+            held.borrow_mut().remove(&self.continuation_id);
+        });
+    }
+}
+
+fn headless_continuation_decision_lock_is_held(continuation_id: &str) -> bool {
+    HELD_HEADLESS_CONTINUATION_DECISION_LOCKS.with(|held| held.borrow().contains(continuation_id))
 }
 
 #[derive(Debug)]
