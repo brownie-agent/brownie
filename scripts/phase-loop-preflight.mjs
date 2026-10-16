@@ -42,14 +42,32 @@ function parseArgs(argv) {
   return args;
 }
 
-function readText(repoRoot, relativePath, errors) {
+function requiredPathInRepository(repoRoot, requestedPath, errors) {
+  const resolvedPath = path.resolve(repoRoot, requestedPath);
+  const relativePath = path.relative(repoRoot, resolvedPath);
+  if (relativePath === '..' || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    errors.push({
+      code: 'required_file_outside_repository',
+      path: requestedPath,
+      message: `${requestedPath} must resolve inside the repository root.`
+    });
+    return null;
+  }
+  return resolvedPath;
+}
+
+function readText(repoRoot, requestedPath, errors) {
+  const resolvedPath = requiredPathInRepository(repoRoot, requestedPath, errors);
+  if (!resolvedPath) {
+    return '';
+  }
   try {
-    return fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
+    return fs.readFileSync(resolvedPath, 'utf8');
   } catch (error) {
     errors.push({
       code: 'required_file_unreadable',
-      path: relativePath,
-      message: `${relativePath} must be readable: ${error.message}`
+      path: requestedPath,
+      message: `${requestedPath} must be readable: ${error.message}`
     });
     return '';
   }
