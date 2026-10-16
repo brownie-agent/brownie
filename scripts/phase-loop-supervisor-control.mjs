@@ -2462,6 +2462,63 @@ function maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, diagnostic) {
   }
 }
 
+// Progress-integrity deliberately rejects operational-only changes: they must
+// not satisfy a claimed implementation leaf.  Preserve that fail-closed
+// verdict, but make the next worker turn actionable rather than leaving a
+// terminal no-progress state with no target-specific instruction.
+function maybeWriteSelectedTargetRedelegationFeedback(repoRoot, diagnostic) {
+  const integrity = (diagnostic.issues ?? []).find((issue) => issue.code === 'progress_integrity_invalid');
+  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
+  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const claim = readJsonOrNull(claimPath);
+  const feedback = readJsonOrNull(feedbackPath);
+  const violation = (integrity?.errors ?? []).find((error) => error?.code === 'selected_target_not_changed');
+  const retainedIntegrityFailure = feedback?.reason === 'verification_output_unparseable'
+    && String(feedback?.verification?.raw_tail ?? '').includes('selected_target_not_changed');
+  if (!violation && !retainedIntegrityFailure) return { attempted: false, reason: 'selected_target_not_changed_not_reported' };
+  const selectedTodo = claim?.selected_todo ?? selectedTodoBlock(diagnostic) ?? feedback?.selected_todo_first_line ?? null;
+  const selectedId = violation?.selected_todo_id ?? diagnostic.verification_failure?.selected_todo?.id ?? todoIdFromFirstLine(todoFirstLine(selectedTodo));
+  const inlineTargets = typeof selectedTodo === 'string'
+    ? [...selectedTodo.matchAll(/`([^`]+)`/gu)].map((match) => match[1]).filter((value) => value.includes('/'))
+    : [];
+  const targets = Array.isArray(violation?.selected_scopes)
+    ? violation.selected_scopes
+    : Array.isArray(diagnostic.verification_failure?.selected_todo?.patch_targets)
+      ? diagnostic.verification_failure.selected_todo.patch_targets
+      : inlineTargets;
+  if (!selectedId || targets.length === 0) {
+    return { attempted: true, ok: false, reason: 'selected_target_redelegation_missing_contract', todo_id: selectedId ?? null };
+  }
+  const redelegationFeedback = {
+    schema_version: 1,
+    kind: 'phase_loop_selected_target_redelegation_feedback',
+    generated_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
+    completed: false,
+    reason: 'selected_target_not_changed',
+    selected_todo: selectedTodo,
+    selected_todo_first_line: todoFirstLine(selectedTodo),
+    selected_todo_id: selectedId,
+    claim_id: claim?.claim_id ?? null,
+    selected_patch_targets: targets,
+    observed_changed_files: Array.isArray(violation?.changed_files) ? violation.changed_files : [],
+    repair_hint: 'Operational artifacts do not complete this TODO. Preserve the TODO and user changes; emit a compact patch to one selected target, then run its declared verification.',
+    semantic_repair_policy: {
+      mode: 'force_selected_target_patch',
+      allowed_next_actions: ['patch one selected target', 'report one concrete external blocker'],
+      forbidden_next_actions: ['rewrite TODO queue', 'treat .brownie operational artifacts as progress', 'modify unrelated files']
+    },
+    generated_by: 'phase-loop-supervisor-control'
+  };
+  try {
+    fs.mkdirSync(path.dirname(feedbackPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(feedbackPath, `${JSON.stringify(redelegationFeedback, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fsyncFileAndParent(feedbackPath);
+    return { attempted: true, ok: true, path: path.relative(repoRoot, feedbackPath), todo_id: selectedId };
+  } catch (error) {
+    return { attempted: true, ok: false, error: error?.message ?? String(error) };
+  }
+}
+
 function maybeWriteInvalidPatchRepairFeedback(repoRoot, diagnostic) {
   const codes = issueCodes(diagnostic);
   if (!codes.has('invalid_workspace_write_patch_repeated')) {
@@ -2651,6 +2708,11 @@ export function controlPhaseLoop(options = {}) {
     && completedLeafFeedbackResolution.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterTerminalNoEligibleClaimRepair;
+  const selectedTargetRedelegation = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : completedLeafRecovery.completed
+      ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+      : maybeWriteSelectedTargetRedelegationFeedback(repoRoot, afterCompletedLeafFeedbackResolution);
   // A rejected refinement of an already bounded leaf is not evidence that the
   // leaf needs another decomposition.  It is a targeted execution failure:
   // retain the leaf contract and force the next worker turn onto its declared
@@ -2660,21 +2722,29 @@ export function controlPhaseLoop(options = {}) {
     ? { attempted: false, reason: 'repair_disabled' }
     : completedLeafRecovery.completed
       ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+      : selectedTargetRedelegation.attempted && selectedTargetRedelegation.ok
+        ? { attempted: false, reason: 'selected_target_redelegation_takes_precedence' }
       : maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, afterCompletedLeafFeedbackResolution);
   const terminalStalledReplanRecovery = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : completedLeafRecovery.completed
       ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+      : selectedTargetRedelegation.attempted && selectedTargetRedelegation.ok
+        ? { attempted: false, reason: 'selected_target_redelegation_takes_precedence' }
       : maybeRecoverTerminalStalledReplan(repoRoot, afterCompletedLeafFeedbackResolution);
   const delegationPendingRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : completedLeafRecovery.completed
       ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+      : selectedTargetRedelegation.attempted && selectedTargetRedelegation.ok
+        ? { attempted: false, reason: 'selected_target_redelegation_takes_precedence' }
       : maybeWriteDelegationPendingFeedback(repoRoot, afterCompletedLeafFeedbackResolution, ledgerSummary);
   const todoContractReplanRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : completedLeafRecovery.completed
       ? { attempted: false, reason: 'selected_todo_not_live_after_durable_completion', todo_id: completedLeafRecovery.todo_id }
+    : selectedTargetRedelegation.attempted && selectedTargetRedelegation.ok
+      ? { attempted: false, reason: 'selected_target_redelegation_takes_precedence' }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
       : delegationPendingRepair.attempted && delegationPendingRepair.ok
@@ -2770,6 +2840,7 @@ export function controlPhaseLoop(options = {}) {
     terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
     completed_leaf_recovery: completedLeafRecovery,
     completed_leaf_feedback_resolution: completedLeafFeedbackResolution,
+    selected_target_redelegation: selectedTargetRedelegation,
     acknowledged_delegation_reconciliation: acknowledgedDelegationReconciliation,
     delegation_pending: delegationPendingRepair,
     semantic_verification: semanticVerificationRepair,
@@ -2872,6 +2943,7 @@ export function controlPhaseLoop(options = {}) {
       terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
       completed_leaf_recovery: completedLeafRecovery,
       completed_leaf_feedback_resolution: completedLeafFeedbackResolution,
+      selected_target_redelegation: selectedTargetRedelegation,
       acknowledged_delegation_reconciliation: acknowledgedDelegationReconciliation,
       delegation_pending: delegationPendingRepair,
       semantic_verification: semanticVerificationRepair,
