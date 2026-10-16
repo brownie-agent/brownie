@@ -3,11 +3,11 @@
   "evidence_id": "brownie-dependency-security-license-audit-v1",
   "phase": "RRP-8.5",
   "repository": "globalpocket/brownie",
-  "generated_at": "2026-09-28T20:01:59.890Z",
-  "source_commit": "1a2d7c9c401c8aa8ef2e4601eecf49226fe3a825",
+  "generated_at": "2026-10-16T22:36:37.983Z",
+  "source_commit": "42ac962d59983d446a32a740d1805a213e64d4af",
   "release_ready": false,
   "runtime_release_ready": false,
-  "mandatory_gate_passed": true,
+  "mandatory_gate_passed": false,
   "required_checks": [
     "cargo_audit_locked",
     "cargo_deny_policy",
@@ -17,7 +17,7 @@
     {
       "path": "Cargo.lock",
       "present": true,
-      "sha256": "sha256:15bb5e19c11fa1c2531fec7cef801bb8c7aec4def850cd2c24749c1d33d466b6"
+      "sha256": "sha256:c1537dc89ab48ada0a6fcd254751f855c4bd1be85f93936a80751d37ccdc0022"
     },
     {
       "path": "pnpm-lock.yaml",
@@ -38,10 +38,10 @@
       "category": "rust_vulnerability_audit",
       "command": "cargo audit",
       "available": true,
-      "passed": true,
-      "exit_code": 0,
+      "passed": false,
+      "exit_code": 1,
       "timed_out": false,
-      "status": "satisfied",
+      "status": "failed",
       "release_blocking": true
     },
     {
@@ -49,10 +49,10 @@
       "category": "rust_license_advisory_policy",
       "command": "cargo deny check",
       "available": true,
-      "passed": true,
-      "exit_code": 0,
+      "passed": false,
+      "exit_code": 1,
       "timed_out": false,
-      "status": "satisfied",
+      "status": "failed",
       "release_blocking": true
     },
     {
@@ -67,6 +67,9 @@
       "release_blocking": true
     }
   ],
-  "fail_closed_reasons": [],
+  "fail_closed_reasons": [
+    "cargo_audit_locked:failed",
+    "cargo_deny_policy:failed"
+  ],
   "privacy_policy": "No raw process output, absolute path, secret, environment value, or file content is stored."
 }
