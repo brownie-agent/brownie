@@ -2475,8 +2475,13 @@ function maybeWriteSelectedTargetRedelegationFeedback(repoRoot, diagnostic) {
   const violation = (integrity?.errors ?? []).find((error) => error?.code === 'selected_target_not_changed');
   const retainedIntegrityFailure = feedback?.reason === 'verification_output_unparseable'
     && String(feedback?.verification?.raw_tail ?? '').includes('selected_target_not_changed');
-  if (!violation && !retainedIntegrityFailure) return { attempted: false, reason: 'selected_target_not_changed_not_reported' };
   const selectedTodo = claim?.selected_todo ?? selectedTodoBlock(diagnostic) ?? feedback?.selected_todo_first_line ?? null;
+  const selectedFirstLine = todoFirstLine(selectedTodo);
+  const retainedFeedbackMatchesSelection = retainedIntegrityFailure && (
+    (claim?.claim_id && feedback?.claim_id === claim.claim_id)
+    || (selectedFirstLine && feedback?.selected_todo_first_line === selectedFirstLine)
+  );
+  if (!violation && !retainedFeedbackMatchesSelection) return { attempted: false, reason: 'selected_target_not_changed_not_reported' };
   const selectedId = violation?.selected_todo_id ?? diagnostic.verification_failure?.selected_todo?.id ?? todoIdFromFirstLine(todoFirstLine(selectedTodo));
   const inlineTargets = typeof selectedTodo === 'string'
     ? [...selectedTodo.matchAll(/`([^`]+)`/gu)].map((match) => match[1]).filter((value) => value.includes('/'))
@@ -2496,7 +2501,7 @@ function maybeWriteSelectedTargetRedelegationFeedback(repoRoot, diagnostic) {
     completed: false,
     reason: 'selected_target_not_changed',
     selected_todo: selectedTodo,
-    selected_todo_first_line: todoFirstLine(selectedTodo),
+    selected_todo_first_line: selectedFirstLine,
     selected_todo_id: selectedId,
     claim_id: claim?.claim_id ?? null,
     selected_patch_targets: targets,
@@ -2805,6 +2810,8 @@ export function controlPhaseLoop(options = {}) {
     ? { attempted: false, reason: 'repair_disabled' }
     : completedLeafFailureSuppressed
       ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+    : selectedTargetRedelegation.attempted && selectedTargetRedelegation.ok
+      ? { attempted: false, reason: 'selected_target_redelegation_takes_precedence' }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
       : delegationPendingRepair.attempted
@@ -2816,6 +2823,8 @@ export function controlPhaseLoop(options = {}) {
     ? { attempted: false, reason: 'repair_disabled' }
     : completedLeafFailureSuppressed
       ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+    : selectedTargetRedelegation.attempted && selectedTargetRedelegation.ok
+      ? { attempted: false, reason: 'selected_target_redelegation_takes_precedence' }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
       : delegationPendingRepair.attempted
