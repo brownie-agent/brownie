@@ -50,6 +50,7 @@ const MODEPACK_CANDIDATES_DIR: &str = "modepack-candidates";
 const RUN_ADMISSION_LOCK_RETRIES: usize = 200;
 const RUN_ADMISSION_LOCK_SLEEP: Duration = Duration::from_millis(10);
 const HEADLESS_OBJECTIVE_ADMISSION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5);
+const HEADLESS_CONTINUATION_DECISION_LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 const CODEBASE_INDEX_LOCK_STALE_AFTER_SECONDS: i64 = 30 * 60;
 const DURABLE_STORE_SCHEMA_ID: &str = "brownie-runtime-durable-store";
 
@@ -5600,7 +5601,7 @@ impl TaskStore {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
         let lock_path = parent.join(format!("{continuation_id}.lock"));
-        for _ in 0..RUN_ADMISSION_LOCK_RETRIES {
+        loop {
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -5621,7 +5622,7 @@ impl TaskStore {
                             .ok()
                             .and_then(|modified| modified.elapsed().ok())
                             .is_some_and(|age| {
-                                age >= HEADLESS_OBJECTIVE_ADMISSION_LOCK_STALE_AFTER
+                                age >= HEADLESS_CONTINUATION_DECISION_LOCK_STALE_AFTER
                             });
                     if should_reclaim {
                         match fs::remove_file(&lock_path) {
@@ -5638,11 +5639,6 @@ impl TaskStore {
                 }
             }
         }
-        bail!(
-            "headless continuation decision lock remained busy after {} attempts: {}",
-            RUN_ADMISSION_LOCK_RETRIES,
-            lock_path.display()
-        )
     }
 
     fn should_reclaim_headless_objective_admission_lock(

@@ -16108,8 +16108,33 @@ mod tests {
         lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub(super) fn lock_env() -> MutexGuard<'static, ()> {
-        recover_lock(&ENV_LOCK)
+    pub(super) struct EnvLockGuard {
+        _guard: MutexGuard<'static, ()>,
+        brownie_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    }
+
+    impl Drop for EnvLockGuard {
+        fn drop(&mut self) {
+            for (key, _) in
+                std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("BROWNIE_"))
+            {
+                std::env::remove_var(key);
+            }
+            for (key, value) in &self.brownie_environment {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    pub(super) fn lock_env() -> EnvLockGuard {
+        let guard = recover_lock(&ENV_LOCK);
+        let brownie_environment = std::env::vars_os()
+            .filter(|(key, _)| key.to_string_lossy().starts_with("BROWNIE_"))
+            .collect();
+        EnvLockGuard {
+            _guard: guard,
+            brownie_environment,
+        }
     }
 
     #[test]
@@ -16121,6 +16146,20 @@ mod tests {
         }));
 
         let _guard = recover_lock(&lock);
+    }
+
+    #[test]
+    fn lock_env_restores_brownie_environment_after_a_panic() {
+        const KEY: &str = "BROWNIE_TEST_ENV_LOCK_RESTORE";
+        let original = std::env::var_os(KEY);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = lock_env();
+            std::env::set_var(KEY, "abandoned-by-panicking-test");
+            panic!("intentional environment mutation");
+        });
+
+        let _guard = lock_env();
+        assert_eq!(std::env::var_os(KEY), original);
     }
 
     #[test]
