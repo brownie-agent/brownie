@@ -5645,7 +5645,7 @@ fn headless_continuation_decision_for_replay(
         if let Some(scanned) =
             headless_continuation_decision_from_task_ledgers(store, tasks, continuation_id)?
         {
-            if scanned != indexed {
+            if !headless_continuation_decisions_have_same_effect(&scanned, &indexed) {
                 return Err(format!(
                     "conflicting headless continuation decision for {continuation_id}"
                 ));
@@ -5874,7 +5874,7 @@ fn headless_continuation_decision_from_task_ledgers(
                 ));
             };
             if let Some(existing) = found.as_ref() {
-                if existing != &decision {
+                if !headless_continuation_decisions_have_same_effect(existing, &decision) {
                     return Err(format!(
                         "conflicting headless continuation decision for {continuation_id}"
                     ));
@@ -5885,6 +5885,19 @@ fn headless_continuation_decision_from_task_ledgers(
         }
     }
     Ok(found)
+}
+
+fn headless_continuation_decisions_have_same_effect(
+    left: &HeadlessContinuationDecisionLookup,
+    right: &HeadlessContinuationDecisionLookup,
+) -> bool {
+    left.continuation_id == right.continuation_id
+        && left.selected_task_id == right.selected_task_id
+        && left.selected_run_id == right.selected_run_id
+        && left.expected_progress_fingerprint == right.expected_progress_fingerprint
+        && left.expected_aggregate_sequence == right.expected_aggregate_sequence
+        && left.candidate_count == right.candidate_count
+        && left.policy_version == right.policy_version
 }
 
 pub(super) fn headless_continuation_decision_from_payload(

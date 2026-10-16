@@ -4871,9 +4871,12 @@ impl TaskStore {
         &self,
         lookup: &HeadlessContinuationDecisionLookup,
     ) -> Result<()> {
+        let _lock = self.acquire_headless_continuation_decision_lock(&lookup.continuation_id)?;
         let path = self.headless_continuation_decision_path(&lookup.continuation_id);
         if let Some(existing) = self.read_headless_continuation_decision(&lookup.continuation_id)? {
-            if existing == *lookup {
+            if existing == *lookup
+                || headless_continuation_decisions_have_same_effect(&existing, lookup)
+            {
                 return Ok(());
             }
             bail!(
@@ -5566,6 +5569,65 @@ impl TaskStore {
         )
     }
 
+    fn acquire_headless_continuation_decision_lock(
+        &self,
+        continuation_id: &str,
+    ) -> Result<RunAdmissionLock> {
+        let decision_path = self.headless_continuation_decision_path(continuation_id);
+        let parent = decision_path.parent().with_context(|| {
+            format!(
+                "failed to resolve headless continuation decision lock parent for {}",
+                decision_path.display()
+            )
+        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        let lock_path = parent.join(format!("{continuation_id}.lock"));
+        for _ in 0..RUN_ADMISSION_LOCK_RETRIES {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "{}", timestamp()?)
+                        .context("failed to write headless continuation decision lock")?;
+                    return Ok(RunAdmissionLock { path: lock_path });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    let should_reclaim = self
+                        .read_headless_continuation_decision(continuation_id)
+                        .map(|decision| decision.is_some())
+                        .unwrap_or(false)
+                        || fs::metadata(&lock_path)
+                            .and_then(|metadata| metadata.modified())
+                            .ok()
+                            .and_then(|modified| modified.elapsed().ok())
+                            .is_some_and(|age| {
+                                age >= HEADLESS_OBJECTIVE_ADMISSION_LOCK_STALE_AFTER
+                            });
+                    if should_reclaim {
+                        match fs::remove_file(&lock_path) {
+                            Ok(()) => continue,
+                            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                            Err(_) => {}
+                        }
+                    }
+                    thread::sleep(RUN_ADMISSION_LOCK_SLEEP);
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to acquire {}", lock_path.display()));
+                }
+            }
+        }
+        bail!(
+            "headless continuation decision lock remained busy after {} attempts: {}",
+            RUN_ADMISSION_LOCK_RETRIES,
+            lock_path.display()
+        )
+    }
+
     fn should_reclaim_headless_objective_admission_lock(
         &self,
         lock_path: &Path,
@@ -5897,6 +5959,19 @@ impl TaskStore {
     pub fn workspace_root(&self) -> &std::path::Path {
         &self.workspace_root
     }
+}
+
+fn headless_continuation_decisions_have_same_effect(
+    left: &HeadlessContinuationDecisionLookup,
+    right: &HeadlessContinuationDecisionLookup,
+) -> bool {
+    left.continuation_id == right.continuation_id
+        && left.selected_task_id == right.selected_task_id
+        && left.selected_run_id == right.selected_run_id
+        && left.expected_progress_fingerprint == right.expected_progress_fingerprint
+        && left.expected_aggregate_sequence == right.expected_aggregate_sequence
+        && left.candidate_count == right.candidate_count
+        && left.policy_version == right.policy_version
 }
 
 #[derive(Debug)]
@@ -11345,6 +11420,53 @@ fn timestamp() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_equivalent_headless_continuation_decisions_converge_on_one_checkpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = TaskStore::new(temp.path());
+        store.ensure_durable_schema().expect("ensure schema");
+        let base = HeadlessContinuationDecisionLookup {
+            decision_id: "headless_decision_first".to_string(),
+            continuation_id: "concurrent.decision".to_string(),
+            selected_task_id: "task_1".to_string(),
+            selected_run_id: "run_1".to_string(),
+            expected_progress_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            expected_aggregate_sequence: 1,
+            candidate_count: 1,
+            policy_version: "headless_continue_once_v1".to_string(),
+        };
+        let mut duplicate = base.clone();
+        duplicate.decision_id = "headless_decision_second".to_string();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut writers = Vec::new();
+        for decision in [base.clone(), duplicate.clone()] {
+            let store = store.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.write_headless_continuation_decision(&decision)
+            }));
+        }
+        barrier.wait();
+        for writer in writers {
+            writer
+                .join()
+                .expect("writer joined")
+                .expect("equivalent write");
+        }
+
+        let stored = store
+            .read_headless_continuation_decision("concurrent.decision")
+            .expect("read decision")
+            .expect("decision");
+        assert!(
+            stored.decision_id == base.decision_id || stored.decision_id == duplicate.decision_id
+        );
+        assert!(headless_continuation_decisions_have_same_effect(
+            &stored, &base
+        ));
+    }
 
     #[test]
     fn durable_schema_manifest_created_on_first_task_store_access() {
