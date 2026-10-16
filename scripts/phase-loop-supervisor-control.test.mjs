@@ -142,6 +142,7 @@ test('reconciles an acknowledged reviewed merged delegation into a durable compl
   assert.equal(feedback.completed, true);
   assert.equal(completion.selected_todo_id, 'E-21c-runtime-operational-evidence-impl-2-target-02');
   assert.equal(completion.implementation_commit, mergedCommit);
+
 });
 
 test('fails closed when acknowledged delegation lacks independently reviewable merge evidence', () => {
@@ -2218,6 +2219,107 @@ test('escalates invalid patch followed by no-progress on the same leaf to TODO c
   assert.match(todo, /E-21c-replan-stalled-leaf-/u);
   assert.equal(feedback.kind, 'phase_loop_todo_contract_replan_feedback');
   assert.equal(feedback.failure_ledger_summary.replan_reason, 'invalid_patch_followed_by_no_progress');
+});
+
+test('does not recreate a replan for a completed leaf retained only in failure history', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const todoPath = path.join(repo, '.brownie/todo.md');
+  fs.writeFileSync(todoPath, fs.readFileSync(todoPath, 'utf8').replace('- [ ] E-21c-runtime-operational-evidence-impl-2-target-02:', '- [x] E-21c-runtime-operational-evidence-impl-2-target-02:'));
+  fs.mkdirSync(path.join(repo, '.brownie/private/phase-loop/todo-completions'), { recursive: true });
+  writeJson(repo, '.brownie/private/phase-loop/todo-completions/completed-target.json', {
+    selected_todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02'
+  });
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress',
+    run_id: 'run-completed-leaf-history',
+    consecutive_failures: 1,
+    detail: 'Brownie run exited successfully but repeated the same non-progress fingerprint'
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress',
+    same_progress_count: 1,
+    run_stamp: '20261003T171500Z',
+    progress_projection: {
+      cli_status: 'no_eligible_task',
+      closure: 'no_eligible_task',
+      claim_id: 'claim-completed-leaf-history',
+      selected_todo: runtimeEvidenceTodo
+    }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-completed-leaf-history',
+    status: 'claimed',
+    selected_todo: runtimeEvidenceTodo
+  });
+  fs.writeFileSync(
+    path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl'),
+    `${JSON.stringify({
+      schema_version: 1,
+      record_type: 'phase_loop_failure_event',
+      event_id: 'event-completed-leaf-invalid-patch',
+      observed_at: '2026-10-03T17:10:00Z',
+      todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02',
+      selected_todo_first_line: runtimeEvidenceTodo.split('\n')[0],
+      kind: 'invalid_patch',
+      status: 'no_progress',
+      progress_run_stamp: '20261003T171000Z',
+      same_progress_count: 2
+    })}\n`
+  );
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
+    kind: 'phase_loop_semantic_verification_repair_feedback',
+    completed: false,
+    selected_todo: runtimeEvidenceTodo,
+    selected_todo_first_line: runtimeEvidenceTodo.split('\n')[0],
+    verification_failure: {
+      selected_todo: { first_line: runtimeEvidenceTodo.split('\n')[0] },
+      failed_commands: ['pnpm --workspace-root release:runtime-operational-evidence:test']
+    }
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.todo_contract_replan.attempted, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.todo_contract_replan.reason, 'selected_todo_not_live_after_durable_completion');
+  assert.equal(result.repair.semantic_verification.reason, 'completed_leaf_failure_suppressed');
+  assert.equal(result.repair.invalid_patch.reason, 'completed_leaf_failure_suppressed');
+  assert.equal(result.repair.completed_leaf_recovery.completed, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.completed_leaf_feedback_resolution.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8')).completed,
+    true
+  );
+  assert.equal(fs.existsSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl')), false);
+});
+
+test('fails closed when a selected leaf disappears without durable completion evidence', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const todoPath = path.join(repo, '.brownie/todo.md');
+  fs.writeFileSync(todoPath, fs.readFileSync(todoPath, 'utf8').replace('- [ ] E-21c-runtime-operational-evidence-impl-2-target-02:', '- [x] E-21c-runtime-operational-evidence-impl-2-target-02:'));
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress', run_id: 'run-missing-leaf-without-receipt', consecutive_failures: 1
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1,
+    progress_projection: { cli_status: 'no_eligible_task', closure: 'no_eligible_task', selected_todo: runtimeEvidenceTodo }
+  });
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl'), `${JSON.stringify({
+    schema_version: 1, record_type: 'phase_loop_failure_event', event_id: 'missing-leaf-history',
+    observed_at: '2026-10-03T17:10:00Z', todo_id: 'E-21c-runtime-operational-evidence-impl-2-target-02',
+    selected_todo_first_line: runtimeEvidenceTodo.split('\n')[0], kind: 'invalid_patch', status: 'no_progress',
+    progress_run_stamp: '20261003T171000Z', same_progress_count: 2
+  })}\n`);
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: true });
+
+  assert.equal(result.repair.todo_contract_replan.ok, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.todo_contract_replan.reason, 'selected_todo_not_live_without_durable_completion');
+  assert.equal(result.start.attempted, false, JSON.stringify(result, null, 2));
+  assert.equal(result.start.reason, 'todo_contract_replan_failed_not_starting');
 });
 
 test('runs TODO guard after repair when diagnostic reports an existing TODO contract violation', () => {

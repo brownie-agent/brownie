@@ -137,6 +137,64 @@ function maybeArchiveResolvedRepairFeedback(repoRoot) {
   }
 }
 
+// A checked queue entry alone is not proof that a failed leaf completed: it
+// can be an accidental edit.  Suppress retained diagnostics only when the
+// leaf is absent from the live queue *and* a parsed completion receipt names
+// it.  This predicate is evaluated before every feedback writer.
+function completedLeafRecoveryState(repoRoot, diagnostic) {
+  const selectedId = todoIdFromFirstLine(todoFirstLine(selectedTodoBlock(diagnostic)));
+  if (!selectedId) return { completed: false, reason: 'selected_todo_id_missing' };
+  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+  let todoText = '';
+  try {
+    todoText = fs.readFileSync(todoPath, 'utf8');
+  } catch {
+    return { completed: false, reason: 'todo_missing', todo_id: selectedId };
+  }
+  const todoState = loadTodoState(repoRoot, todoText);
+  const liveIds = liveUncheckedTodoIds(todoText);
+  const hasCompletionReceipt = todoState.completionRecords.some((record) => (
+    record?.selected_todo_id === selectedId && record?.reason !== 'source_parent_completed'
+  ));
+  return {
+    completed: !liveIds.has(selectedId) && hasCompletionReceipt,
+    todo_id: selectedId,
+    live: liveIds.has(selectedId),
+    has_completion_receipt: hasCompletionReceipt
+  };
+}
+
+function maybeResolveCompletedLeafRepairFeedback(repoRoot, completion) {
+  if (!completion?.completed) return { attempted: false, reason: 'selected_leaf_not_durably_completed' };
+  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const feedback = readJsonOrNull(feedbackPath);
+  if (!feedback || feedback.completed === true) return { attempted: false, reason: 'no_active_repair_feedback' };
+  const feedbackId = todoIdFromFirstLine(feedback.selected_todo_first_line ?? todoFirstLine(feedback.selected_todo));
+  if (feedbackId !== completion.todo_id) {
+    return { attempted: false, reason: 'active_feedback_targets_different_todo', feedback_todo_id: feedbackId ?? null };
+  }
+  try {
+    const archiveDir = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback-archive');
+    fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+    const stamp = new Date().toISOString().replace(/[-:.]/gu, '').replace(/Z$/u, 'Z');
+    const archivePath = path.join(archiveDir, `${stamp}-durable-completion.json`);
+    fs.writeFileSync(archivePath, `${JSON.stringify(feedback, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    const resolvedAt = new Date().toISOString();
+    fs.writeFileSync(feedbackPath, `${JSON.stringify({
+      ...feedback,
+      completed: true,
+      resolved_at: resolvedAt,
+      resolution: 'selected_leaf_durably_completed',
+      completion_todo_id: completion.todo_id,
+      archived_path: path.relative(repoRoot, archivePath)
+    }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fsyncFileAndParent(archivePath); fsyncFileAndParent(feedbackPath);
+    return { attempted: true, ok: true, archive_path: path.relative(repoRoot, archivePath) };
+  } catch (error) {
+    return { attempted: true, ok: false, error: error?.message ?? String(error) };
+  }
+}
+
 function maybeRepairTodoContract(repoRoot, diagnostic) {
   const codes = issueCodes(diagnostic);
   if (!codes.has('todo_contract_invalid')) {
@@ -2101,6 +2159,34 @@ function maybeWriteTodoContractReplanFeedback(repoRoot, diagnostic, ledgerSummar
   const selectedTodo = claim?.selected_todo ?? selectedTodoBlock(diagnostic);
   const selectedRoute = diagnostic.progress?.selected_todo?.route ?? null;
   const selectedId = ledgerSummary.todo_id ?? todoIdFromFirstLine(todoFirstLine(selectedTodo));
+  const todoText = fs.existsSync(path.join(repoRoot, '.brownie/todo.md'))
+    ? fs.readFileSync(path.join(repoRoot, '.brownie/todo.md'), 'utf8')
+    : '';
+  const todoState = loadTodoState(repoRoot, todoText);
+  const liveTodoIds = liveUncheckedTodoIds(todoText);
+  // A durable delegation receipt may have removed this leaf after its last
+  // failure. Historical ledger events must not resurrect a completed target
+  // as a new replan request on a later supervisor pass.
+  if (!selectedId || !liveTodoIds.has(selectedId)) {
+    const hasCompletionReceipt = todoState.completionRecords.some((record) => (
+      record?.selected_todo_id === selectedId && record?.reason !== 'source_parent_completed'
+    ));
+    if (!selectedId || !hasCompletionReceipt) {
+      return {
+        attempted: true,
+        ok: false,
+        reason: 'selected_todo_not_live_without_durable_completion',
+        todo_id: selectedId ?? null,
+        ledger_summary: ledgerSummary
+      };
+    }
+    return {
+      attempted: false,
+      reason: 'selected_todo_not_live_after_durable_completion',
+      todo_id: selectedId ?? null,
+      ledger_summary: ledgerSummary
+    };
+  }
   if (selectedRoute === 'todo-decomposition' && String(selectedId ?? '').includes('replan-stalled-leaf')) {
     return {
       attempted: false,
@@ -2557,6 +2643,14 @@ export function controlPhaseLoop(options = {}) {
   const afterTerminalNoEligibleClaimRepair = terminalNoEligibleClaimRepair.attempted && terminalNoEligibleClaimRepair.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterRejectedBoundedLeafReplanResidueRepair;
+  const completedLeafRecovery = completedLeafRecoveryState(repoRoot, afterTerminalNoEligibleClaimRepair);
+  const completedLeafFeedbackResolution = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : maybeResolveCompletedLeafRepairFeedback(repoRoot, completedLeafRecovery);
+  const afterCompletedLeafFeedbackResolution = completedLeafFeedbackResolution.attempted
+    && completedLeafFeedbackResolution.ok
+    ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
+    : afterTerminalNoEligibleClaimRepair;
   // A rejected refinement of an already bounded leaf is not evidence that the
   // leaf needs another decomposition.  It is a targeted execution failure:
   // retain the leaf contract and force the next worker turn onto its declared
@@ -2564,22 +2658,34 @@ export function controlPhaseLoop(options = {}) {
   // can otherwise turn one rejected refinement into an endless replan chain.
   const boundedLeafApplyRejectionRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, afterTerminalNoEligibleClaimRepair);
+    : completedLeafRecovery.completed
+      ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+      : maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, afterCompletedLeafFeedbackResolution);
   const terminalStalledReplanRecovery = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : maybeRecoverTerminalStalledReplan(repoRoot, afterTerminalNoEligibleClaimRepair);
+    : completedLeafRecovery.completed
+      ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+      : maybeRecoverTerminalStalledReplan(repoRoot, afterCompletedLeafFeedbackResolution);
   const delegationPendingRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : maybeWriteDelegationPendingFeedback(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary);
+    : completedLeafRecovery.completed
+      ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
+      : maybeWriteDelegationPendingFeedback(repoRoot, afterCompletedLeafFeedbackResolution, ledgerSummary);
   const todoContractReplanRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
+    : completedLeafRecovery.completed
+      ? { attempted: false, reason: 'selected_todo_not_live_after_durable_completion', todo_id: completedLeafRecovery.todo_id }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
       : delegationPendingRepair.attempted && delegationPendingRepair.ok
         ? { attempted: false, reason: 'delegation_pending_blocks_same_scope_replan' }
       : terminalStalledReplanRecovery.attempted && terminalStalledReplanRecovery.ok
         ? { attempted: false, reason: 'terminal_stalled_replan_recovered_to_bounded_leaf' }
-      : maybeWriteTodoContractReplanFeedback(repoRoot, afterTerminalNoEligibleClaimRepair, ledgerSummary);
+      : maybeWriteTodoContractReplanFeedback(repoRoot, afterCompletedLeafFeedbackResolution, ledgerSummary);
+  // A retained diagnostic can outlive the leaf it describes.  Once the
+  // failure-ledger path has verified a durable completion receipt, no later
+  // repair writer may recreate feedback for that completed leaf.
+  const completedLeafFailureSuppressed = completedLeafRecovery.completed;
   const stalledTodoBlocked = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : todoContractReplanRepair.attempted && todoContractReplanRepair.ok
@@ -2604,7 +2710,7 @@ export function controlPhaseLoop(options = {}) {
     terminalStalledReplanRecovery.attempted && terminalStalledReplanRecovery.ok
   )
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
-    : afterTerminalNoEligibleClaimRepair;
+    : afterCompletedLeafFeedbackResolution;
   const postReplanStaleActiveClaimRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : (
@@ -2619,12 +2725,16 @@ export function controlPhaseLoop(options = {}) {
     : afterTodoContractReplan;
   const resolvedRepairFeedbackArchive = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
+    : completedLeafRecovery.completed
+      ? { attempted: false, reason: 'completed_leaf_feedback_already_resolved' }
     : maybeArchiveResolvedRepairFeedback(repoRoot);
   const afterResolvedRepairFeedback = resolvedRepairFeedbackArchive.attempted && resolvedRepairFeedbackArchive.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterPostReplanClaimRepair;
   const semanticVerificationRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
+    : completedLeafFailureSuppressed
+      ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
       : delegationPendingRepair.attempted
@@ -2634,6 +2744,8 @@ export function controlPhaseLoop(options = {}) {
       : maybeWriteSemanticVerificationRepairFeedback(repoRoot, afterResolvedRepairFeedback);
   const invalidPatchRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
+    : completedLeafFailureSuppressed
+      ? { attempted: false, reason: 'completed_leaf_failure_suppressed' }
     : boundedLeafApplyRejectionRepair.attempted && boundedLeafApplyRejectionRepair.ok
       ? { attempted: false, reason: 'bounded_leaf_target_patch_takes_precedence' }
       : delegationPendingRepair.attempted
@@ -2656,6 +2768,8 @@ export function controlPhaseLoop(options = {}) {
     rejected_bounded_leaf_replan_residue: rejectedBoundedLeafReplanResidueRepair,
     stale_active_claim: staleActiveClaimRepair,
     terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
+    completed_leaf_recovery: completedLeafRecovery,
+    completed_leaf_feedback_resolution: completedLeafFeedbackResolution,
     acknowledged_delegation_reconciliation: acknowledgedDelegationReconciliation,
     delegation_pending: delegationPendingRepair,
     semantic_verification: semanticVerificationRepair,
@@ -2673,6 +2787,10 @@ export function controlPhaseLoop(options = {}) {
   );
   const postReplanClaimArchivalFailed = postReplanStaleActiveClaimRepair.attempted
     && postReplanStaleActiveClaimRepair.ok === false;
+  const todoContractReplanFailed = todoContractReplanRepair.attempted
+    && todoContractReplanRepair.ok === false;
+  const completedLeafFeedbackResolutionFailed = completedLeafFeedbackResolution.attempted
+    && completedLeafFeedbackResolution.ok === false;
   // A controller self-update is a distinct Brownie run.  It is intentionally
   // dispatched before, and instead of, restarting the normal supervisor: the
   // worker may change the controller/runtime that selected the stopped state.
@@ -2702,6 +2820,18 @@ export function controlPhaseLoop(options = {}) {
         ? { attempted: false, reason: 'self_update_retry_budget_exhausted_not_starting', self_update: selfUpdate }
     : postRepair.attempted && !postRepair.ok
     ? { attempted: false, reason: 'post_repair_validation_failed', validation: postRepair }
+    : completedLeafFeedbackResolutionFailed
+    ? {
+        attempted: false,
+        reason: 'completed_leaf_feedback_resolution_failed_not_starting',
+        completed_leaf_feedback_resolution: completedLeafFeedbackResolution
+      }
+    : todoContractReplanFailed
+    ? {
+        attempted: false,
+        reason: 'todo_contract_replan_failed_not_starting',
+        todo_contract_replan: todoContractReplanRepair
+      }
     : postReplanClaimArchivalFailed
       ? {
           attempted: false,
@@ -2740,6 +2870,8 @@ export function controlPhaseLoop(options = {}) {
       rejected_bounded_leaf_replan_residue: rejectedBoundedLeafReplanResidueRepair,
       stale_active_claim: staleActiveClaimRepair,
       terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
+      completed_leaf_recovery: completedLeafRecovery,
+      completed_leaf_feedback_resolution: completedLeafFeedbackResolution,
       acknowledged_delegation_reconciliation: acknowledgedDelegationReconciliation,
       delegation_pending: delegationPendingRepair,
       semantic_verification: semanticVerificationRepair,
