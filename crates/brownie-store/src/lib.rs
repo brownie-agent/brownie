@@ -1,8 +1,6 @@
 //! Brownie persistence crate.
 
-#[cfg(unix)]
-use std::fs::File;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
 use std::io::Read;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
@@ -29,6 +27,7 @@ use brownie_protocol::{
     RuntimeDeadline, TaskRecord, TaskStartParams, TaskStatus, VerificationRecoveryProvenance,
     VerificationRecoveryRetryProvenance,
 };
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
@@ -5614,14 +5613,7 @@ impl TaskStore {
                         .context("failed to write headless continuation decision lock owner")?;
                     writeln!(file, "created_at={}", timestamp()?)
                         .context("failed to write headless continuation decision lock")?;
-                    #[cfg(unix)]
-                    {
-                        return RunAdmissionLock::with_headless_continuation_advisory_lock(
-                            lock_path, file,
-                        );
-                    }
-                    #[cfg(not(unix))]
-                    return Ok(RunAdmissionLock::new(lock_path));
+                    return RunAdmissionLock::with_headless_continuation_lock(lock_path, file);
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     if self
@@ -5897,6 +5889,18 @@ impl TaskStore {
         lock_path: &Path,
         continuation_id: &str,
     ) -> Result<bool> {
+        let file = match OpenOptions::new().read(true).write(true).open(lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(error).context("failed to inspect headless continuation lock")
+            }
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error).context("failed to claim headless continuation lock"),
+        }
         let should_reclaim = self
             .read_headless_continuation_decision(continuation_id)?
             .is_some()
@@ -6135,56 +6139,38 @@ fn headless_continuation_lock_content_owner_is_dead(body: &str) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-#[cfg(not(unix))]
-fn headless_continuation_lock_owner_is_dead(_lock_path: &Path) -> bool {
-    false
-}
-
 #[derive(Debug)]
 struct RunAdmissionLock {
     path: PathBuf,
-    #[cfg(unix)]
-    headless_continuation_advisory_lock: Option<HeadlessContinuationAdvisoryLock>,
+    headless_continuation_lock: Option<HeadlessContinuationLock>,
 }
 
 impl RunAdmissionLock {
     fn new(path: PathBuf) -> Self {
         Self {
             path,
-            #[cfg(unix)]
-            headless_continuation_advisory_lock: None,
+            headless_continuation_lock: None,
         }
     }
 
-    #[cfg(unix)]
-    fn with_headless_continuation_advisory_lock(path: PathBuf, file: File) -> Result<Self> {
-        use std::os::fd::AsRawFd;
-
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to retain headless continuation advisory lock");
-        }
+    fn with_headless_continuation_lock(path: PathBuf, file: File) -> Result<Self> {
+        file.lock_exclusive()
+            .context("failed to retain headless continuation lock")?;
         Ok(Self {
             path,
-            headless_continuation_advisory_lock: Some(HeadlessContinuationAdvisoryLock { file }),
+            headless_continuation_lock: Some(HeadlessContinuationLock { file }),
         })
     }
 }
 
-#[cfg(unix)]
 #[derive(Debug)]
-struct HeadlessContinuationAdvisoryLock {
+struct HeadlessContinuationLock {
     file: File,
 }
 
-#[cfg(unix)]
-impl Drop for HeadlessContinuationAdvisoryLock {
+impl Drop for HeadlessContinuationLock {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -6194,8 +6180,7 @@ impl Drop for RunAdmissionLock {
         if let Some(parent) = self.path.parent() {
             let _ = sync_dir(parent);
         }
-        #[cfg(unix)]
-        drop(self.headless_continuation_advisory_lock.take());
+        drop(self.headless_continuation_lock.take());
     }
 }
 
