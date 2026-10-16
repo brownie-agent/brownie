@@ -2961,6 +2961,13 @@ fn apply_replace_file_transaction_recovery(
                 "Approved diff does not match a current transaction recovery target.",
             );
         }
+        if let Some(reason) = todo_queue_post_apply_rejection_reason(
+            store.workspace_root(),
+            &proposal.path,
+            &item.replacement_content,
+        ) {
+            return deny(apply_result, "todo_queue_post_apply_preflight", &reason);
+        }
         let content_chars = item.replacement_content.chars().count();
         let replacement_bytes = item.replacement_content.as_bytes().to_vec();
         let content_bytes = replacement_bytes.len() as u64;
@@ -4720,6 +4727,13 @@ fn apply_replace_file_transaction(
                 "transaction_approved_diffs_match_current_targets",
                 "Approved diff does not match a current transaction target and replacement content.",
             );
+        }
+        if let Some(reason) = todo_queue_post_apply_rejection_reason(
+            store.workspace_root(),
+            &proposal.path,
+            &item.replacement_content,
+        ) {
+            return deny_item(apply_result, "todo_queue_post_apply_preflight", &reason);
         }
         let content_chars = item.replacement_content.chars().count();
         let replacement_bytes = item.replacement_content.as_bytes().to_vec();
