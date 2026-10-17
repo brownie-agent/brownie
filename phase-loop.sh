@@ -4721,7 +4721,7 @@ try_no_eligible_multitarget_leaf_split_fallback() {
     printf '%s\n' '{"applied":false,"eligible":false,"operation":"no_eligible_multitarget_leaf_split_fallback","reason":"claim_or_progress_state_missing"}'
     return 2
   fi
-  python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$PROGRESS_STATE_FILE" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$PHASE_LOOP_WORKSPACE_ROOT" "$run_stamp" "$(now_utc)" <<'PY'
+  python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$PROGRESS_STATE_FILE" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$PHASE_LOOP_WORKSPACE_ROOT" "$RUN_DIR" "$run_stamp" "$(now_utc)" <<'PY'
 import json
 import os
 import pathlib
@@ -4735,8 +4735,9 @@ progress_path = pathlib.Path(sys.argv[3])
 todo_path = pathlib.Path(sys.argv[4])
 breakdown_path = pathlib.Path(sys.argv[5])
 workspace = pathlib.Path(sys.argv[6])
-run_stamp = sys.argv[7]
-timestamp = sys.argv[8]
+runs_dir = pathlib.Path(sys.argv[7])
+run_stamp = sys.argv[8]
+timestamp = sys.argv[9]
 
 def read_json(path):
     try:
@@ -4762,6 +4763,45 @@ def safe_leaf_id(parent_id, index):
         return base
     suffix = f"-target-{index:02d}"
     return f"{parent_id[:96-len(suffix)].rstrip('-')}{suffix}"
+
+def prior_terminal_no_eligible_evidence():
+    """Return the newest earlier terminal no-eligible stdout for this state dir.
+
+    The current invocation has already retained its claim, while terminal repair
+    feedback is written only after the runtime returns.  A previous terminal
+    result is therefore the durable, auditable evidence that permits this
+    narrowly-scoped queue replan before another identical invocation.
+    """
+    candidates = []
+    try:
+        candidates = sorted(runs_dir.glob("*.stdout.log"), reverse=True)
+    except Exception:
+        return None
+    for candidate in candidates:
+        stamp = candidate.name.split(".stdout.log", 1)[0]
+        if not stamp or stamp >= run_stamp:
+            continue
+        try:
+            if not candidate.is_file() or candidate.is_symlink() or candidate.stat().st_size > 1024 * 1024:
+                continue
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        run = payload.get("run") if isinstance(payload, dict) else None
+        if not isinstance(run, dict) or run.get("status") != "no_eligible_task":
+            continue
+        automation = run.get("automation") if isinstance(run.get("automation"), dict) else {}
+        terminal = (
+            run.get("terminal_failure") is True
+            or automation.get("terminal_failure") is True
+            or run.get("stop_class") == "terminal_failure"
+            or automation.get("stop_class") == "terminal_failure"
+            or run.get("stop_reason") == "terminal_task_failed"
+            or automation.get("stop_reason") == "terminal_task_failed"
+        )
+        if terminal:
+            return {"source": "prior_terminal_no_eligible_stdout", "run_stamp": stamp, "path": str(candidate)}
+    return None
 
 def target_route(original_route, target):
     route = original_route if original_route in {"implementation", "documentation", "release-ops", "todo-decomposition"} else "implementation"
@@ -4802,6 +4842,7 @@ if "Route: todo-decomposition" in selected:
     skip("todo_decomposition_route")
 verification_feedback = feedback.get("verification") if isinstance(feedback.get("verification"), dict) else {}
 progress_projection = progress.get("progress_projection") if isinstance(progress.get("progress_projection"), dict) else {}
+prior_terminal_evidence = prior_terminal_no_eligible_evidence()
 combined = " ".join(
     str(value)
     for value in [
@@ -4816,6 +4857,7 @@ combined = " ".join(
         progress_projection.get("closure"),
         progress_projection.get("stop_class"),
         progress_projection.get("stop_reason"),
+        prior_terminal_evidence.get("source") if prior_terminal_evidence else "",
     ]
 )
 if "no_eligible_task" not in combined and "split_multitarget_leaf" not in combined:
@@ -4823,6 +4865,7 @@ if "no_eligible_task" not in combined and "split_multitarget_leaf" not in combin
 if (
     progress.get("classification") not in {"no_progress", "non_progress_success"}
     and not feedback
+    and not prior_terminal_evidence
 ):
     skip("progress_not_terminal_non_progress_without_feedback")
 
@@ -5029,6 +5072,7 @@ record = {
     "workspace_changed_files": [".brownie/todo.md", ".brownie/todo-breakdown.md"],
     "selected_scopes": targets,
     "replan_record_reason": "deterministic_no_eligible_multitarget_split",
+    "evidence_source": prior_terminal_evidence or {"source": "repair_feedback_or_terminal_progress"},
     "generated_leaf_ids": leaf_ids,
     "generated_child_ids": leaf_ids,
     "written_at": timestamp,
@@ -5052,6 +5096,7 @@ print(json.dumps({
     "leaf_ids": leaf_ids,
     "targets": targets,
     "run_stamp": run_stamp,
+    "evidence_source": prior_terminal_evidence or {"source": "repair_feedback_or_terminal_progress"},
 }, ensure_ascii=False, sort_keys=True))
 PY
 }
