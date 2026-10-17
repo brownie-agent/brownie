@@ -77,7 +77,23 @@ run_with_timeout() {
     sleep 1
     elapsed=$((elapsed + 1))
   done
-  wait "$child_pid"
+  local child_status=0
+  if wait "$child_pid"; then
+    child_status=0
+  else
+    child_status="$?"
+  fi
+  if [ -n "${CLAIM_SMOKE_REPO_TODO_SHA256:-}" ]; then
+    local current_todo_sha256
+    local current_breakdown_sha256
+    current_todo_sha256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
+    current_breakdown_sha256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
+    if [ "$current_todo_sha256" != "$CLAIM_SMOKE_REPO_TODO_SHA256" ] || [ "$current_breakdown_sha256" != "$CLAIM_SMOKE_REPO_BREAKDOWN_SHA256" ]; then
+      echo "phase-loop claim smoke leaked a temporary queue into the repository: todo=${PHASE_LOOP_TODO:-<default>} breakdown=${PHASE_LOOP_TODO_BREAKDOWN:-<default>} workspace=${PHASE_LOOP_WORKSPACE_ROOT:-<default>}" >&2
+      return 97
+    fi
+  fi
+  return "$child_status"
 }
 
 wait_for_pid_exit() {
@@ -124,6 +140,12 @@ assert_contains "$PHASE_LOOP" "Every generated leaf ID must be unique within new
 assert_contains "$PHASE_LOOP" "A leaf must never depend on itself"
 assert_contains "$PHASE_LOOP" "distinct prerequisite TODO ID already present in the live queue"
 assert_contains "$PHASE_LOOP" 'never generate a read-only `Read`, `Inspect`, or `Extract` leaf'
+
+# Every scenario below must confine queue mutations to its own TODO/breakdown
+# paths.  A smoke fixture must never mutate the repository queue that CI later
+# validates, even when the scenario exits through a replan or repair path.
+CLAIM_SMOKE_REPO_TODO_SHA256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
+CLAIM_SMOKE_REPO_BREAKDOWN_SHA256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
 
 test_workspace="$(mktemp -d)"
 git -C "$test_workspace" init -b main >/dev/null
