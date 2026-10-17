@@ -659,6 +659,8 @@ PY
 state_terminal_no_eligible="$(mktemp -d)"
 prompt_terminal_no_eligible="$(mktemp)"
 todo_terminal_no_eligible="$(mktemp)"
+todo_breakdown_terminal_no_eligible="$(mktemp)"
+root_breakdown_before="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
 printf 'base prompt\n' > "$prompt_terminal_no_eligible"
 printf -- '- [ ] E-15a-redaction-guard: implement concrete guard task\n' > "$todo_terminal_no_eligible"
 
@@ -666,12 +668,14 @@ set +e
 PHASE_LOOP_STATE_DIR="$state_terminal_no_eligible" \
 PHASE_LOOP_PROMPT="$prompt_terminal_no_eligible" \
 PHASE_LOOP_TODO="$todo_terminal_no_eligible" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_no_eligible" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 terminal_no_eligible_exit="$?"
 set -e
 test "$terminal_no_eligible_exit" = "76"
+test "$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')" = "$root_breakdown_before"
 python3 - "$state_terminal_no_eligible/status.json" "$state_terminal_no_eligible/progress-state.json" "$state_terminal_no_eligible/todo-claims/current.json" "$state_terminal_no_eligible/todo-claims/repair-feedback.json" <<'PY'
 import json
 import sys
