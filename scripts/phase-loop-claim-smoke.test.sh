@@ -83,6 +83,25 @@ run_with_timeout() {
   else
     child_status="$?"
   fi
+  if [ "$child_status" -ne 0 ]; then
+    echo "phase-loop claim smoke command failed exit=$child_status: $*" >&2
+    if [ -n "${PHASE_LOOP_STATE_DIR:-}" ]; then
+      for diagnostic_file in status.json progress-state.json; do
+        if [ -f "$PHASE_LOOP_STATE_DIR/$diagnostic_file" ]; then
+          echo "--- $PHASE_LOOP_STATE_DIR/$diagnostic_file ---" >&2
+          cat "$PHASE_LOOP_STATE_DIR/$diagnostic_file" >&2
+        fi
+      done
+      latest_stdout="$(find "$PHASE_LOOP_STATE_DIR/runs" -name '*.stdout.log' -type f -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+      latest_stderr="$(find "$PHASE_LOOP_STATE_DIR/runs" -name '*.stderr.log' -type f -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+      for diagnostic_file in "$latest_stdout" "$latest_stderr"; do
+        if [ -n "$diagnostic_file" ] && [ -f "$diagnostic_file" ]; then
+          echo "--- $diagnostic_file (tail) ---" >&2
+          tail -n 80 "$diagnostic_file" >&2
+        fi
+      done
+    fi
+  fi
   if [ -n "${CLAIM_SMOKE_REPO_TODO_SHA256:-}" ]; then
     local current_todo_sha256
     local current_breakdown_sha256
