@@ -150,9 +150,9 @@ for path in (aggregate_path, run_path):
         os.fsync(handle.fileno())
 PY
   # The ledger adapter derives its controller-state path from a repository
-  # root.  Pass that root rather than STATE_DIR so writers and readers share
-  # the canonical .brownie/private/phase-loop/task-ledger.jsonl location.
-  if ! node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-trajectory --repo "$ROOT_DIR" --claim "$TODO_CLAIM_FILE" --todo "$PHASE_LOOP_TODO" --type "$ledger_event_type" --payload "$payload_json" --run "$run_stamp"; then
+  # root.  Keep it inside the selected workspace so isolated controller runs
+  # cannot write task-ledger records into the phase-loop script checkout.
+  if ! node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-trajectory --repo "$PHASE_LOOP_WORKSPACE_ROOT" --claim "$TODO_CLAIM_FILE" --todo "$PHASE_LOOP_TODO" --type "$ledger_event_type" --payload "$payload_json" --run "$run_stamp"; then
     printf '%s task_ledger_transition_failed run=%s event=%s\n' "$(now_utc)" "$run_stamp" "$ledger_event_type" >> "$SUPERVISOR_LOG"
   fi
   case "$event_type" in
