@@ -4717,8 +4717,8 @@ PY
 
 try_no_eligible_multitarget_leaf_split_fallback() {
   local run_stamp="$1"
-  if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$TODO_REPAIR_FEEDBACK_FILE" ] || [ ! -f "$PROGRESS_STATE_FILE" ]; then
-    printf '%s\n' '{"applied":false,"eligible":false,"operation":"no_eligible_multitarget_leaf_split_fallback","reason":"required_state_missing"}'
+  if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$PROGRESS_STATE_FILE" ]; then
+    printf '%s\n' '{"applied":false,"eligible":false,"operation":"no_eligible_multitarget_leaf_split_fallback","reason":"claim_or_progress_state_missing"}'
     return 2
   fi
   python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$PROGRESS_STATE_FILE" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$PHASE_LOOP_WORKSPACE_ROOT" "$run_stamp" "$(now_utc)" <<'PY'
@@ -4798,14 +4798,13 @@ if feedback_claim_id and feedback_claim_id != claim.get("claim_id"):
     skip("feedback_claim_id_mismatch")
 if not feedback_claim_id and feedback_first_line and feedback_first_line != selected_first:
     skip("feedback_selected_todo_mismatch")
-if not feedback_claim_id and not feedback_first_line:
-    skip("feedback_identity_missing")
 if "Route: todo-decomposition" in selected:
     skip("todo_decomposition_route")
 if progress.get("classification") != "no_progress":
     skip("progress_not_no_progress")
 
 verification_feedback = feedback.get("verification") if isinstance(feedback.get("verification"), dict) else {}
+progress_projection = progress.get("progress_projection") if isinstance(progress.get("progress_projection"), dict) else {}
 combined = " ".join(
     str(value)
     for value in [
@@ -4816,6 +4815,10 @@ combined = " ".join(
         verification_feedback.get("stop_reason"),
         verification_feedback.get("repair_hint"),
         verification_feedback.get("no_eligible_task_recovery"),
+        progress_projection.get("cli_status"),
+        progress_projection.get("closure"),
+        progress_projection.get("stop_class"),
+        progress_projection.get("stop_reason"),
     ]
 )
 if "no_eligible_task" not in combined and "split_multitarget_leaf" not in combined:
