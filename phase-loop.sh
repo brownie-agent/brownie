@@ -4800,9 +4800,6 @@ if not feedback_claim_id and feedback_first_line and feedback_first_line != sele
     skip("feedback_selected_todo_mismatch")
 if "Route: todo-decomposition" in selected:
     skip("todo_decomposition_route")
-if progress.get("classification") not in {"no_progress", "non_progress_success"}:
-    skip("progress_not_terminal_non_progress")
-
 verification_feedback = feedback.get("verification") if isinstance(feedback.get("verification"), dict) else {}
 progress_projection = progress.get("progress_projection") if isinstance(progress.get("progress_projection"), dict) else {}
 combined = " ".join(
@@ -4823,6 +4820,11 @@ combined = " ".join(
 )
 if "no_eligible_task" not in combined and "split_multitarget_leaf" not in combined:
     skip("no_eligible_recovery_evidence_missing")
+if (
+    progress.get("classification") not in {"no_progress", "non_progress_success"}
+    and not feedback
+):
+    skip("progress_not_terminal_non_progress_without_feedback")
 
 scope_match = re.search(r"\b(?P<operation>Patch|Create) only\b(?P<scope>[^\n:]+)", selected_first)
 if not scope_match:
