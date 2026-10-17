@@ -160,6 +160,12 @@ claim_smoke_private_state_sha256() {
 CLAIM_SMOKE_REPO_TODO_SHA256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
 CLAIM_SMOKE_REPO_BREAKDOWN_SHA256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
 CLAIM_SMOKE_REPO_PRIVATE_STATE_SHA256="$(claim_smoke_private_state_sha256)"
+# Test invocations always use temporary queue/state paths; their durable
+# controller store must be isolated as well.  Otherwise phase-loop's default
+# store rooted at this repository can leave replan records that alter later
+# repository guards despite an unchanged fixture TODO.
+CLAIM_SMOKE_BROWNIE_STORE_ROOT="$(mktemp -d)"
+export PHASE_LOOP_BROWNIE_STORE_ROOT="$CLAIM_SMOKE_BROWNIE_STORE_ROOT"
 
 test_workspace="$(mktemp -d)"
 git -C "$test_workspace" init -b main >/dev/null
