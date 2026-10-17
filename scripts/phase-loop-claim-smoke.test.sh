@@ -2460,6 +2460,8 @@ assert "no_eligible_multitarget_leaf_split_pre_guard_exit" in phase_loop, phase_
 assert '"reason": "selected_todo_not_in_queue"' in phase_loop, phase_loop
 assert '"reason":"claim_or_progress_state_missing"' in phase_loop, phase_loop
 assert 'progress_projection.get("cli_status")' in phase_loop, phase_loop
+assert '"non_progress_success"' in phase_loop, phase_loop
+assert '"rolled_back": True' in phase_loop, phase_loop
 assert "split_multitarget_or_force_bounded_workspace_write" in phase_loop, phase_loop
 assert "TODO guard failure takes precedence over public-harness actionable-terminal feedback" in phase_loop, phase_loop
 assert "harness_actionable_terminal_policy: suppressed because TODO queue repair is active" in phase_loop, phase_loop

@@ -4800,8 +4800,8 @@ if not feedback_claim_id and feedback_first_line and feedback_first_line != sele
     skip("feedback_selected_todo_mismatch")
 if "Route: todo-decomposition" in selected:
     skip("todo_decomposition_route")
-if progress.get("classification") != "no_progress":
-    skip("progress_not_no_progress")
+if progress.get("classification") not in {"no_progress", "non_progress_success"}:
+    skip("progress_not_terminal_non_progress")
 
 verification_feedback = feedback.get("verification") if isinstance(feedback.get("verification"), dict) else {}
 progress_projection = progress.get("progress_projection") if isinstance(progress.get("progress_projection"), dict) else {}
@@ -4851,6 +4851,8 @@ try:
     breakdown_text = breakdown_path.read_text(encoding="utf-8")
 except FileNotFoundError:
     breakdown_text = "# Brownie TODO breakdown\n"
+original_todo_text = todo_text
+original_breakdown_text = breakdown_text
 
 original_route = line_value(selected, "Route", "implementation").lower()
 original_depends = line_value(selected, "Depends on", "<none>") or "<none>"
@@ -4980,6 +4982,24 @@ if guard_path and (workspace / "scripts/guard-todo-decomposition.mjs").exists():
         timeout=30,
     )
     if guard.returncode != 0:
+        for path, content, suffix in (
+            (todo_path, original_todo_text, "no-eligible-multitarget-rollback-todo"),
+            (breakdown_path, original_breakdown_text, "no-eligible-multitarget-rollback-breakdown"),
+        ):
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{suffix}-{run_stamp}.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                pass
         print(json.dumps({
             "applied": False,
             "eligible": True,
@@ -4987,6 +5007,7 @@ if guard_path and (workspace / "scripts/guard-todo-decomposition.mjs").exists():
             "reason": "todo_decomposition_guard_failed",
             "stdout_tail": guard.stdout[-4000:],
             "stderr_tail": guard.stderr[-4000:],
+            "rolled_back": True,
         }, ensure_ascii=False, sort_keys=True))
         raise SystemExit(1)
 
