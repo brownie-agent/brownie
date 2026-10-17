@@ -3131,7 +3131,22 @@ changed_all = {
     if len(line) >= 4 and line[:2].strip()
 }
 todo_paths = {".brownie/todo.md", "todo.md"}
-unexpected = sorted(path for path in changed_all if path not in allowed_paths and path not in todo_paths)
+# Controller state is intentionally rooted beneath the selected workspace so
+# task-ledger and trajectory writes survive a process restart.  It is not a
+# product change and must not make an otherwise bounded release-ops evidence
+# refresh fail closed.  All other unallowlisted workspace paths remain
+# fail-closed below.
+controller_private_paths = {
+    path for path in changed_all
+    if path == ".brownie/private" or path.startswith(".brownie/private/")
+}
+unexpected = sorted(
+    path
+    for path in changed_all
+    if path not in allowed_paths
+    and path not in todo_paths
+    and path not in controller_private_paths
+)
 if unexpected:
     print(json.dumps({"completed": False, "reason": "unexpected_workspace_changes", "unexpected": unexpected}, sort_keys=True))
     raise SystemExit(1)
