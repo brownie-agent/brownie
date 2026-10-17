@@ -1,74 +1,51 @@
 use super::*;
 
-thread_local! {
-    static HELD_HEADLESS_CONTINUATION_LOCKS: std::cell::RefCell<std::collections::BTreeSet<String>> =
-        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
-}
-
-struct HeldHeadlessContinuationLock {
-    continuation_id: String,
-}
-
-impl HeldHeadlessContinuationLock {
-    fn acquire(continuation_id: &str) -> Self {
-        HELD_HEADLESS_CONTINUATION_LOCKS.with(|held| {
-            held.borrow_mut().insert(continuation_id.to_string());
-        });
-        Self {
-            continuation_id: continuation_id.to_string(),
-        }
-    }
-}
-
-impl Drop for HeldHeadlessContinuationLock {
-    fn drop(&mut self) {
-        HELD_HEADLESS_CONTINUATION_LOCKS.with(|held| {
-            held.borrow_mut().remove(&self.continuation_id);
-        });
-    }
-}
-
-fn headless_continuation_lock_is_held(continuation_id: &str) -> bool {
-    HELD_HEADLESS_CONTINUATION_LOCKS.with(|held| held.borrow().contains(continuation_id))
-}
-
 pub(super) fn handle_headless_continue_once(
     id: Value,
     params: Option<Value>,
 ) -> JsonRpcResponse<Value> {
-    let continuation_id = params
-        .as_ref()
-        .and_then(|value| serde_json::from_value::<HeadlessContinueOnceParams>(value.clone()).ok())
-        .and_then(|params| {
-            (params.max_steps.unwrap_or(1) <= 1)
-                .then_some(params.continuation_id)
-                .flatten()
-        });
-
+    let continuation_id = match validate_headless_continue_once_lock_preflight(params.as_ref()) {
+        Ok(continuation_id) => continuation_id,
+        Err(message) => return error_response(id, -32602, message),
+    };
     if let Some(continuation_id) = continuation_id.as_deref() {
-        if is_valid_headless_continuation_id(continuation_id)
-            && !headless_continuation_lock_is_held(continuation_id)
-        {
-            let store = match BrownieStore::from_env_or_cwd() {
-                Ok(store) => store,
-                Err(error) => {
-                    return error_response(id, -32603, &format!("internal error: {error}"));
-                }
-            };
-            return match store.tasks().with_headless_continuation_decision_lock(
-                continuation_id,
-                || {
-                    let _held = HeldHeadlessContinuationLock::acquire(continuation_id);
-                    Ok(handle_headless_continue_once_claimed(id.clone(), params))
-                },
-            ) {
-                Ok(response) => response,
-                Err(error) => error_response(id, -32603, &format!("internal error: {error}")),
-            };
-        }
+        let store = match BrownieStore::from_env_or_cwd() {
+            Ok(store) => store,
+            Err(error) => return error_response(id, -32603, &format!("internal error: {error}")),
+        };
+        return match store
+            .tasks()
+            .with_headless_continuation_decision_lock(continuation_id, || {
+                Ok(handle_headless_continue_once_claimed(id.clone(), params))
+            }) {
+            Ok(response) => response,
+            Err(error) => error_response(id, -32603, &format!("internal error: {error}")),
+        };
     }
-
     handle_headless_continue_once_claimed(id, params)
+}
+
+fn validate_headless_continue_once_lock_preflight(
+    raw_params: Option<&Value>,
+) -> Result<Option<String>, &'static str> {
+    let Some(raw_params) = raw_params else {
+        return Ok(None);
+    };
+    let params: HeadlessContinueOnceParams =
+        serde_json::from_value(raw_params.clone()).map_err(|_| "invalid params")?;
+    if !params.authorize {
+        return Err("invalid params: authorize must be true");
+    }
+    if params.expected_progress_fingerprint.trim().is_empty() {
+        return Err("invalid params: expected_progress_fingerprint must not be empty");
+    }
+    let Some(continuation_id) = params.continuation_id else {
+        return Ok(None);
+    };
+    if !is_valid_headless_continuation_id(&continuation_id) {
+        return Err("invalid params: continuation_id must be 1-96 ASCII alphanumeric, dash, underscore, colon, or dot characters");
+    }
+    Ok(Some(continuation_id))
 }
 
 fn handle_headless_continue_once_claimed(

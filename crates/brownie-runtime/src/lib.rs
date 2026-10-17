@@ -32180,6 +32180,22 @@ modes:
     }
 
     #[test]
+    fn headless_continue_once_rejects_invalid_request_before_continuation_lock_setup() {
+        let _guard = lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let non_directory_workspace = temp.path().join("not-a-workspace");
+        std::fs::write(&non_directory_workspace, "not a directory").expect("workspace file");
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", &non_directory_workspace);
+
+        let response = parse_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"headless.continue_once","params":{"authorize":false,"expected_progress_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_aggregate_sequence":1,"continuation_id":"invalid-before-lock"}}"#,
+        );
+        assert_eq!(response.error.expect("invalid params error").code, -32602);
+
+        std::env::remove_var("BROWNIE_WORKSPACE_ROOT");
+    }
+
+    #[test]
     fn headless_continue_once_rejects_stale_progress_fingerprint_without_task_running() {
         let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
