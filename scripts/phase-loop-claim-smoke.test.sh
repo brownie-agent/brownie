@@ -2457,7 +2457,9 @@ assert "selected_target_implementation_required" in phase_loop, phase_loop
 assert "try_no_eligible_multitarget_leaf_split_fallback" in phase_loop, phase_loop
 assert "deterministic_no_eligible_multitarget_split" in phase_loop, phase_loop
 assert "no_eligible_multitarget_leaf_split_pre_guard_exit" in phase_loop, phase_loop
-assert '"reason": "selected_todo_not_in_queue"' in phase_loop, phase_loop
+# `skip` is the single formatter for structured fallback rejections; assert the
+# branch rather than a whitespace-sensitive rendering of its JSON output.
+assert 'skip("selected_todo_not_in_queue")' in phase_loop, phase_loop
 assert '"reason":"claim_or_progress_state_missing"' in phase_loop, phase_loop
 assert 'progress_projection.get("cli_status")' in phase_loop, phase_loop
 assert '"non_progress_success"' in phase_loop, phase_loop
