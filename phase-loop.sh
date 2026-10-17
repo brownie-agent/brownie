@@ -4721,7 +4721,7 @@ try_no_eligible_multitarget_leaf_split_fallback() {
     printf '%s\n' '{"applied":false,"eligible":false,"operation":"no_eligible_multitarget_leaf_split_fallback","reason":"claim_or_progress_state_missing"}'
     return 2
   fi
-  python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$PROGRESS_STATE_FILE" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$PHASE_LOOP_WORKSPACE_ROOT" "$RUN_DIR" "$run_stamp" "$(now_utc)" <<'PY'
+  python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$PROGRESS_STATE_FILE" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$PHASE_LOOP_WORKSPACE_ROOT" "$STATE_DIR" "$RUN_DIR" "$run_stamp" "$(now_utc)" <<'PY'
 import json
 import os
 import pathlib
@@ -4735,9 +4735,10 @@ progress_path = pathlib.Path(sys.argv[3])
 todo_path = pathlib.Path(sys.argv[4])
 breakdown_path = pathlib.Path(sys.argv[5])
 workspace = pathlib.Path(sys.argv[6])
-runs_dir = pathlib.Path(sys.argv[7])
-run_stamp = sys.argv[8]
-timestamp = sys.argv[9]
+state_dir = pathlib.Path(sys.argv[7])
+runs_dir = pathlib.Path(sys.argv[8])
+run_stamp = sys.argv[9]
+timestamp = sys.argv[10]
 
 def read_json(path):
     try:
@@ -4802,6 +4803,15 @@ def prior_terminal_no_eligible_evidence():
         if terminal:
             return {"source": "prior_terminal_no_eligible_stdout", "run_stamp": stamp, "path": str(candidate)}
     return None
+
+def controller_replan_dir():
+    """Keep fixture/external TODO history out of the live workspace ledger."""
+    try:
+        if todo_path.resolve() == (workspace / ".brownie/todo.md").resolve():
+            return workspace / ".brownie/private/phase-loop/todo-replans", "workspace_canonical_todo"
+    except Exception:
+        pass
+    return state_dir / "todo-replans", "isolated_external_todo_state"
 
 def target_route(original_route, target):
     route = original_route if original_route in {"implementation", "documentation", "release-ops", "todo-decomposition"} else "implementation"
@@ -5057,7 +5067,7 @@ if guard_path and (workspace / "scripts/guard-todo-decomposition.mjs").exists():
         raise SystemExit(1)
 
 claim_id = str(claim.get("claim_id") or f"run-{run_stamp}")
-replan_dir = workspace / ".brownie/private/phase-loop/todo-replans"
+replan_dir, controller_store = controller_replan_dir()
 replan_dir.mkdir(parents=True, exist_ok=True)
 record = {
     "schema_version": 1,
@@ -5073,6 +5083,7 @@ record = {
     "selected_scopes": targets,
     "replan_record_reason": "deterministic_no_eligible_multitarget_split",
     "evidence_source": prior_terminal_evidence or {"source": "repair_feedback_or_terminal_progress"},
+    "controller_store": controller_store,
     "generated_leaf_ids": leaf_ids,
     "generated_child_ids": leaf_ids,
     "written_at": timestamp,
@@ -5097,6 +5108,7 @@ print(json.dumps({
     "targets": targets,
     "run_stamp": run_stamp,
     "evidence_source": prior_terminal_evidence or {"source": "repair_feedback_or_terminal_progress"},
+    "controller_store": controller_store,
 }, ensure_ascii=False, sort_keys=True))
 PY
 }
@@ -6156,7 +6168,7 @@ try_reconstruct_missing_todo_replan_records() {
   if [ ! -f "$PHASE_LOOP_TODO" ]; then
     return 2
   fi
-  python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$PHASE_LOOP_TODO" "$validation_json" "$run_stamp" "$(now_utc)" <<'PY'
+  python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$PHASE_LOOP_TODO" "$STATE_DIR" "$validation_json" "$run_stamp" "$(now_utc)" <<'PY'
 import hashlib
 import json
 import os
@@ -6167,9 +6179,10 @@ import sys
 
 workspace = pathlib.Path(sys.argv[1])
 todo_path = pathlib.Path(sys.argv[2])
-validation_text = sys.argv[3]
-run_stamp = sys.argv[4]
-timestamp = sys.argv[5]
+state_dir = pathlib.Path(sys.argv[3])
+validation_text = sys.argv[4]
+run_stamp = sys.argv[5]
+timestamp = sys.argv[6]
 
 def unchecked_blocks(text):
     starts = [match.start() for match in re.finditer(r"^(?:[-*]|\d+[.)])\s+\[\s\]\s+", text or "", re.M)]
@@ -6224,7 +6237,11 @@ except Exception:
 
 unchecked = {todo_id(block): block for block in unchecked_blocks(todo_text) if todo_id(block)}
 checked = {todo_id(block): block for block in checked_blocks(todo_text) if todo_id(block)}
-replan_dir = workspace / ".brownie/private/phase-loop/todo-replans"
+try:
+    canonical_todo = todo_path.resolve() == (workspace / ".brownie/todo.md").resolve()
+except Exception:
+    canonical_todo = False
+replan_dir = (workspace / ".brownie/private/phase-loop/todo-replans") if canonical_todo else (state_dir / "todo-replans")
 replan_dir.mkdir(parents=True, exist_ok=True)
 written = []
 for parent_id in removed_ids:

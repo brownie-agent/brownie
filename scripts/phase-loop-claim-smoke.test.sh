@@ -2466,6 +2466,7 @@ assert '"non_progress_success"' in phase_loop, phase_loop
 assert 'progress_not_terminal_non_progress_without_feedback' in phase_loop, phase_loop
 assert 'prior_terminal_no_eligible_stdout' in phase_loop, phase_loop
 assert 'evidence_source' in phase_loop, phase_loop
+assert 'isolated_external_todo_state' in phase_loop, phase_loop
 assert '"rolled_back": True' in phase_loop, phase_loop
 assert "split_multitarget_or_force_bounded_workspace_write" in phase_loop, phase_loop
 assert "TODO guard failure takes precedence over public-harness actionable-terminal feedback" in phase_loop, phase_loop
