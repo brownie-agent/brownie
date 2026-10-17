@@ -100,6 +100,10 @@ run_with_timeout() {
           tail -n 80 "$diagnostic_file" >&2
         fi
       done
+      if [ -f "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" ]; then
+        echo "--- $PHASE_LOOP_STATE_DIR/logs/supervisor.log (tail) ---" >&2
+        tail -n 80 "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" >&2
+      fi
     fi
   fi
   if [ -n "${CLAIM_SMOKE_REPO_TODO_SHA256:-}" ]; then
@@ -2452,6 +2456,8 @@ assert "must_not_complete_by_todo_refinement_only" in phase_loop, phase_loop
 assert "selected_target_implementation_required" in phase_loop, phase_loop
 assert "try_no_eligible_multitarget_leaf_split_fallback" in phase_loop, phase_loop
 assert "deterministic_no_eligible_multitarget_split" in phase_loop, phase_loop
+assert "no_eligible_multitarget_leaf_split_pre_guard_exit" in phase_loop, phase_loop
+assert '"reason": "selected_todo_not_in_queue"' in phase_loop, phase_loop
 assert "split_multitarget_or_force_bounded_workspace_write" in phase_loop, phase_loop
 assert "TODO guard failure takes precedence over public-harness actionable-terminal feedback" in phase_loop, phase_loop
 assert "harness_actionable_terminal_policy: suppressed because TODO queue repair is active" in phase_loop, phase_loop

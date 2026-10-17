@@ -4718,6 +4718,7 @@ PY
 try_no_eligible_multitarget_leaf_split_fallback() {
   local run_stamp="$1"
   if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$TODO_REPAIR_FEEDBACK_FILE" ] || [ ! -f "$PROGRESS_STATE_FILE" ]; then
+    printf '%s\n' '{"applied":false,"eligible":false,"operation":"no_eligible_multitarget_leaf_split_fallback","reason":"required_state_missing"}'
     return 2
   fi
   python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$PROGRESS_STATE_FILE" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$PHASE_LOOP_WORKSPACE_ROOT" "$run_stamp" "$(now_utc)" <<'PY'
@@ -4772,28 +4773,37 @@ def target_route(original_route, target):
         return "implementation"
     return route
 
+def skip(reason):
+    print(json.dumps({
+        "applied": False,
+        "eligible": False,
+        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "reason": reason,
+    }, ensure_ascii=False, sort_keys=True))
+    raise SystemExit(2)
+
 claim = read_json(claim_path)
 feedback = read_json(feedback_path)
 progress = read_json(progress_path)
 selected = claim.get("selected_todo")
 if not isinstance(selected, str) or not selected.strip():
-    raise SystemExit(2)
+    skip("selected_todo_missing")
 selected_first = selected.splitlines()[0] if selected.splitlines() else ""
 selected_id = todo_id_from_first_line(selected_first)
 if not selected_id:
-    raise SystemExit(2)
+    skip("selected_todo_id_missing")
 feedback_claim_id = feedback.get("claim_id")
 feedback_first_line = feedback.get("selected_todo_first_line")
 if feedback_claim_id and feedback_claim_id != claim.get("claim_id"):
-    raise SystemExit(2)
+    skip("feedback_claim_id_mismatch")
 if not feedback_claim_id and feedback_first_line and feedback_first_line != selected_first:
-    raise SystemExit(2)
+    skip("feedback_selected_todo_mismatch")
 if not feedback_claim_id and not feedback_first_line:
-    raise SystemExit(2)
+    skip("feedback_identity_missing")
 if "Route: todo-decomposition" in selected:
-    raise SystemExit(2)
+    skip("todo_decomposition_route")
 if progress.get("classification") != "no_progress":
-    raise SystemExit(2)
+    skip("progress_not_no_progress")
 
 verification_feedback = feedback.get("verification") if isinstance(feedback.get("verification"), dict) else {}
 combined = " ".join(
@@ -4809,15 +4819,15 @@ combined = " ".join(
     ]
 )
 if "no_eligible_task" not in combined and "split_multitarget_leaf" not in combined:
-    raise SystemExit(2)
+    skip("no_eligible_recovery_evidence_missing")
 
 scope_match = re.search(r"\b(?P<operation>Patch|Create) only\b(?P<scope>[^\n:]+)", selected_first)
 if not scope_match:
-    raise SystemExit(2)
+    skip("selected_scope_not_patch_or_create_only")
 operation = scope_match.group("operation")
 targets = [target.strip() for target in re.findall(r"`([^`\n]+)`", scope_match.group("scope")) if target.strip()]
 if len(targets) <= 1:
-    raise SystemExit(2)
+    skip("selected_scope_not_multitarget")
 if len(set(targets)) != len(targets):
     print(json.dumps({
         "applied": False,
@@ -4831,9 +4841,9 @@ if len(set(targets)) != len(targets):
 try:
     todo_text = todo_path.read_text(encoding="utf-8")
 except Exception:
-    raise SystemExit(2)
+    skip("todo_unreadable")
 if selected not in todo_text:
-    raise SystemExit(2)
+    skip("selected_todo_not_in_queue")
 try:
     breakdown_text = breakdown_path.read_text(encoding="utf-8")
 except FileNotFoundError:
@@ -4858,7 +4868,7 @@ if not original_verification:
 
 checked_selected = re.sub(r"^(\s*[-*]\s+)\[\s\]", r"\1[x]", selected, count=1)
 if checked_selected == selected:
-    raise SystemExit(2)
+    skip("selected_todo_not_pending")
 
 leaf_blocks = []
 leaf_ids = []
@@ -11846,6 +11856,7 @@ PY
   local pre_guard_no_eligible_multitarget_output pre_guard_no_eligible_multitarget_status
   pre_guard_no_eligible_multitarget_output="$(try_no_eligible_multitarget_leaf_split_fallback "$run_stamp" 2>&1)"
   pre_guard_no_eligible_multitarget_status=$?
+  printf '%s run=%s no_eligible_multitarget_leaf_split_pre_guard_exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$pre_guard_no_eligible_multitarget_status" "$pre_guard_no_eligible_multitarget_output" >> "$SUPERVISOR_LOG"
   if [ "$pre_guard_no_eligible_multitarget_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_no_eligible_multitarget_output" > "$stdout_log"
