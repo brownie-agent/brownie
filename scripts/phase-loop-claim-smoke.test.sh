@@ -1783,6 +1783,7 @@ git -C "$empty_queue_guard_workspace" config user.name Brownie
 git -C "$empty_queue_guard_workspace" config user.email brownie@example.invalid
 mkdir -p "$empty_queue_guard_workspace/.brownie" "$empty_queue_guard_workspace/docs/architecture" "$empty_queue_guard_workspace/scripts" "$empty_queue_guard_workspace/docs"
 cp "$REPO_ROOT/scripts/guard-todo-decomposition.mjs" "$empty_queue_guard_workspace/scripts/guard-todo-decomposition.mjs"
+cp "$REPO_ROOT/scripts/phase-loop-todo-state.mjs" "$empty_queue_guard_workspace/scripts/phase-loop-todo-state.mjs"
 printf '{"scripts":{}}\n' > "$empty_queue_guard_workspace/package.json"
 printf '{"product_ready":false}\n' > "$empty_queue_guard_workspace/docs/architecture/phase-value-manifest.json"
 cat > "$empty_queue_guard_workspace/docs/golden.js" <<'EOF'
@@ -1845,6 +1846,7 @@ cp "$REPO_ROOT/package.json" "$verified_noop_e19_workspace/package.json"
 cp "$REPO_ROOT/extensions/brownie-vsix/package.json" "$verified_noop_e19_workspace/extensions/brownie-vsix/package.json"
 cp "$REPO_ROOT/scripts/phase-loop-claim-smoke.test.sh" "$verified_noop_e19_workspace/scripts/phase-loop-claim-smoke.test.sh"
 cp "$REPO_ROOT/scripts/guard-todo-decomposition.mjs" "$verified_noop_e19_workspace/scripts/guard-todo-decomposition.mjs"
+cp "$REPO_ROOT/scripts/phase-loop-todo-state.mjs" "$verified_noop_e19_workspace/scripts/phase-loop-todo-state.mjs"
 printf '{"product_ready":false}\n' > "$verified_noop_e19_workspace/docs/architecture/phase-value-manifest.json"
 cat > "$verified_noop_e19_workspace/.brownie/todo.md" <<'EOF'
 - [ ] E-19a-prevent-empty-queue-completion: Patch only `phase-loop.sh` so completed TODO removal is reverted when the resulting `.brownie/todo.md` fails the decomposition guard:
@@ -1917,6 +1919,7 @@ release_ops_workspace="$(mktemp -d)"
 mkdir -p "$release_ops_workspace/.brownie/release-evidence" "$release_ops_workspace/docs/architecture" "$release_ops_workspace/scripts"
 cp "$REPO_ROOT/phase-loop.sh" "$release_ops_workspace/phase-loop.sh"
 cp "$REPO_ROOT/scripts/guard-todo-decomposition.mjs" "$release_ops_workspace/scripts/guard-todo-decomposition.mjs"
+cp "$REPO_ROOT/scripts/phase-loop-todo-state.mjs" "$release_ops_workspace/scripts/phase-loop-todo-state.mjs"
 cp "$REPO_ROOT/scripts/phase-loop-todo-evaluator.mjs" "$release_ops_workspace/scripts/phase-loop-todo-evaluator.mjs"
 cp "$REPO_ROOT/scripts/phase-loop-release-ops-blocker.mjs" "$release_ops_workspace/scripts/phase-loop-release-ops-blocker.mjs"
 printf '{"scripts":{}}\n' > "$release_ops_workspace/package.json"
