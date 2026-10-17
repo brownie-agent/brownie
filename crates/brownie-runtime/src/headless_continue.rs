@@ -4,6 +4,54 @@ pub(super) fn handle_headless_continue_once(
     id: Value,
     params: Option<Value>,
 ) -> JsonRpcResponse<Value> {
+    let continuation_id = match validate_headless_continue_once_lock_preflight(params.as_ref()) {
+        Ok(continuation_id) => continuation_id,
+        Err(message) => return error_response(id, -32602, message),
+    };
+    if let Some(continuation_id) = continuation_id.as_deref() {
+        let store = match BrownieStore::from_env_or_cwd() {
+            Ok(store) => store,
+            Err(error) => return error_response(id, -32603, &format!("internal error: {error}")),
+        };
+        return match store
+            .tasks()
+            .with_headless_continuation_decision_lock(continuation_id, || {
+                Ok(handle_headless_continue_once_claimed(id.clone(), params))
+            }) {
+            Ok(response) => response,
+            Err(error) => error_response(id, -32603, &format!("internal error: {error}")),
+        };
+    }
+    handle_headless_continue_once_claimed(id, params)
+}
+
+fn validate_headless_continue_once_lock_preflight(
+    raw_params: Option<&Value>,
+) -> Result<Option<String>, &'static str> {
+    let Some(raw_params) = raw_params else {
+        return Ok(None);
+    };
+    let params: HeadlessContinueOnceParams =
+        serde_json::from_value(raw_params.clone()).map_err(|_| "invalid params")?;
+    if !params.authorize {
+        return Err("invalid params: authorize must be true");
+    }
+    if params.expected_progress_fingerprint.trim().is_empty() {
+        return Err("invalid params: expected_progress_fingerprint must not be empty");
+    }
+    let Some(continuation_id) = params.continuation_id else {
+        return Ok(None);
+    };
+    if !is_valid_headless_continuation_id(&continuation_id) {
+        return Err("invalid params: continuation_id must be 1-96 ASCII alphanumeric, dash, underscore, colon, or dot characters");
+    }
+    Ok(Some(continuation_id))
+}
+
+fn handle_headless_continue_once_claimed(
+    id: Value,
+    params: Option<Value>,
+) -> JsonRpcResponse<Value> {
     let params: HeadlessContinueOnceParams = match parse_params(params) {
         Ok(params) => params,
         Err(message) => return error_response(id, -32602, &message),
@@ -5645,7 +5693,7 @@ fn headless_continuation_decision_for_replay(
         if let Some(scanned) =
             headless_continuation_decision_from_task_ledgers(store, tasks, continuation_id)?
         {
-            if scanned != indexed {
+            if !headless_continuation_decisions_have_same_effect(&scanned, &indexed) {
                 return Err(format!(
                     "conflicting headless continuation decision for {continuation_id}"
                 ));
@@ -5874,7 +5922,7 @@ fn headless_continuation_decision_from_task_ledgers(
                 ));
             };
             if let Some(existing) = found.as_ref() {
-                if existing != &decision {
+                if !headless_continuation_decisions_have_same_effect(existing, &decision) {
                     return Err(format!(
                         "conflicting headless continuation decision for {continuation_id}"
                     ));
@@ -5885,6 +5933,19 @@ fn headless_continuation_decision_from_task_ledgers(
         }
     }
     Ok(found)
+}
+
+fn headless_continuation_decisions_have_same_effect(
+    left: &HeadlessContinuationDecisionLookup,
+    right: &HeadlessContinuationDecisionLookup,
+) -> bool {
+    left.continuation_id == right.continuation_id
+        && left.selected_task_id == right.selected_task_id
+        && left.selected_run_id == right.selected_run_id
+        && left.expected_progress_fingerprint == right.expected_progress_fingerprint
+        && left.expected_aggregate_sequence == right.expected_aggregate_sequence
+        && left.candidate_count == right.candidate_count
+        && left.policy_version == right.policy_version
 }
 
 pub(super) fn headless_continuation_decision_from_payload(

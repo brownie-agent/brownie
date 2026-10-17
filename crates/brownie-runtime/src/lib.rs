@@ -16099,10 +16099,68 @@ mod tests {
     use super::*;
     use brownie_context::MAX_LEDGER_CONTEXT_EVENTS;
     use brownie_protocol::{TaskRecord, TaskStatus};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
     const TEST_MODEPACK_PINNED_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn recover_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) struct EnvLockGuard {
+        _guard: MutexGuard<'static, ()>,
+        brownie_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    }
+
+    impl Drop for EnvLockGuard {
+        fn drop(&mut self) {
+            for (key, _) in
+                std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("BROWNIE_"))
+            {
+                std::env::remove_var(key);
+            }
+            for (key, value) in &self.brownie_environment {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    pub(super) fn lock_env() -> EnvLockGuard {
+        let guard = recover_lock(&ENV_LOCK);
+        let brownie_environment = std::env::vars_os()
+            .filter(|(key, _)| key.to_string_lossy().starts_with("BROWNIE_"))
+            .collect();
+        EnvLockGuard {
+            _guard: guard,
+            brownie_environment,
+        }
+    }
+
+    #[test]
+    fn recover_lock_keeps_follow_on_tests_observable_after_a_panic() {
+        let lock = Mutex::new(());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.lock().expect("fresh lock");
+            panic!("intentional lock poison");
+        }));
+
+        let _guard = recover_lock(&lock);
+    }
+
+    #[test]
+    fn lock_env_restores_brownie_environment_after_a_panic() {
+        const KEY: &str = "BROWNIE_TEST_ENV_LOCK_RESTORE";
+        let original = std::env::var_os(KEY);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = lock_env();
+            std::env::set_var(KEY, "abandoned-by-panicking-test");
+            panic!("intentional environment mutation");
+        });
+
+        let _guard = lock_env();
+        assert_eq!(std::env::var_os(KEY), original);
+    }
 
     #[test]
     fn bounds_workspace_read_context_for_followup_writes() {
@@ -16178,7 +16236,7 @@ mod tests {
 
     #[test]
     fn task_cancel_authorized_request_marks_created_task_cancelled_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -16244,7 +16302,7 @@ mod tests {
 
     #[test]
     fn task_run_resume_fails_closed_when_persisted_runtime_deadline_expired() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -16314,7 +16372,7 @@ mod tests {
 
     #[test]
     fn task_run_rejects_runtime_deadline_mismatch_before_resume_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -16375,7 +16433,7 @@ mod tests {
 
     #[test]
     fn task_cancel_rejects_stale_request_without_terminal_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -16416,7 +16474,7 @@ mod tests {
 
     #[test]
     fn task_cancel_rejects_terminal_task_without_new_terminal_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -16788,7 +16846,7 @@ mod tests {
 
     #[test]
     fn verification_recovery_context_read_rejects_non_recovery_task_before_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let start = parse_line(
@@ -16837,7 +16895,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn codebase_index_build_persists_snapshot_and_bounded_ledger_event() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join(".brownie")).expect("brownie dir");
         std::fs::create_dir(temp.path().join("src")).expect("src dir");
@@ -17009,7 +17067,7 @@ mod tests {
 
     #[test]
     fn codebase_index_build_rejects_unsafe_and_unknown_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -17030,7 +17088,7 @@ mod tests {
 
     #[test]
     fn codebase_index_build_requires_authorized_index_mode_before_scanning() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "# Index\n").expect("readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -17073,7 +17131,7 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn codebase_index_build_fails_closed_on_unsupported_platforms() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "# Index\n").expect("readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -17095,7 +17153,7 @@ mod tests {
 
     #[test]
     fn codebase_index_query_requires_authorized_index_mode_before_snapshot_read() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join(".brownie/codebase-index")).expect("index dir");
         std::fs::write(
@@ -17125,7 +17183,7 @@ mod tests {
 
     #[test]
     fn codebase_index_query_returns_bounded_selection_from_current_filtered_snapshot() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         store
@@ -17183,7 +17241,7 @@ mod tests {
 
     #[test]
     fn codebase_index_query_is_deterministic_and_path_sorted_for_ties() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         store
@@ -17215,7 +17273,7 @@ mod tests {
 
     #[test]
     fn codebase_index_query_rejects_missing_current_snapshot_without_success_event() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -17238,7 +17296,7 @@ mod tests {
 
     #[test]
     fn codebase_index_query_rejects_unknown_fields_and_unbounded_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -17266,7 +17324,7 @@ mod tests {
 
     #[test]
     fn codebase_index_query_does_not_return_or_ledger_raw_query_or_raw_content() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         store
@@ -17314,7 +17372,7 @@ mod tests {
 
     #[test]
     fn codebase_index_query_skips_unsafe_entries_from_current_snapshot() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         store
@@ -17345,7 +17403,7 @@ mod tests {
 
     #[test]
     fn codebase_index_query_appends_summary_only_query_event() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         store
@@ -17404,7 +17462,7 @@ mod tests {
 
     #[test]
     fn codebase_index_selection_read_returns_bounded_content_and_summary_event() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("src/runtime")).expect("src dir");
         let selected_content = "pub fn selected() {}\n";
@@ -17500,7 +17558,7 @@ mod tests {
 
     #[test]
     fn task_run_materializes_selected_index_context_from_prior_read() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let selected_content = "pub fn selected_context() {}\n";
         let (store, selected_context) =
@@ -17637,7 +17695,7 @@ mod tests {
 
     #[test]
     fn task_run_applies_explicit_context_budget_to_materialized_context() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let selected_content = "pub fn selected_context_budget() { let marker = 42; }\n";
         let (store, selected_context) =
@@ -17733,7 +17791,7 @@ mod tests {
 
     #[test]
     fn task_run_omitted_context_budget_uses_provider_prompt_budget() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         std::env::set_var("BROWNIE_LLM_MAX_PROMPT_CHARS", "12000");
@@ -17778,7 +17836,7 @@ mod tests {
 
     #[test]
     fn task_run_selected_index_context_requires_read_and_index_permissions_before_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let (store, selected_context) =
             prepared_selected_index_context(temp.path(), "pub fn selected_context() {}\n");
@@ -17824,7 +17882,7 @@ mod tests {
 
     #[test]
     fn task_run_selected_index_context_rejects_hash_mismatch_before_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let (store, mut selected_context) =
             prepared_selected_index_context(temp.path(), "pub fn selected_context() {}\n");
@@ -17870,7 +17928,7 @@ mod tests {
 
     #[test]
     fn codebase_index_selection_read_allows_large_unrequested_selected_entries() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("src/runtime")).expect("src dir");
         let selected_content = "pub fn selected() {}\n";
@@ -17930,7 +17988,7 @@ mod tests {
 
     #[test]
     fn codebase_index_selection_read_resolves_workspace_modepack_modes() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_index_modepack(temp.path());
         std::fs::create_dir_all(temp.path().join("src/runtime")).expect("src dir");
@@ -17980,7 +18038,7 @@ mod tests {
 
     #[test]
     fn codebase_index_selection_read_requires_index_permission_before_snapshot_or_file_read() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join(".brownie/codebase-index")).expect("index dir");
         std::fs::write(
@@ -18028,7 +18086,7 @@ mod tests {
 
     #[test]
     fn codebase_index_selection_read_fails_without_query_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "# Read\n").expect("readme");
         let store = BrownieStore::new(temp.path());
@@ -18077,7 +18135,7 @@ mod tests {
 
     #[test]
     fn codebase_index_selection_read_rejects_stale_file_hash_without_success_event() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let original = "alpha\n";
         std::fs::write(temp.path().join("notes.txt"), original).expect("notes");
@@ -18123,7 +18181,7 @@ mod tests {
 
     #[test]
     fn codebase_index_selection_read_rejects_malformed_or_unsafe_input_without_ledger_event() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let base_input = selected_read_test_input(
@@ -19783,7 +19841,7 @@ modes:
 
     #[test]
     fn tool_execute_workspace_read_returns_completed() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "hello brownie").expect("write");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -19801,7 +19859,7 @@ modes:
 
     #[test]
     fn tool_execute_controlled_cargo_fmt_check_returns_completed_without_raw_output() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "# Brownie\n").expect("readme");
@@ -19838,7 +19896,7 @@ modes:
 
     #[test]
     fn approved_git_status_intent_executes_through_controlled_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let init = std::process::Command::new("git")
             .arg("-C")
@@ -19934,7 +19992,7 @@ modes:
 
     #[test]
     fn approved_git_commit_intent_executes_with_sanitized_replay_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let init = std::process::Command::new("git")
             .arg("-C")
@@ -20144,7 +20202,7 @@ modes:
 
     #[test]
     fn tool_execute_controlled_cargo_check_returns_honest_safety_metadata() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -20190,7 +20248,7 @@ modes:
 
     #[test]
     fn tool_execute_controlled_cargo_test_returns_honest_safety_metadata() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -20228,7 +20286,7 @@ modes:
 
     #[test]
     fn tool_execute_rejects_verification_command_overrides_without_launch() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -20288,7 +20346,7 @@ modes:
 
     #[test]
     fn tool_execute_generic_process_exec_remains_denied_for_verifier() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -20307,7 +20365,7 @@ modes:
 
     #[test]
     fn tool_execute_process_exec_does_not_imply_git_commit() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -20330,7 +20388,7 @@ modes:
 
     #[test]
     fn tool_execute_git_commit_rejects_caller_supplied_runtime_fields() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -20375,7 +20433,7 @@ modes:
 
     #[test]
     fn task_run_with_readme_records_second_pass_events() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("README.md"),
@@ -20540,7 +20598,7 @@ modes:
 
     #[test]
     fn task_run_executes_controlled_verifier_and_records_bounded_metadata() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "# Brownie\n").expect("readme");
@@ -20635,7 +20693,7 @@ modes:
 
     #[test]
     fn task_run_executes_controlled_cargo_check_and_records_bounded_metadata() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(temp.path(), "task_check_pass", "pub fn ok() -> i32 { 1 }\n");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -20739,7 +20797,7 @@ modes:
 
     #[test]
     fn task_run_executes_controlled_cargo_test_and_records_bounded_metadata() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -20831,7 +20889,7 @@ modes:
 
     #[test]
     fn task_run_fails_when_required_cargo_test_verifier_fails_with_bounded_diagnostics() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -20926,7 +20984,7 @@ modes:
 
     #[test]
     fn task_run_fails_when_required_cargo_fmt_verifier_fails() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "# Brownie\n").expect("readme");
@@ -21021,7 +21079,7 @@ modes:
 
     #[test]
     fn task_run_fails_when_required_cargo_check_verifier_fails() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -21135,7 +21193,7 @@ modes:
 
     #[test]
     fn task_start_admits_verification_recovery_once_from_failed_cargo_fmt_gate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "# Brownie\n").expect("readme");
@@ -21307,7 +21365,7 @@ modes:
 
     #[test]
     fn task_start_rejects_stale_or_unauthorized_verification_recovery_without_task_creation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "# Brownie\n").expect("readme");
@@ -21384,7 +21442,7 @@ modes:
 
     #[test]
     fn task_start_rejects_invalid_verification_recovery_sources_without_task_creation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "# Brownie\n").expect("readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -21539,7 +21597,7 @@ modes:
 
     #[test]
     fn task_start_admits_verification_recovery_from_failed_cargo_check_gate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -21608,7 +21666,7 @@ modes:
     #[test]
     fn task_start_admits_verification_recovery_from_failed_cargo_test_gate_with_bounded_diagnostics(
     ) {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -21680,7 +21738,7 @@ modes:
 
     #[test]
     fn task_run_recovery_task_creates_recovery_scoped_workspace_proposal_from_failed_fmt_gate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("readme");
@@ -21843,7 +21901,7 @@ modes:
     #[test]
     fn task_run_recovery_task_creates_recovery_scoped_workspace_proposal_from_failed_cargo_check_gate(
     ) {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -21885,7 +21943,7 @@ modes:
 
     #[test]
     fn task_start_and_run_verification_recovery_retry_after_applied_recovery_proposal() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("readme");
@@ -22156,7 +22214,7 @@ modes:
 
     #[test]
     fn task_run_recovery_task_rejects_stale_recovery_provenance_before_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "# Brownie\n").expect("readme");
@@ -22211,7 +22269,7 @@ modes:
 
     #[test]
     fn task_run_recovery_task_with_denied_workspace_write_fails_closed_without_repair_proposal() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("readme");
@@ -22339,7 +22397,7 @@ modes:
 
     #[test]
     fn task_run_recovery_task_with_unusable_workspace_proposal_fails_repair_gate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("readme");
@@ -22501,7 +22559,7 @@ modes:
 
     #[test]
     fn headless_continue_once_admits_verification_recovery_from_failed_gate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("README.md")).expect("readme directory");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -22585,7 +22643,7 @@ modes:
 
     #[test]
     fn headless_continue_once_runs_targeted_verification_recovery_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(
             temp.path(),
@@ -22793,7 +22851,7 @@ modes:
 
     #[test]
     fn task_run_records_verifier_tool_execution_denied_without_launch_for_orchestrator() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "# Brownie\n").expect("readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -22866,7 +22924,7 @@ modes:
 
     #[test]
     fn task_run_records_cargo_check_execution_denied_without_launch_for_orchestrator() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_cargo_check_fixture(temp.path(), "denied_check", "pub fn ok() {}\n");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -22942,7 +23000,7 @@ modes:
 
     #[test]
     fn run_inspection_methods_return_sanitized_summaries() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("README.md"),
@@ -23093,7 +23151,7 @@ modes:
 
     #[test]
     fn run_inspect_includes_progress_snapshot_for_created_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -23119,7 +23177,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_created_status_beats_historical_agent_loop_started() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23154,7 +23212,7 @@ modes:
 
     #[test]
     fn run_inspect_includes_progress_snapshot_for_queued_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -23188,7 +23246,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_queued_status_beats_historical_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -23224,7 +23282,7 @@ modes:
 
     #[test]
     fn run_inspect_includes_progress_snapshot_for_running_or_active_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23263,7 +23321,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_ignores_non_terminal_gate_shaped_payloads() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23315,7 +23373,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_malformed_latest_terminal_gate_as_unknown() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23398,7 +23456,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_failed_non_verification_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23439,7 +23497,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_terminal_completed() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23481,7 +23539,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_cancelled_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23522,7 +23580,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_uses_latest_verification_gate_state() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23578,7 +23636,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_ignores_recovery_gate_status_for_verification_state() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -23629,7 +23687,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_keeps_failed_parent_above_queued_child() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -23670,7 +23728,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_keeps_cancelled_parent_above_running_child() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -23719,7 +23777,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_completed_parent_with_pending_child() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -23764,7 +23822,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_completed_parent_with_non_runnable_child() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -23818,7 +23876,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_parent_join_ready() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -23886,7 +23944,7 @@ modes:
 
     #[test]
     fn task_list_progress_overview_groups_runtime_owned_task_sets() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent_join = store
@@ -24042,7 +24100,7 @@ modes:
 
     #[test]
     fn task_list_accepts_runtime_owned_transport_bounds_without_breaking_no_param_compatibility() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         for index in 0..12 {
@@ -24109,7 +24167,7 @@ modes:
 
     #[test]
     fn headless_continue_once_runs_one_created_task_from_expected_progress_state() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let first = store
@@ -24229,7 +24287,7 @@ modes:
 
     #[test]
     fn headless_continue_once_budget_runs_bounded_sequential_created_tasks() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let first = store
@@ -24350,7 +24408,7 @@ modes:
 
     #[test]
     fn headless_continue_once_budget_replays_without_duplicate_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let first = store
@@ -24462,7 +24520,7 @@ modes:
 
     #[test]
     fn headless_continue_once_budget_validates_budget_authorization_bounds() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -24523,7 +24581,7 @@ modes:
 
     #[test]
     fn headless_continue_once_budget_stale_progress_stops_before_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -24569,7 +24627,7 @@ modes:
 
     #[test]
     fn headless_run_advance_persists_checkpoint_replays_and_advances_from_checkpoint() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let first = store
@@ -24767,7 +24825,7 @@ modes:
 
     #[test]
     fn headless_run_advance_returns_stale_retry_without_checkpoint_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -24830,7 +24888,7 @@ modes:
 
     #[test]
     fn headless_run_drive_advances_from_checkpoint_replays_and_records_drive_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         for goal in ["Drive first", "Drive second", "Drive third"] {
@@ -24997,7 +25055,7 @@ modes:
 
     #[test]
     fn headless_continue_once_scope_selects_latest_cli_journey() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let older = store
@@ -25112,7 +25170,7 @@ modes:
 
     #[test]
     fn headless_run_advance_accepts_runtime_scoped_continuation_and_writes_session_checkpoint() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let older = store
@@ -25269,7 +25327,7 @@ modes:
 
     #[test]
     fn headless_continue_once_scope_does_not_fallback_when_latest_cli_journey_is_terminal() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let older = store
@@ -25340,7 +25398,7 @@ modes:
 
     #[test]
     fn headless_continue_once_scope_includes_typed_recovery_without_parent_ids() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let source = store
@@ -25422,7 +25480,7 @@ modes:
 
     #[test]
     fn headless_continue_once_scope_includes_typed_retry_only_when_recovery_matches_scope() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let source = store
@@ -25536,7 +25594,7 @@ modes:
 
     #[test]
     fn headless_continue_once_scope_fails_closed_for_conflicting_recovery_provenance() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let source = store
@@ -25613,7 +25671,7 @@ modes:
 
     #[test]
     fn headless_continue_once_scope_rejects_missing_ambiguous_and_targeted_inputs() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let older = store
@@ -26154,7 +26212,7 @@ modes:
 
     #[test]
     fn headless_run_drive_finalizes_complete_closure_once_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -27095,7 +27153,7 @@ modes:
 
     #[test]
     fn headless_run_drive_rejects_missing_checkpoint_before_execution() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -27132,7 +27190,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_admission_starts_task_drives_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -27211,7 +27269,7 @@ modes:
 
     #[test]
     fn headless_run_drive_objective_admission_id_replays_and_conflicts_without_duplicate_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -27328,7 +27386,7 @@ modes:
 
     #[test]
     fn headless_run_drive_same_objective_admission_id_concurrent_requests_create_one_root_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         std::env::set_var("BROWNIE_LLM_PROVIDER", "fake");
@@ -27382,6 +27440,9 @@ modes:
                         .message
                         .contains("conflicting headless run session drive checkpoint")
                     && !error.message.contains("task terminal status race")
+                    && !error.message.contains(
+                        "invalid params: task must be Created, a controlled Queued child task, or a completed parent with completed controlled child tasks or failed controlled child tasks",
+                    )
             })
             .collect::<Vec<_>>();
         assert!(unexpected_errors.is_empty(), "{responses:?}");
@@ -27409,7 +27470,7 @@ modes:
 
     #[test]
     fn headless_run_drive_objective_admission_reconciles_task_only_crash_without_duplicate_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -27505,7 +27566,7 @@ modes:
 
     #[test]
     fn headless_run_drive_objective_admission_backfills_after_journey_checkpoint_crash() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -27612,7 +27673,7 @@ modes:
 
     #[test]
     fn headless_run_drive_objective_admission_replays_checkpoint_before_event_without_duplicate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -27695,7 +27756,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_admission_uses_runtime_default_for_omitted_mode() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "# Runtime default journey\n")
             .expect("write readme");
@@ -27739,7 +27800,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_admission_uses_active_modepack_entrypoint_for_omitted_mode() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -27808,7 +27869,7 @@ modes:
 
     #[test]
     fn headless_run_drive_configured_workspace_modepack_without_entrypoint_fails_closed() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -27836,7 +27897,7 @@ modes:
 
     #[test]
     fn headless_run_drive_configured_invalid_workspace_modepack_fails_closed() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -27892,7 +27953,7 @@ modes:
 
     #[test]
     fn headless_run_drive_configured_active_modepack_without_entrypoint_fails_closed() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -27998,7 +28059,7 @@ modes:
 
     #[test]
     fn headless_run_drive_missing_configured_active_modepack_snapshot_fails_closed() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -28031,7 +28092,7 @@ modes:
 
     #[test]
     fn headless_run_drive_omitted_mode_development_objective_routes_proposal_candidate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -28111,7 +28172,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_admission_binds_objective_selected_context_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let (store, selected_context) = prepared_selected_index_context(
             temp.path(),
@@ -28247,7 +28308,7 @@ modes:
 
     #[test]
     fn headless_run_drive_binds_objective_workspace_proposal_candidate_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -28385,7 +28446,7 @@ modes:
 
     #[test]
     fn headless_objective_workspace_proposal_candidate_denies_ambiguous_or_non_pending_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -28493,7 +28554,7 @@ modes:
 
     #[test]
     fn headless_continue_authorizes_and_preflights_objective_proposal_candidate_once() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -28745,7 +28806,7 @@ modes:
 
     #[test]
     fn headless_continue_applies_objective_proposal_after_authorization_preflight_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -29304,7 +29365,7 @@ modes:
 
     #[test]
     fn headless_continue_objective_authorization_preflight_denies_mismatch_before_side_effects() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -29411,7 +29472,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_admission_rejects_stale_selected_context_before_task_start() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let (store, mut selected_context) =
             prepared_selected_index_context(temp.path(), "pub fn stale_context() {}\n");
@@ -29459,7 +29520,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_execution_admits_checkpoints_and_replays_without_new_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -29587,7 +29648,7 @@ modes:
     #[test]
     fn headless_run_drive_journey_execution_recovers_committed_admission_without_execution_checkpoint(
     ) {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -29636,7 +29697,7 @@ modes:
 
     #[test]
     fn headless_run_recovery_probe_distinguishes_not_persisted_and_persisted_identity() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let objective = "Recover exact failed run identity";
@@ -29748,7 +29809,7 @@ modes:
 
     #[test]
     fn headless_run_recovery_probe_reconciles_task_only_crash_window_idempotently() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         std::env::set_var(
@@ -29861,7 +29922,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_execution_recovers_committed_route_and_closure_checkpoints() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -30092,7 +30153,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_denial_fails_before_task_creation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -30118,7 +30179,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_checkpoint_failure_rolls_back_started_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -30154,7 +30215,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_started_event_failure_rolls_back_checkpoint_and_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -30190,7 +30251,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_invalid_admissions_fail_before_task_creation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -30352,7 +30413,7 @@ modes:
 
     #[test]
     fn headless_run_drive_journey_conflicting_replay_fails_without_new_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -30386,7 +30447,7 @@ modes:
     #[test]
     fn headless_run_drive_journey_route_resume_derives_fetch_provenance_and_approval_targets_and_replays(
     ) {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -31816,7 +31877,7 @@ modes:
 
     #[test]
     fn headless_continue_once_budget_stops_at_failed_verifier_recovery_boundary() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -31944,7 +32005,7 @@ modes:
 
     #[test]
     fn headless_continue_once_budget_stops_at_parent_join_boundary_without_running_parent() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -32032,7 +32093,7 @@ modes:
 
     #[test]
     fn headless_continue_once_runs_one_queued_controlled_child_from_expected_progress_state() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -32083,7 +32144,7 @@ modes:
 
     #[test]
     fn headless_continue_once_rejects_missing_authorization_without_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -32119,8 +32180,24 @@ modes:
     }
 
     #[test]
+    fn headless_continue_once_rejects_invalid_request_before_continuation_lock_setup() {
+        let _guard = lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let non_directory_workspace = temp.path().join("not-a-workspace");
+        std::fs::write(&non_directory_workspace, "not a directory").expect("workspace file");
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", &non_directory_workspace);
+
+        let response = parse_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"headless.continue_once","params":{"authorize":false,"expected_progress_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_aggregate_sequence":1,"continuation_id":"invalid-before-lock"}}"#,
+        );
+        assert_eq!(response.error.expect("invalid params error").code, -32602);
+
+        std::env::remove_var("BROWNIE_WORKSPACE_ROOT");
+    }
+
+    #[test]
     fn headless_continue_once_rejects_stale_progress_fingerprint_without_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -32160,7 +32237,7 @@ modes:
 
     #[test]
     fn headless_continue_once_rejects_when_no_created_or_queued_runnable_task_exists() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -32213,7 +32290,7 @@ modes:
 
     #[test]
     fn headless_continue_once_does_not_execute_parent_join_ready_completed_parent() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -32289,7 +32366,7 @@ modes:
 
     #[test]
     fn headless_continue_once_replays_terminal_continuation_without_duplicate_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -32368,7 +32445,7 @@ modes:
 
     #[test]
     fn headless_continue_once_replays_running_continuation_without_duplicate_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -32447,7 +32524,7 @@ modes:
 
     #[test]
     fn headless_continue_once_rejects_conflicting_continuation_decision_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let first = store
@@ -32515,7 +32592,7 @@ modes:
 
     #[test]
     fn headless_continue_once_replay_routes_failed_verification_to_recovery_start() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -32630,7 +32707,7 @@ modes:
 
     #[test]
     fn headless_continue_once_replay_routes_recovery_repair_to_proposal_review() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let source = store
@@ -32741,7 +32818,7 @@ modes:
 
     #[test]
     fn headless_continue_once_replay_routes_applied_recovery_to_verification_retry_start() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let source = store
@@ -32855,7 +32932,7 @@ modes:
 
     #[test]
     fn headless_continue_once_admits_verification_retry_after_recovery_apply() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("readme");
@@ -33072,7 +33149,7 @@ modes:
 
     #[test]
     fn headless_continue_once_applies_approved_recovery_proposal_to_retry_boundary() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("readme");
@@ -33284,7 +33361,7 @@ modes:
 
     #[test]
     fn headless_continue_once_runs_targeted_verification_retry_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("readme");
@@ -33619,7 +33696,7 @@ modes:
 
     #[test]
     fn headless_continue_once_replay_routes_parent_join_ready_to_explicit_parent_run() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -33710,7 +33787,7 @@ modes:
 
     #[test]
     fn task_list_progress_overview_parent_join_ready_path_is_bounded() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let parent = store
@@ -33906,7 +33983,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_is_read_only_and_fingerprint_is_stable_until_state_changes() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -33998,7 +34075,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_failed_verification_recovery_next_action() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir");
         std::fs::write(
@@ -34252,7 +34329,7 @@ modes:
 
     #[test]
     fn run_inspect_progress_snapshot_reports_selected_index_context_signal() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let store = BrownieStore::new(temp.path());
         let task = store
@@ -34326,7 +34403,7 @@ modes:
 
     #[test]
     fn run_inspect_unknown_run_returns_invalid_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let response = parse_line(
@@ -34617,7 +34694,7 @@ modes:
 
     #[test]
     fn tool_execute_workspace_read_path_traversal_fails() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -34631,7 +34708,7 @@ modes:
 
     #[test]
     fn tool_execute_unknown_mode_returns_invalid_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -34646,7 +34723,7 @@ modes:
 
     #[test]
     fn tool_execute_workspace_write_is_denied_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -34661,7 +34738,7 @@ modes:
 
     #[test]
     fn task_start_get_and_list_through_jsonrpc() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -34708,7 +34785,7 @@ modes:
 
     #[test]
     fn llm_status_returns_fake_when_env_unset() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         std::env::remove_var("BROWNIE_LLM_PROVIDER");
         std::env::remove_var("BROWNIE_LLM_BASE_URL");
         std::env::remove_var("BROWNIE_LLM_MODEL");
@@ -34730,7 +34807,7 @@ modes:
 
     #[test]
     fn llm_status_reports_task_run_network_allowed_when_guard_true() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         std::env::remove_var("BROWNIE_LLM_PROVIDER");
         std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
         let response =
@@ -34742,7 +34819,7 @@ modes:
 
     #[test]
     fn llm_status_accepts_legacy_task_run_network_guard_when_new_guard_unset() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         std::env::remove_var("BROWNIE_LLM_PROVIDER");
         std::env::remove_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS");
         std::env::set_var("BROWNIE_LLM_ALLOW_TASK_RUN_NETWORK", "true");
@@ -34755,7 +34832,7 @@ modes:
 
     #[test]
     fn llm_status_fails_closed_when_provider_access_guards_conflict() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         std::env::remove_var("BROWNIE_LLM_PROVIDER");
         std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
         std::env::set_var("BROWNIE_LLM_ALLOW_TASK_RUN_NETWORK", "false");
@@ -34769,7 +34846,7 @@ modes:
 
     #[test]
     fn llm_status_does_not_expose_api_key_for_incomplete_config() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         std::env::set_var("BROWNIE_LLM_PROVIDER", "openai-compatible");
         std::env::remove_var("BROWNIE_LLM_BASE_URL");
         std::env::set_var("BROWNIE_LLM_MODEL", "qwen35");
@@ -34789,7 +34866,7 @@ modes:
 
     #[test]
     fn llm_status_openai_missing_strict_false_reports_fallback() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         std::env::set_var("BROWNIE_LLM_PROVIDER", "openai-compatible");
         std::env::remove_var("BROWNIE_LLM_BASE_URL");
         std::env::remove_var("BROWNIE_LLM_MODEL");
@@ -34807,7 +34884,7 @@ modes:
 
     #[test]
     fn llm_status_openai_missing_strict_true_reports_no_fallback() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         std::env::set_var("BROWNIE_LLM_PROVIDER", "openai-compatible");
         std::env::set_var("BROWNIE_LLM_STRICT", "true");
         std::env::remove_var("BROWNIE_LLM_BASE_URL");
@@ -34826,7 +34903,7 @@ modes:
 
     #[test]
     fn task_run_changes_created_to_completed_through_jsonrpc() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -35812,7 +35889,7 @@ modes:
 
     #[test]
     fn task_run_returns_child_orchestration_outcome_for_materialized_queued_child() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -36040,7 +36117,7 @@ modes:
 
     #[test]
     fn task_run_reports_pending_siblings_before_parent_join_readiness() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -36279,7 +36356,7 @@ modes:
 
     #[test]
     fn parent_inspect_reports_child_set_join_readiness_without_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -36642,7 +36719,7 @@ modes:
 
     #[test]
     fn parent_inspect_reports_non_runnable_children_without_rerun_action() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -36866,7 +36943,7 @@ modes:
 
     #[test]
     fn task_run_parentless_task_omits_parent_join_readiness_outcome() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -37006,7 +37083,7 @@ modes:
 
     #[test]
     fn accepted_handoff_envelope_materializes_one_child_per_distinct_candidate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -37379,7 +37456,7 @@ modes:
 
     #[test]
     fn external_mode_handoff_allowed_target_queues_subtask() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         write_test_handoff_modepack(temp.path());
@@ -37431,7 +37508,7 @@ modes:
 
     #[test]
     fn scoped_workspace_write_intents_are_checked_at_proposal_creation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("docs")).expect("docs dir");
         std::fs::write(temp.path().join("docs/guide.md"), "old docs").expect("docs file");
@@ -37504,7 +37581,7 @@ modes:
 
     #[test]
     fn external_mode_handoff_selector_allows_valid_member_and_denies_self() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         write_test_handoff_selector_modepack(temp.path());
@@ -37565,7 +37642,7 @@ modes:
 
     #[test]
     fn agentmodes_new_task_alias_uses_active_handoff_admission() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         write_test_handoff_selector_modepack(temp.path());
@@ -37678,7 +37755,7 @@ modes:
 
     #[test]
     fn current_agentmodes_pack_activates_with_repository_local_trust_narrowing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let Some(fixture) = write_current_agentmodes_modepack_if_available(temp.path()) else {
             return;
@@ -37780,7 +37857,7 @@ modes:
 
     #[test]
     fn current_agentmodes_orchestrator_reaches_provider_request_with_omitted_budget() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let Some(fixture) = write_current_agentmodes_modepack_if_available(temp.path()) else {
@@ -37904,7 +37981,7 @@ modes:
 
     #[test]
     fn current_agentmodes_coding_journey_uses_real_entrypoint_policy_not_builtin_fallback() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -38034,7 +38111,7 @@ modes:
 
     #[test]
     fn current_agentmodes_core_roles_do_not_expose_member_pack_write_authority() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
@@ -38159,7 +38236,7 @@ modes:
 
     #[test]
     fn current_agentmodes_orchestrator_explicit_small_budget_fails_before_provider_request() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let Some(fixture) = write_current_agentmodes_modepack_if_available(temp.path()) else {
@@ -38211,7 +38288,7 @@ modes:
 
     #[test]
     fn current_agentmodes_core_new_task_alias_is_denied_without_dispatch_authority() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let Some(fixture) = write_current_agentmodes_modepack_if_available(temp.path()) else {
             return;
@@ -38272,7 +38349,7 @@ modes:
 
     #[test]
     fn external_modepack_child_run_validates_matching_snapshot_provenance() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         write_test_handoff_modepack(temp.path());
@@ -38370,7 +38447,7 @@ modes:
 
     #[test]
     fn external_modepack_child_run_rejects_stale_snapshot_before_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         write_test_handoff_modepack(temp.path());
@@ -38497,7 +38574,7 @@ modes:
 
     #[test]
     fn external_modepack_child_run_rejects_missing_snapshot_provenance() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         write_test_handoff_modepack(temp.path());
@@ -38588,7 +38665,7 @@ modes:
 
     #[test]
     fn external_mode_handoff_disallowed_target_is_denied_before_queueing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         write_test_handoff_modepack(temp.path());
@@ -38747,7 +38824,7 @@ modes:
 
     #[test]
     fn headless_continue_once_runs_parent_join_continuation_from_bounded_child_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -39595,7 +39672,7 @@ modes:
 
     #[test]
     fn llm_failure_reason_is_bounded_before_persistence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -39657,7 +39734,7 @@ modes:
 
     #[test]
     fn task_run_accepts_valid_queued_child_task_with_provenance() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -39827,7 +39904,7 @@ modes:
 
     #[test]
     fn task_run_replays_child_orchestration_outcome_for_existing_queued_child_without_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -39984,7 +40061,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_continuation_consumes_completed_child_summary() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -40143,7 +40220,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_materializes_continuation_subtask_without_auto_run() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -40527,7 +40604,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_recovers_failed_controlled_child_without_auto_run() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -40827,7 +40904,7 @@ modes:
 
     #[test]
     fn failed_child_terminal_outcome_fingerprint_changes_with_failure_reason() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -40893,7 +40970,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_recovery_child_completion_materializes_next_cycle_without_auto_run() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -41361,7 +41438,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_repeated_recovery_cycle_materializes_next_child_without_auto_run() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -42263,7 +42340,7 @@ modes:
     #[test]
     fn task_run_parent_join_budget_exhaustion_replays_bounded_outcome_without_child_materialization(
     ) {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -42811,7 +42888,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_materializes_second_continuation_cycle_without_stale_candidates() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -43196,7 +43273,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_fingerprint_uses_result_fingerprint_not_preview() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -43322,7 +43399,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_recovers_orphaned_admission_without_terminal() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -43445,7 +43522,7 @@ modes:
 
     #[test]
     fn task_run_parent_join_concurrent_admission_consumes_once() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -43548,7 +43625,7 @@ modes:
     #[test]
     fn task_run_replays_parent_join_outcome_for_same_child_completion_fingerprint_without_mutation()
     {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -43680,7 +43757,7 @@ modes:
 
     #[test]
     fn task_run_admits_parent_join_when_child_completion_fingerprint_changes() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -43799,7 +43876,7 @@ modes:
 
     #[test]
     fn task_run_rejects_parent_join_when_child_is_not_controlled() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -43858,7 +43935,7 @@ modes:
 
     #[test]
     fn task_run_rejects_queued_child_task_without_complete_provenance() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -43910,7 +43987,7 @@ modes:
 
     #[test]
     fn task_run_accepts_recovery_cycle_child_with_parent_ledger_provenance() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -43953,7 +44030,7 @@ modes:
 
     #[test]
     fn task_run_rejects_recovery_cycle_child_with_missing_provenance() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -43976,7 +44053,7 @@ modes:
 
     #[test]
     fn task_run_rejects_over_budget_recovery_cycle_child_before_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -43999,7 +44076,7 @@ modes:
 
     #[test]
     fn task_run_rejects_recovery_cycle_child_with_stale_parent_join_admission_id() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -44023,7 +44100,7 @@ modes:
 
     #[test]
     fn task_run_rejects_recovery_cycle_child_with_stale_completion_fingerprint() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -44047,7 +44124,7 @@ modes:
 
     #[test]
     fn task_run_rejects_recovery_cycle_child_with_stale_terminal_counts() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -44071,7 +44148,7 @@ modes:
 
     #[test]
     fn task_run_rejects_recovery_cycle_child_with_stale_recovery_depth() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -44094,7 +44171,7 @@ modes:
 
     #[test]
     fn task_run_rejects_recovery_cycle_child_with_stale_handoff_fingerprint() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -44118,7 +44195,7 @@ modes:
 
     #[test]
     fn task_run_unknown_task_returns_invalid_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -44133,7 +44210,7 @@ modes:
 
     #[test]
     fn implementer_workspace_write_creates_proposal_without_modifying_file() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -45236,7 +45313,7 @@ modes:
 
     #[test]
     fn proposal_apply_replaces_existing_file_after_approval_and_current_hash() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -45350,7 +45427,7 @@ modes:
 
     #[test]
     fn patch_apply_recovery_source_rejects_bad_fingerprint_before_task_start() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\n").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -45430,7 +45507,7 @@ modes:
 
     #[test]
     fn patch_apply_recovery_task_start_admits_recoverable_apply_failure_once() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\n").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -45542,7 +45619,7 @@ modes:
 
     #[test]
     fn patch_apply_recovery_task_run_marks_recovery_scoped_patch_proposal() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\n").expect("write readme");
@@ -45683,7 +45760,7 @@ modes:
 
     #[test]
     fn headless_patch_apply_recovery_source_admits_and_replays_without_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\n").expect("write readme");
@@ -45803,7 +45880,7 @@ modes:
 
     #[test]
     fn headless_patch_apply_recovery_run_executes_and_replays_targeted_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\n").expect("write readme");
@@ -45980,7 +46057,7 @@ modes:
 
     #[test]
     fn headless_patch_apply_recovery_apply_applies_and_replays_approved_recovery_proposal() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\ngamma\n")
@@ -46297,7 +46374,7 @@ modes:
 
     #[test]
     fn headless_patch_apply_recovery_source_rejects_stale_and_invalid_inputs_before_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\n").expect("write readme");
@@ -46438,7 +46515,7 @@ modes:
 
     #[test]
     fn patch_apply_recovery_repair_gate_rejects_unrelated_proposal_path() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
@@ -46541,7 +46618,7 @@ modes:
 
     #[test]
     fn patch_apply_recovery_source_rejects_superseded_apply_result() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\n").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -46640,7 +46717,7 @@ modes:
 
     #[test]
     fn patch_apply_recovery_source_rejects_malformed_receipts_and_normalizes_path() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
         std::fs::write(temp.path().join("src/lib.rs"), "alpha\nbeta\n").expect("write lib");
@@ -46786,7 +46863,7 @@ modes:
 
     #[test]
     fn proposal_apply_patch_file_replaces_single_hunk_after_approval_and_current_hash() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("README.md"),
@@ -46874,7 +46951,7 @@ modes:
 
     #[test]
     fn proposal_apply_patch_file_replaces_multiple_hunks_after_approval_and_current_hash() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\ngamma\nomega\n")
             .expect("write readme");
@@ -46953,7 +47030,7 @@ modes:
 
     #[test]
     fn proposal_apply_patch_file_occurrence_hunk_removes_second_duplicate() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("todo.md"),
@@ -47054,7 +47131,7 @@ modes:
 
     #[test]
     fn patch_file_proposal_rejects_overlapping_multi_hunk_context_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\ngamma\n")
             .expect("write readme");
@@ -47084,7 +47161,7 @@ modes:
 
     #[test]
     fn patch_file_proposal_accepts_unified_diff_content_as_bounded_hunk() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\ngamma\n")
             .expect("write readme");
@@ -47109,7 +47186,7 @@ modes:
 
     #[test]
     fn patch_file_proposal_rejects_function_signature_only_replacement() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("script.mjs"),
@@ -47141,7 +47218,7 @@ modes:
 
     #[test]
     fn patch_file_proposal_rejects_duplicate_context_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\nbeta\ngamma\n")
             .expect("write readme");
@@ -47170,7 +47247,7 @@ modes:
 
     #[test]
     fn duplicate_todo_repair_normalizes_top_level_patch_to_occurrence_hunk() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join(".brownie")).expect("mkdir brownie");
         let duplicate_block = "- [ ] E-15d-soak-section-guard: Patch only `scripts/guard-runtime-operational-evidence.test.mjs`\n  Route: implementation.\n";
@@ -47208,7 +47285,7 @@ modes:
 
     #[test]
     fn disambiguates_patch_file_status_hunk_with_selected_json_object_id() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("docs/architecture")).expect("mkdir docs");
         std::fs::write(
@@ -47253,7 +47330,7 @@ modes:
 
     #[test]
     fn disambiguates_unindented_status_hunk_with_plain_selected_json_object_id() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("docs/architecture")).expect("mkdir docs");
         std::fs::write(
@@ -47294,7 +47371,7 @@ modes:
 
     #[test]
     fn disambiguates_status_hunk_when_duplicate_status_exists_outside_selected_object() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("docs/architecture")).expect("mkdir docs");
         std::fs::write(
@@ -47339,7 +47416,7 @@ modes:
 
     #[test]
     fn disambiguates_minified_object_status_hunk_with_selected_json_object_id() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("docs/architecture")).expect("mkdir docs");
         std::fs::write(
@@ -47380,7 +47457,7 @@ modes:
 
     #[test]
     fn does_not_disambiguate_minified_status_hunk_with_additional_semantic_change() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("docs/architecture")).expect("mkdir docs");
         std::fs::write(
@@ -47422,7 +47499,7 @@ modes:
 
     #[test]
     fn normalizes_json_line_block_patch_when_only_indentation_differs() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("docs/architecture")).expect("mkdir docs");
         std::fs::write(
@@ -47465,7 +47542,7 @@ modes:
 
     #[test]
     fn does_not_normalize_indentation_patch_for_non_json_target() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("script.py"),
@@ -47500,7 +47577,7 @@ modes:
 
     #[test]
     fn disambiguates_incomplete_status_hunk_with_trailing_space_using_selected_json_object_id() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("docs/architecture")).expect("mkdir docs");
         std::fs::write(
@@ -47541,7 +47618,7 @@ modes:
 
     #[test]
     fn patch_file_proposal_rejects_partial_word_context_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("README.md"),
@@ -47573,7 +47650,7 @@ modes:
 
     #[test]
     fn patch_file_proposal_rejects_trailing_whitespace_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "alpha\nbeta\ngamma\n")
             .expect("write readme");
@@ -47602,7 +47679,7 @@ modes:
 
     #[test]
     fn replace_file_proposal_rejects_trailing_whitespace_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "old\n").expect("write readme");
         let store = BrownieStore::new(temp.path());
@@ -47626,7 +47703,7 @@ modes:
 
     #[test]
     fn proposal_apply_denies_read_only_source_mode_before_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -47720,7 +47797,7 @@ modes:
 
     #[test]
     fn proposal_apply_denies_out_of_scope_write_before_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -47816,7 +47893,7 @@ modes:
 
     #[test]
     fn proposal_apply_replace_file_transaction_updates_two_files_with_bounded_result() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::fs::write(temp.path().join("NOTES.md"), "original notes").expect("write notes");
@@ -47949,7 +48026,7 @@ modes:
 
     #[test]
     fn proposal_apply_transaction_denies_out_of_scope_item_before_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("docs")).expect("docs dir");
         std::fs::write(temp.path().join("docs/guide.md"), "original docs").expect("docs");
@@ -48066,7 +48143,7 @@ modes:
 
     #[test]
     fn proposal_apply_transaction_denies_read_only_source_mode_before_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::fs::write(temp.path().join("NOTES.md"), "original notes").expect("write notes");
@@ -48158,7 +48235,7 @@ modes:
 
     #[test]
     fn proposal_apply_transaction_recovery_denies_read_only_source_mode_before_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("NOTES.md"), "original notes").expect("write notes");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -48214,7 +48291,7 @@ modes:
 
     #[test]
     fn proposal_apply_replace_file_transaction_rejects_hash_mismatch_before_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::fs::write(temp.path().join("NOTES.md"), "original notes").expect("write notes");
@@ -48295,7 +48372,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_transaction_deletes_two_files_with_bounded_result() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete-a.md"), "obsolete a\n").expect("write a");
         std::fs::write(temp.path().join("obsolete-b.md"), "obsolete b\n").expect("write b");
@@ -48414,7 +48491,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_transaction_rejects_hash_mismatch_before_deleting() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete-a.md"), "obsolete a\n").expect("write a");
         std::fs::write(temp.path().join("obsolete-b.md"), "obsolete b\n").expect("write b");
@@ -48502,7 +48579,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_transaction_rejects_consumed_item_before_deleting() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete-a.md"), "obsolete a\n").expect("write a");
         std::fs::write(temp.path().join("obsolete-b.md"), "obsolete b\n").expect("write b");
@@ -48596,7 +48673,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_transaction_rejects_mixed_operation_before_deleting() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete.md"), "obsolete\n").expect("write obsolete");
         std::fs::write(temp.path().join("notes.md"), "notes\n").expect("write notes");
@@ -48678,7 +48755,7 @@ modes:
 
     #[test]
     fn proposal_apply_transaction_recovery_mutates_unrecovered_item_from_partial_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "updated README").expect("write readme");
         std::fs::write(temp.path().join("NOTES.md"), "original notes").expect("write notes");
@@ -48783,7 +48860,7 @@ modes:
 
     #[test]
     fn proposal_apply_transaction_recovery_rejects_bad_source_fingerprint_before_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "updated README").expect("write readme");
         std::fs::write(temp.path().join("NOTES.md"), "original notes").expect("write notes");
@@ -48863,7 +48940,7 @@ modes:
 
     #[test]
     fn proposal_apply_transaction_recovery_rejects_create_source_for_replace_recovery() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::fs::write(temp.path().join("notes/a.md"), "created a\n").expect("source item");
@@ -48946,7 +49023,7 @@ modes:
 
     #[test]
     fn proposal_apply_denies_missing_authorization_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -48995,7 +49072,7 @@ modes:
 
     #[test]
     fn proposal_apply_rejects_expected_hash_mismatch_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("README.md"), "original README").expect("write readme");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -49046,7 +49123,7 @@ modes:
     #[cfg(unix)]
     #[test]
     fn proposal_apply_rejects_symlink_target_without_writing_link_target() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("actual.md"), "original README").expect("write actual");
         std::os::unix::fs::symlink("actual.md", temp.path().join("README.md"))
@@ -49097,7 +49174,7 @@ modes:
 
     #[test]
     fn proposal_apply_deletes_existing_file_after_approval_and_current_hash() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::fs::write(temp.path().join("notes/obsolete.md"), "obsolete content\n")
@@ -49246,7 +49323,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_denies_missing_authorization_without_deleting() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete.md"), "obsolete content\n")
             .expect("write obsolete");
@@ -49322,7 +49399,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_rejects_missing_expected_hash_without_deleting() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete.md"), "obsolete content\n")
             .expect("write obsolete");
@@ -49393,7 +49470,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_rejects_expected_hash_mismatch_without_deleting() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete.md"), "obsolete content\n")
             .expect("write obsolete");
@@ -49466,7 +49543,7 @@ modes:
     #[cfg(unix)]
     #[test]
     fn proposal_apply_delete_file_rejects_symlink_target_without_deleting_link_target() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("actual.md"), "link target\n").expect("write actual");
         std::os::unix::fs::symlink("actual.md", temp.path().join("obsolete.md"))
@@ -49543,7 +49620,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_transaction_recovery_deletes_unrecovered_source_item() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete-a.md"), "obsolete a\n").expect("write a");
         std::fs::write(temp.path().join("obsolete-b.md"), "obsolete b\n").expect("write b");
@@ -49648,7 +49725,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_transaction_recovery_rejects_bad_fingerprint() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete-a.md"), "obsolete a\n").expect("write a");
         std::fs::write(temp.path().join("obsolete-b.md"), "obsolete b\n").expect("write b");
@@ -49731,7 +49808,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_transaction_recovery_rejects_reappeared_source_item() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("obsolete-a.md"), "obsolete a\n").expect("write a");
         std::fs::write(temp.path().join("obsolete-b.md"), "obsolete b\n").expect("write b");
@@ -49814,7 +49891,7 @@ modes:
 
     #[test]
     fn proposal_apply_delete_file_transaction_recovery_rejects_create_source() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::fs::write(temp.path().join("notes/a.md"), "created a\n").expect("created a");
@@ -49897,7 +49974,7 @@ modes:
 
     #[test]
     fn proposal_apply_creates_new_file_after_approval_and_absent_preflight() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -50047,7 +50124,7 @@ modes:
 
     #[test]
     fn proposal_apply_create_file_transaction_creates_two_files_after_approval() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -50163,7 +50240,7 @@ modes:
 
     #[test]
     fn proposal_apply_create_file_transaction_denies_existing_target_without_writing_other_file() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -50251,7 +50328,7 @@ modes:
 
     #[test]
     fn proposal_apply_create_file_transaction_recovery_creates_unapplied_item_only() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::fs::write(temp.path().join("notes/a.md"), "created a\n").expect("source item");
@@ -50366,7 +50443,7 @@ modes:
 
     #[test]
     fn proposal_apply_create_file_transaction_recovery_rejects_changed_applied_source_item() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::fs::write(temp.path().join("notes/a.md"), "changed a\n").expect("changed source");
@@ -50441,7 +50518,7 @@ modes:
 
     #[test]
     fn proposal_apply_create_file_denies_missing_authorization_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -50511,7 +50588,7 @@ modes:
 
     #[test]
     fn proposal_apply_create_file_denies_missing_absence_confirmation_without_writing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -50608,7 +50685,7 @@ modes:
 
     #[test]
     fn proposal_apply_create_file_rejects_raced_existing_target_without_overwrite() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(temp.path().join("notes")).expect("notes dir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -53342,7 +53419,7 @@ modes:
 
     #[test]
     fn proposal_list_unknown_run_returns_invalid_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let response = parse_line(
@@ -53354,7 +53431,7 @@ modes:
 
     #[test]
     fn task_run_completed_task_replays_completion_evidence_without_duplicate_events() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -53406,7 +53483,7 @@ modes:
 
     #[test]
     fn task_run_completed_task_accepts_completion_once_with_bounded_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -53593,7 +53670,7 @@ modes:
 
     #[test]
     fn headless_run_drive_routes_accepted_completion_without_duplicate_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -53733,7 +53810,7 @@ modes:
 
     #[test]
     fn headless_run_drive_records_product_completion_decision_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -54047,7 +54124,7 @@ modes:
 
     #[test]
     fn headless_run_drive_selects_remaining_product_dod_gap_and_decides() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let (project_completion_policy, artifacts) =
             write_m52_product_evidence_artifacts(temp.path(), false);
@@ -54889,7 +54966,7 @@ modes:
 
     #[test]
     fn headless_run_drive_rejects_stale_or_malformed_remaining_gap_selection() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let (_project_completion_policy, artifacts) =
             write_m52_product_evidence_artifacts(temp.path(), false);
@@ -55025,7 +55102,7 @@ modes:
 
     #[test]
     fn headless_run_drive_rejects_stale_product_evidence_artifact_hash() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let (project_completion_policy, mut artifacts) =
             write_m52_product_evidence_artifacts(temp.path(), false);
@@ -55146,7 +55223,7 @@ modes:
 
     #[test]
     fn headless_run_drive_records_product_complete_decision() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -55346,7 +55423,7 @@ modes:
 
     #[test]
     fn headless_run_drive_blocks_invalid_product_completion_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -55470,7 +55547,7 @@ modes:
 
     #[test]
     fn task_start_admits_product_continuation_and_replays_without_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -56180,7 +56257,7 @@ modes:
 
     #[test]
     fn headless_continue_runs_product_continuation_admission_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -56425,7 +56502,7 @@ modes:
 
     #[test]
     fn headless_run_drive_advances_product_continuation_routes_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -56802,7 +56879,7 @@ modes:
 
     #[test]
     fn headless_run_drive_admits_product_objective_continuation_journey_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -57096,7 +57173,7 @@ modes:
 
     #[test]
     fn headless_continue_admits_product_loop_stop_recovery_from_drive_evidence_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -57502,7 +57579,7 @@ modes:
 
     #[test]
     fn task_run_revalidates_product_continuation_provenance_before_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::new(temp.path());
@@ -57744,7 +57821,7 @@ modes:
 
     #[test]
     fn headless_run_drive_does_not_route_unaccepted_completion() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -57779,7 +57856,7 @@ modes:
 
     #[test]
     fn headless_run_drive_rejects_malformed_accepted_completion_before_session_mutation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -57864,7 +57941,7 @@ modes:
 
     #[test]
     fn task_run_completion_acceptance_fails_before_mutation_for_invalid_state_or_fingerprint() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -57997,7 +58074,7 @@ modes:
 
     #[test]
     fn task_run_completion_acceptance_denies_failed_gate_and_conflicting_replay() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -58141,7 +58218,7 @@ modes:
 
     #[test]
     fn task_start_with_null_mode_stores_default_and_mode_resolved() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -58177,7 +58254,7 @@ modes:
 
     #[test]
     fn task_start_with_unknown_mode_returns_invalid_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -58192,7 +58269,7 @@ modes:
 
     #[test]
     fn mode_list_and_get_return_builtin_modes() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -58217,7 +58294,7 @@ modes:
 
     #[test]
     fn mode_list_get_and_permission_check_include_local_modepack_modes() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -58252,7 +58329,7 @@ modes:
 
     #[test]
     fn mode_list_get_and_permission_check_include_agentmodes_workspace_framework() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_agentmodes_workspace_framework(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -58291,7 +58368,7 @@ modes:
 
     #[test]
     fn mode_list_get_and_permission_check_narrow_repository_local_side_effect_capabilities() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_capability_test_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -58353,7 +58430,7 @@ modes:
 
     #[test]
     fn permission_check_denies_untrusted_repository_local_declared_side_effects() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_untrusted_all_side_effects_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -58420,7 +58497,7 @@ modes:
 
     #[test]
     fn active_snapshot_and_task_policy_preserve_repository_local_side_effect_denial() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         write_capability_test_modepack(temp.path());
@@ -58499,7 +58576,7 @@ modes:
 
     #[test]
     fn active_modepack_policy_shadows_builtin_for_colliding_mode_id() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         write_collision_test_modepack(temp.path());
@@ -58581,7 +58658,7 @@ modes:
 
     #[test]
     fn modepack_activate_writes_bounded_snapshot_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -58652,7 +58729,7 @@ modes:
 
     #[test]
     fn modepack_fetch_candidate_caches_summary_and_replays_without_raw_ledger_payload() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -58794,7 +58871,7 @@ modes:
         use base64::{engine::general_purpose, Engine as _};
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -58944,7 +59021,7 @@ modes:
         use base64::{engine::general_purpose, Engine as _};
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -59178,7 +59255,7 @@ modes:
         };
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -60275,7 +60352,7 @@ modes:
         };
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -60970,7 +61047,7 @@ modes:
         use base64::{engine::general_purpose, Engine as _};
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -61202,7 +61279,7 @@ modes:
 
     #[test]
     fn modepack_trust_signer_records_bounded_state_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let signer_fingerprint =
@@ -61293,7 +61370,7 @@ modes:
         use base64::{engine::general_purpose, Engine as _};
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -61425,7 +61502,7 @@ modes:
 
     #[test]
     fn modepack_revoke_signer_records_bounded_state_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let signer_fingerprint =
@@ -61506,7 +61583,7 @@ modes:
         use base64::{engine::general_purpose, Engine as _};
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -61629,7 +61706,7 @@ modes:
         use base64::{engine::general_purpose, Engine as _};
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -61747,7 +61824,7 @@ modes:
 
     #[test]
     fn modepack_approve_candidate_rejects_missing_auth_unknown_and_fingerprint_mismatch() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let store = BrownieStore::from_env_or_cwd().expect("store");
@@ -61870,7 +61947,7 @@ modes:
         use base64::{engine::general_purpose, Engine as _};
         use ed25519_dalek::{Signer, SigningKey};
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
@@ -62391,7 +62468,7 @@ modes:
 
     #[test]
     fn active_modepack_snapshot_drives_mode_resolution_after_live_candidate_changes() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
@@ -62478,7 +62555,7 @@ modes:
 
     #[test]
     fn modepack_replace_active_replaces_replays_and_drives_mode_resolution() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
@@ -62593,7 +62670,7 @@ modes:
 
     #[test]
     fn modepack_replace_active_rejects_stale_current_and_candidate_mismatch() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -62640,7 +62717,7 @@ modes:
 
     #[test]
     fn modepack_rollback_active_restores_previous_snapshot_and_replays() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
@@ -62760,7 +62837,7 @@ modes:
 
     #[test]
     fn modepack_rollback_active_rejects_stale_wrong_missing_and_legacy_evidence() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         clear_llm_env_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
@@ -62858,7 +62935,7 @@ modes:
 
     #[test]
     fn task_start_records_local_modepack_provenance_for_matching_task_run() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -62923,7 +63000,7 @@ modes:
 
     #[test]
     fn task_run_rejects_deleted_external_modepack_before_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -62992,7 +63069,7 @@ modes:
 
     #[test]
     fn task_run_rejects_changed_external_modepack_before_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -63041,7 +63118,7 @@ modes:
 
     #[test]
     fn task_run_rejects_malformed_external_modepack_before_task_running() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         write_test_modepack(temp.path());
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -63091,7 +63168,7 @@ modes:
 
     #[test]
     fn permission_check_returns_allowed_and_denied_decisions() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63118,7 +63195,7 @@ modes:
 
     #[test]
     fn permission_check_unknown_mode_returns_invalid_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63133,7 +63210,7 @@ modes:
 
     #[test]
     fn task_run_appends_permission_events() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63185,7 +63262,7 @@ modes:
 
     #[test]
     fn tool_intent_parse_returns_evaluated_decisions() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63208,7 +63285,7 @@ modes:
 
     #[test]
     fn tool_intent_parse_does_not_return_raw_input_or_suspicious_path() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63228,7 +63305,7 @@ modes:
 
     #[test]
     fn tool_intent_parse_adapts_agentmodes_new_task_without_raw_payload() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63254,7 +63331,7 @@ modes:
 
     #[test]
     fn tool_intent_parse_rejected_response_omits_raw_input_json() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63324,7 +63401,7 @@ modes:
 
     #[test]
     fn tool_plan_returns_dry_run_decisions_for_task() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63357,7 +63434,7 @@ modes:
 
     #[test]
     fn mode_get_unknown_returns_invalid_params() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
 
@@ -63509,7 +63586,7 @@ modes:
         assert!(empty_digest_history.entries.is_empty());
         assert!(!empty_digest_history.apply_authorized);
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let response = parse_line(
@@ -63609,7 +63686,7 @@ modes:
         assert!(empty_report.required_next_actions.is_empty());
         assert!(!empty_report.apply_authorized);
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let response = parse_line(
@@ -63689,7 +63766,7 @@ modes:
         assert!(empty_history.entries.is_empty());
         assert!(!empty_history.apply_authorized);
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_env();
         let temp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
         let response = parse_line(
@@ -63761,7 +63838,7 @@ mod phase_2_2_tests {
 
     #[test]
     fn no_env_and_no_config_uses_default_fake() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         let status = llm_provider_status_from_workspace(dir.path()).unwrap();
@@ -63771,7 +63848,7 @@ mod phase_2_2_tests {
 
     #[test]
     fn env_fake_overrides_workspace_config() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -63786,7 +63863,7 @@ mod phase_2_2_tests {
 
     #[test]
     fn workspace_config_openai_status_is_sanitized() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -63807,7 +63884,7 @@ mod phase_2_2_tests {
 
     #[test]
     fn diagnostics_no_config_reports_default_fake() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         let result = runtime_diagnostics_from_workspace(dir.path());
@@ -63818,7 +63895,7 @@ mod phase_2_2_tests {
 
     #[test]
     fn diagnostics_unknown_env_provider_reports_strict_semantics() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("BROWNIE_LLM_PROVIDER", "mystery");
@@ -63837,7 +63914,7 @@ mod phase_2_2_tests {
 
     #[test]
     fn diagnostics_direct_api_key_and_malformed_config_do_not_leak_raw_content() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -63860,7 +63937,7 @@ mod phase_2_2_tests {
 
     #[test]
     fn diagnostics_workspace_profiles_and_missing_key() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -63889,7 +63966,7 @@ mod phase_2_2_tests {
 
     #[test]
     fn runtime_config_get_rejects_direct_api_key_without_leaking_value() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -63970,7 +64047,7 @@ mod phase_2_5_tests {
 
     #[test]
     fn llm_health_fake_returns_healthy_without_network() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         let result =
@@ -63987,7 +64064,7 @@ mod phase_2_5_tests {
 
     #[test]
     fn llm_health_openai_network_not_allowed_does_not_probe() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("BROWNIE_LLM_PROVIDER", "openai-compatible");
@@ -64021,7 +64098,7 @@ mod phase_2_5_tests {
 
     #[test]
     fn llm_health_missing_openai_config_is_disabled() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("BROWNIE_LLM_PROVIDER", "openai-compatible");
@@ -64035,7 +64112,7 @@ mod phase_2_5_tests {
 
     #[test]
     fn llm_health_openai_2xx_and_500_mock_server() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         for (status, healthy) in [(200, true), (500, false)] {
@@ -64060,7 +64137,7 @@ mod phase_2_5_tests {
 
     #[test]
     fn llm_health_rejects_query_secret_base_url_without_leaking_value() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -64344,7 +64421,7 @@ content-length: {}
 
     #[test]
     fn prompt_sensitive_scanner_warn_records_findings_without_values_or_blocking() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         let (base_url, handle) = spawn_mock_two(
@@ -64416,7 +64493,7 @@ content-length: {}
 
     #[test]
     fn config_profile_openai_mock_task_run_completes_and_is_sanitized() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         let (base_url, handle) = spawn_mock_two(
@@ -64503,7 +64580,7 @@ content-length: {}
 
     #[test]
     fn phase_loop_task_run_routes_first_and_second_pass_models() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         let (base_url, handle) = spawn_mock_many_with_models(
@@ -64561,7 +64638,7 @@ content-length: {}
 
     #[test]
     fn openai_task_run_fails_side_effect_goal_when_response_has_no_tool_intent() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         let (base_url, handle) = spawn_mock(
@@ -64618,7 +64695,7 @@ content-length: {}
 
     #[test]
     fn openai_task_run_fails_side_effect_goal_when_only_process_exec_is_denied() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         let (base_url, handle) = spawn_mock(
@@ -64675,7 +64752,7 @@ content-length: {}
 
     #[test]
     fn openai_task_run_synthesizes_concrete_e04_decomposition_after_duplicate_read_denial() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".brownie")).expect("brownie dir");
@@ -64760,7 +64837,7 @@ content-length: {}
 
     #[test]
     fn openai_task_run_recovers_after_protected_workspace_read_rejection() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".brownie")).expect("brownie dir");
@@ -64834,7 +64911,7 @@ content-length: {}
 
     #[test]
     fn openai_task_run_recovers_from_oversized_workspace_write_with_bounded_hunk() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
@@ -64927,7 +65004,7 @@ content-length: {}
 
     #[test]
     fn openai_task_run_recovers_from_unclosed_workspace_write_intent_with_bounded_hunk() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
@@ -65004,7 +65081,7 @@ content-length: {}
 
     #[test]
     fn openai_task_run_stops_after_repeated_oversized_workspace_write_rejections() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
@@ -65093,7 +65170,7 @@ content-length: {}
 
     #[test]
     fn openai_phase_loop_slice_denies_additional_workspace_read_after_budget_exhausted() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
@@ -65179,7 +65256,7 @@ content-length: {}
 
     #[test]
     fn openai_workspace_edit_task_retries_after_read_only_followup_until_write_proposal() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
@@ -65215,7 +65292,7 @@ content-length: {}
 
     #[test]
     fn openai_workspace_edit_task_retries_invalid_patch_with_line_context() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
@@ -65258,7 +65335,7 @@ content-length: {}
 
     #[test]
     fn openai_workspace_edit_task_admits_first_pass_invalid_patch_for_repair() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
@@ -65292,7 +65369,7 @@ content-length: {}
 
     #[test]
     fn openai_workspace_edit_task_fails_when_workspace_write_proposal_is_invalid() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
@@ -65350,7 +65427,7 @@ content-length: {}
 
     #[test]
     fn strict_openai_task_run_denies_without_llm_provider_permission_before_provider_request() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -65486,7 +65563,7 @@ content-length: {}
 
     #[test]
     fn strict_openai_task_run_without_guard_fails_before_network() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         write_mock_config(temp.path(), "http://127.0.0.1:9/v1");
@@ -65523,7 +65600,7 @@ content-length: {}
 
     #[test]
     fn strict_openai_task_run_with_conflicting_provider_access_guards_fails_before_network() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -65571,7 +65648,7 @@ content-length: {}
 
     #[test]
     fn mock_500_strict_fails_and_records_llm_failure() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         assert_strict_failure(
             "500 Internal Server Error",
             r#"{"error":"boom"}"#,
@@ -65583,7 +65660,7 @@ content-length: {}
 
     #[test]
     fn malformed_json_strict_fails_and_records_llm_failure() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         assert_strict_failure(
             "200 OK",
             "not json",
@@ -65595,7 +65672,7 @@ content-length: {}
 
     #[test]
     fn missing_choices_strict_fails_and_records_llm_failure() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         assert_strict_failure(
             "200 OK",
             r#"{"choices":[]}"#,
@@ -65607,7 +65684,7 @@ content-length: {}
 
     #[test]
     fn missing_message_content_strict_returns_structured_provider_failure() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         assert_strict_failure(
             "200 OK",
             r#"{"choices":[{"message":{"content":""}}]}"#,
@@ -65619,7 +65696,7 @@ content-length: {}
 
     #[test]
     fn strict_openai_missing_configuration_returns_structured_provider_failure() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join(".brownie")).unwrap();
@@ -65644,7 +65721,7 @@ content-length: {}
 
     #[test]
     fn llm_provider_failure_replay_returns_same_structured_outcome() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         let (base_url, handle) = spawn_mock("500 Internal Server Error", r#"{"error":"boom"}"#);
@@ -65754,7 +65831,7 @@ content-length: {}
 
     #[test]
     fn llm_provider_failure_retry_admission_creates_and_replays_retry_task() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_retryable_provider_task();
@@ -65836,7 +65913,7 @@ content-length: {}
 
     #[test]
     fn headless_llm_provider_failure_retry_admission_creates_and_replays_retry_task() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_retryable_provider_task();
@@ -65944,7 +66021,7 @@ content-length: {}
     #[test]
     fn headless_llm_provider_failure_retry_admission_rejects_stale_and_invalid_inputs_before_mutation(
     ) {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_retryable_provider_task();
@@ -66035,7 +66112,7 @@ content-length: {}
 
     #[test]
     fn headless_llm_provider_failure_retry_task_run_executes_and_replays() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (_temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_transport_provider_task();
@@ -66154,7 +66231,7 @@ content-length: {}
     #[test]
     fn headless_llm_provider_failure_retry_task_run_rejects_stale_and_invalid_inputs_before_running(
     ) {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_retryable_provider_task();
@@ -66294,7 +66371,7 @@ content-length: {}
 
     #[test]
     fn headless_llm_provider_failure_retry_task_run_denies_without_llm_provider_permission() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (_temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_retryable_provider_task();
@@ -66403,7 +66480,7 @@ content-length: {}
 
     #[test]
     fn llm_provider_failure_retry_task_run_revalidates_and_enters_provider_path() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (_temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_transport_provider_task();
@@ -66478,7 +66555,7 @@ content-length: {}
 
     #[test]
     fn llm_provider_failure_retry_task_run_denies_without_llm_provider_permission() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (_temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_retryable_provider_task();
@@ -66552,7 +66629,7 @@ content-length: {}
 
     #[test]
     fn llm_provider_failure_retry_task_run_rejects_stale_source_before_running() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (temp, source_run, source_task_id, source_run_id, failure_fingerprint) =
             failed_retryable_provider_task();
@@ -66623,7 +66700,7 @@ content-length: {}
 
     #[test]
     fn llm_provider_failure_retry_admission_rejects_stale_or_missing_authorization() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let (temp, _run, source_task_id, source_run_id, failure_fingerprint) =
             failed_retryable_provider_task();
@@ -66681,7 +66758,7 @@ content-length: {}
 
     #[test]
     fn llm_provider_failure_retry_admission_rejects_non_retryable_failure() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().unwrap();
         write_mock_config(temp.path(), "http://127.0.0.1:9/v1");
@@ -66730,7 +66807,7 @@ content-length: {}
 
     #[test]
     fn unknown_env_provider_status_is_not_silent_fake() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         std::env::set_var("BROWNIE_LLM_PROVIDER", "mystery");
         std::env::set_var("BROWNIE_LLM_STRICT", "true");
@@ -66748,7 +66825,7 @@ content-length: {}
 
     #[test]
     fn mcp_stdio_tool_call_uses_modepack_allow_list_and_runtime_gate() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "ok");
         write_mcp_modepack(
@@ -66793,7 +66870,7 @@ content-length: {}
 
     #[test]
     fn mcp_stdio_tool_call_materializes_bounded_result_context_without_raw_response() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "oversized_result");
         write_mcp_modepack(
@@ -66857,7 +66934,7 @@ content-length: {}
 
     #[test]
     fn mcp_stdio_tool_call_distinguishes_tool_error_from_success() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "tool_error");
         write_mcp_modepack(
@@ -66909,7 +66986,7 @@ content-length: {}
 
     #[test]
     fn mcp_stdio_tool_call_treats_omitted_is_error_as_success() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "call_omitted_is_error");
         write_mcp_modepack(
@@ -66952,7 +67029,7 @@ content-length: {}
 
     #[test]
     fn mcp_stdio_tool_call_classifies_protocol_timeout_result_type_and_malformed_results() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         for (scenario, expected_status, expected_protocol_status) in [
             ("call_protocol_error", "ProtocolFailed", "ProtocolFailed"),
             ("call_timeout", "TimedOut", "TimedOut"),
@@ -67017,7 +67094,7 @@ content-length: {}
 
     #[test]
     fn mcp_stdio_requests_include_2026_07_28_required_client_metadata() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "strict_meta");
         write_mcp_modepack(
@@ -67052,7 +67129,7 @@ content-length: {}
 
     #[test]
     fn tool_intent_parse_uses_task_pinned_mcp_dynamic_catalog() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "ok");
         write_mcp_modepack(
@@ -67105,7 +67182,7 @@ content-length: {}
 
     #[test]
     fn task_run_agent_loop_executes_approved_mcp_tool_and_continues() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
@@ -67202,7 +67279,7 @@ content-length: {}
 
     #[test]
     fn task_run_does_not_use_mcp_tool_error_as_completion_or_success_replay_evidence() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting_tool_error");
@@ -67283,7 +67360,7 @@ content-length: {}
 
     #[test]
     fn task_run_replays_completed_mcp_tool_result_after_pre_second_pass_crash() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
@@ -67394,7 +67471,7 @@ content-length: {}
 
     #[test]
     fn task_run_replays_mcp_tool_result_after_terminal_record_process_loss() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
@@ -67487,7 +67564,7 @@ content-length: {}
 
     #[test]
     fn task_run_agent_loop_materializes_git_status_context_for_second_pass() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let _guard = EnvGuard::clear();
         let temp = tempfile::tempdir().expect("temp dir");
         let init = std::process::Command::new("git")
@@ -67588,7 +67665,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_rejects_unknown_server_tool_and_mode_without_capability() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "ok");
         write_mcp_modepack(
@@ -67665,7 +67742,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_legacy_policy_fails_closed_before_call() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_legacy_mcp_modepack(
@@ -67709,7 +67786,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_input_schema_validation_denies_invalid_input_before_call() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "schema_validation_counting");
         write_mcp_modepack(
@@ -67814,7 +67891,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_output_schema_validation_blocks_success_evidence() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         for (scenario, expected_status) in [
             ("schema_output_validating", "Completed"),
             ("schema_output_invalid", "Failed"),
@@ -67870,7 +67947,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_public_approval_round_trip_executes_once_and_consumes_approval() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack_with_tool_policy(
@@ -67976,7 +68053,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_concurrent_same_approval_execution_launches_once() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack_with_tool_policy(
@@ -68068,7 +68145,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_timeout_after_approval_records_outcome_unknown_and_blocks_reuse() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "call_timeout");
         write_mcp_modepack_with_tool_policy(
@@ -68149,7 +68226,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_key_required_idempotency_fails_closed_without_runtime_key_validation() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack_with_tool_policy(
@@ -68203,7 +68280,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_stale_claim_lock_file_does_not_authorize_or_block_claim() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack_with_tool_policy(
@@ -68261,7 +68338,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_recovery_probe_marks_unfinished_executing_once_and_blocks_reuse() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack_with_tool_policy(
@@ -68412,7 +68489,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_approval_latest_consumed_state_beats_historical_approved_event() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack_with_tool_policy(
@@ -68501,7 +68578,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_mutation_policy_requires_matching_runtime_approval_binding() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack_with_tool_policy(
@@ -68670,7 +68747,7 @@ content-length: {}
 
     #[test]
     fn mcp_tool_approval_binding_cannot_override_destructive_policy() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack_with_tool_policy(
@@ -68746,7 +68823,7 @@ content-length: {}
 
     #[test]
     fn mcp_catalog_fails_closed_for_duplicate_schema_error_timeout_and_process_failure() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         for scenario in [
             "duplicate",
             "malformed_schema",
@@ -68778,7 +68855,7 @@ content-length: {}
 
     #[test]
     fn mcp_stdio_timeout_cleans_up_process_without_accumulating_children() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         for attempt in 0..2 {
             let temp = tempfile::tempdir().expect("temp dir");
             let fake_server = write_fake_mcp_server(temp.path(), "timeout_pid");
@@ -68809,7 +68886,7 @@ content-length: {}
 
     #[test]
     fn mcp_stdio_oversized_no_newline_response_fails_bounded_and_cleans_up_process() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "oversized_no_newline_pid");
         write_mcp_modepack(
@@ -68840,7 +68917,7 @@ content-length: {}
 
     #[test]
     fn mcp_authorization_replay_is_deterministic() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "ok");
         write_mcp_modepack(
@@ -68891,7 +68968,7 @@ content-length: {}
 
     #[test]
     fn mcp_catalog_change_after_admission_does_not_widen_authority() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "ok");
         write_mcp_modepack(
@@ -68931,7 +69008,7 @@ content-length: {}
 
     #[test]
     fn mcp_execution_uses_active_snapshot_config_not_live_workspace_modepack() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "ok");
         write_mcp_modepack(
@@ -68977,7 +69054,7 @@ content-length: {}
 
     #[test]
     fn mcp_execution_replays_task_pinned_config_after_later_activation_change() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let original_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack(
@@ -69029,7 +69106,7 @@ content-length: {}
 
     #[test]
     fn mcp_execution_fails_closed_when_task_pinned_config_archive_is_missing() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let original_server = write_fake_mcp_server(temp.path(), "counting");
         write_mcp_modepack(
@@ -69086,7 +69163,7 @@ content-length: {}
 
     #[test]
     fn mcp_catalog_pins_tool_annotations_and_detects_annotation_drift() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "annotated_counting");
         write_mcp_modepack(
@@ -69148,7 +69225,7 @@ content-length: {}
 
     #[test]
     fn mcp_read_only_execution_is_narrowed_by_contradictory_annotations() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         for (scenario, expected_fragment) in [
             ("annotation_read_only_false", "readOnlyHint=false"),
             ("annotation_destructive_true", "destructiveHint=true"),
@@ -69209,7 +69286,7 @@ content-length: {}
 
     #[test]
     fn mcp_invalid_annotation_shape_fails_closed_at_catalog_admission() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "annotation_invalid_type");
         write_mcp_modepack(
@@ -69233,7 +69310,7 @@ content-length: {}
 
     #[test]
     fn mcp_mode_resolved_pins_bounded_catalog_without_raw_config_or_schema() {
-        let _lock = super::tests::ENV_LOCK.lock().expect("env lock");
+        let _lock = super::tests::lock_env();
         let temp = tempfile::tempdir().expect("temp dir");
         let fake_server = write_fake_mcp_server(temp.path(), "ok");
         write_mcp_modepack(

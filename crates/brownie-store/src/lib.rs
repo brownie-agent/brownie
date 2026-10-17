@@ -1,6 +1,6 @@
 //! Brownie persistence crate.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
 use std::io::Read;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
@@ -27,6 +27,7 @@ use brownie_protocol::{
     RuntimeDeadline, TaskRecord, TaskStartParams, TaskStatus, VerificationRecoveryProvenance,
     VerificationRecoveryRetryProvenance,
 };
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
@@ -50,8 +51,14 @@ const MODEPACK_CANDIDATES_DIR: &str = "modepack-candidates";
 const RUN_ADMISSION_LOCK_RETRIES: usize = 200;
 const RUN_ADMISSION_LOCK_SLEEP: Duration = Duration::from_millis(10);
 const HEADLESS_OBJECTIVE_ADMISSION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5);
+const HEADLESS_CONTINUATION_DECISION_LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 const CODEBASE_INDEX_LOCK_STALE_AFTER_SECONDS: i64 = 30 * 60;
 const DURABLE_STORE_SCHEMA_ID: &str = "brownie-runtime-durable-store";
+
+thread_local! {
+    static HELD_HEADLESS_CONTINUATION_DECISION_LOCKS: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
 const DURABLE_STORE_SCHEMA_MANIFEST_FORMAT_VERSION: u64 = 1;
 const DURABLE_STORE_SCHEMA_STATE_CURRENT: &str = "current";
 const DURABLE_STORE_SCHEMA_STATE_MIGRATION_IN_PROGRESS: &str = "migration_in_progress";
@@ -4871,9 +4878,14 @@ impl TaskStore {
         &self,
         lookup: &HeadlessContinuationDecisionLookup,
     ) -> Result<()> {
+        let _lock = (!headless_continuation_decision_lock_is_held(&lookup.continuation_id))
+            .then(|| self.acquire_headless_continuation_decision_lock(&lookup.continuation_id))
+            .transpose()?;
         let path = self.headless_continuation_decision_path(&lookup.continuation_id);
         if let Some(existing) = self.read_headless_continuation_decision(&lookup.continuation_id)? {
-            if existing == *lookup {
+            if existing == *lookup
+                || headless_continuation_decisions_have_same_effect(&existing, lookup)
+            {
                 return Ok(());
             }
             bail!(
@@ -5146,6 +5158,16 @@ impl TaskStore {
         f()
     }
 
+    pub fn with_headless_continuation_decision_lock<T>(
+        &self,
+        continuation_id: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _lock = self.acquire_headless_continuation_decision_lock(continuation_id)?;
+        let _held = HeldHeadlessContinuationDecisionLock::acquire(continuation_id);
+        f()
+    }
+
     pub fn remove_headless_objective_admission_checkpoint(
         &self,
         checkpoint: &HeadlessObjectiveAdmissionCheckpoint,
@@ -5406,7 +5428,7 @@ impl TaskStore {
                 Ok(mut file) => {
                     writeln!(file, "{}", timestamp()?)
                         .context("failed to write run admission lock heartbeat")?;
-                    return Ok(RunAdmissionLock { path: lock_path });
+                    return Ok(RunAdmissionLock::new(lock_path));
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     thread::sleep(RUN_ADMISSION_LOCK_SLEEP);
@@ -5448,7 +5470,7 @@ impl TaskStore {
                     file.sync_all()
                         .context("failed to sync terminal mutation lock")?;
                     sync_dir(&run_dir)?;
-                    return Ok(RunAdmissionLock { path: lock_path });
+                    return Ok(RunAdmissionLock::new(lock_path));
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     if reclaim_stale_process_lock(&lock_path, RUN_TERMINAL_MUTATION_LOCK)
@@ -5497,7 +5519,7 @@ impl TaskStore {
                 Ok(mut file) => {
                     writeln!(file, "{}", timestamp()?)
                         .context("failed to write product loop stop recovery admission lock")?;
-                    return Ok(RunAdmissionLock { path: lock_path });
+                    return Ok(RunAdmissionLock::new(lock_path));
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     thread::sleep(RUN_ADMISSION_LOCK_SLEEP);
@@ -5538,7 +5560,7 @@ impl TaskStore {
                 Ok(mut file) => {
                     writeln!(file, "{}", timestamp()?)
                         .context("failed to write headless objective admission lock")?;
-                    return Ok(RunAdmissionLock { path: lock_path });
+                    return Ok(RunAdmissionLock::new(lock_path));
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     if self
@@ -5564,6 +5586,49 @@ impl TaskStore {
             RUN_ADMISSION_LOCK_RETRIES,
             lock_path.display()
         )
+    }
+
+    fn acquire_headless_continuation_decision_lock(
+        &self,
+        continuation_id: &str,
+    ) -> Result<RunAdmissionLock> {
+        let decision_path = self.headless_continuation_decision_path(continuation_id);
+        let parent = decision_path.parent().with_context(|| {
+            format!(
+                "failed to resolve headless continuation decision lock parent for {}",
+                decision_path.display()
+            )
+        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        let lock_path = parent.join(format!("{continuation_id}.lock"));
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "pid={}", std::process::id())
+                        .context("failed to write headless continuation decision lock owner")?;
+                    writeln!(file, "created_at={}", timestamp()?)
+                        .context("failed to write headless continuation decision lock")?;
+                    return RunAdmissionLock::with_headless_continuation_lock(lock_path, file);
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if self
+                        .reclaim_headless_continuation_decision_lock(&lock_path, continuation_id)?
+                    {
+                        continue;
+                    }
+                    thread::sleep(RUN_ADMISSION_LOCK_SLEEP);
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to acquire {}", lock_path.display()));
+                }
+            }
+        }
     }
 
     fn should_reclaim_headless_objective_admission_lock(
@@ -5722,7 +5787,7 @@ impl TaskStore {
                     file.sync_all()
                         .context("failed to sync durable schema migration lock")?;
                     sync_dir(&state_dir)?;
-                    return Ok(RunAdmissionLock { path: lock_path });
+                    return Ok(RunAdmissionLock::new(lock_path));
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     if self.reclaim_stale_durable_schema_migration_lock(&lock_path)? {
@@ -5741,6 +5806,117 @@ impl TaskStore {
             RUN_ADMISSION_LOCK_RETRIES,
             lock_path.display()
         )
+    }
+
+    #[cfg(unix)]
+    fn reclaim_headless_continuation_decision_lock(
+        &self,
+        lock_path: &Path,
+        continuation_id: &str,
+    ) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(false),
+            Err(error) => {
+                return Err(error).context("failed to inspect headless continuation lock")
+            }
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+            ) {
+                return Ok(false);
+            }
+            return Err(error).context("failed to claim headless continuation lock");
+        }
+        let _claim = FlockGuard {
+            fd: file.as_raw_fd(),
+        };
+        let lock_metadata = file
+            .metadata()
+            .context("failed to inspect claimed headless continuation lock")?;
+        if !lock_metadata.is_file() {
+            return Ok(false);
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .context("failed to read claimed headless continuation lock")?;
+        let should_reclaim = self
+            .read_headless_continuation_decision(continuation_id)
+            .map(|decision| decision.is_some())
+            .unwrap_or(false)
+            || headless_continuation_lock_content_owner_is_dead(&contents)
+            || lock_metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= HEADLESS_CONTINUATION_DECISION_LOCK_STALE_AFTER);
+        if !should_reclaim {
+            return Ok(false);
+        }
+        let path_metadata = match fs::symlink_metadata(lock_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(error).context("failed to reinspect headless continuation lock")
+            }
+        };
+        if path_metadata.dev() != lock_metadata.dev() || path_metadata.ino() != lock_metadata.ino()
+        {
+            return Ok(false);
+        }
+        fs::remove_file(lock_path).context("failed to reclaim headless continuation lock")?;
+        if let Some(parent) = lock_path.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(unix))]
+    fn reclaim_headless_continuation_decision_lock(
+        &self,
+        lock_path: &Path,
+        continuation_id: &str,
+    ) -> Result<bool> {
+        let file = match OpenOptions::new().read(true).write(true).open(lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(error).context("failed to inspect headless continuation lock")
+            }
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error).context("failed to claim headless continuation lock"),
+        }
+        let should_reclaim = self
+            .read_headless_continuation_decision(continuation_id)?
+            .is_some()
+            || fs::metadata(lock_path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= HEADLESS_CONTINUATION_DECISION_LOCK_STALE_AFTER);
+        if !should_reclaim {
+            return Ok(false);
+        }
+        match fs::remove_file(lock_path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error).context("failed to reclaim headless continuation lock"),
+        }
     }
 
     #[cfg(unix)]
@@ -5899,9 +6075,103 @@ impl TaskStore {
     }
 }
 
+fn headless_continuation_decisions_have_same_effect(
+    left: &HeadlessContinuationDecisionLookup,
+    right: &HeadlessContinuationDecisionLookup,
+) -> bool {
+    left.continuation_id == right.continuation_id
+        && left.selected_task_id == right.selected_task_id
+        && left.selected_run_id == right.selected_run_id
+        && left.expected_progress_fingerprint == right.expected_progress_fingerprint
+        && left.expected_aggregate_sequence == right.expected_aggregate_sequence
+        && left.candidate_count == right.candidate_count
+        && left.policy_version == right.policy_version
+}
+
+struct HeldHeadlessContinuationDecisionLock {
+    continuation_id: String,
+}
+
+impl HeldHeadlessContinuationDecisionLock {
+    fn acquire(continuation_id: &str) -> Self {
+        HELD_HEADLESS_CONTINUATION_DECISION_LOCKS.with(|held| {
+            held.borrow_mut().insert(continuation_id.to_string());
+        });
+        Self {
+            continuation_id: continuation_id.to_string(),
+        }
+    }
+}
+
+impl Drop for HeldHeadlessContinuationDecisionLock {
+    fn drop(&mut self) {
+        HELD_HEADLESS_CONTINUATION_DECISION_LOCKS.with(|held| {
+            held.borrow_mut().remove(&self.continuation_id);
+        });
+    }
+}
+
+fn headless_continuation_decision_lock_is_held(continuation_id: &str) -> bool {
+    HELD_HEADLESS_CONTINUATION_DECISION_LOCKS.with(|held| held.borrow().contains(continuation_id))
+}
+
+#[cfg(all(unix, test))]
+fn headless_continuation_lock_owner_is_dead(lock_path: &Path) -> bool {
+    let Ok(body) = fs::read_to_string(lock_path) else {
+        return false;
+    };
+    headless_continuation_lock_content_owner_is_dead(&body)
+}
+
+#[cfg(unix)]
+fn headless_continuation_lock_content_owner_is_dead(body: &str) -> bool {
+    let Some(pid) = body
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
 #[derive(Debug)]
 struct RunAdmissionLock {
     path: PathBuf,
+    headless_continuation_lock: Option<HeadlessContinuationLock>,
+}
+
+impl RunAdmissionLock {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            headless_continuation_lock: None,
+        }
+    }
+
+    fn with_headless_continuation_lock(path: PathBuf, file: File) -> Result<Self> {
+        file.lock_exclusive()
+            .context("failed to retain headless continuation lock")?;
+        Ok(Self {
+            path,
+            headless_continuation_lock: Some(HeadlessContinuationLock { file }),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct HeadlessContinuationLock {
+    file: File,
+}
+
+impl Drop for HeadlessContinuationLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 impl Drop for RunAdmissionLock {
@@ -5910,6 +6180,7 @@ impl Drop for RunAdmissionLock {
         if let Some(parent) = self.path.parent() {
             let _ = sync_dir(parent);
         }
+        drop(self.headless_continuation_lock.take());
     }
 }
 
@@ -11345,6 +11616,96 @@ fn timestamp() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_headless_continuation_lock_owner_is_reclaimable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("continuation.lock");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("start short-lived owner");
+        let pid = child.id();
+        child.wait().expect("wait for owner exit");
+        fs::write(
+            &lock_path,
+            format!("pid={pid}\ncreated_at=1970-01-01T00:00:00Z\n"),
+        )
+        .expect("write lock owner");
+
+        assert!(headless_continuation_lock_owner_is_dead(&lock_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_headless_continuation_lock_is_not_reclaimed_while_owner_holds_advisory_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = TaskStore::new(temp.path());
+        let continuation_id = "live.continuation";
+        let decision_path = store.headless_continuation_decision_path(continuation_id);
+        let lock_path = decision_path
+            .parent()
+            .expect("decision parent")
+            .join(format!("{continuation_id}.lock"));
+        let lock = store
+            .acquire_headless_continuation_decision_lock(continuation_id)
+            .expect("acquire live lock");
+
+        assert!(!store
+            .reclaim_headless_continuation_decision_lock(&lock_path, continuation_id)
+            .expect("inspect live lock"));
+        assert!(lock_path.exists());
+        drop(lock);
+    }
+
+    #[test]
+    fn concurrent_equivalent_headless_continuation_decisions_converge_on_one_checkpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = TaskStore::new(temp.path());
+        store.ensure_durable_schema().expect("ensure schema");
+        let base = HeadlessContinuationDecisionLookup {
+            decision_id: "headless_decision_first".to_string(),
+            continuation_id: "concurrent.decision".to_string(),
+            selected_task_id: "task_1".to_string(),
+            selected_run_id: "run_1".to_string(),
+            expected_progress_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            expected_aggregate_sequence: 1,
+            candidate_count: 1,
+            policy_version: "headless_continue_once_v1".to_string(),
+        };
+        let mut duplicate = base.clone();
+        duplicate.decision_id = "headless_decision_second".to_string();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut writers = Vec::new();
+        for decision in [base.clone(), duplicate.clone()] {
+            let store = store.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.write_headless_continuation_decision(&decision)
+            }));
+        }
+        barrier.wait();
+        for writer in writers {
+            writer
+                .join()
+                .expect("writer joined")
+                .expect("equivalent write");
+        }
+
+        let stored = store
+            .read_headless_continuation_decision("concurrent.decision")
+            .expect("read decision")
+            .expect("decision");
+        assert!(
+            stored.decision_id == base.decision_id || stored.decision_id == duplicate.decision_id
+        );
+        assert!(headless_continuation_decisions_have_same_effect(
+            &stored, &base
+        ));
+    }
 
     #[test]
     fn durable_schema_manifest_created_on_first_task_store_access() {
