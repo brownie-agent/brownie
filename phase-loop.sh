@@ -11479,13 +11479,34 @@ is_supervisor_pid() {
   local pid="$1" command
   command="$(process_command "$pid")"
   case "$command" in
-    *phase-loop.sh*supervise*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
+    *"$ROOT_DIR/phase-loop.sh"*supervise*) ;;
+    *) return 1 ;;
   esac
+  if [ ! -f "$SUPERVISOR_OWNER_FILE" ] || [ ! -f "$STATUS_FILE" ]; then
+    return 1
+  fi
+  python3 - "$SUPERVISOR_OWNER_FILE" "$STATUS_FILE" "$pid" "$ROOT_DIR" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+owner_path, status_path, expected_pid, root_dir = sys.argv[1:]
+try:
+    owner = json.loads(pathlib.Path(owner_path).read_text(encoding="utf-8"))
+    status = json.loads(pathlib.Path(status_path).read_text(encoding="utf-8"))
+    pid = int(expected_pid)
+except Exception:
+    raise SystemExit(1)
+if (
+    owner.get("pid") != pid
+    or status.get("supervisor_pid") != pid
+    or not owner.get("generation")
+    or owner.get("generation") != status.get("supervisor_generation")
+    or os.path.realpath(str(owner.get("root_dir") or "")) != os.path.realpath(root_dir)
+):
+    raise SystemExit(1)
+PY
 }
 
 supervisor_descendant_pids() {
@@ -14160,6 +14181,7 @@ case "${1:-status}" in
     stop_loop
     ;;
   watchdog)
+    load_env
     phase_loop_watch_continuation_liveness "manual-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"
     exit $?
     ;;

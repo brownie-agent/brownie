@@ -102,7 +102,27 @@ start_status=$?
 set -e
 [ "$start_status" -eq 75 ]
 [ ! -e "$start_case_dir/is-running-called" ]
+
+ownership_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-owner.XXXXXX")"
+trap 'rm -rf "$ownership_case_dir"' EXIT
+mkdir -p "$ownership_case_dir/logs"
+PHASE_LOOP_STATE_DIR="$ownership_case_dir" STATE_DIR="$ownership_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  PID_FILE="$STATE_DIR/phase-loop.pid"
+  SUPERVISOR_OWNER_FILE="$STATE_DIR/phase-loop-owner.json"
+  STATUS_FILE="$STATE_DIR/status.json"
+  printf "%s\n" "$$" > "$PID_FILE"
+  printf "%s\n" "bash $ROOT_DIR/phase-loop.sh supervise" > "$STATE_DIR/process-command.txt"
+  process_command() { cat "$STATE_DIR/process-command.txt"; }
+  printf "%s\n" "{\"schema_version\":1,\"pid\":$$,\"generation\":\"foreign-generation\",\"root_dir\":\"/foreign-checkout\"}" > "$SUPERVISOR_OWNER_FILE"
+  printf "%s\n" "{\"status\":\"supervising\",\"supervisor_pid\":$$,\"supervisor_generation\":\"foreign-generation\"}" > "$STATUS_FILE"
+  if is_running; then
+    exit 1
+  fi
+' bash
 printf '%s\n' 'phase-loop watchdog preserves caller errexit state (off/on)'
 printf '%s\n' 'phase-loop supervisor terminalizes watchdog ownership failure (75 -> blocked/78)'
 printf '%s\n' 'phase-loop supervisor terminalizes generic watchdog failure (78 -> blocked/78)'
 printf '%s\n' 'phase-loop startup checks continuation watchdog before live-owner return'
+printf '%s\n' 'phase-loop is_running fails closed on foreign owner metadata'
