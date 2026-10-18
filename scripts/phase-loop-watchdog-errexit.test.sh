@@ -63,6 +63,30 @@ set -e
 [ ! -e "$supervise_case_dir/stop-if-todo-empty-called" ]
 [ ! -e "$supervise_case_dir/run-brownie-once-called" ]
 
+supervise_error_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-supervise-error.XXXXXX")"
+trap 'rm -rf "$supervise_error_case_dir"' EXIT
+mkdir -p "$supervise_error_case_dir/logs"
+set +e
+PHASE_LOOP_STATE_DIR="$supervise_error_case_dir" STATE_DIR="$supervise_error_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -e
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  acquire_lock() { return 0; }
+  write_supervisor_owner() { :; }
+  write_status() {
+    printf "%s|%s|%s|%s\n" "$1" "$2" "$3" "$4" > "$STATE_DIR/supervisor-status.txt"
+  }
+  phase_loop_watch_continuation_liveness() { return 78; }
+  stop_if_todo_empty() { touch "$STATE_DIR/stop-if-todo-empty-called"; return 0; }
+  run_brownie_once() { touch "$STATE_DIR/run-brownie-once-called"; return 0; }
+  supervise
+' bash
+supervise_error_status=$?
+set -e
+[ "$supervise_error_status" -eq 78 ]
+[ "$(cut -d "|" -f 1 "$supervise_error_case_dir/supervisor-status.txt")" = "blocked" ]
+[ ! -e "$supervise_error_case_dir/stop-if-todo-empty-called" ]
+[ ! -e "$supervise_error_case_dir/run-brownie-once-called" ]
+
 start_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-start.XXXXXX")"
 trap 'rm -rf "$start_case_dir"' EXIT
 mkdir -p "$start_case_dir/logs"
@@ -80,4 +104,5 @@ set -e
 [ ! -e "$start_case_dir/is-running-called" ]
 printf '%s\n' 'phase-loop watchdog preserves caller errexit state (off/on)'
 printf '%s\n' 'phase-loop supervisor terminalizes watchdog ownership failure (75 -> blocked/78)'
+printf '%s\n' 'phase-loop supervisor terminalizes generic watchdog failure (78 -> blocked/78)'
 printf '%s\n' 'phase-loop startup checks continuation watchdog before live-owner return'

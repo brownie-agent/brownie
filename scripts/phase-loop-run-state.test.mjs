@@ -220,7 +220,7 @@ test('keeps an authorized continuation within the watchdog deadline', () => {
   assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
 });
 
-test('audits and terminalizes an expired continuation for redelegation', () => {
+test('audits and terminalizes an expired continuation held by a live hung owner', () => {
   const { stateDir, statusPath, pidPath, ownerPath } = fixture();
   fs.writeFileSync(statusPath, JSON.stringify({
     status: 'running',
