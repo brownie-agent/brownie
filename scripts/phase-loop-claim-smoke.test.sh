@@ -2294,7 +2294,15 @@ selected_first = str(archived_claim["selected_todo"]).splitlines()[0]
 task_match = re.match(r"^\s*- \[ \]\s+([^:\s]+)", selected_first)
 assert task_match, archived_claim
 attempt_id = f"{task_match.group(1)}@{archived_claim['claim_id']}"
-ledger_events = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+ledger_events = []
+for line in ledger_path.read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get("kind") == "replan_transaction":
+        ledger_events.extend(record.get("events", []))
+    else:
+        ledger_events.append(record)
 terminal_events = [event for event in ledger_events if event.get("task_id") == attempt_id and event.get("to_state") in {"completed", "blocked", "failed", "replanned"}]
 assert terminal_events and terminal_events[-1]["to_state"] == "replanned", (attempt_id, ledger_events)
 assert not any(event.get("kind") == "unclaimed_trajectory" and event.get("trajectory_type") == "todo.replanned" for event in ledger_events), ledger_events
