@@ -109,6 +109,11 @@ test('repairs reparable pre-claim decomposition drift and records a reversible t
   assert.equal(record.target_snapshot[0].path, 'scripts/a.mjs');
   assert.equal(record.target_snapshot[0].exists_before, false);
   assert.notEqual(record.before.todo_sha256, record.after.todo_sha256);
+  assert.match(record.contract_rebaseline_receipt, /contract-rebaselines/u);
+  const contractReceipt = JSON.parse(fs.readFileSync(path.join(root, record.contract_rebaseline_receipt), 'utf8'));
+  assert.equal(contractReceipt.status, 'approved');
+  assert.equal(contractReceipt.cause_run.run_stamp, 'fixture-run');
+  assert.equal(contractReceipt.verification.guard_passed, true);
   fs.copyFileSync(record.rollback_snapshot.todo, path.join(root, '.brownie/todo.md'));
   fs.copyFileSync(record.rollback_snapshot.breakdown, path.join(root, '.brownie/todo-breakdown.md'));
   const repeated = runRecovery(root, diagnostic);

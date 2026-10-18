@@ -3,6 +3,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import {
+  buildContractRebaselineReceipt,
+  writeContractRebaselineReceipt
+} from './phase-loop-todo-contract-rebaseline.mjs';
 
 const repositoryRoot = path.resolve(new URL('..', import.meta.url).pathname);
 
@@ -324,10 +328,50 @@ async function main(rawArgs) {
     writeJson(recordPath, currentRecord);
 
     if (guard.exitCode === 0) {
-      currentRecord.status = 'applied';
-      currentRecord.rollback_performed = false;
-      writeJson(recordPath, currentRecord);
-      return 0;
+      try {
+        const beforeTodoText = fs.readFileSync(currentRecord.rollback_snapshot.todo, 'utf8');
+        const afterTodoText = fs.readFileSync(todoPath, 'utf8');
+        const beforeBreakdownText = currentRecord.rollback_snapshot.breakdown
+          ? fs.readFileSync(currentRecord.rollback_snapshot.breakdown, 'utf8')
+          : null;
+        const afterBreakdownText = fs.existsSync(breakdownPath)
+          ? fs.readFileSync(breakdownPath, 'utf8')
+          : null;
+        const contractReceipt = buildContractRebaselineReceipt({
+          repoRoot: repo,
+          beforeTodoText,
+          afterTodoText,
+          beforeBreakdownText,
+          afterBreakdownText,
+          runStamp,
+          eventKey,
+          diagnostic,
+          verification: {
+            repair_command: 'node scripts/repair-todo-decomposition.mjs',
+            guard_command: 'node scripts/guard-todo-decomposition.mjs',
+            integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+          }
+        });
+        if (contractReceipt) {
+          currentRecord.contract_rebaseline_receipt = writeContractRebaselineReceipt(repo, contractReceipt);
+        }
+        currentRecord.status = 'applied';
+        currentRecord.rollback_performed = false;
+        writeJson(recordPath, currentRecord);
+        return 0;
+      } catch (error) {
+        restoreSnapshot({ recoveryDir, todoPath, breakdownPath, breakdownExisted: breakdownBeforeExists });
+        currentRecord.status = 'failed_reverted';
+        currentRecord.rollback_performed = true;
+        currentRecord.failure_reason = 'contract_rebaseline_receipt_failed';
+        currentRecord.after_rollback = {
+          todo_sha256: sha256File(todoPath),
+          breakdown_sha256: sha256File(breakdownPath),
+          receipt_error: String(error?.message ?? error)
+        };
+        writeJson(recordPath, currentRecord);
+        return 1;
+      }
     }
 
     const canRetry = repair.exitCode === 0 && attempt < maxRetries && isReparableDecompositionDiagnostic(guard.output);

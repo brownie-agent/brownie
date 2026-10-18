@@ -11279,7 +11279,7 @@ load_env() {
 }
 
 phase_loop_require_approved_controller_baseline() {
-  local guard_script="$PHASE_LOOP_WORKSPACE_ROOT/scripts/phase-loop-source-baseline-guard.mjs"
+  local guard_script="$ROOT_DIR/scripts/phase-loop-source-baseline-guard.mjs"
   if [ ! -f "$guard_script" ]; then
     PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT="missing guard script: $guard_script"
     printf '%s controller_source_baseline_guard_failed=true reason=guard_missing path=%s\n' "$(now_utc)" "$guard_script" >> "$SUPERVISOR_LOG"
@@ -11288,8 +11288,8 @@ phase_loop_require_approved_controller_baseline() {
   local output status
   set +e
   output="$(
-    cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    node "$guard_script" --repo "$PHASE_LOOP_WORKSPACE_ROOT" --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" 2>&1
+    cd "$ROOT_DIR" || exit 70
+    node "$guard_script" --repo "$ROOT_DIR" --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" 2>&1
   )"
   status=$?
   set -e
@@ -11981,8 +11981,11 @@ PY
     fi
   fi
   local deterministic_todo_decomposition_output deterministic_todo_decomposition_status
-  deterministic_todo_decomposition_output="$(try_deterministic_todo_decomposition_repair "$run_stamp" 2>&1)"
-  deterministic_todo_decomposition_status=$?
+  if deterministic_todo_decomposition_output="$(try_deterministic_todo_decomposition_repair "$run_stamp" 2>&1)"; then
+    deterministic_todo_decomposition_status=0
+  else
+    deterministic_todo_decomposition_status=$?
+  fi
   if [ "$deterministic_todo_decomposition_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$deterministic_todo_decomposition_output" > "$stdout_log"
@@ -12008,8 +12011,11 @@ PY
     return 74
   fi
   local pre_guard_schema_alignment_output pre_guard_schema_alignment_status
-  pre_guard_schema_alignment_output="$(try_bounded_leaf_schema_alignment_fallback "$run_stamp" 2>&1)"
-  pre_guard_schema_alignment_status=$?
+  if pre_guard_schema_alignment_output="$(try_bounded_leaf_schema_alignment_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_schema_alignment_status=0
+  else
+    pre_guard_schema_alignment_status=$?
+  fi
   if [ "$pre_guard_schema_alignment_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_schema_alignment_output" > "$stdout_log"
@@ -12041,8 +12047,11 @@ PY
     return 74
   fi
   local pre_guard_test_leaf_production_guard_output pre_guard_test_leaf_production_guard_status
-  pre_guard_test_leaf_production_guard_output="$(try_stagnated_test_leaf_production_guard_fallback "$run_stamp" 2>&1)"
-  pre_guard_test_leaf_production_guard_status=$?
+  if pre_guard_test_leaf_production_guard_output="$(try_stagnated_test_leaf_production_guard_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_test_leaf_production_guard_status=0
+  else
+    pre_guard_test_leaf_production_guard_status=$?
+  fi
   if [ "$pre_guard_test_leaf_production_guard_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_test_leaf_production_guard_output" > "$stdout_log"
@@ -12063,8 +12072,11 @@ PY
     return 74
   fi
   local pre_guard_analysis_only_repair_output pre_guard_analysis_only_repair_status
-  pre_guard_analysis_only_repair_output="$(try_stagnated_analysis_only_leaf_repair "$run_stamp" 2>&1)"
-  pre_guard_analysis_only_repair_status=$?
+  if pre_guard_analysis_only_repair_output="$(try_stagnated_analysis_only_leaf_repair "$run_stamp" 2>&1)"; then
+    pre_guard_analysis_only_repair_status=0
+  else
+    pre_guard_analysis_only_repair_status=$?
+  fi
   if [ "$pre_guard_analysis_only_repair_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_analysis_only_repair_output" > "$stdout_log"
@@ -12085,8 +12097,11 @@ PY
     return 74
   fi
   local pre_guard_broad_scope_split_output pre_guard_broad_scope_split_status
-  pre_guard_broad_scope_split_output="$(try_stagnated_broad_patch_scope_decomposition_fallback "$run_stamp" 2>&1)"
-  pre_guard_broad_scope_split_status=$?
+  if pre_guard_broad_scope_split_output="$(try_stagnated_broad_patch_scope_decomposition_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_broad_scope_split_status=0
+  else
+    pre_guard_broad_scope_split_status=$?
+  fi
   if [ "$pre_guard_broad_scope_split_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_broad_scope_split_output" > "$stdout_log"
@@ -12107,8 +12122,11 @@ PY
     return 74
   fi
   local pre_guard_decomposition_fallback_output pre_guard_decomposition_fallback_status
-  pre_guard_decomposition_fallback_output="$(try_stagnated_todo_decomposition_fallback "$run_stamp" 2>&1)"
-  pre_guard_decomposition_fallback_status=$?
+  if pre_guard_decomposition_fallback_output="$(try_stagnated_todo_decomposition_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_decomposition_fallback_status=0
+  else
+    pre_guard_decomposition_fallback_status=$?
+  fi
   if [ "$pre_guard_decomposition_fallback_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_decomposition_fallback_output" > "$stdout_log"
@@ -12130,8 +12148,11 @@ PY
     return 74
   fi
   local pre_guard_no_eligible_multitarget_output pre_guard_no_eligible_multitarget_status
-  pre_guard_no_eligible_multitarget_output="$(try_no_eligible_multitarget_leaf_split_fallback "$run_stamp" 2>&1)"
-  pre_guard_no_eligible_multitarget_status=$?
+  if pre_guard_no_eligible_multitarget_output="$(try_no_eligible_multitarget_leaf_split_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_no_eligible_multitarget_status=0
+  else
+    pre_guard_no_eligible_multitarget_status=$?
+  fi
   printf '%s run=%s no_eligible_multitarget_leaf_split_pre_guard_exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$pre_guard_no_eligible_multitarget_status" "$pre_guard_no_eligible_multitarget_output" >> "$SUPERVISOR_LOG"
   if [ "$pre_guard_no_eligible_multitarget_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
@@ -12158,8 +12179,11 @@ PY
     return 74
   fi
   local pre_guard_multifile_split_output pre_guard_multifile_split_status
-  pre_guard_multifile_split_output="$(try_stagnated_multifile_leaf_split_fallback "$run_stamp" 2>&1)"
-  pre_guard_multifile_split_status=$?
+  if pre_guard_multifile_split_output="$(try_stagnated_multifile_leaf_split_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_multifile_split_status=0
+  else
+    pre_guard_multifile_split_status=$?
+  fi
   if [ "$pre_guard_multifile_split_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_multifile_split_output" > "$stdout_log"
@@ -12181,8 +12205,11 @@ PY
     return 74
   fi
   local pre_guard_vsix_scripts_output pre_guard_vsix_scripts_status
-  pre_guard_vsix_scripts_output="$(try_stagnated_vsix_package_scripts_fallback "$run_stamp" 2>&1)"
-  pre_guard_vsix_scripts_status=$?
+  if pre_guard_vsix_scripts_output="$(try_stagnated_vsix_package_scripts_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_vsix_scripts_status=0
+  else
+    pre_guard_vsix_scripts_status=$?
+  fi
   if [ "$pre_guard_vsix_scripts_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_vsix_scripts_output" > "$stdout_log"
@@ -12204,8 +12231,11 @@ PY
     return 74
   fi
   local pre_guard_runtime_readiness_fingerprint_output pre_guard_runtime_readiness_fingerprint_status
-  pre_guard_runtime_readiness_fingerprint_output="$(try_runtime_readiness_fingerprint_fallback "$run_stamp" 2>&1)"
-  pre_guard_runtime_readiness_fingerprint_status=$?
+  if pre_guard_runtime_readiness_fingerprint_output="$(try_runtime_readiness_fingerprint_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_runtime_readiness_fingerprint_status=0
+  else
+    pre_guard_runtime_readiness_fingerprint_status=$?
+  fi
   if [ "$pre_guard_runtime_readiness_fingerprint_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_runtime_readiness_fingerprint_output" > "$stdout_log"
@@ -12225,8 +12255,11 @@ PY
     return 74
   fi
   local pre_guard_release_contract_audit_hash_output pre_guard_release_contract_audit_hash_status
-  pre_guard_release_contract_audit_hash_output="$(try_release_contract_readiness_audit_hash_fallback "$run_stamp" 2>&1)"
-  pre_guard_release_contract_audit_hash_status=$?
+  if pre_guard_release_contract_audit_hash_output="$(try_release_contract_readiness_audit_hash_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_release_contract_audit_hash_status=0
+  else
+    pre_guard_release_contract_audit_hash_status=$?
+  fi
   if [ "$pre_guard_release_contract_audit_hash_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_release_contract_audit_hash_output" > "$stdout_log"
@@ -12246,8 +12279,11 @@ PY
     return 74
   fi
   local pre_guard_runtime_readiness_verified_output pre_guard_runtime_readiness_verified_status
-  pre_guard_runtime_readiness_verified_output="$(try_runtime_readiness_verified_completion_fallback "$run_stamp" 2>&1)"
-  pre_guard_runtime_readiness_verified_status=$?
+  if pre_guard_runtime_readiness_verified_output="$(try_runtime_readiness_verified_completion_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_runtime_readiness_verified_status=0
+  else
+    pre_guard_runtime_readiness_verified_status=$?
+  fi
   if [ "$pre_guard_runtime_readiness_verified_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_runtime_readiness_verified_output" > "$stdout_log"
@@ -12270,8 +12306,11 @@ PY
     return 74
   fi
   local pre_guard_verified_noop_output pre_guard_verified_noop_status
-  pre_guard_verified_noop_output="$(try_selected_todo_verified_noop_completion_fallback "$run_stamp" 2>&1)"
-  pre_guard_verified_noop_status=$?
+  if pre_guard_verified_noop_output="$(try_selected_todo_verified_noop_completion_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_verified_noop_status=0
+  else
+    pre_guard_verified_noop_status=$?
+  fi
   if [ "$pre_guard_verified_noop_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_verified_noop_output" > "$stdout_log"
@@ -12358,8 +12397,11 @@ PY
     fi
   fi
   local pre_guard_release_ops_output pre_guard_release_ops_status
-  pre_guard_release_ops_output="$(try_release_ops_evidence_refresh_completion_fallback "$run_stamp" 2>&1)"
-  pre_guard_release_ops_status=$?
+  if pre_guard_release_ops_output="$(try_release_ops_evidence_refresh_completion_fallback "$run_stamp" 2>&1)"; then
+    pre_guard_release_ops_status=0
+  else
+    pre_guard_release_ops_status=$?
+  fi
   if [ "$pre_guard_release_ops_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_release_ops_output" > "$stdout_log"
@@ -12460,8 +12502,11 @@ PY
     fi
   fi
   local pre_guard_exact_fast_path_output pre_guard_exact_fast_path_status
-  pre_guard_exact_fast_path_output="$(try_exact_line_todo_fast_path "$run_stamp" 2>&1)"
-  pre_guard_exact_fast_path_status=$?
+  if pre_guard_exact_fast_path_output="$(try_exact_line_todo_fast_path "$run_stamp" 2>&1)"; then
+    pre_guard_exact_fast_path_status=0
+  else
+    pre_guard_exact_fast_path_status=$?
+  fi
   if [ "$pre_guard_exact_fast_path_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$pre_guard_exact_fast_path_output" > "$stdout_log"
@@ -12520,8 +12565,11 @@ PY
     chmod 600 "$phase_value_manifest_before" 2>/dev/null || true
   fi
   local exact_fast_path_output exact_fast_path_status
-  exact_fast_path_output="$(try_exact_line_todo_fast_path "$run_stamp" 2>&1)"
-  exact_fast_path_status=$?
+  if exact_fast_path_output="$(try_exact_line_todo_fast_path "$run_stamp" 2>&1)"; then
+    exact_fast_path_status=0
+  else
+    exact_fast_path_status=$?
+  fi
   if [ "$exact_fast_path_status" -eq 0 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$exact_fast_path_output" > "$stdout_log"
@@ -12766,8 +12814,11 @@ PY
     fi
   fi
   workspace_after="$(git_workspace_fingerprint)"
-  phase_value_manifest_repair_output="$(json_target_parse_violation_repair "$phase_value_manifest_before" "$PHASE_LOOP_WORKSPACE_ROOT/docs/architecture/phase-value-manifest.json" "$run_stamp" "phase_value_manifest" 2>&1)"
-  phase_value_manifest_repair_status=$?
+  if phase_value_manifest_repair_output="$(json_target_parse_violation_repair "$phase_value_manifest_before" "$PHASE_LOOP_WORKSPACE_ROOT/docs/architecture/phase-value-manifest.json" "$run_stamp" "phase_value_manifest" 2>&1)"; then
+    phase_value_manifest_repair_status=0
+  else
+    phase_value_manifest_repair_status=$?
+  fi
   if [ "$phase_value_manifest_repair_status" -eq 1 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     local phase_value_manifest_feedback
@@ -12794,8 +12845,11 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"json_target_parse_violation_repaired"}'
     return 76
   fi
-  release_contract_repair_output="$(release_contract_runtime_ready_violation_repair "$release_contract_before" "$run_stamp" 2>&1)"
-  release_contract_repair_status=$?
+  if release_contract_repair_output="$(release_contract_runtime_ready_violation_repair "$release_contract_before" "$run_stamp" 2>&1)"; then
+    release_contract_repair_status=0
+  else
+    release_contract_repair_status=$?
+  fi
   if [ "$release_contract_repair_status" -eq 1 ]; then
     workspace_after="$(git_workspace_fingerprint)"
     local release_contract_feedback
@@ -13076,18 +13130,24 @@ PY
 )"
         if [ -f "$PHASE_LOOP_WORKSPACE_ROOT/scripts/validate-audit-schema.mjs" ]; then
           local validator_schema_assumption_output validator_schema_assumption_status
-          validator_schema_assumption_output="$(
+          if validator_schema_assumption_output="$(
             cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
             pnpm --workspace-root guard:validator-schema-assumptions 2>&1
-          )"
-          validator_schema_assumption_status=$?
+          )"; then
+            validator_schema_assumption_status=0
+          else
+            validator_schema_assumption_status=$?
+          fi
           if [ "$validator_schema_assumption_status" -ne 0 ]; then
             local validator_schema_repair_output validator_schema_repair_status
-            validator_schema_repair_output="$(
+            if validator_schema_repair_output="$(
               cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
               node scripts/repair-validator-schema-assumptions.mjs 2>&1
-            )"
-            validator_schema_repair_status=$?
+            )"; then
+              validator_schema_repair_status=0
+            else
+              validator_schema_repair_status=$?
+            fi
             verification_completion="$(python3 - "$verification_completion" "$validator_schema_assumption_output" "$validator_schema_repair_output" "$validator_schema_repair_status" <<'PY'
 import json
 import sys
@@ -13143,8 +13203,11 @@ PY
     fi
 
     local todo_breakdown_patch_proposal_apply_output todo_breakdown_patch_proposal_apply_status
-    todo_breakdown_patch_proposal_apply_output="$(apply_valid_todo_breakdown_patch_proposal_fallback "$run_stamp" "$run_id" 2>&1)"
-    todo_breakdown_patch_proposal_apply_status=$?
+    if todo_breakdown_patch_proposal_apply_output="$(apply_valid_todo_breakdown_patch_proposal_fallback "$run_stamp" "$run_id" 2>&1)"; then
+      todo_breakdown_patch_proposal_apply_status=0
+    else
+      todo_breakdown_patch_proposal_apply_status=$?
+    fi
     if [ "$todo_breakdown_patch_proposal_apply_status" -eq 0 ]; then
       local todo_breakdown_patch_guard_output
       if todo_breakdown_patch_guard_output="$(
@@ -13191,8 +13254,11 @@ PY
     fi
 
     local todo_patch_proposal_apply_output todo_patch_proposal_apply_status
-    todo_patch_proposal_apply_output="$(apply_valid_todo_patch_proposal_fallback "$run_stamp" "$run_id" 2>&1)"
-    todo_patch_proposal_apply_status=$?
+    if todo_patch_proposal_apply_output="$(apply_valid_todo_patch_proposal_fallback "$run_stamp" "$run_id" 2>&1)"; then
+      todo_patch_proposal_apply_status=0
+    else
+      todo_patch_proposal_apply_status=$?
+    fi
     if [ "$todo_patch_proposal_apply_status" -eq 0 ]; then
       local todo_patch_guard_output
       if todo_patch_guard_output="$(
