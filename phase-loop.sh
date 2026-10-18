@@ -13996,13 +13996,19 @@ supervise() {
       exit 0
     fi
 
-    phase_loop_watch_continuation_liveness "watchdog-$(date -u +%Y%m%dT%H%M%SZ)"
-    local watchdog_status=$?
+    local watchdog_status
+    if phase_loop_watch_continuation_liveness "watchdog-$(date -u +%Y%m%dT%H%M%SZ)"; then
+      watchdog_status=0
+    else
+      watchdog_status=$?
+    fi
     if [ "$watchdog_status" -ne 0 ]; then
       if [ "$watchdog_status" -eq 75 ]; then
         write_status "blocked" "Continuation watchdog could not prove supervisor ownership; refusing to resume." "watchdog-$(date -u +%Y%m%dT%H%M%SZ)" "78" "${CONSECUTIVE_FAILURES:-0}"
         exit 78
       fi
+      write_status "blocked" "Continuation watchdog failed with status $watchdog_status; refusing to resume." "watchdog-$(date -u +%Y%m%dT%H%M%SZ)" "78" "${CONSECUTIVE_FAILURES:-0}"
+      exit 78
     fi
 
     stop_if_todo_empty "$CONSECUTIVE_FAILURES"
@@ -14071,8 +14077,12 @@ start() {
     echo "phase-loop already running: pid $(cat "$PID_FILE")"
     exit 0
   fi
-  phase_loop_watch_continuation_liveness "startup-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"
-  local watchdog_status=$?
+  local watchdog_status
+  if phase_loop_watch_continuation_liveness "startup-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"; then
+    watchdog_status=0
+  else
+    watchdog_status=$?
+  fi
   if [ "$watchdog_status" -ne 0 ]; then
     printf '%s\n' "Continuation watchdog refused startup: ownership could not be proven." >&2
     exit "$watchdog_status"

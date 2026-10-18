@@ -9,7 +9,7 @@ run_case() {
   state_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-errexit.XXXXXX")"
   mkdir -p "$state_dir/logs" "$state_dir/todo-claims" "$state_dir/runs" "$state_dir/trajectories" "$state_dir/known-good-targets"
   trap 'rm -rf "$state_dir"' RETURN
-  STATE_DIR="$state_dir" ROOT_DIR="$ROOT_DIR" MODE="$mode" bash -c '
+  PHASE_LOOP_STATE_DIR="$state_dir" STATE_DIR="$state_dir" ROOT_DIR="$ROOT_DIR" MODE="$mode" bash -c '
     set -u
     printf "%s\n" "$$" > "$STATE_DIR/phase-loop.pid"
     printf "%s\n" "{\"schema_version\":1,\"pid\":$$,\"generation\":\"generation-1\",\"root_dir\":\"$ROOT_DIR\"}" > "$STATE_DIR/phase-loop-owner.json"
@@ -38,4 +38,29 @@ run_case() {
 
 run_case off
 run_case on
+
+supervise_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-supervise.XXXXXX")"
+trap 'rm -rf "$supervise_case_dir"' EXIT
+mkdir -p "$supervise_case_dir/logs"
+set +e
+PHASE_LOOP_STATE_DIR="$supervise_case_dir" STATE_DIR="$supervise_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -e
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  acquire_lock() { return 0; }
+  write_supervisor_owner() { :; }
+  write_status() {
+    printf "%s|%s|%s|%s\n" "$1" "$2" "$3" "$4" > "$STATE_DIR/supervisor-status.txt"
+  }
+  phase_loop_watch_continuation_liveness() { return 75; }
+  stop_if_todo_empty() { touch "$STATE_DIR/stop-if-todo-empty-called"; return 0; }
+  run_brownie_once() { touch "$STATE_DIR/run-brownie-once-called"; return 0; }
+  supervise
+' bash
+supervise_status=$?
+set -e
+[ "$supervise_status" -eq 78 ]
+[ "$(cut -d "|" -f 1 "$supervise_case_dir/supervisor-status.txt")" = "blocked" ]
+[ ! -e "$supervise_case_dir/stop-if-todo-empty-called" ]
+[ ! -e "$supervise_case_dir/run-brownie-once-called" ]
 printf '%s\n' 'phase-loop watchdog preserves caller errexit state (off/on)'
+printf '%s\n' 'phase-loop supervisor terminalizes watchdog ownership failure (75 -> blocked/78)'
