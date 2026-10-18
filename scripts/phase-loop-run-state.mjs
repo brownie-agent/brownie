@@ -77,15 +77,10 @@ function canonicalizePath(value) {
 function supervisorCommandMatchesRoot(command, rootDir) {
   const canonicalRootDir = canonicalizePath(rootDir);
   if (!canonicalRootDir || !/\bphase-loop\.sh\b.*\bsupervise\b/u.test(command)) return false;
-  const commandScriptPath = path.join(canonicalRootDir, 'phase-loop.sh');
-  return command.split(/\s+/u).some((token) => {
-    const candidateToken = token.replace(/^['"]|['"]$/gu, '');
-    if (path.basename(candidateToken) !== 'phase-loop.sh') return false;
-    const candidatePath = path.isAbsolute(candidateToken)
-      ? candidateToken
-      : path.join(canonicalRootDir, candidateToken);
-    return canonicalizePath(candidatePath) === commandScriptPath;
-  });
+  const commandRootCandidates = new Set([canonicalRootDir, path.resolve(rootDir)]);
+  return [...commandRootCandidates].some((candidateRoot) => (
+    command.includes(path.join(candidateRoot, 'phase-loop.sh'))
+  ));
 }
 
 function liveSupervisorPids(rootDir) {
@@ -166,7 +161,7 @@ export function inspectSupervisorOwnership({
   const command = livePid
     ? (getProcessCommand === processCommand ? processCommand(pid) : getProcessCommand(pid))
     : '';
-  const commandLooksLikeSupervisor = supervisorCommandMatchesRoot(command, canonicalRootDir);
+  const commandLooksLikeSupervisor = supervisorCommandMatchesRoot(command, rootDir);
   const supervisors = [...new Set(listSupervisors().filter((candidate) => Number.isInteger(candidate) && candidate > 1))];
   const liveSupervisors = supervisors.filter((candidate) => processExists(candidate));
   return {

@@ -194,7 +194,7 @@ test('fails closed when a live supervisor command belongs to another root', () =
 
 test('accepts a supervisor launched through a symlinked root path', () => {
   const { stateDir, pidPath, ownerPath } = fixture();
-  const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-root-'));
+  const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie root '));
   const linkedRoot = `${realRoot}-link`;
   fs.writeFileSync(path.join(realRoot, 'phase-loop.sh'), '');
   fs.symlinkSync(realRoot, linkedRoot, 'dir');
