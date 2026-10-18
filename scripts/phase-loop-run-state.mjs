@@ -104,6 +104,17 @@ function ownerMatches({ status, pid, owner, ownerPid, ownerGeneration, rootDir, 
   return true;
 }
 
+function continuationVersion(status) {
+  if (!status) return null;
+  return JSON.stringify({
+    run_id: status.run_id ?? null,
+    updated_at: status.updated_at ?? null,
+    supervisor_generation: status.supervisor_generation ?? null,
+    continuation_required: status.continuation_required ?? null,
+    controller_action: status.controller_action ?? null
+  });
+}
+
 export function inspectSupervisorOwnership({
   stateDir,
   pidFile = path.join(stateDir, 'phase-loop.pid'),
@@ -340,10 +351,19 @@ export function watchdogContinuationLiveness({
       owner_generation: ownership.owner?.generation ?? null
     };
   }
+  const currentStatus = readJson(statusPath);
+  if (continuationVersion(currentStatus) !== continuationVersion(status)) {
+    return {
+      ok: true,
+      expired: false,
+      reason: 'continuation_changed_during_watchdog_check',
+      run_id: currentStatus?.run_id ?? null
+    };
+  }
   const recoveryId = crypto.randomUUID();
-  const previous = { ...status };
+  const previous = { ...currentStatus };
   const replacement = {
-    ...status,
+    ...currentStatus,
     status: 'blocked',
     detail: `Continuation resume watchdog expired after ${ageSeconds}s; terminalized for audited redelegation. recovery_id=${recoveryId}`,
     exit_code: '78',

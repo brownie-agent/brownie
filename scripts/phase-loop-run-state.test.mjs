@@ -256,6 +256,48 @@ test('audits and terminalizes an expired continuation held by a live hung owner'
   assert.equal(audit[0].kind, 'phase_loop_continuation_watchdog');
 });
 
+test('does not replace a continuation refreshed during ownership inspection', () => {
+  const { stateDir, statusPath, pidPath, ownerPath } = fixture();
+  const staleStatus = {
+    status: 'running',
+    run_id: 'continuation-race',
+    updated_at: '2026-10-18T01:00:00.000Z',
+    continuation_required: true,
+    controller_action: 'resume',
+    supervisor_pid: 1234,
+    supervisor_generation: 'generation-1'
+  };
+  fs.writeFileSync(statusPath, JSON.stringify(staleStatus));
+  fs.writeFileSync(pidPath, '1234');
+  writeOwner(ownerPath);
+  let inspected = false;
+  const result = watchdogContinuationLiveness({
+    stateDir,
+    pidFile: pidPath,
+    ownerFile: ownerPath,
+    rootDir: '/repo',
+    now: '2026-10-18T01:20:01.000Z',
+    maxAgeSeconds: 900,
+    processExists: () => true,
+    getProcessCommand: () => {
+      if (!inspected) {
+        inspected = true;
+        fs.writeFileSync(statusPath, JSON.stringify({
+          ...staleStatus,
+          updated_at: '2026-10-18T01:19:59.000Z'
+        }));
+      }
+      return 'bash /repo/phase-loop.sh supervise';
+    },
+    listSupervisors: () => [1234]
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.expired, false);
+  assert.equal(result.reason, 'continuation_changed_during_watchdog_check');
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).updated_at, '2026-10-18T01:19:59.000Z');
+  assert.equal(fs.existsSync(path.join(stateDir, 'run-state-recovery.jsonl')), false);
+});
+
 test('run-once installs exit and signal terminalization hooks after entering running state', () => {
   const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
   const controller = fs.readFileSync(path.join(repoRoot, 'phase-loop.sh'), 'utf8');

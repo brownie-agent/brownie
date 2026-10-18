@@ -14107,7 +14107,7 @@ start() {
       -- /bin/bash "$ROOT_DIR/phase-loop.sh" supervise
     sleep 1
   else
-    nohup "$0" supervise >> "$LOG_DIR/launcher.out" 2>> "$LOG_DIR/launcher.err" &
+    nohup "$ROOT_DIR/phase-loop.sh" supervise >> "$LOG_DIR/launcher.out" 2>> "$LOG_DIR/launcher.err" &
     echo $! > "$PID_FILE"
   fi
   if is_running; then
