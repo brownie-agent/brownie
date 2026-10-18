@@ -192,6 +192,33 @@ test('fails closed when a live supervisor command belongs to another root', () =
   assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
 });
 
+test('accepts a supervisor launched through a symlinked root path', () => {
+  const { stateDir, pidPath, ownerPath } = fixture();
+  const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-root-'));
+  const linkedRoot = `${realRoot}-link`;
+  fs.writeFileSync(path.join(realRoot, 'phase-loop.sh'), '');
+  fs.symlinkSync(realRoot, linkedRoot, 'dir');
+  fs.writeFileSync(path.join(stateDir, 'status.json'), JSON.stringify({
+    status: 'running',
+    run_id: 'symlinked-root',
+    supervisor_pid: 1234,
+    supervisor_generation: 'generation-1'
+  }));
+  fs.writeFileSync(pidPath, '1234');
+  fs.writeFileSync(ownerPath, JSON.stringify({ schema_version: 1, pid: 1234, generation: 'generation-1', root_dir: realRoot }));
+  const result = inspectSupervisorOwnership({
+    stateDir,
+    pidFile: pidPath,
+    ownerFile: ownerPath,
+    rootDir: linkedRoot,
+    processExists: () => true,
+    getProcessCommand: () => `bash ${linkedRoot}/phase-loop.sh supervise`,
+    listSupervisors: () => [1234]
+  });
+  assert.equal(result.command_looks_like_supervisor, true);
+  assert.equal(result.ownership_ok, true);
+});
+
 test('keeps an authorized continuation within the watchdog deadline', () => {
   const { stateDir, statusPath, pidPath, ownerPath } = fixture();
   fs.writeFileSync(statusPath, JSON.stringify({
@@ -218,6 +245,26 @@ test('keeps an authorized continuation within the watchdog deadline', () => {
   });
   assert.equal(result.expired, false);
   assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+});
+
+test('rejects an invalid watchdog duration without expiring a continuation', () => {
+  const { stateDir, statusPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'continuation-invalid-duration',
+    updated_at: '2026-10-18T01:00:00.000Z',
+    continuation_required: true,
+    controller_action: 'resume'
+  }));
+  const result = watchdogContinuationLiveness({
+    stateDir,
+    maxAgeSeconds: 'not-a-duration',
+    now: '2026-10-18T01:20:01.000Z'
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'continuation_watchdog_duration_invalid');
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+  assert.equal(fs.existsSync(path.join(stateDir, 'run-state-recovery.jsonl')), false);
 });
 
 test('audits and terminalizes an expired continuation held by a live hung owner', () => {

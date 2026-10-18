@@ -65,6 +65,29 @@ function processCommand(pid) {
   }
 }
 
+function canonicalizePath(value) {
+  if (!value) return '';
+  try {
+    return fs.realpathSync.native(value);
+  } catch {
+    return path.resolve(value);
+  }
+}
+
+function supervisorCommandMatchesRoot(command, rootDir) {
+  const canonicalRootDir = canonicalizePath(rootDir);
+  if (!canonicalRootDir || !/\bphase-loop\.sh\b.*\bsupervise\b/u.test(command)) return false;
+  const commandScriptPath = path.join(canonicalRootDir, 'phase-loop.sh');
+  return command.split(/\s+/u).some((token) => {
+    const candidateToken = token.replace(/^['"]|['"]$/gu, '');
+    if (path.basename(candidateToken) !== 'phase-loop.sh') return false;
+    const candidatePath = path.isAbsolute(candidateToken)
+      ? candidateToken
+      : path.join(canonicalRootDir, candidateToken);
+    return canonicalizePath(candidatePath) === commandScriptPath;
+  });
+}
+
 function liveSupervisorPids(rootDir) {
   let output = '';
   try {
@@ -74,8 +97,7 @@ function liveSupervisorPids(rootDir) {
   }
   return output.split('\n').flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(.*)$/u);
-    if (!match || !match[2].includes('phase-loop.sh') || !match[2].includes(' supervise')) return [];
-    if (rootDir && !match[2].includes(rootDir)) return [];
+    if (!match || !supervisorCommandMatchesRoot(match[2], rootDir)) return [];
     return [Number.parseInt(match[1], 10)];
   });
 }
@@ -130,16 +152,8 @@ export function inspectSupervisorOwnership({
   const pid = readPid(pidFile);
   const owner = readOwner(ownerFile);
   const livePid = pid && processExists(pid);
-  const canonicalizeRoot = (value) => {
-    if (!value) return '';
-    try {
-      return fs.realpathSync.native(value);
-    } catch {
-      return path.resolve(value);
-    }
-  };
-  const canonicalRootDir = canonicalizeRoot(rootDir);
-  const canonicalOwnerRootDir = canonicalizeRoot(owner?.root_dir);
+  const canonicalRootDir = canonicalizePath(rootDir);
+  const canonicalOwnerRootDir = canonicalizePath(owner?.root_dir);
   const matchingOwner = ownerMatches({
     status,
     pid,
@@ -152,12 +166,7 @@ export function inspectSupervisorOwnership({
   const command = livePid
     ? (getProcessCommand === processCommand ? processCommand(pid) : getProcessCommand(pid))
     : '';
-  const commandScriptPath = canonicalRootDir === '/' ? '/phase-loop.sh' : `${canonicalRootDir}/phase-loop.sh`;
-  const commandLooksLikeSupervisor = Boolean(
-    canonicalRootDir
-    && command.includes(commandScriptPath)
-    && /phase-loop\.sh.*\bsupervise\b/u.test(command)
-  );
+  const commandLooksLikeSupervisor = supervisorCommandMatchesRoot(command, canonicalRootDir);
   const supervisors = [...new Set(listSupervisors().filter((candidate) => Number.isInteger(candidate) && candidate > 1))];
   const liveSupervisors = supervisors.filter((candidate) => processExists(candidate));
   return {
@@ -319,13 +328,22 @@ export function watchdogContinuationLiveness({
   if (!status || status.continuation_required !== true || status.controller_action !== 'resume') {
     return { ok: true, expired: false, reason: 'continuation_not_pending' };
   }
+  const normalizedMaxAgeSeconds = Number(maxAgeSeconds);
+  if (!Number.isFinite(normalizedMaxAgeSeconds) || !Number.isInteger(normalizedMaxAgeSeconds) || normalizedMaxAgeSeconds <= 0) {
+    return {
+      ok: false,
+      code: 'continuation_watchdog_duration_invalid',
+      max_age_seconds: maxAgeSeconds,
+      run_id: status.run_id ?? null
+    };
+  }
   const updatedAt = Date.parse(status.updated_at || '');
   const nowMs = Date.parse(now);
   if (!Number.isFinite(updatedAt) || !Number.isFinite(nowMs)) {
     return { ok: false, code: 'continuation_timestamp_invalid', run_id: status.run_id ?? null };
   }
   const ageSeconds = Math.max(0, Math.floor((nowMs - updatedAt) / 1000));
-  if (ageSeconds < Number(maxAgeSeconds)) {
+  if (ageSeconds < normalizedMaxAgeSeconds) {
     return { ok: true, expired: false, age_seconds: ageSeconds, reason: 'continuation_within_deadline' };
   }
   const ownership = inspectSupervisorOwnership({
