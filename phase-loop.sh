@@ -6,6 +6,7 @@ STATE_DIR="${PHASE_LOOP_STATE_DIR:-"$ROOT_DIR/.brownie/private/phase-loop"}"
 RUN_DIR="$STATE_DIR/runs"
 LOG_DIR="$STATE_DIR/logs"
 PID_FILE="$STATE_DIR/phase-loop.pid"
+SUPERVISOR_OWNER_FILE="$STATE_DIR/phase-loop-owner.json"
 LOCK_DIR="$STATE_DIR/phase-loop.lock"
 STOP_FILE="$STATE_DIR/stop"
 STATUS_FILE="$STATE_DIR/status.json"
@@ -34,6 +35,8 @@ PHASE_LOOP_ACTIVE_STDOUT_LOG=""
 PHASE_LOOP_ACTIVE_STDERR_LOG=""
 PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 PHASE_LOOP_SUPERVISOR_PID=""
+PHASE_LOOP_SUPERVISOR_GENERATION=""
+PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS="${PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS:-900}"
 PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
 PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
 PHASE_LOOP_FINALIZING=0
@@ -324,6 +327,12 @@ write_status() {
   escaped_blocked_file="$(printf '%s' "$TODO_BLOCKED_FILE" | json_escape)"
   local escaped_progress_state_file
   escaped_progress_state_file="$(printf '%s' "$PROGRESS_STATE_FILE" | json_escape)"
+  local escaped_supervisor_generation
+  escaped_supervisor_generation="$(printf '%s' "${PHASE_LOOP_SUPERVISOR_GENERATION:-}" | json_escape)"
+  local supervisor_pid_json="null"
+  if [[ "${PHASE_LOOP_SUPERVISOR_PID:-}" =~ ^[0-9]+$ ]]; then
+    supervisor_pid_json="${PHASE_LOOP_SUPERVISOR_PID}"
+  fi
   local claim_lifecycle_json escaped_claim_state escaped_claim_id escaped_claim_error_code escaped_claim_error_message claim_id_json
   claim_lifecycle_json="$(claim_snapshot_json)"
   escaped_claim_state="$(printf '%s' "$claim_lifecycle_json" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("claim_state", "unreadable"))[1:-1])')"
@@ -351,6 +360,8 @@ write_status() {
   "consecutive_failures": $consecutive_failures,
   "continuation_required": $continuation_required,
   "controller_action": "$([ "$continuation_required" = "true" ] && printf 'resume' || printf '')",
+  "supervisor_pid": $supervisor_pid_json,
+  "supervisor_generation": "$escaped_supervisor_generation",
   "updated_at": "$timestamp",
   "pid_file": "$PID_FILE",
   "stop_file": "$STOP_FILE",
@@ -11439,7 +11450,10 @@ is_running() {
   if [ -z "$pid" ]; then
     return 1
   fi
-  kill -0 "$pid" 2>/dev/null
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  is_supervisor_pid "$pid"
 }
 
 process_command() {
@@ -11465,13 +11479,34 @@ is_supervisor_pid() {
   local pid="$1" command
   command="$(process_command "$pid")"
   case "$command" in
-    *phase-loop.sh*supervise*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
+    *"$ROOT_DIR/phase-loop.sh"*supervise*) ;;
+    *) return 1 ;;
   esac
+  if [ ! -f "$SUPERVISOR_OWNER_FILE" ] || [ ! -f "$STATUS_FILE" ]; then
+    return 1
+  fi
+  python3 - "$SUPERVISOR_OWNER_FILE" "$STATUS_FILE" "$pid" "$ROOT_DIR" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+owner_path, status_path, expected_pid, root_dir = sys.argv[1:]
+try:
+    owner = json.loads(pathlib.Path(owner_path).read_text(encoding="utf-8"))
+    status = json.loads(pathlib.Path(status_path).read_text(encoding="utf-8"))
+    pid = int(expected_pid)
+except Exception:
+    raise SystemExit(1)
+if (
+    owner.get("pid") != pid
+    or status.get("supervisor_pid") != pid
+    or not owner.get("generation")
+    or owner.get("generation") != status.get("supervisor_generation")
+    or os.path.realpath(str(owner.get("root_dir") or "")) != os.path.realpath(root_dir)
+):
+    raise SystemExit(1)
+PY
 }
 
 supervisor_descendant_pids() {
@@ -11864,7 +11899,7 @@ _run_brownie_once() {
 
   if [ -f "$ROOT_DIR/scripts/phase-loop-run-state.mjs" ]; then
     local stale_running_output stale_running_status
-    if stale_running_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" normalize-stale-running --state-dir "$STATE_DIR" --pid-file "$PID_FILE" --owner-pid "${PHASE_LOOP_SUPERVISOR_PID:-}" --run-stamp "$run_stamp" 2>&1)"; then
+    if stale_running_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" normalize-stale-running --state-dir "$STATE_DIR" --pid-file "$PID_FILE" --owner-file "$SUPERVISOR_OWNER_FILE" --root-dir "$ROOT_DIR" --owner-pid "${PHASE_LOOP_SUPERVISOR_PID:-}" --owner-generation "${PHASE_LOOP_SUPERVISOR_GENERATION:-}" --run-stamp "$run_stamp" 2>&1)"; then
       if [ -n "$stale_running_output" ]; then
         printf '%s run=%s stale_running_normalization=%s\n' "$(now_utc)" "$run_stamp" "$stale_running_output" >> "$SUPERVISOR_LOG"
       fi
@@ -13847,6 +13882,37 @@ phase_loop_finalize_unexpected_exit() {
   fi
 }
 
+write_supervisor_owner() {
+  local timestamp tmp_owner
+  timestamp="$(now_utc)"
+  tmp_owner="$SUPERVISOR_OWNER_FILE.$$.$RANDOM.tmp"
+  python3 - "$tmp_owner" "$PHASE_LOOP_SUPERVISOR_PID" "$PHASE_LOOP_SUPERVISOR_GENERATION" "$ROOT_DIR" "$timestamp" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = {
+    "schema_version": 1,
+    "pid": int(sys.argv[2]),
+    "generation": sys.argv[3],
+    "root_dir": sys.argv[4],
+    "started_at": sys.argv[5],
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(path, 0o600)
+PY
+  mv "$tmp_owner" "$SUPERVISOR_OWNER_FILE"
+  chmod 600 "$SUPERVISOR_OWNER_FILE"
+  sync_parent_dir "$STATE_DIR"
+}
+
 phase_loop_drain_deferred_signal() {
   if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -ne 1 ] && [ -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" ]; then
     PHASE_LOOP_DEFERRED_SIGNAL_CODE="$(cat "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" 2>/dev/null || true)"
@@ -13885,14 +13951,61 @@ phase_loop_handle_run_signal() {
   exit "$signal_code"
 }
 
+phase_loop_watch_continuation_liveness() {
+  if [ ! -f "$ROOT_DIR/scripts/phase-loop-run-state.mjs" ]; then
+    return 0
+  fi
+  local run_stamp="${1:-watchdog-$(date -u +%Y%m%dT%H%M%SZ)}"
+  local watchdog_output watchdog_status caller_errexit=0
+  case "$-" in
+    *e*) caller_errexit=1 ;;
+  esac
+  set +e
+  watchdog_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" watch-continuation \
+    --state-dir "$STATE_DIR" \
+    --pid-file "$PID_FILE" \
+    --owner-file "$SUPERVISOR_OWNER_FILE" \
+    --root-dir "$ROOT_DIR" \
+    --max-age-seconds "$PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS" \
+    --run-stamp "$run_stamp" 2>&1)"
+  watchdog_status=$?
+  if [ "$caller_errexit" -eq 1 ]; then
+    set -e
+  else
+    set +e
+  fi
+  printf '%s continuation_watchdog_exit=%s result=%s\n' "$(now_utc)" "$watchdog_status" "${watchdog_output:-<no output>}" >> "$SUPERVISOR_LOG"
+  if [ "$watchdog_status" -ne 0 ]; then
+    return "$watchdog_status"
+  fi
+  if ! printf '%s' "$watchdog_output" | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("redelegate") else 1)'; then
+    return 0
+  fi
+  if active_todo_claim_exists; then
+    write_todo_claim "$(claim_field claim_id)" "blocked" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"continuation_watchdog_expired"}'
+  fi
+  local owner_pid
+  owner_pid="$(printf '%s' "$watchdog_output" | python3 -c 'import json,sys; value=json.load(sys.stdin).get("owner_pid"); print(value if isinstance(value,int) else "")')"
+  if [ -n "$owner_pid" ] && [ "$owner_pid" != "${PHASE_LOOP_SUPERVISOR_PID:-}" ] && kill -0 "$owner_pid" 2>/dev/null; then
+    touch "$STOP_FILE"
+    terminate_supervisor_tree "$owner_pid" || return 78
+    rm -f "$STOP_FILE"
+  fi
+  return 0
+}
+
 supervise() {
+  load_env
   if ! acquire_lock; then
     write_status "already_running" "Another phase-loop.sh instance holds the lock." "" "" 0
     exit 0
   fi
 
-  echo "$$" > "$PID_FILE"
   PHASE_LOOP_SUPERVISOR_PID="$$"
+  PHASE_LOOP_SUPERVISOR_GENERATION="supervisor-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+  write_supervisor_owner
+  echo "$PHASE_LOOP_SUPERVISOR_PID" > "$PID_FILE"
   write_status "supervising" "Supervisor started." "" "" 0
   printf '%s supervisor pid=%s started\n' "$(now_utc)" "$$" >> "$SUPERVISOR_LOG"
 
@@ -13903,6 +14016,21 @@ supervise() {
       write_status "stopped" "Stop file present." "" "" "$CONSECUTIVE_FAILURES"
       printf '%s stop file observed; exiting\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
       exit 0
+    fi
+
+    local watchdog_status
+    if phase_loop_watch_continuation_liveness "watchdog-$(date -u +%Y%m%dT%H%M%SZ)"; then
+      watchdog_status=0
+    else
+      watchdog_status=$?
+    fi
+    if [ "$watchdog_status" -ne 0 ]; then
+      if [ "$watchdog_status" -eq 75 ]; then
+        write_status "blocked" "Continuation watchdog could not prove supervisor ownership; refusing to resume." "watchdog-$(date -u +%Y%m%dT%H%M%SZ)" "78" "${CONSECUTIVE_FAILURES:-0}"
+        exit 78
+      fi
+      write_status "blocked" "Continuation watchdog failed with status $watchdog_status; refusing to resume." "watchdog-$(date -u +%Y%m%dT%H%M%SZ)" "78" "${CONSECUTIVE_FAILURES:-0}"
+      exit 78
     fi
 
     stop_if_todo_empty "$CONSECUTIVE_FAILURES"
@@ -13950,7 +14078,7 @@ normalize_stale_running_before_start() {
   fi
   local start_run_stamp="start-$(date -u +%Y%m%dT%H%M%SZ)"
   local normalization_output normalization_status
-  normalization_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" normalize-stale-running --state-dir "$STATE_DIR" --pid-file "$PID_FILE" --owner-pid "" --run-stamp "$start_run_stamp" 2>&1)"
+  normalization_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" normalize-stale-running --state-dir "$STATE_DIR" --pid-file "$PID_FILE" --owner-file "$SUPERVISOR_OWNER_FILE" --root-dir "$ROOT_DIR" --owner-pid "" --run-stamp "$start_run_stamp" 2>&1)"
   normalization_status=$?
   if [ -n "$normalization_output" ]; then
     printf '%s startup_stale_running_normalization=%s\n' "$(now_utc)" "$normalization_output" >> "$SUPERVISOR_LOG"
@@ -13967,6 +14095,17 @@ normalize_stale_running_before_start() {
 }
 
 start() {
+  load_env
+  local watchdog_status
+  if phase_loop_watch_continuation_liveness "startup-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"; then
+    watchdog_status=0
+  else
+    watchdog_status=$?
+  fi
+  if [ "$watchdog_status" -ne 0 ]; then
+    printf '%s\n' "Continuation watchdog refused startup: ownership could not be proven." >&2
+    exit "$watchdog_status"
+  fi
   if is_running; then
     echo "phase-loop already running: pid $(cat "$PID_FILE")"
     exit 0
@@ -13991,7 +14130,7 @@ start() {
       -- /bin/bash "$ROOT_DIR/phase-loop.sh" supervise
     sleep 1
   else
-    nohup "$0" supervise >> "$LOG_DIR/launcher.out" 2>> "$LOG_DIR/launcher.err" &
+    nohup "$ROOT_DIR/phase-loop.sh" supervise >> "$LOG_DIR/launcher.out" 2>> "$LOG_DIR/launcher.err" &
     echo $! > "$PID_FILE"
   fi
   if is_running; then
@@ -14041,13 +14180,36 @@ case "${1:-status}" in
   stop)
     stop_loop
     ;;
+  watchdog)
+    load_env
+    phase_loop_watch_continuation_liveness "manual-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"
+    exit $?
+    ;;
   restart)
+    restart_pid=""
+    if [ -f "$PID_FILE" ]; then
+      restart_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+      if [ -n "$restart_pid" ] && kill -0 "$restart_pid" 2>/dev/null && ! is_running; then
+        printf '%s\n' "phase-loop restart refused; live supervisor ownership could not be proven: pid $restart_pid" >&2
+        exit 75
+      fi
+    fi
     stop_loop
     sleep 2
-    if is_running; then
-      old_pid="$(cat "$PID_FILE")"
-      kill "$old_pid" 2>/dev/null || true
-      sleep 1
+    if [ -f "$PID_FILE" ]; then
+      old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+      if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        if ! is_running; then
+          printf '%s\n' "phase-loop restart refused; live supervisor ownership could not be proven: pid $old_pid" >&2
+          exit 75
+        fi
+        kill "$old_pid" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$old_pid" 2>/dev/null; then
+          printf '%s\n' "phase-loop restart refused; supervisor pid $old_pid is still running" >&2
+          exit 75
+        fi
+      fi
     fi
     rm -f "$PID_FILE" "$STOP_FILE"
     rm -rf "$LOCK_DIR"
