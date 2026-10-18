@@ -2615,7 +2615,7 @@ run_status_write_signal_regression() {
   PHASE_LOOP_TEST_STATUS_WRITE_MARKER="$signal_marker" \
   PHASE_LOOP_TEST_STATUS_WRITE_DELAY_SECONDS=2 \
   BROWNIE_BIN="$fake_brownie_json" \
-  "$PHASE_LOOP" run-once >/dev/null 2>/dev/null &
+  bash -c 'trap - INT TERM; exec "$@"' phase-loop-signal-wrapper "$PHASE_LOOP" run-once >/dev/null 2>/dev/null &
   signal_run_pid="$!"
   for _ in $(seq 1 40); do
     if [ -f "$signal_marker" ]; then
