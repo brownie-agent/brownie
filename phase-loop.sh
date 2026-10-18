@@ -336,13 +336,15 @@ write_status() {
 }
 EOF
   mv "$tmp_status" "$STATUS_FILE"
-  if [ -n "$force_status_exit_code" ]; then
-    PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
-    exit "$force_status_exit_code"
-  fi
+  # The replacement is now durable.  Clear the write window before any
+  # forced exit so a signal captured during the write must finish
+  # terminalization against the committed status rather than being lost.
   PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
   if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -eq 1 ] && [ "${PHASE_LOOP_FINALIZING:-0}" -eq 0 ]; then
     phase_loop_drain_deferred_signal
+  fi
+  if [ -n "$force_status_exit_code" ]; then
+    exit "$force_status_exit_code"
   fi
 }
 

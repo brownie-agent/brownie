@@ -47,6 +47,39 @@ test('replan atomically records a terminal parent and executable queued children
   assert.equal(projection.get('T-5b').parent_task_id, 'T-5');
 });
 
+test('accepts only an exact duplicate replan transaction', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  appendTaskTransition(repo, { task_id: 'T-5x', to_state: 'queued' });
+  const children = [
+    { task_id: 'T-5xa', route: 'implementation', patch_targets: ['a.rs'], verification_commands: ['cargo test'], task_spec_sha256: 'child-a' },
+    { task_id: 'T-5xb', route: 'documentation', patch_targets: ['docs/a.md'], verification_commands: ['pnpm check'], task_spec_sha256: 'child-b' }
+  ];
+  const input = { task_id: 'T-5x', reason: 'over_broad', children, run_id: 'run-replan', claim_id: 'claim-replan', task_spec_sha256: 'parent-spec' };
+  assert.equal(replanTaskWithChildren(repo, input).ok, true);
+  const ledger = path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl');
+  const before = fs.readFileSync(ledger, 'utf8');
+  const duplicate = replanTaskWithChildren(repo, { ...input, at: 'later' });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.code, 'duplicate_replan');
+  assert.equal(duplicate.events.length, 3);
+  assert.equal(fs.readFileSync(ledger, 'utf8'), before);
+
+  const changedChild = replanTaskWithChildren(repo, {
+    ...input,
+    children: [{ ...children[0], patch_targets: ['different.rs'] }, children[1]]
+  });
+  assert.equal(changedChild.ok, false);
+  assert.equal(changedChild.code, 'replan_duplicate_mismatch');
+
+  const changedSet = replanTaskWithChildren(repo, {
+    ...input,
+    children: [children[0], { ...children[1], task_id: 'T-5xc' }]
+  });
+  assert.equal(changedSet.ok, false);
+  assert.equal(changedSet.code, 'replan_duplicate_mismatch');
+  assert.equal(fs.readFileSync(ledger, 'utf8'), before);
+});
+
 test('replan leaves the ledger unchanged when a child fails the execution gate', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   appendTaskTransition(repo, { task_id: 'T-6', to_state: 'queued' });

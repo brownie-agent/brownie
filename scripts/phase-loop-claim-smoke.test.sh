@@ -2597,56 +2597,68 @@ assert "stdout=" in status["detail"], status
 assert "stderr=" in status["detail"], status
 PY
 
-# A signal delivered during the atomic status-write window must be deferred
-# until the replacement is visible, then terminalize the run instead of
-# leaving status.json at `running`.
-signal_state="$(mktemp -d)"
-signal_prompt="$(mktemp)"
-signal_todo="$(mktemp)"
-signal_marker="$signal_state/status-write.started"
-printf 'base prompt\n' > "$signal_prompt"
-printf -- '- [ ] S-01: signal during status write\n' > "$signal_todo"
-PHASE_LOOP_STATE_DIR="$signal_state" \
-PHASE_LOOP_PROMPT="$signal_prompt" \
-PHASE_LOOP_TODO="$signal_todo" \
-PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
-PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
-PHASE_LOOP_TEST_STATUS_WRITE_MARKER="$signal_marker" \
-PHASE_LOOP_TEST_STATUS_WRITE_DELAY_SECONDS=2 \
-BROWNIE_BIN="$fake_brownie_json" \
-"$PHASE_LOOP" run-once >/dev/null 2>/dev/null &
-signal_run_pid="$!"
-for _ in $(seq 1 40); do
-  if [ -f "$signal_marker" ]; then
-    break
+run_status_write_signal_regression() {
+  local signal_name="$1"
+  local expected_exit_code="$2"
+  local signal_state signal_prompt signal_todo signal_marker signal_run_pid signal_exit_code
+  signal_state="$(mktemp -d)"
+  signal_prompt="$(mktemp)"
+  signal_todo="$(mktemp)"
+  signal_marker="$signal_state/status-write.started"
+  printf 'base prompt\n' > "$signal_prompt"
+  printf -- '- [ ] S-01: signal during status write\n' > "$signal_todo"
+  PHASE_LOOP_STATE_DIR="$signal_state" \
+  PHASE_LOOP_PROMPT="$signal_prompt" \
+  PHASE_LOOP_TODO="$signal_todo" \
+  PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+  PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+  PHASE_LOOP_TEST_STATUS_WRITE_MARKER="$signal_marker" \
+  PHASE_LOOP_TEST_STATUS_WRITE_DELAY_SECONDS=2 \
+  BROWNIE_BIN="$fake_brownie_json" \
+  "$PHASE_LOOP" run-once >/dev/null 2>/dev/null &
+  signal_run_pid="$!"
+  for _ in $(seq 1 40); do
+    if [ -f "$signal_marker" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [ ! -f "$signal_marker" ]; then
+    echo "status write test window was not reached for SIG$signal_name" >&2
+    kill -KILL "$signal_run_pid" 2>/dev/null || true
+    wait "$signal_run_pid" 2>/dev/null || true
+    exit 1
   fi
-  sleep 0.1
-done
-if [ ! -f "$signal_marker" ]; then
-  echo "status write test window was not reached" >&2
-  kill -KILL "$signal_run_pid" 2>/dev/null || true
-  wait "$signal_run_pid" 2>/dev/null || true
-  exit 1
-fi
-kill -TERM "$signal_run_pid"
-set +e
-wait "$signal_run_pid"
-signal_exit_code="$?"
-set -e
-if [ "$signal_exit_code" -ne 143 ]; then
-  echo "expected deferred TERM to exit 143, got $signal_exit_code" >&2
-  exit 1
-fi
-python3 - "$signal_state/status.json" <<'PY'
+  kill -"$signal_name" "$signal_run_pid"
+  set +e
+  wait "$signal_run_pid"
+  signal_exit_code="$?"
+  set -e
+  if kill -0 "$signal_run_pid" 2>/dev/null; then
+    echo "physical process remained after deferred SIG$signal_name" >&2
+    exit 1
+  fi
+  if [ "$signal_exit_code" -ne "$expected_exit_code" ]; then
+    echo "expected deferred SIG$signal_name to exit $expected_exit_code, got $signal_exit_code" >&2
+    exit 1
+  fi
+  python3 - "$signal_state/status.json" "$expected_exit_code" <<'PY'
 import json
 import sys
 
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 assert status["status"] == "blocked", status
-assert status["exit_code"] == "143", status
+assert status["exit_code"] == sys.argv[2], status
 assert status["consecutive_failures"] >= 1, status
 assert "terminalized status before process exit" in status["detail"], status
 PY
+}
+
+# Signals delivered during the atomic status-write window must be deferred
+# until the replacement is visible, then terminalize the run instead of
+# leaving status.json at `running`.
+run_status_write_signal_regression TERM 143
+run_status_write_signal_regression INT 130
 
 assert_repository_state_unchanged
 echo "phase-loop claim smoke passed"

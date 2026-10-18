@@ -106,6 +106,53 @@ export function appendTaskTransition(repoRoot, input) {
   return { ok: true, event };
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]));
+  }
+  return value ?? null;
+}
+
+function semanticEqual(left, right) {
+  return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right));
+}
+
+function sameTaskIdSet(left, right) {
+  return semanticEqual([...left].sort(), [...right].sort());
+}
+
+function replacementChildMatches(event, child, parentTaskId, runId) {
+  return event?.task_id === child?.task_id
+    && event?.from_state === null
+    && event?.to_state === 'queued'
+    && (event?.run_id ?? null) === (runId ?? null)
+    && event?.claim_id === null
+    && event?.reason === `replacement_for:${parentTaskId}`
+    && Array.isArray(event?.replaces)
+    && event.replaces.length === 0
+    && (event?.task_spec_sha256 ?? null) === (child?.task_spec_sha256 ?? null)
+    && semanticEqual(event?.patch_targets, child?.patch_targets)
+    && semanticEqual(event?.verification_commands, child?.verification_commands)
+    && semanticEqual(event?.route, child?.route)
+    && event?.parent_task_id === parentTaskId;
+}
+
+function exactReplanEvents(events, parentEvent, children, parentTaskId, runId) {
+  const childIds = children.map((child) => child?.task_id);
+  if (!sameTaskIdSet(parentEvent?.replaces ?? [], childIds)) return null;
+  const replacementEvents = events.filter((event) => (
+    event?.parent_task_id === parentTaskId
+    && event?.to_state === 'queued'
+    && (event?.run_id ?? null) === (runId ?? null)
+    && event?.claim_id === null
+  ));
+  if (replacementEvents.length !== children.length) return null;
+  const matchedChildren = children.map((child) => replacementEvents.find((event) => replacementChildMatches(event, child, parentTaskId, runId)));
+  if (matchedChildren.some((event) => !event)) return null;
+  return [parentEvent, ...matchedChildren];
+}
+
 // Replanning is a single ledger commit: the original task becomes terminal
 // only in the same append that introduces every replacement child.  The TODO
 // markdown remains a compatibility projection during migration; consumers
@@ -114,7 +161,8 @@ export function replanTaskWithChildren(repoRoot, { task_id, reason, children, ru
   if (!Array.isArray(children) || children.length === 0) return { ok: false, code: 'replan_requires_reason_and_children' };
   const events = readTaskLedger(repoRoot);
   const projection = taskProjection(events);
-  const duplicate = events.find((event) => (
+  const childIds = children.map((child) => child?.task_id);
+  const duplicateCandidates = events.filter((event) => (
     event?.task_id === task_id
     && event?.to_state === 'replanned'
     && (event?.run_id ?? null) === run_id
@@ -122,9 +170,17 @@ export function replanTaskWithChildren(repoRoot, { task_id, reason, children, ru
     && (event?.task_spec_sha256 ?? null) === (task_spec_sha256 ?? null)
     && (event?.reason ?? null) === reason
   ));
-  if (duplicate) return { ok: true, code: 'duplicate_replan', events: [duplicate], duplicate: true };
+  if (duplicateCandidates.length > 0) {
+    const exact = duplicateCandidates.map((parentEvent) => exactReplanEvents(events, parentEvent, children, task_id, run_id)).find(Boolean);
+    if (exact) return { ok: true, code: 'duplicate_replan', events: exact, duplicate: true };
+    return {
+      ok: false,
+      code: 'replan_duplicate_mismatch',
+      task_id,
+      reason: 'immutable_replan_parent_matches_but_replacement_children_differ'
+    };
+  }
   const parent = projection.get(task_id);
-  const childIds = children.map((child) => child?.task_id);
   if (new Set(childIds).size !== childIds.length || childIds.some((id) => !id)) return { ok: false, code: 'replan_children_must_have_unique_ids' };
   const parentVerdict = validateTransition({ previous: parent, toState: 'replanned', reason, replaces: childIds });
   if (!parentVerdict.ok) return parentVerdict;
