@@ -36,6 +36,7 @@ PHASE_LOOP_SUPERVISOR_PID=""
 PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
 PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
 PHASE_LOOP_FINALIZING=0
+PHASE_LOOP_LAST_CLAIM_ARCHIVE=""
 
 BROWNIE_BIN="${BROWNIE_BIN:-"$ROOT_DIR/target/debug/brownie"}"
 PHASE_LOOP_DEFAULT_BROWNIE_BIN="$ROOT_DIR/target/debug/brownie"
@@ -98,10 +99,21 @@ claim_path_for_run() {
     return 0
   fi
   # Terminal paths may archive current.json before emitting their final
-  # trajectory event. Recover only an archive belonging to this run; never
-  # attach a prior run's claim to a new trajectory.
-  local archived_claim
-  archived_claim="$(find "$TODO_CLAIM_DIR" -maxdepth 1 -type f -name "*${run_stamp}*.json" -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+  # trajectory event. Prefer the archive recorded by the terminal path, then
+  # a completed archive for this run. Never let lexical ordering select a
+  # stale snapshot when a newer terminal claim is available.
+  local archived_claim=""
+  if [ -n "${PHASE_LOOP_LAST_CLAIM_ARCHIVE:-}" ] &&
+    [ -f "$PHASE_LOOP_LAST_CLAIM_ARCHIVE" ] &&
+    [[ "$PHASE_LOOP_LAST_CLAIM_ARCHIVE" == *"$run_stamp"* ]]; then
+    archived_claim="$PHASE_LOOP_LAST_CLAIM_ARCHIVE"
+  fi
+  if [ -z "$archived_claim" ]; then
+    archived_claim="$(find "$TODO_CLAIM_DIR" -maxdepth 1 -type f -name "completed-*${run_stamp}*.json" -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+  fi
+  if [ -z "$archived_claim" ]; then
+    archived_claim="$(find "$TODO_CLAIM_DIR" -maxdepth 1 -type f -name "*${run_stamp}*.json" -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+  fi
   if [ -n "$archived_claim" ] && [ -f "$archived_claim" ]; then
     printf '%s\n' "$archived_claim"
   else
@@ -8260,6 +8272,7 @@ os.chmod(archive_path, 0o600)
 current_path.unlink()
 PY
   sync_parent_dir "$TODO_CLAIM_DIR"
+  PHASE_LOOP_LAST_CLAIM_ARCHIVE="$archive_path"
 }
 
 git_workspace_fingerprint() {
@@ -12124,7 +12137,8 @@ PY
     clear_repair_feedback
     write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
     if [ -f "$TODO_CLAIM_FILE" ]; then
-      mv "$TODO_CLAIM_FILE" "$TODO_CLAIM_DIR/completed-deterministic-decomposition-$run_stamp.json"
+      PHASE_LOOP_LAST_CLAIM_ARCHIVE="$TODO_CLAIM_DIR/completed-deterministic-decomposition-$run_stamp.json"
+      mv "$TODO_CLAIM_FILE" "$PHASE_LOOP_LAST_CLAIM_ARCHIVE"
       sync_parent_dir "$TODO_CLAIM_DIR"
     fi
     detail="Applied deterministic TODO decomposition repair before invoking Brownie: $deterministic_todo_decomposition_output"
@@ -12292,7 +12306,8 @@ PY
     clear_repair_feedback
     write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
     if [ -f "$TODO_CLAIM_FILE" ]; then
-      mv "$TODO_CLAIM_FILE" "$TODO_CLAIM_DIR/completed-no-eligible-multitarget-split-$run_stamp.json"
+      PHASE_LOOP_LAST_CLAIM_ARCHIVE="$TODO_CLAIM_DIR/completed-no-eligible-multitarget-split-$run_stamp.json"
+      mv "$TODO_CLAIM_FILE" "$PHASE_LOOP_LAST_CLAIM_ARCHIVE"
       sync_parent_dir "$TODO_CLAIM_DIR"
     fi
     detail="Applied deterministic fallback for no_eligible_task multi-target leaf split before invoking Brownie: $pre_guard_no_eligible_multitarget_output"
