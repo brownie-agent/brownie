@@ -3134,7 +3134,7 @@ customModes:
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
-        let write_executable_fixture = |prefix: &str, source: String| {
+        let write_executable_fixture = |prefix: &str, source: String| -> tempfile::TempPath {
             let mut fixture = tempfile::Builder::new()
                 .prefix(prefix)
                 .tempfile_in(temp.path())
@@ -3146,7 +3146,7 @@ customModes:
             fixture.as_file_mut().sync_all().expect("fixture sync");
             std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("fixture permissions");
-            fixture
+            fixture.into_temp_path()
         };
 
         let git_fixture = write_executable_fixture(
@@ -3160,7 +3160,8 @@ customModes:
         );
 
         run_git_with_retries("fixture git operation", || {
-            std::process::Command::new(git_fixture.path())
+            let path: &std::path::Path = git_fixture.as_ref();
+            std::process::Command::new(path)
         })
         .expect("transient fixture failure should retry");
         assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "2");
@@ -3170,7 +3171,8 @@ customModes:
             "#!/bin/sh\necho 'Could not resolve host: fixture.invalid' >&2\nexit 128\n".to_string(),
         );
         let error = run_git_with_retries("fixture blocked operation", || {
-            std::process::Command::new(always_fail.path())
+            let path: &std::path::Path = always_fail.as_ref();
+            std::process::Command::new(path)
         })
         .expect_err("persistent external failure should classify as blocked");
         assert!(error.contains("fixture blocked operation"));
