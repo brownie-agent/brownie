@@ -20,6 +20,7 @@ BDK_TRAJECTORY_DIR="$STATE_DIR/trajectories"
 KNOWN_GOOD_DIR="$STATE_DIR/known-good-targets"
 BDK_TRAJECTORY_FILE="${PHASE_LOOP_BDK_TRAJECTORY_FILE:-"$STATE_DIR/bdk-trajectory.jsonl"}"
 BDK_HARNESS_FEEDBACK_FILE="$STATE_DIR/bdk-harness-feedback.json"
+PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
 LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
 LAUNCHD_LABEL="${PHASE_LOOP_LAUNCHD_LABEL:-globalpocket.brownie.phase-loop}"
 SCREEN_NAME="${PHASE_LOOP_SCREEN_NAME:-brownie-phase-loop}"
@@ -372,6 +373,13 @@ EOF
   # forced exit so a signal captured during the write must finish
   # terminalization against the committed status rather than being lost.
   PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
+  if [ -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" ]; then
+    PHASE_LOOP_DEFERRED_SIGNAL_CODE="$(cat "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" 2>/dev/null || true)"
+    rm -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE"
+    if [ -n "$PHASE_LOOP_DEFERRED_SIGNAL_CODE" ]; then
+      PHASE_LOOP_DEFERRED_SIGNAL_PENDING=1
+    fi
+  fi
   if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -eq 1 ] && [ "${PHASE_LOOP_FINALIZING:-0}" -eq 0 ]; then
     phase_loop_drain_deferred_signal
   fi
@@ -13804,6 +13812,7 @@ PY
 run_brownie_once() {
   PHASE_LOOP_TASK_LEDGER_FAILURE=0
   PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL=""
+  rm -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE"
   _run_brownie_once "$@"
   local run_status=$?
   if [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 1 ]; then
@@ -13839,6 +13848,13 @@ phase_loop_finalize_unexpected_exit() {
 }
 
 phase_loop_drain_deferred_signal() {
+  if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -ne 1 ] && [ -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" ]; then
+    PHASE_LOOP_DEFERRED_SIGNAL_CODE="$(cat "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" 2>/dev/null || true)"
+    rm -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE"
+    if [ -n "$PHASE_LOOP_DEFERRED_SIGNAL_CODE" ]; then
+      PHASE_LOOP_DEFERRED_SIGNAL_PENDING=1
+    fi
+  fi
   if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -ne 1 ]; then
     return 0
   fi
@@ -13857,6 +13873,9 @@ phase_loop_handle_run_signal() {
     signal_code=130
   fi
   if [ "${PHASE_LOOP_STATUS_WRITE_IN_PROGRESS:-0}" -eq 1 ]; then
+    local tmp_signal_file="$PHASE_LOOP_DEFERRED_SIGNAL_FILE.$$"
+    printf '%s\n' "$signal_code" > "$tmp_signal_file"
+    mv "$tmp_signal_file" "$PHASE_LOOP_DEFERRED_SIGNAL_FILE"
     PHASE_LOOP_DEFERRED_SIGNAL_PENDING=1
     PHASE_LOOP_DEFERRED_SIGNAL_CODE="$signal_code"
     return 0

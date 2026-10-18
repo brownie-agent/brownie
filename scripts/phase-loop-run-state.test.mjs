@@ -136,6 +136,8 @@ test('run-once installs exit and signal terminalization hooks after entering run
   assert.match(controller, /continuation_required\)\n[\s\S]*write_status "running"[^\n]*"true"/u);
   assert.match(controller, /PHASE_LOOP_DEFERRED_SIGNAL_PENDING=1/gu);
   assert.match(controller, /phase_loop_drain_deferred_signal/gu);
-  assert.match(controller, /mv "\$tmp_status" "\$STATUS_FILE"[\s\S]*PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0\n  if \[ "\$\{PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0\}"/u);
+  assert.match(controller, /PHASE_LOOP_DEFERRED_SIGNAL_FILE/gu);
+  assert.match(controller, /mv "\$tmp_status" "\$STATUS_FILE"[\s\S]*PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0[\s\S]*if \[ "\$\{PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0\}"/u);
   assert.match(controller, /PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0[\s\S]*if \[ -n "\$force_status_exit_code" \]; then\n    exit "\$force_status_exit_code"/u);
+  assert.match(controller, /normalize_stale_running_before_start[\s\S]*write_status "starting"/u);
 });

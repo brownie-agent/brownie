@@ -71,6 +71,19 @@ test('accepts only an exact duplicate replan transaction', () => {
   assert.equal(changedChild.ok, false);
   assert.equal(changedChild.code, 'replan_duplicate_mismatch');
 
+  for (const changed of [
+    { ...children[0], verification_commands: ['cargo test --locked'] },
+    { ...children[0], route: 'documentation' },
+    { ...children[0], task_spec_sha256: 'child-a-changed' }
+  ]) {
+    const mismatch = replanTaskWithChildren(repo, {
+      ...input,
+      children: [changed, children[1]]
+    });
+    assert.equal(mismatch.ok, false);
+    assert.equal(mismatch.code, 'replan_duplicate_mismatch');
+  }
+
   const changedSet = replanTaskWithChildren(repo, {
     ...input,
     children: [children[0], { ...children[1], task_id: 'T-5xc' }]
