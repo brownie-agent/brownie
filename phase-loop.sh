@@ -11860,6 +11860,7 @@ _run_brownie_once() {
   if ! todo_first_raw_pending_is_recorded_blocked && todo_first_raw_pending_is_explicit_blocker; then
     if claim_first_raw_pending_todo "$run_stamp"; then
       record_explicit_blocker_todo_claim "$run_stamp"
+      write_bdk_trajectory_event "$run_stamp" "todo.claimed" '{"source":"phase-loop"}'
       write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"explicit_blocker_pre_runtime"}'
       return 0
     fi
