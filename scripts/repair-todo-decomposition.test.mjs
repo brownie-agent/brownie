@@ -315,6 +315,111 @@ test('does not accept a sibling dependency backed only by an invalidated complet
   }
 });
 
+test('preserves a canonically completed dependency during sibling normalization', () => {
+  const root = makeTempRepo();
+  try {
+    const tick = String.fromCharCode(96);
+    const sourceId = 'E-23z-canonical-completion';
+    const leafId = sourceId + '-target-01';
+    const completedId = 'E-23z-completed-prerequisite';
+    fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-completions'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-completions/completed.json'), JSON.stringify({
+      selected_todo_id: completedId
+    }));
+    const leaf = '- [ ] ' + leafId + ': Create only ' + tick + 'package.json' + tick + ' after the completed prerequisite:\n'
+      + '  Route: implementation.\n'
+      + '  Source TODO: ' + sourceId + '.\n'
+      + '  Depends on: ' + completedId + '.\n'
+      + '  Completion condition: normalize the existing target without dropping the completed prerequisite.\n'
+      + '  Forbidden changes: do not edit unrelated files.\n'
+      + '  Verification: run ' + tick + 'pnpm --workspace-root guard:todo-decomposition' + tick + '.';
+    fs.writeFileSync(path.join(root, '.brownie/todo.md'), [
+      '- [x] ' + sourceId + ': Parent fixture.',
+      '',
+      leaf,
+      ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(root, '.brownie/todo-breakdown.md'), [
+      '# TODO breakdown', '', '## ' + sourceId + ' split', '',
+      'Parent TODO: ' + sourceId, '', 'Dependency graph:',
+      '- ' + leafId + ': ' + completedId, '', 'Verification ledger:',
+      '- ' + leafId + ': ' + tick + 'pnpm --workspace-root guard:todo-decomposition' + tick,
+      '', 'Quality rubric:', '- ' + leafId + ': bounded target.', '', 'History:', ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-claims/current.json'), JSON.stringify({
+      schema_version: 1,
+      claim_id: 'claim-canonical-completion',
+      selected_todo: leaf
+    }, null, 2));
+
+    const result = runRepair(root);
+    assert.equal(result.status, 0, result.stdout + '\n' + result.stderr);
+    const todo = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8');
+    assert.match(todo, new RegExp(leafId + ': Patch only ' + tick + 'package\\.json' + tick));
+    assert.match(todo, new RegExp('Depends on: ' + completedId + '\\.'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rejects a sibling normalization that depends on an unresolved checked superseded parent', () => {
+  const root = makeTempRepo();
+  try {
+    const tick = String.fromCharCode(96);
+    const parentId = 'E-23z-unresolved-parent';
+    const childId = parentId + '-target-01';
+    const sourceId = 'E-23z-dependent-source';
+    const leafId = sourceId + '-target-01';
+    const child = '- [ ] ' + childId + ': Create only ' + tick + 'scripts/new-child.mjs' + tick + ' for the split parent:\n'
+      + '  Route: implementation.\n'
+      + '  Source TODO: ' + parentId + '.\n'
+      + '  Depends on: <none>.\n'
+      + '  Completion condition: create the generated child.\n'
+      + '  Forbidden changes: do not edit unrelated files.\n'
+      + '  Verification: run ' + tick + 'pnpm --workspace-root guard:todo-decomposition' + tick + '.';
+    const leaf = '- [ ] ' + leafId + ': Create only ' + tick + 'package.json' + tick + ' after the unresolved parent:\n'
+      + '  Route: implementation.\n'
+      + '  Source TODO: ' + sourceId + '.\n'
+      + '  Depends on: ' + parentId + '.\n'
+      + '  Completion condition: preserve the unresolved parent dependency.\n'
+      + '  Forbidden changes: do not edit unrelated files.\n'
+      + '  Verification: run ' + tick + 'pnpm --workspace-root guard:todo-decomposition' + tick + '.';
+    fs.writeFileSync(path.join(root, '.brownie/todo.md'), [
+      '- [x] ' + parentId + ': Superseded parent fixture.',
+      '', child, '', leaf, ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(root, '.brownie/todo-breakdown.md'), [
+      '# TODO breakdown', '', '## ' + parentId + ' split', '',
+      'Parent TODO: ' + parentId, '', 'Targets:', '- ' + childId + ': ' + tick + 'scripts/new-child.mjs' + tick,
+      '', 'Dependency graph:', '- ' + childId + ': <none>', '- ' + leafId + ': ' + parentId,
+      '', 'Verification ledger:', '- ' + childId + ': ' + tick + 'pnpm --workspace-root guard:todo-decomposition' + tick,
+      '- ' + leafId + ': ' + tick + 'pnpm --workspace-root guard:todo-decomposition' + tick,
+      '', 'Quality rubric:', '- ' + childId + ': bounded target.', '- ' + leafId + ': bounded target.', '', 'History:', ''
+    ].join('\n'));
+    fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-replans'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-replans/split.json'), JSON.stringify({
+      schema_version: 1,
+      record_type: 'todo_replan',
+      operation: 'split_parent_into_children',
+      parent_status: 'superseded_by_children',
+      parent_todo_id: parentId,
+      generated_child_ids: [childId]
+    }));
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-claims/current.json'), JSON.stringify({
+      schema_version: 1,
+      claim_id: 'claim-unresolved-parent',
+      selected_todo: leaf
+    }, null, 2));
+
+    const result = runRepair(root);
+    assert.notEqual(result.status, 0, result.stdout + '\n' + result.stderr);
+    assert.match(result.stdout, /source_sibling_contract_repair_failed_guard/u);
+    assert.match(fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8'), new RegExp(leafId + ': Create only ' + tick + 'package\\.json' + tick));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('retains descriptive scope words while normalizing an existing Create-only target', () => {
   const root = makeTempRepo();
   try {
