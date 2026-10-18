@@ -80,10 +80,6 @@ function readTodoReplanRecords() {
   return records;
 }
 
-function canonicalCompletedTodoIds(todoText, breakdownPath) {
-  return canonicalTodoState(todoText, breakdownPath).completedIds;
-}
-
 function canonicalTodoState(todoText, breakdownPath) {
   return loadTodoState(repoRoot, todoText, {
     breakdownPath: path.resolve(repoRoot, breakdownPath)
