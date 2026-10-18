@@ -169,7 +169,7 @@ export function buildContractRebaselineReceipt({
   const changes = contractChanges({ beforeTodoText, afterTodoText, todoIds });
   if (changes.length === 0) return null;
   const targetTodoIds = changes.map((change) => change.todo_id);
-  const parentTodoIds = [...new Set(changes.map(parentTodoIdForChange).filter(Boolean))];
+  const parentTodoIds = [...new Set(changes.map((change) => parentTodoIdForChange(change)).filter(Boolean))];
   if (!runStamp || !eventKey || !diagnostic || !verification?.repair_command || !verification?.guard_command || !verification?.integrity_command) {
     throw new Error('contract rebaseline receipt requires cause run and verification path');
   }
