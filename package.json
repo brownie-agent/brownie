@@ -6,7 +6,7 @@
   "description": "Brownie Code-OSS extension and Rust runtime workspace.",
   "scripts": {
     "build": "pnpm --filter brownie-vsix build",
-    "check": "pnpm --filter brownie-vsix check && pnpm guard:release-contract && pnpm guard:trace-binding && pnpm guard:js-added-function-reachability",
+    "check": "pnpm --filter brownie-vsix check && pnpm phase-loop:run-state:test && pnpm phase-loop:claim-lifecycle:test && pnpm phase-loop:delegation-admission:test && pnpm guard:release-contract && pnpm guard:trace-binding && pnpm guard:js-added-function-reachability",
     "guard:control-plane-authority": "node scripts/guard-control-plane-authority.mjs",
     "guard:control-plane-authority:test": "node --test scripts/guard-control-plane-authority.test.mjs",
     "guard:diagnostics": "node scripts/guard-diagnostics-api.mjs",
@@ -82,6 +82,9 @@
     "guard:tool-intent-contract:test": "node --test scripts/guard-tool-intent-contract.test.mjs",
     "phase-loop:todo-state:test": "node --test scripts/phase-loop-todo-state.test.mjs",
     "phase-loop:task-ledger:test": "node --test scripts/phase-loop-task-ledger.test.mjs",
+    "phase-loop:run-state:test": "node --test scripts/phase-loop-run-state.test.mjs",
+    "phase-loop:claim-lifecycle:test": "node --test scripts/phase-loop-claim-lifecycle.test.mjs",
+    "phase-loop:delegation-admission:test": "node --test scripts/phase-loop-delegation-admission.test.mjs",
     "phase-loop:todo-evaluator:test": "node --test scripts/phase-loop-todo-evaluator.test.mjs",
     "phase-loop:blocked-queue-replan:test": "node --test scripts/phase-loop-blocked-queue-replan.test.mjs",
     "phase-loop:progress-integrity": "node scripts/phase-loop-progress-integrity.mjs",

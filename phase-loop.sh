@@ -25,6 +25,13 @@ LAUNCHD_LABEL="${PHASE_LOOP_LAUNCHD_LABEL:-globalpocket.brownie.phase-loop}"
 SCREEN_NAME="${PHASE_LOOP_SCREEN_NAME:-brownie-phase-loop}"
 PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED=0
 PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL=""
+PHASE_LOOP_TASK_LEDGER_FAILURE=0
+PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL=""
+PHASE_LOOP_ACTIVE_RUN_STAMP=""
+PHASE_LOOP_ACTIVE_RUN_ID=""
+PHASE_LOOP_ACTIVE_STDOUT_LOG=""
+PHASE_LOOP_ACTIVE_STDERR_LOG=""
+PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 
 BROWNIE_BIN="${BROWNIE_BIN:-"$ROOT_DIR/target/debug/brownie"}"
 PHASE_LOOP_DEFAULT_BROWNIE_BIN="$ROOT_DIR/target/debug/brownie"
@@ -80,6 +87,15 @@ now_utc() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+claim_snapshot_json() {
+  node "$ROOT_DIR/scripts/phase-loop-claim-lifecycle.mjs" snapshot --claim "$TODO_CLAIM_FILE" 2>/dev/null || printf '%s\n' '{"ok":false,"state":"unreadable","claim_state":"unreadable","claim_id":null,"claim_error_code":"snapshot_failed","claim_error_message":"claim snapshot command failed"}'
+}
+
+claim_snapshot_field() {
+  local field="$1"
+  claim_snapshot_json | python3 -c 'import json,sys; value=json.load(sys.stdin).get(sys.argv[1]); print("" if value is None else value)' "$field"
+}
+
 write_bdk_trajectory_event() {
   local run_stamp="$1"
   local event_type="$2"
@@ -88,7 +104,9 @@ write_bdk_trajectory_event() {
   if [ -z "$payload_json" ]; then
     payload_json="{}"
   fi
-  python3 - "$TODO_CLAIM_FILE" "$BDK_TRAJECTORY_FILE" "$BDK_TRAJECTORY_DIR/$run_stamp.jsonl" "$run_stamp" "$event_type" "$(now_utc)" "$payload_json" <<'PY'
+  local claim_snapshot
+  claim_snapshot="$(claim_snapshot_json)"
+  python3 - "$BDK_TRAJECTORY_FILE" "$BDK_TRAJECTORY_DIR/$run_stamp.jsonl" "$run_stamp" "$event_type" "$(now_utc)" "$payload_json" "$claim_snapshot" <<'PY'
 import hashlib
 import json
 import os
@@ -96,17 +114,19 @@ import pathlib
 import re
 import sys
 
-claim_path = pathlib.Path(sys.argv[1])
-aggregate_path = pathlib.Path(sys.argv[2])
-run_path = pathlib.Path(sys.argv[3])
-run_id = sys.argv[4]
-event_type = sys.argv[5]
-timestamp = sys.argv[6]
-payload_raw = sys.argv[7]
+aggregate_path = pathlib.Path(sys.argv[1])
+run_path = pathlib.Path(sys.argv[2])
+run_id = sys.argv[3]
+event_type = sys.argv[4]
+timestamp = sys.argv[5]
+payload_raw = sys.argv[6]
 
 try:
-    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    snapshot = json.loads(sys.argv[7])
+    claim = snapshot.get("claim") if snapshot.get("ok") else None
 except Exception:
+    claim = None
+if not isinstance(claim, dict):
     sys.exit(0)
 
 claim_id = str(claim.get("claim_id") or "")
@@ -154,8 +174,16 @@ PY
   # The ledger adapter derives its controller-state path from a repository
   # root.  Keep it inside the selected workspace so isolated controller runs
   # cannot write task-ledger records into the phase-loop script checkout.
-  if ! node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-trajectory --repo "$PHASE_LOOP_WORKSPACE_ROOT" --claim "$TODO_CLAIM_FILE" --todo "$PHASE_LOOP_TODO" --type "$ledger_event_type" --payload "$payload_json" --run "$run_stamp"; then
-    printf '%s task_ledger_transition_failed run=%s event=%s\n' "$(now_utc)" "$run_stamp" "$ledger_event_type" >> "$SUPERVISOR_LOG"
+  local task_ledger_output task_ledger_status
+  if task_ledger_output="$(node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-trajectory --repo "$PHASE_LOOP_WORKSPACE_ROOT" --claim "$TODO_CLAIM_FILE" --todo "$PHASE_LOOP_TODO" --type "$ledger_event_type" --payload "$payload_json" --run "$run_stamp" 2>&1)"; then
+    if [ -n "$task_ledger_output" ]; then
+      printf '%s task_ledger_transition_result run=%s event=%s result=%s\n' "$(now_utc)" "$run_stamp" "$ledger_event_type" "$task_ledger_output" >> "$SUPERVISOR_LOG"
+    fi
+  else
+    task_ledger_status=$?
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="event=$ledger_event_type exit=$task_ledger_status result=${task_ledger_output:-<no output>} claim=$TODO_CLAIM_FILE"
+    printf '%s task_ledger_transition_failed run=%s %s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL" >> "$SUPERVISOR_LOG"
   fi
   case "$event_type" in
     todo.completed|todo.replanned|todo.blocked|todo.repair_feedback)
@@ -258,6 +286,17 @@ write_status() {
   escaped_blocked_file="$(printf '%s' "$TODO_BLOCKED_FILE" | json_escape)"
   local escaped_progress_state_file
   escaped_progress_state_file="$(printf '%s' "$PROGRESS_STATE_FILE" | json_escape)"
+  local claim_lifecycle_json escaped_claim_state escaped_claim_id escaped_claim_error_code escaped_claim_error_message claim_id_json
+  claim_lifecycle_json="$(claim_snapshot_json)"
+  escaped_claim_state="$(printf '%s' "$claim_lifecycle_json" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("claim_state", "unreadable"))[1:-1])')"
+  escaped_claim_id="$(printf '%s' "$claim_lifecycle_json" | python3 -c 'import json,sys; value=json.load(sys.stdin).get("claim_id"); print(json.dumps(value)[1:-1] if isinstance(value,str) else "")')"
+  escaped_claim_error_code="$(printf '%s' "$claim_lifecycle_json" | python3 -c 'import json,sys; value=json.load(sys.stdin).get("claim_error_code"); print(json.dumps(value if isinstance(value,str) else "")[1:-1])')"
+  escaped_claim_error_message="$(printf '%s' "$claim_lifecycle_json" | python3 -c 'import json,sys; value=json.load(sys.stdin).get("claim_error_message"); print(json.dumps(value if isinstance(value,str) else "")[1:-1])')"
+  claim_id_json="null"
+  if [ -n "$escaped_claim_id" ]; then
+    claim_id_json="\"$escaped_claim_id\""
+  fi
+  PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=1
   tmp_status="$STATUS_FILE.$$.$RANDOM.tmp"
   cat > "$tmp_status" <<EOF
 {
@@ -275,14 +314,20 @@ write_status() {
   "todo_queue_state": "$escaped_queue_state_file",
   "todo_blocked": "$escaped_blocked_file",
   "progress_state": "$escaped_progress_state_file",
+  "claim_state": "$escaped_claim_state",
+  "claim_id": $claim_id_json,
+  "claim_error_code": "$escaped_claim_error_code",
+  "claim_error_message": "$escaped_claim_error_message",
   "workspace_root": "$escaped_workspace",
   "control_root": "$escaped_control_root"
 }
 EOF
   mv "$tmp_status" "$STATUS_FILE"
   if [ -n "$force_status_exit_code" ]; then
+    PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
     exit "$force_status_exit_code"
   fi
+  PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 }
 
 sync_parent_dir() {
@@ -442,6 +487,12 @@ todo_first_pending_item() {
 phase_loop_delegation_pending() {
   if [ ! -f "$TODO_REPAIR_FEEDBACK_FILE" ]; then
     return 1
+  fi
+  local delegation_admission_output
+  if delegation_admission_output="$(node "$ROOT_DIR/scripts/phase-loop-delegation-admission.mjs" record --feedback "$TODO_REPAIR_FEEDBACK_FILE" --audit "$TODO_CLAIM_DIR/delegation-admission.jsonl" 2>&1)"; then
+    printf '%s delegation_admission=%s\n' "$(now_utc)" "$delegation_admission_output" >> "$SUPERVISOR_LOG"
+  else
+    printf '%s delegation_admission_failed=%s\n' "$(now_utc)" "${delegation_admission_output:-<no output>}" >> "$SUPERVISOR_LOG"
   fi
   python3 - "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
 import json
@@ -1487,18 +1538,18 @@ selected_todo_is_explicit_blocker() {
   if [ ! -f "$TODO_CLAIM_FILE" ]; then
     return 1
   fi
-  node --input-type=module - "$TODO_CLAIM_FILE" "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" <<'NODE'
-import fs from 'node:fs';
+  node --input-type=module - "$TODO_CLAIM_FILE" "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" "$ROOT_DIR/scripts/phase-loop-claim-lifecycle.mjs" <<'NODE'
 import { pathToFileURL } from 'node:url';
 
 const claimPath = process.argv[2];
 const evaluatorPath = process.argv[3];
-let claim;
-try {
-  claim = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
-} catch {
+const lifecyclePath = process.argv[4];
+const { readClaimSnapshot } = await import(pathToFileURL(lifecyclePath).href);
+const snapshot = readClaimSnapshot(claimPath);
+if (!snapshot.ok) {
   process.exit(1);
 }
+const claim = snapshot.claim;
 const selected = claim.selected_todo;
 if (typeof selected !== 'string' || !selected.trim()) {
   process.exit(1);
@@ -8481,7 +8532,9 @@ write_progress_state() {
   local timestamp tmp_progress
   timestamp="$(now_utc)"
   tmp_progress="$PROGRESS_STATE_FILE.$$.$RANDOM.tmp"
-  python3 - "$tmp_progress" "$PROGRESS_STATE_FILE" "$stdout_log" "$run_stamp" "$exit_code" "$workspace_before" "$workspace_after" "$head_commit" "$TODO_CLAIM_FILE" "$timestamp" "$PHASE_LOOP_STAGNATION_THRESHOLD" "$PHASE_LOOP_TODO" <<'PY'
+  local claim_snapshot
+  claim_snapshot="$(claim_snapshot_json)"
+  python3 - "$tmp_progress" "$PROGRESS_STATE_FILE" "$stdout_log" "$run_stamp" "$exit_code" "$workspace_before" "$workspace_after" "$head_commit" "$TODO_CLAIM_FILE" "$claim_snapshot" "$timestamp" "$PHASE_LOOP_STAGNATION_THRESHOLD" "$PHASE_LOOP_TODO" <<'PY'
 import hashlib
 import json
 import os
@@ -8497,9 +8550,13 @@ workspace_before = sys.argv[6]
 workspace_after = sys.argv[7]
 head_commit = sys.argv[8]
 claim_path = pathlib.Path(sys.argv[9])
-timestamp = sys.argv[10]
-threshold = int(sys.argv[11])
-todo_path = pathlib.Path(sys.argv[12])
+try:
+    claim_snapshot = json.loads(sys.argv[10])
+except Exception:
+    claim_snapshot = {"ok": False, "state": "unreadable"}
+timestamp = sys.argv[11]
+threshold = int(sys.argv[12])
+todo_path = pathlib.Path(sys.argv[13])
 
 payload = None
 if stdout_log.exists() and stdout_log.stat().st_size > 0:
@@ -8516,12 +8573,8 @@ if not isinstance(payload, dict):
 
 automation = payload.get("automation") if isinstance(payload.get("automation"), dict) else {}
 claim = {}
-if claim_path.exists():
-    try:
-        with open(claim_path, encoding="utf-8") as handle:
-            claim = json.load(handle)
-    except Exception:
-        claim = {}
+if claim_snapshot.get("ok") and isinstance(claim_snapshot.get("claim"), dict):
+    claim = claim_snapshot["claim"]
 
 def text(value):
     if value is None:
@@ -8533,6 +8586,8 @@ def text(value):
 progress_projection = {
     "schema_version": 1,
     "commit": head_commit,
+    "claim_state": claim_snapshot.get("state", "unreadable"),
+    "claim_error_code": text(claim_snapshot.get("claim_error_code")),
     "claim_id": text(claim.get("claim_id")),
     "selected_todo": text(claim.get("selected_todo")),
     "queue_generation": text(claim.get("queue_generation")),
@@ -8734,6 +8789,12 @@ state = {
     "continuation_required": continuation_required,
     "workspace_changed": workspace_changed,
     "exit_code": exit_code,
+    "claim_lifecycle": {
+        "state": claim_snapshot.get("state", "unreadable"),
+        "claim_id": text(claim.get("claim_id")),
+        "error_code": text(claim_snapshot.get("claim_error_code")),
+        "error_message": text(claim_snapshot.get("claim_error_message")),
+    },
     "progress_projection": progress_projection,
     "stdout_log": str(stdout_log),
 }
@@ -11710,7 +11771,7 @@ except Exception:
 PY
 }
 
-run_brownie_once() {
+_run_brownie_once() {
   load_env
   local started_at run_stamp stdout_log stderr_log effective_prompt exit_code run_id detail brownie_timeout_seconds
   local workspace_before workspace_after head_commit validation progress_summary progress_classification
@@ -11729,6 +11790,28 @@ run_brownie_once() {
   release_contract_before="$RUN_DIR/$run_stamp.runtime-release-contract.before.json"
   phase_value_manifest_before="$RUN_DIR/$run_stamp.phase-value-manifest.before.json"
   workspace_status_before="$RUN_DIR/$run_stamp.workspace-status.before"
+  PHASE_LOOP_ACTIVE_RUN_STAMP="$run_stamp"
+  PHASE_LOOP_ACTIVE_RUN_ID="$run_stamp"
+  PHASE_LOOP_ACTIVE_STDOUT_LOG="$stdout_log"
+  PHASE_LOOP_ACTIVE_STDERR_LOG="$stderr_log"
+
+  if [ -f "$ROOT_DIR/scripts/phase-loop-run-state.mjs" ]; then
+    local stale_running_output stale_running_status
+    if stale_running_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" normalize-stale-running --state-dir "$STATE_DIR" --pid-file "$PID_FILE" --run-stamp "$run_stamp" 2>&1)"; then
+      if [ -n "$stale_running_output" ]; then
+        printf '%s run=%s stale_running_normalization=%s\n' "$(now_utc)" "$run_stamp" "$stale_running_output" >> "$SUPERVISOR_LOG"
+      fi
+    else
+      stale_running_status=$?
+      detail="Unable to validate or normalize the previous phase-loop status before starting a new run: exit=$stale_running_status result=${stale_running_output:-<no output>}"
+      printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+      if [ "$stale_running_status" -eq 75 ]; then
+        return 75
+      fi
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
+  fi
 
   if ! phase_loop_require_approved_controller_baseline; then
     detail="Phase-loop controller source is not synchronized with the approved ${PHASE_LOOP_APPROVED_CONTROLLER_BASELINE} baseline; refusing to run the controller. ${PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT:-<no diagnostic>}"
@@ -13640,6 +13723,51 @@ PY
   return "$exit_code"
 }
 
+run_brownie_once() {
+  PHASE_LOOP_TASK_LEDGER_FAILURE=0
+  PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL=""
+  _run_brownie_once "$@"
+  local run_status=$?
+  if [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 1 ]; then
+    local detail="Task ledger failed while recording the run; refusing to leave status running. ${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL} stdout=${PHASE_LOOP_ACTIVE_STDOUT_LOG:-<not-created>} stderr=${PHASE_LOOP_ACTIVE_STDERR_LOG:-<not-created>} progress=$PROGRESS_STATE_FILE"
+    local task_ledger_failure_count="${CONSECUTIVE_FAILURES:-1}"
+    if [ "$task_ledger_failure_count" -lt 1 ]; then
+      task_ledger_failure_count=1
+    fi
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "${PHASE_LOOP_ACTIVE_RUN_ID:-${PHASE_LOOP_ACTIVE_RUN_STAMP:-unknown}}" "78" "$task_ledger_failure_count"
+    return 78
+  fi
+  return "$run_status"
+}
+
+phase_loop_finalize_unexpected_exit() {
+  local exit_code="${1:-1}"
+  if [ "${PHASE_LOOP_STATUS_WRITE_IN_PROGRESS:-0}" -eq 1 ]; then
+    return 0
+  fi
+  local current_status
+  current_status="$(status_field status 2>/dev/null || true)"
+  if [ "$current_status" = "running" ]; then
+    local failure_count="${CONSECUTIVE_FAILURES:-1}"
+    if [ "$failure_count" -lt 1 ]; then
+      failure_count=1
+    fi
+    write_status "blocked" "Unexpected phase-loop run-once exit; terminalized status before process exit. exit_code=$exit_code stdout=${PHASE_LOOP_ACTIVE_STDOUT_LOG:-<not-created>} stderr=${PHASE_LOOP_ACTIVE_STDERR_LOG:-<not-created>}" "${PHASE_LOOP_ACTIVE_RUN_ID:-${PHASE_LOOP_ACTIVE_RUN_STAMP:-unknown}}" "$exit_code" "$failure_count"
+  fi
+}
+
+phase_loop_handle_run_signal() {
+  local signal_name="$1"
+  local signal_code=143
+  if [ "$signal_name" = "INT" ]; then
+    signal_code=130
+  fi
+  phase_loop_finalize_unexpected_exit "$signal_code"
+  trap - INT TERM EXIT
+  exit "$signal_code"
+}
+
 supervise() {
   if ! acquire_lock; then
     write_status "already_running" "Another phase-loop.sh instance holds the lock." "" "" 0
@@ -13789,7 +13917,13 @@ case "${1:-status}" in
     ;;
   run-once)
     CONSECUTIVE_FAILURES=0
+    trap 'phase_loop_finalize_unexpected_exit "$?"' EXIT
+    trap 'phase_loop_handle_run_signal INT' INT
+    trap 'phase_loop_handle_run_signal TERM' TERM
     run_brownie_once
+    run_once_status=$?
+    trap - INT TERM EXIT
+    exit "$run_once_status"
     ;;
   *)
     echo "usage: $0 {start|status|stop|restart|check-binary-freshness|run-once}" >&2

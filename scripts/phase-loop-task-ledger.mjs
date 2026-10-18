@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readClaimSnapshot } from './phase-loop-claim-lifecycle.mjs';
 
 export const TASK_STATES = new Set(['queued', 'claimed', 'running', 'completed', 'blocked', 'replanned', 'failed']);
 const TERMINAL_STATES = new Set(['completed', 'blocked', 'replanned', 'failed']);
@@ -32,6 +33,7 @@ export function readTaskLedger(repoRoot) {
           return Array.isArray(record.events) && record.events.length > 1 && record.events.every((event) => event?.task_id && TASK_STATES.has(event?.to_state))
             ? record.events : [];
         }
+        if (record?.kind === 'unclaimed_trajectory') return [];
         return [record];
       } catch { return []; }
     });
@@ -159,11 +161,165 @@ export function taskIsExecutable(task) {
   return { ok: missing.length === 0, missing };
 }
 
-function taskIdFromClaim(claimPath) {
-  const claim = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
+function appendLedgerRecord(repoRoot, record) {
+  const file = taskLedgerPath(repoRoot);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+function unclaimedTrajectoryRecord({ type, runId, claimPath, claimState, errorCode = null, errorMessage = null, at }) {
+  return {
+    schema_version: 1,
+    kind: 'unclaimed_trajectory',
+    event_id: crypto.randomUUID(),
+    task_id: null,
+    claim_id: null,
+    trajectory_type: type,
+    run_id: runId ?? null,
+    claim_path: claimPath,
+    claim_state: claimState,
+    error_code: errorCode,
+    error_message: errorMessage,
+    at: at ?? new Date().toISOString()
+  };
+}
+
+export function recordTrajectory(repoRoot, {
+  claimPath,
+  todoPath,
+  type,
+  runId,
+  payloadRaw,
+  at,
+  readClaim = readClaimSnapshot
+}) {
+  let snapshot;
+  try {
+    snapshot = readClaim(claimPath);
+  } catch (error) {
+    snapshot = {
+      ok: false,
+      state: error?.code === 'ENOENT' ? 'absent' : 'unreadable',
+      error
+    };
+  }
+  if (!snapshot.ok) {
+    const errorCode = snapshot.state === 'absent'
+      ? 'claim_absent'
+      : snapshot.state === 'malformed' ? 'claim_malformed' : 'claim_unreadable';
+    const record = unclaimedTrajectoryRecord({
+      type,
+      runId,
+      claimPath,
+      claimState: snapshot.state,
+      errorCode,
+      errorMessage: snapshot.error?.message ?? null,
+      at
+    });
+    try {
+      appendLedgerRecord(repoRoot, record);
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'ledger_append_failed',
+        claim_state: snapshot.state,
+        error: error.message,
+        record
+      };
+    }
+    if (snapshot.state === 'absent') {
+      return { ok: true, code: 'unclaimed_empty', record };
+    }
+    return { ok: false, code: errorCode, error: snapshot.error?.message ?? errorCode, record };
+  }
+
+  const claimPathForId = claimPath;
+  const claim = snapshot.claim;
   const first = String(claim.selected_todo ?? '').split('\n')[0] ?? '';
   const match = first.match(/^(?:[-*]|\d+[.)])\s+\[\s\]\s+([^:\s]+)/u);
-  return { sourceTaskId: match?.[1] ?? '', claimId: claim.claim_id ?? null, spec: String(claim.selected_todo ?? '') };
+  const sourceTaskId = match?.[1] ?? '';
+  const claimId = claim.claim_id ?? null;
+  const spec = String(claim.selected_todo ?? '');
+  if (!claimId || !spec || !sourceTaskId) {
+    const record = unclaimedTrajectoryRecord({
+      type,
+      runId,
+      claimPath: claimPathForId,
+      claimState: 'malformed',
+      errorCode: 'claim_fields_missing',
+      errorMessage: 'claim_id and selected_todo with a TODO id are required',
+      at
+    });
+    try {
+      appendLedgerRecord(repoRoot, record);
+    } catch (error) {
+      return { ok: false, code: 'ledger_append_failed', error: error.message, record };
+    }
+    return { ok: false, code: 'claim_fields_missing', error: record.error_message, record };
+  }
+
+  const taskId = taskAttemptId(sourceTaskId, claimId);
+  const specHash = crypto.createHash('sha256').update(spec).digest('hex');
+  if (type === 'todo.replanned') {
+    let payload = {};
+    try { payload = JSON.parse(payloadRaw ?? '{}'); } catch { /* use the event name below */ }
+    const reason = String(payload.reason ?? 'trajectory_replanned');
+    const children = replacementChildren(todoPath, sourceTaskId);
+    if (children.length === 0) return { ok: true, code: 'trajectory_without_replacement', task_id: taskId };
+    let result;
+    try {
+      result = replanTaskWithChildren(repoRoot, {
+        task_id: taskId,
+        reason,
+        children,
+        run_id: runId,
+        claim_id: claimId,
+        task_spec_sha256: specHash,
+        at
+      });
+    } catch (error) {
+      return { ok: false, code: 'ledger_append_failed', error: error.message };
+    }
+    if (!result.ok) {
+      return {
+        ok: true,
+        code: 'ledger_transition_rejected',
+        task_id: taskId,
+        rejected: result
+      };
+    }
+    return result;
+  }
+  const transitions = {
+    'todo.claimed': ['queued', 'claimed'],
+    'workflow.routed': ['running'],
+    'todo.completed': ['completed'],
+    'todo.blocked': ['blocked'],
+    'todo.failed': ['failed']
+  }[type] ?? [];
+  let rejected = null;
+  for (const to_state of transitions) {
+    let result;
+    try {
+      result = appendTaskTransition(repoRoot, {
+        task_id: taskId,
+        to_state,
+        at,
+        run_id: runId,
+        claim_id: claimId,
+        task_spec_sha256: specHash,
+        reason: to_state === 'blocked' ? 'trajectory_blocked' : to_state === 'failed' ? 'trajectory_failed' : undefined
+      });
+    } catch (error) {
+      return { ok: false, code: 'ledger_append_failed', error: error.message };
+    }
+    if (!result.ok) {
+      rejected ??= result;
+      continue;
+    }
+  }
+  if (rejected) return { ok: true, code: 'ledger_transition_rejected', task_id: taskId, rejected };
+  return { ok: true, code: 'trajectory_recorded', task_id: taskId };
 }
 
 // A TODO can be retried after an interrupted or failed claim. The ledger is
@@ -200,47 +356,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   const todoPath = args.get('todo');
   const payloadRaw = args.get('payload');
   if (!repo || !claimPath || !type) process.exit(2);
-  const { sourceTaskId, claimId, spec } = taskIdFromClaim(claimPath);
-  if (!sourceTaskId) process.exit(0);
-  const taskId = taskAttemptId(sourceTaskId, claimId);
-  const specHash = crypto.createHash('sha256').update(spec).digest('hex');
-  if (type === 'todo.replanned') {
-    let payload = {};
-    try { payload = JSON.parse(payloadRaw ?? '{}'); } catch { /* use the event name below */ }
-    const reason = String(payload.reason ?? 'trajectory_replanned');
-    const children = replacementChildren(todoPath, sourceTaskId);
-    // `todo.replanned` is also emitted for repair feedback that deliberately
-    // keeps the same claim in progress. A durable replan exists only when
-    // replacement children are present; otherwise preserve the nonterminal
-    // attempt so a later routed/completed event remains valid.
-    if (children.length === 0) process.exit(0);
-    const result = replanTaskWithChildren(repo, {
-        task_id: taskId,
-        reason,
-        children,
-        run_id: runId,
-        claim_id: claimId,
-        task_spec_sha256: specHash
-      });
-    if (!result.ok && result.code !== 'terminal_task_cannot_transition') process.exit(1);
-    process.exit(0);
-  }
-  const transitions = {
-    'todo.claimed': ['queued', 'claimed'],
-    'workflow.routed': ['running'],
-    'todo.completed': ['completed'],
-    'todo.blocked': ['blocked'],
-    'todo.failed': ['failed']
-  }[type] ?? [];
-  for (const to_state of transitions) {
-    const result = appendTaskTransition(repo, {
-      task_id: taskId,
-      to_state,
-      run_id: runId,
-      claim_id: claimId,
-      task_spec_sha256: specHash,
-      reason: to_state === 'blocked' ? 'trajectory_blocked' : to_state === 'failed' ? 'trajectory_failed' : undefined
-    });
-    if (!result.ok && result.code !== 'terminal_task_cannot_transition') process.exit(1);
-  }
+  const result = recordTrajectory(repo, {
+    claimPath,
+    todoPath,
+    type,
+    runId,
+    payloadRaw
+  });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (!result.ok) process.exit(78);
 }

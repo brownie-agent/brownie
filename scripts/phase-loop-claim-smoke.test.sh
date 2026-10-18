@@ -141,6 +141,8 @@ assert_contains "$PHASE_LOOP" "phase-loop-todo-queue-integrity\\.mjs"
 assert_contains "$PHASE_LOOP" 'local guard_script="\$ROOT_DIR/scripts/phase-loop-source-baseline-guard\.mjs"'
 assert_contains "$PHASE_LOOP" 'node "\$guard_script" --repo "\$ROOT_DIR" --baseline-ref "\$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE"'
 assert_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_WORKSPACE_ROOT"'
+assert_contains "$PHASE_LOOP" "phase-loop-run-state\.mjs"
+assert_contains "$PHASE_LOOP" "refusing to leave status running"
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$ROOT_DIR"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_STATE_DIR"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$STATE_DIR"'
@@ -2556,6 +2558,43 @@ assert "parent_dependencies = split_dependency_ids(line_value(selected_block, \"
 assert "concrete_replacements" not in phase_loop, phase_loop
 assert "not selected_decomposition_active" in phase_loop, phase_loop
 assert "^\\s*Route:\\s*todo-decomposition\\.?\\s*$" in phase_loop, phase_loop
+PY
+
+# A controller-only ledger failure must terminalize the run.  In particular,
+# the task-ledger path is made a directory so the first append fails after the
+# claim has been created; this exercises the same downstream failure surface
+# that previously left status.json at `running`.
+ledger_failure_workspace="$(mktemp -d)"
+git -C "$ledger_failure_workspace" init -b main >/dev/null
+git -C "$ledger_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$ledger_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl"
+ledger_failure_state="$(mktemp -d)"
+ledger_failure_prompt="$(mktemp)"
+ledger_failure_todo="$(mktemp)"
+printf 'base prompt\n' > "$ledger_failure_prompt"
+printf -- '- [ ] L-01: task-ledger failure terminalization\n' > "$ledger_failure_todo"
+
+if PHASE_LOOP_STATE_DIR="$ledger_failure_state" \
+  PHASE_LOOP_PROMPT="$ledger_failure_prompt" \
+  PHASE_LOOP_TODO="$ledger_failure_todo" \
+  PHASE_LOOP_WORKSPACE_ROOT="$ledger_failure_workspace" \
+  BROWNIE_BIN="$fake_brownie_json" \
+  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null 2>/dev/null; then
+  echo "expected task-ledger append failure to fail run-once" >&2
+  exit 1
+fi
+python3 - "$ledger_failure_state/status.json" <<'PY'
+import json
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["status"] != "running", status
+assert status["status"] == "blocked", status
+assert status["exit_code"] == "78", status
+assert status["consecutive_failures"] >= 1, status
+assert "Task ledger failed" in status["detail"], status
+assert "stdout=" in status["detail"], status
+assert "stderr=" in status["detail"], status
 PY
 
 assert_repository_state_unchanged
