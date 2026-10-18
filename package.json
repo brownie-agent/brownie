@@ -6,7 +6,7 @@
   "description": "Brownie Code-OSS extension and Rust runtime workspace.",
   "scripts": {
     "build": "pnpm --filter brownie-vsix build",
-    "check": "pnpm --filter brownie-vsix check && pnpm phase-loop:run-state:test && pnpm phase-loop:claim-lifecycle:test && pnpm phase-loop:delegation-admission:test && pnpm guard:release-contract && pnpm guard:trace-binding && pnpm guard:js-added-function-reachability",
+    "check": "pnpm --filter brownie-vsix check && pnpm phase-loop:run-state:test && pnpm phase-loop:claim-lifecycle:test && pnpm phase-loop:delegation-admission:test && pnpm guard:phase-loop-pr-author:test && pnpm guard:release-contract && pnpm guard:trace-binding && pnpm guard:js-added-function-reachability",
     "guard:control-plane-authority": "node scripts/guard-control-plane-authority.mjs",
     "guard:control-plane-authority:test": "node --test scripts/guard-control-plane-authority.test.mjs",
     "guard:diagnostics": "node scripts/guard-diagnostics-api.mjs",
@@ -51,6 +51,8 @@
     "guard:brownie-private-state:test": "node --test scripts/guard-brownie-private-state.test.mjs",
     "guard:phase-loop-actor-separation": "node scripts/guard-phase-loop-actor-separation.mjs",
     "guard:phase-loop-actor-separation:test": "node --test scripts/guard-phase-loop-actor-separation.test.mjs",
+    "guard:phase-loop-pr-author": "node scripts/phase-loop-pr-author-guard.mjs",
+    "guard:phase-loop-pr-author:test": "node --test scripts/phase-loop-pr-author-guard.test.mjs",
     "guard:phase-loop-source-baseline": "node scripts/phase-loop-source-baseline-guard.mjs",
     "guard:phase-loop-source-baseline:test": "node --test scripts/phase-loop-source-baseline-guard.test.mjs",
     "guard:phase-loop-embedded-python": "node scripts/guard-phase-loop-embedded-python.mjs",

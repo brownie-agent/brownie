@@ -8982,6 +8982,10 @@ This PR was created by the external phase-loop controller after Brownie produced
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     git branch --show-current
   )"
+  if ! phase_loop_require_implementation_pr_actor; then
+    printf '%s pr_create_skipped reason=implementation_actor_guard_failed_before_push branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
+    return 1
+  fi
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     set +x
@@ -9008,6 +9012,10 @@ This PR was created by the external phase-loop controller after Brownie produced
       gh pr view "$branch" --json url --jq .url
     )"
   else
+    if ! phase_loop_require_implementation_pr_actor; then
+      printf '%s pr_create_skipped reason=implementation_actor_guard_failed_before_pr_create branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
+      return 1
+    fi
     if [ "$PHASE_LOOP_PR_DRAFT" = "1" ]; then
       pr_url="$(
         cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
