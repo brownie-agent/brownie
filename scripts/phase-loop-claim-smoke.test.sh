@@ -2261,16 +2261,19 @@ PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/.brownie/todo-breakdown.md" "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/private/phase-loop/todo-replans" <<'PY'
+python3 - "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/.brownie/todo-breakdown.md" "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/private/phase-loop/todo-replans" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 todo = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 breakdown = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 status = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
 replan_dir = pathlib.Path(sys.argv[4])
+ledger_path = pathlib.Path(sys.argv[5])
 records = list(replan_dir.glob("*.json"))
+claim_archives = list(pathlib.Path(sys.argv[3]).parent.glob("todo-claims/completed-no-eligible-multitarget-split-*.json"))
 assert "- [x] E-20g-final-judgment-sync:" in todo, todo
 assert "- [ ] E-20g-final-judgment-sync-target-01: Patch only `docs/a.md`" in todo, todo
 assert "- [ ] E-20g-final-judgment-sync-target-02: Patch only `scripts/b.mjs`" in todo, todo
@@ -2285,6 +2288,16 @@ record_text = "\n".join(path.read_text(encoding="utf-8") for path in records)
 assert "deterministic_no_eligible_multitarget_split" in record_text, record_text
 assert '"record_type": "todo_replan"' in record_text, record_text
 assert '"parent_status": "superseded_by_children"' in record_text, record_text
+assert claim_archives, "missing completed no-eligible claim archive"
+archived_claim = json.loads(claim_archives[-1].read_text(encoding="utf-8"))
+selected_first = str(archived_claim["selected_todo"]).splitlines()[0]
+task_match = re.match(r"^\s*- \[ \]\s+([^:\s]+)", selected_first)
+assert task_match, archived_claim
+attempt_id = f"{task_match.group(1)}@{archived_claim['claim_id']}"
+ledger_events = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+terminal_events = [event for event in ledger_events if event.get("task_id") == attempt_id and event.get("to_state") in {"completed", "blocked", "failed", "replanned"}]
+assert terminal_events and terminal_events[-1]["to_state"] == "replanned", (attempt_id, ledger_events)
+assert not any(event.get("kind") == "unclaimed_trajectory" and event.get("trajectory_type") == "todo.replanned" for event in ledger_events), ledger_events
 PY
 
 repair_feedback_state="$(mktemp -d)"

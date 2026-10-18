@@ -71,7 +71,12 @@ export function validateTransition({ previous, toState, to_state: snakeCaseToSta
 }
 
 export function appendTaskTransition(repoRoot, input) {
-  const events = readTaskLedger(repoRoot);
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
   const current = taskProjection(events).get(input.task_id);
   const toState = input.to_state ?? input.toState;
   const verdict = validateTransition({ previous: current, toState, ...input });
@@ -98,7 +103,8 @@ export function appendTaskTransition(repoRoot, input) {
     claim_id: input.claim_id ?? null,
     reason: input.reason ?? null,
     replaces: input.replaces ?? [],
-    task_spec_sha256: input.task_spec_sha256 ?? null
+    task_spec_sha256: input.task_spec_sha256 ?? null,
+    parent_task_id: input.parent_task_id ?? current?.parent_task_id ?? null
   };
   const file = taskLedgerPath(repoRoot);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -159,7 +165,12 @@ function exactReplanEvents(events, parentEvent, children, parentTaskId, runId) {
 // must not infer task state from it.
 export function replanTaskWithChildren(repoRoot, { task_id, reason, children, run_id = null, claim_id = null, task_spec_sha256 = null, at }) {
   if (!Array.isArray(children) || children.length === 0) return { ok: false, code: 'replan_requires_reason_and_children' };
-  const events = readTaskLedger(repoRoot);
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
   const projection = taskProjection(events);
   const childIds = children.map((child) => child?.task_id);
   const duplicateCandidates = events.filter((event) => (
@@ -333,7 +344,22 @@ export function recordTrajectory(repoRoot, {
     return { ok: false, code: 'claim_fields_missing', error: record.error_message, record };
   }
 
-  const taskId = taskAttemptId(sourceTaskId, claimId);
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
+  const projectedSourceTask = taskProjection(events).get(sourceTaskId);
+  // Replan creates the replacement child as the durable queued task itself.
+  // Once that child is claimed, keep transitioning the raw child id so the
+  // parent -> replacement -> terminal graph remains connected.  A terminal
+  // replacement is deliberately not reopened: a later retry gets its own
+  // immutable task attempt, just like an ordinary TODO retry.
+  const taskId = projectedSourceTask?.parent_task_id
+    && !isTerminalTaskState(projectedSourceTask.to_state)
+    ? sourceTaskId
+    : taskAttemptId(sourceTaskId, claimId);
   const specHash = crypto.createHash('sha256').update(spec).digest('hex');
   if (type === 'todo.replanned') {
     let payload = {};
@@ -366,8 +392,11 @@ export function recordTrajectory(repoRoot, {
     'todo.blocked': ['blocked'],
     'todo.failed': ['failed']
   }[type] ?? [];
+  const transitionStates = type === 'todo.claimed' && taskId === sourceTaskId
+    ? ['claimed']
+    : transitions;
   let duplicate = false;
-  for (const to_state of transitions) {
+  for (const to_state of transitionStates) {
     let result;
     try {
       result = appendTaskTransition(repoRoot, {

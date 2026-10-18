@@ -91,8 +91,27 @@ now_utc() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+claim_path_for_run() {
+  local run_stamp="$1"
+  if [ -f "$TODO_CLAIM_FILE" ]; then
+    printf '%s\n' "$TODO_CLAIM_FILE"
+    return 0
+  fi
+  # Terminal paths may archive current.json before emitting their final
+  # trajectory event. Recover only an archive belonging to this run; never
+  # attach a prior run's claim to a new trajectory.
+  local archived_claim
+  archived_claim="$(find "$TODO_CLAIM_DIR" -maxdepth 1 -type f -name "*${run_stamp}*.json" -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+  if [ -n "$archived_claim" ] && [ -f "$archived_claim" ]; then
+    printf '%s\n' "$archived_claim"
+  else
+    printf '%s\n' "$TODO_CLAIM_FILE"
+  fi
+}
+
 claim_snapshot_json() {
-  node "$ROOT_DIR/scripts/phase-loop-claim-lifecycle.mjs" snapshot --claim "$TODO_CLAIM_FILE" 2>/dev/null || printf '%s\n' '{"ok":false,"state":"unreadable","claim_state":"unreadable","claim_id":null,"claim_error_code":"snapshot_failed","claim_error_message":"claim snapshot command failed"}'
+  local claim_path="${1:-$TODO_CLAIM_FILE}"
+  node "$ROOT_DIR/scripts/phase-loop-claim-lifecycle.mjs" snapshot --claim "$claim_path" 2>/dev/null || printf '%s\n' '{"ok":false,"state":"unreadable","claim_state":"unreadable","claim_id":null,"claim_error_code":"snapshot_failed","claim_error_message":"claim snapshot command failed"}'
 }
 
 claim_snapshot_field() {
@@ -108,8 +127,9 @@ write_bdk_trajectory_event() {
   if [ -z "$payload_json" ]; then
     payload_json="{}"
   fi
-  local claim_snapshot
-  claim_snapshot="$(claim_snapshot_json)"
+  local trajectory_claim_path claim_snapshot
+  trajectory_claim_path="$(claim_path_for_run "$run_stamp")"
+  claim_snapshot="$(claim_snapshot_json "$trajectory_claim_path")"
   python3 - "$BDK_TRAJECTORY_FILE" "$BDK_TRAJECTORY_DIR/$run_stamp.jsonl" "$run_stamp" "$event_type" "$(now_utc)" "$payload_json" "$claim_snapshot" <<'PY'
 import hashlib
 import json
@@ -179,7 +199,7 @@ PY
   # root.  Keep it inside the selected workspace so isolated controller runs
   # cannot write task-ledger records into the phase-loop script checkout.
   local task_ledger_output task_ledger_status
-  if task_ledger_output="$(node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-trajectory --repo "$PHASE_LOOP_WORKSPACE_ROOT" --claim "$TODO_CLAIM_FILE" --todo "$PHASE_LOOP_TODO" --type "$ledger_event_type" --payload "$payload_json" --run "$run_stamp" 2>&1)"; then
+  if task_ledger_output="$(node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-trajectory --repo "$PHASE_LOOP_WORKSPACE_ROOT" --claim "$trajectory_claim_path" --todo "$PHASE_LOOP_TODO" --type "$ledger_event_type" --payload "$payload_json" --run "$run_stamp" 2>&1)"; then
     if [ -n "$task_ledger_output" ]; then
       printf '%s task_ledger_transition_result run=%s event=%s result=%s\n' "$(now_utc)" "$run_stamp" "$ledger_event_type" "$task_ledger_output" >> "$SUPERVISOR_LOG"
     fi

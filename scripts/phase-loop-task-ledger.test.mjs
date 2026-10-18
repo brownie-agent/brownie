@@ -80,6 +80,58 @@ test('accepts only an exact duplicate replan transaction', () => {
   assert.equal(fs.readFileSync(ledger, 'utf8'), before);
 });
 
+test('continues a replacement child claim on the queued child task id', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, [
+    '- [ ] P-1: broad parent task',
+    '  Route: todo-decomposition.',
+    '  Verification: run `pnpm check`.',
+    '',
+    '- [ ] C-1: replacement child task',
+    '  Route: implementation.',
+    '  Source TODO: P-1.',
+    '  Patch only `scripts/child.mjs`.',
+    '  Verification: run `node --check scripts/child.mjs`.',
+    ''
+  ].join('\n'));
+  const parentClaim = path.join(repo, 'parent-claim.json');
+  fs.writeFileSync(parentClaim, JSON.stringify({
+    claim_id: 'claim-parent',
+    selected_todo: '- [ ] P-1: broad parent task\n  Route: todo-decomposition.\n  Verification: run `pnpm check`.'
+  }));
+  assert.equal(recordTrajectory(repo, { claimPath: parentClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-parent' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: parentClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-parent' }).ok, true);
+  assert.equal(recordTrajectory(repo, {
+    claimPath: parentClaim,
+    todoPath: todo,
+    type: 'todo.replanned',
+    runId: 'run-parent',
+    payloadRaw: '{"reason":"split_parent"}'
+  }).ok, true);
+
+  const childClaim = path.join(repo, 'child-claim.json');
+  fs.writeFileSync(childClaim, JSON.stringify({
+    claim_id: 'claim-child',
+    selected_todo: '- [ ] C-1: replacement child task\n  Route: implementation.\n  Source TODO: P-1.\n  Patch only `scripts/child.mjs`.\n  Verification: run `node --check scripts/child.mjs`.'
+  }));
+  assert.equal(recordTrajectory(repo, { claimPath: childClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-child' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: childClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-child' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: childClaim, todoPath: todo, type: 'todo.completed', runId: 'run-child' }).ok, true);
+
+  const events = readTaskLedger(repo);
+  const childEvents = events.filter((event) => event.task_id === 'C-1');
+  assert.deepEqual(childEvents.map((event) => event.to_state), ['queued', 'claimed', 'running', 'completed']);
+  assert.equal(events.some((event) => event.task_id === 'C-1@claim-child'), false);
+  for (const event of childEvents.slice(1)) {
+    assert.equal(event.parent_task_id, 'P-1@claim-parent');
+    assert.equal(event.claim_id, 'claim-child');
+    assert.equal(event.run_id, 'run-child');
+  }
+  assert.equal(validateTaskLedger(events).ok, true);
+});
+
 test('replan leaves the ledger unchanged when a child fails the execution gate', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   appendTaskTransition(repo, { task_id: 'T-6', to_state: 'queued' });
