@@ -16101,6 +16101,10 @@ mod tests {
     use brownie_protocol::{TaskRecord, TaskStatus};
     use std::sync::{Mutex, MutexGuard};
 
+    use super::agentmodes_test_support::{
+        current_agentmodes_revision, prepare_current_agentmodes_checkout_for_test,
+    };
+
     pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
     const TEST_MODEPACK_PINNED_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -18904,6 +18908,8 @@ modes:
         runtime_policy_count: usize,
     }
 
+    static CURRENT_AGENTMODES_CHECKOUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn write_current_agentmodes_modepack_if_available(
         workspace_root: &std::path::Path,
     ) -> Option<CurrentAgentModesFixture> {
@@ -18976,8 +18982,15 @@ modes:
         }
 
         if required {
+            let _guard = recover_lock(&CURRENT_AGENTMODES_CHECKOUT_LOCK);
             let root = current_agentmodes_managed_checkout_for_test("brownie-runtime");
-            prepare_current_agentmodes_checkout_for_test(&root);
+            if let Err(reason) = prepare_current_agentmodes_checkout_for_test(&root) {
+                eprintln!(
+                    "agentmodes_compatibility status=external-blocked repository={} revision={} reason={reason}",
+                    baseline.repository, baseline.revision
+                );
+                return None;
+            }
             assert_current_agentmodes_root_for_test(&root);
             return Some(root);
         }
@@ -19048,73 +19061,6 @@ modes:
                 std::process::id(),
                 baseline.revision
             ))
-    }
-
-    fn prepare_current_agentmodes_checkout_for_test(root: &std::path::Path) {
-        let baseline = brownie_agentmodes::CURRENT_AGENTMODES_COMPATIBILITY_BASELINE;
-        if current_agentmodes_revision(root).as_deref() == Some(baseline.revision)
-            && root
-                .join(brownie_agentmodes::AGENTMODES_WORKFLOW_PATH)
-                .is_file()
-            && root.join("prompts/core.orchestrator.md").is_file()
-        {
-            return;
-        }
-        if root.exists() {
-            std::fs::remove_dir_all(root).expect("remove stale AgentModes compatibility checkout");
-        }
-        std::fs::create_dir_all(root.parent().expect("AgentModes checkout parent"))
-            .expect("create AgentModes compatibility checkout parent");
-        let repository_url = format!("https://github.com/{}.git", baseline.repository);
-        assert_git_status_for_test(
-            std::process::Command::new("git")
-                .arg("clone")
-                .arg("--no-checkout")
-                .arg(&repository_url)
-                .arg(root),
-            "clone AgentModes compatibility baseline",
-        );
-        assert_git_status_for_test(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .arg("fetch")
-                .arg("--depth")
-                .arg("1")
-                .arg("origin")
-                .arg(baseline.revision),
-            "fetch AgentModes compatibility baseline revision",
-        );
-        assert_git_status_for_test(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .arg("checkout")
-                .arg("--detach")
-                .arg(baseline.revision),
-            "checkout AgentModes compatibility baseline revision",
-        );
-    }
-
-    fn assert_git_status_for_test(command: &mut std::process::Command, label: &str) {
-        let status = command
-            .status()
-            .unwrap_or_else(|error| panic!("{label}: {error}"));
-        assert!(status.success(), "{label} failed with status {status}");
-    }
-
-    fn current_agentmodes_revision(root: &std::path::Path) -> Option<String> {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .arg("rev-parse")
-            .arg("HEAD")
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     fn modepack_policy_artifact_category_count(
@@ -70095,3 +70041,6 @@ esac
         }
     }
 }
+
+#[cfg(test)]
+mod agentmodes_test_support;
