@@ -13935,7 +13935,10 @@ phase_loop_watch_continuation_liveness() {
     return 0
   fi
   local run_stamp="${1:-watchdog-$(date -u +%Y%m%dT%H%M%SZ)}"
-  local watchdog_output watchdog_status
+  local watchdog_output watchdog_status caller_errexit=0
+  case "$-" in
+    *e*) caller_errexit=1 ;;
+  esac
   set +e
   watchdog_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" watch-continuation \
     --state-dir "$STATE_DIR" \
@@ -13945,7 +13948,11 @@ phase_loop_watch_continuation_liveness() {
     --max-age-seconds "$PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS" \
     --run-stamp "$run_stamp" 2>&1)"
   watchdog_status=$?
-  set -e
+  if [ "$caller_errexit" -eq 1 ]; then
+    set -e
+  else
+    set +e
+  fi
   printf '%s continuation_watchdog_exit=%s result=%s\n' "$(now_utc)" "$watchdog_status" "${watchdog_output:-<no output>}" >> "$SUPERVISOR_LOG"
   if [ "$watchdog_status" -ne 0 ]; then
     return "$watchdog_status"
