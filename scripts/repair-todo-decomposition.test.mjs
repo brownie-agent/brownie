@@ -843,6 +843,62 @@ test('repairs dangling dependency when active claim was already removed from liv
   }
 });
 
+test('rebases a dependency on an unresolved superseded parent to its live child frontier', () => {
+  const root = makeTempRepo();
+  try {
+    const parentId = 'E-23a-parent';
+    const childId = `${parentId}-target-01`;
+    const downstreamSourceId = 'E-23b-release-work';
+    const downstreamId = `${downstreamSourceId}-target-01`;
+    const child = `- [ ] ${childId}: Patch only \`scripts/guard-release-contract.mjs\` for the parent fixture:
+  Route: implementation.
+  Source TODO: ${parentId}.
+  Depends on: <none>.
+  Completion condition: preserve the parent work as an executable child.
+  Forbidden changes: do not edit unrelated files.
+  Verification: run \`pnpm --workspace-root guard:release-contract\`.`;
+    const downstream = `- [ ] ${downstreamId}: Patch only \`scripts/guard-runtime-release-readiness.mjs\` after the parent fixture:
+  Route: implementation.
+  Source TODO: ${downstreamSourceId}.
+  Depends on: ${parentId}.
+  Completion condition: retain the predecessor ordering through an executable dependency.
+  Forbidden changes: do not edit unrelated files.
+  Verification: run \`pnpm --workspace-root guard:runtime-release-readiness\`.`;
+    fs.writeFileSync(path.join(root, '.brownie/todo.md'), [
+      `- [x] ${parentId}: Patch only \`scripts/guard-release-contract.mjs\`.`,
+      '  Route: implementation.',
+      '  Source TODO: fixture.',
+      '  Depends on: <none>.',
+      '  Completion condition: parent fixture.',
+      '  Forbidden changes: do not edit unrelated files.',
+      '  Verification: run `pnpm --workspace-root guard:release-contract`.',
+      '', child, '', downstream, ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(root, '.brownie/todo-breakdown.md'), [
+      '# TODO breakdown', '', `## ${parentId} no-eligible multi-target split`, '', `Parent TODO: ${parentId}`, '',
+      'Targets:', `- ${childId}: \`scripts/guard-release-contract.mjs\``, '', 'Dependency graph:',
+      `- ${childId}: <none>`, `- ${downstreamId}: ${parentId}`,
+      '', 'Verification ledger:', `- ${childId}: run \`pnpm --workspace-root guard:release-contract\``, `- ${downstreamId}: run \`pnpm --workspace-root guard:runtime-release-readiness\``,
+      '', 'Quality rubric:', `- ${childId}: executable child.`, `- ${downstreamId}: ordered successor.`, '', 'History:', ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-claims/current.json'), JSON.stringify({
+      schema_version: 1, claim_id: 'claim-superseded-parent', selected_todo: downstream
+    }, null, 2));
+
+    const result = runRepair(root);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.operation, 'deterministic_dangling_dependency_repair');
+    const todoText = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8');
+    const breakdownText = fs.readFileSync(path.join(root, '.brownie/todo-breakdown.md'), 'utf8');
+    assert.match(todoText, new RegExp(`Depends on: ${childId}\\.`));
+    assert.doesNotMatch(todoText, new RegExp(`Depends on: ${parentId}\\.`));
+    assert.match(breakdownText, new RegExp(`- ${downstreamId}: ${childId}`));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('atomically repairs a derived leaf dependency and missing breakdown entries after a stale claim', () => {
   const root = makeTempRepo();
   try {

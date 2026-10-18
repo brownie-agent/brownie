@@ -1282,10 +1282,26 @@ function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPa
 function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, breakdownPath, additionalSourceIds = [] }) {
   const blocks = uncheckedTodoBlocks(todoText);
   const ids = existingIds(todoText);
-  const completedIds = canonicalCompletedTodoIds(todoText, breakdownPath);
+  const todoState = canonicalTodoState(todoText, breakdownPath);
+  const completedIds = todoState.completedIds;
   const notes = [];
   let updatedTodo = todoText;
   let updatedBreakdown = breakdownText;
+
+  // A checked parent that has been superseded by children is deliberately not
+  // a completion receipt.  Downstream leaves must wait on the live child
+  // frontier, rather than retain an unschedulable dependency on that parent.
+  // Resolve recursively because a repair can itself be superseded later.
+  const executableFrontier = (parentId, seen = new Set()) => {
+    if (seen.has(parentId)) return [];
+    seen.add(parentId);
+    const children = [...(todoState.childrenByParent.get(parentId) ?? [])];
+    return children.flatMap((childId) => {
+      if (todoState.resolvedIds.has(childId)) return [];
+      if (todoState.supersededIds.has(childId)) return executableFrontier(childId, seen);
+      return todoState.liveIds.has(childId) ? [childId] : [];
+    });
+  };
 
   for (const block of blocks) {
     const id = todoId(block);
@@ -1293,12 +1309,28 @@ function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, bre
       continue;
     }
     const dependencies = parseDependsOn(block);
+    const supersededDependencies = dependencies.filter((dependency) => (
+      todoState.supersededIds.has(dependency) && !todoState.resolvedIds.has(dependency)
+    ));
+    const dependencyFrontiers = new Map(supersededDependencies.map((dependency) => [dependency, executableFrontier(dependency)]));
     const danglingDependencies = dependencies.filter((dependency) => !ids.has(dependency) && !completedIds.has(dependency));
     const breakdownOnlyDependencies = danglingDependencies.filter((dependency) => breakdownText.includes(dependency));
-    if (breakdownOnlyDependencies.length === 0) {
+    if (breakdownOnlyDependencies.length === 0 && supersededDependencies.length === 0) {
       continue;
     }
-    const liveDependencies = dependencies.filter((dependency) => ids.has(dependency) || completedIds.has(dependency));
+    const liveDependencies = [...new Set(dependencies.flatMap((dependency) => {
+      if (dependencyFrontiers.has(dependency)) return dependencyFrontiers.get(dependency);
+      return (ids.has(dependency) || completedIds.has(dependency)) ? [dependency] : [];
+    }))];
+    if (supersededDependencies.some((dependency) => dependencyFrontiers.get(dependency).length === 0)) {
+      return {
+        applied: false,
+        eligible: true,
+        reason: 'superseded_dependency_has_no_live_child_frontier',
+        todoId: id,
+        supersededDependencies
+      };
+    }
     const replaced = replaceDependsOn(block, liveDependencies);
     if (!replaced.changed) {
       continue;
@@ -1318,8 +1350,11 @@ function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, bre
     updatedBreakdown = updatedBreakdown.replace(graphPattern, `$1${liveDependencies.join(', ') || '<none>'}$2`);
     notes.push({
       todo_id: id,
-      normalization: 'removed_breakdown_only_dependency',
+      normalization: supersededDependencies.length > 0
+        ? 'rebased_superseded_parent_dependency_to_live_child_frontier'
+        : 'removed_breakdown_only_dependency',
       removed: breakdownOnlyDependencies,
+      superseded_parents: supersededDependencies,
       remaining: liveDependencies
     });
   }
