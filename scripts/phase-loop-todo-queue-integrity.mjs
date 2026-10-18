@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -8,6 +9,10 @@ import {
   readTrackedBreakdownReplanRecords,
   resolveTodoState
 } from './phase-loop-todo-state.mjs';
+import {
+  matchesContractRebaselineRecord,
+  readContractRebaselineRecords
+} from './phase-loop-todo-contract-rebaseline.mjs';
 
 export { readTrackedBreakdownReplanRecords as trackedBreakdownReplanRecords };
 
@@ -260,7 +265,15 @@ function validReplanForRemovedParent(record, after, replanByParent = new Map(), 
   return { valid: true };
 }
 
-export function validateTodoQueueIntegrity({ todoBefore, todoAfter, completedTodoIds: completedIdsInput = [], todoReplanRecords: todoReplanRecordsInput = [] }) {
+export function validateTodoQueueIntegrity({
+  todoBefore,
+  todoAfter,
+  beforeBreakdownText = null,
+  afterBreakdownText = null,
+  completedTodoIds: completedIdsInput = [],
+  todoReplanRecords: todoReplanRecordsInput = [],
+  contractRebaselineRecords: contractRebaselineRecordsInput = []
+}) {
   const errors = [];
   const warnings = [];
   const before = blockMap(todoBefore ?? '');
@@ -311,21 +324,48 @@ export function validateTodoQueueIntegrity({ todoBefore, todoAfter, completedTod
       const afterDependencyValue = lineValue(afterBlock, 'Depends on');
       const afterDependencies = afterDependencyValue
         .split(/\s*,\s*/u).map((entry) => entry.trim()).filter((entry) => entry && entry !== '<none>');
-      if (
-        drift.length === 1
-        && drift[0] === 'depends_on'
-        && afterDependencyValue === '<none>'
-        && afterDependencies.length === 0
-        && beforeDependencies.length > 0
-        && beforeDependencies.every((dependency) => completedIds.has(dependency))
-      ) {
-        warnings.push({
-          code: 'completed_dependency_pruned_rebaseline',
-          message: 'A live TODO dependency was pruned only because every referenced prerequisite has durable completion evidence.',
-          todo_id: id,
-          pruned_dependency_ids: beforeDependencies
-        });
-        continue;
+      if (drift.length === 1 && drift[0] === 'depends_on' && beforeDependencies.length > 0) {
+        const beforeTodoSha256 = crypto.createHash('sha256').update(todoBefore ?? '', 'utf8').digest('hex');
+        const afterTodoSha256 = crypto.createHash('sha256').update(todoAfter ?? '', 'utf8').digest('hex');
+        const beforeBreakdownSha256 = beforeBreakdownText === null
+          ? null
+          : crypto.createHash('sha256').update(beforeBreakdownText, 'utf8').digest('hex');
+        const afterBreakdownSha256 = afterBreakdownText === null
+          ? null
+          : crypto.createHash('sha256').update(afterBreakdownText, 'utf8').digest('hex');
+        const beforeContract = protectedContract(beforeBlock);
+        const afterContract = protectedContract(afterBlock);
+        const approvedRecord = contractRebaselineRecordsInput.find((record) => matchesContractRebaselineRecord(record, {
+          todoId: id,
+          changedFields: drift,
+          beforeContract,
+          afterContract,
+          beforeTodoSha256,
+          afterTodoSha256,
+          beforeBreakdownSha256,
+          afterBreakdownSha256
+        }));
+        const isCompletedDependencyPrune = afterDependencyValue === '<none>'
+          && afterDependencies.length === 0
+          && beforeDependencies.every((dependency) => completedIds.has(dependency));
+        const isApprovedDependencyRebaseline = Boolean(approvedRecord)
+          && (afterDependencies.length > 0 || isCompletedDependencyPrune);
+        if (isApprovedDependencyRebaseline) {
+          const warning = {
+            code: afterDependencies.length === 0
+              ? 'completed_dependency_pruned_rebaseline'
+              : 'todo_dependency_rebaselined',
+            message: afterDependencies.length === 0
+              ? 'A live TODO dependency was pruned only through an approved deterministic contract rebaseline with durable completion evidence.'
+              : 'A live TODO dependency changed only through an approved deterministic contract rebaseline with durable decomposition evidence.',
+            todo_id: id,
+            pruned_dependency_ids: beforeDependencies,
+            contract_rebaseline_run_stamp: approvedRecord.cause_run.run_stamp
+          };
+          if (afterDependencies.length > 0) warning.replacement_dependency_ids = afterDependencies;
+          warnings.push(warning);
+          continue;
+        }
       }
       errors.push({
         code: 'todo_contract_drift',
@@ -367,8 +407,11 @@ export function loadCliInput(args) {
   const repoRoot = path.resolve(args.repo);
   const todoPath = path.resolve(repoRoot, args.todo);
   const todoRelative = path.relative(repoRoot, todoPath).split(path.sep).join('/');
+  const breakdownPath = path.resolve(repoRoot, '.brownie/todo-breakdown.md');
   const todoBefore = gitHeadText(repoRoot, todoRelative);
   const todoAfter = maybeReadText(todoPath);
+  const breakdownBefore = gitHeadText(repoRoot, '.brownie/todo-breakdown.md');
+  const breakdownAfter = maybeReadText(breakdownPath);
   const replanRecords = readAllTodoReplanRecords(repoRoot);
   const todoState = resolveTodoState({
     todoText: todoAfter,
@@ -380,8 +423,11 @@ export function loadCliInput(args) {
     todoRelative,
     todoBefore,
     todoAfter,
+    beforeBreakdownText: breakdownBefore,
+    afterBreakdownText: breakdownAfter,
     completedTodoIds: [...todoState.completedIds],
-    todoReplanRecords: replanRecords
+    todoReplanRecords: replanRecords,
+    contractRebaselineRecords: readContractRebaselineRecords(repoRoot)
   };
 }
 

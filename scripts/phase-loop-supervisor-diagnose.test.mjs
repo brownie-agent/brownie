@@ -29,6 +29,10 @@ function makeRepo() {
     path.join(repo, 'scripts/phase-loop-todo-queue-integrity.mjs')
   );
   fs.copyFileSync(
+    path.join(__dirname, 'phase-loop-todo-contract-rebaseline.mjs'),
+    path.join(repo, 'scripts/phase-loop-todo-contract-rebaseline.mjs')
+  );
+  fs.copyFileSync(
     path.join(__dirname, 'phase-loop-todo-state.mjs'),
     path.join(repo, 'scripts/phase-loop-todo-state.mjs')
   );
@@ -36,7 +40,7 @@ function makeRepo() {
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
   execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
   fs.writeFileSync(path.join(repo, 'README.md'), 'test\n');
-  execFileSync('git', ['add', 'README.md', 'package.json', 'scripts/release-gate.mjs', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-state.mjs'], { cwd: repo });
+  execFileSync('git', ['add', 'README.md', 'package.json', 'scripts/release-gate.mjs', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-contract-rebaseline.mjs', 'scripts/phase-loop-todo-state.mjs'], { cwd: repo });
   execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
   return repo;
 }

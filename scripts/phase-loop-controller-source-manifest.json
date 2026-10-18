@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "controller_source_paths": [
+    "phase-loop.sh",
+    "scripts/bdk-public-harness-evaluate.mjs",
+    "scripts/guard-js-duplicate-exports.mjs",
+    "scripts/guard-json-parse.mjs",
+    "scripts/guard-todo-decomposition.mjs",
+    "scripts/phase-loop-actor-preflight.mjs",
+    "scripts/phase-loop-admit-existing-contract-rebaseline.mjs",
+    "scripts/phase-loop-decomposition-adversarial-real-llm.mjs",
+    "scripts/phase-loop-delivery-reconcile.mjs",
+    "scripts/phase-loop-pr-actor-guard.mjs",
+    "scripts/phase-loop-preclaim-recovery.mjs",
+    "scripts/phase-loop-preflight.mjs",
+    "scripts/phase-loop-progress-integrity.mjs",
+    "scripts/phase-loop-release-ops-blocker.mjs",
+    "scripts/phase-loop-self-update.mjs",
+    "scripts/phase-loop-source-baseline-guard.mjs",
+    "scripts/phase-loop-supervisor-control.mjs",
+    "scripts/phase-loop-supervisor-diagnose.mjs",
+    "scripts/phase-loop-task-ledger.mjs",
+    "scripts/phase-loop-todo-contract-rebaseline.mjs",
+    "scripts/phase-loop-todo-evaluator.mjs",
+    "scripts/phase-loop-todo-queue-integrity.mjs",
+    "scripts/phase-loop-todo-state.mjs",
+    "scripts/repair-todo-decomposition.mjs",
+    "scripts/repair-validator-schema-assumptions.mjs",
+    "scripts/validate-audit-schema.mjs"
+  ]
+}

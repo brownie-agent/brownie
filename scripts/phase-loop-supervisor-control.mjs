@@ -256,20 +256,37 @@ function maybeRepairTodoQueueIntegrity(repoRoot, diagnostic) {
 
   const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
   try {
+    const diagnosticText = [
+      detail,
+      JSON.stringify(diagnostic)
+    ].filter(Boolean).join('\n');
     const repairResult = runJsonCommand(repoRoot, process.execPath, [
-      'scripts/repair-todo-decomposition.mjs',
+      'scripts/phase-loop-preclaim-recovery.mjs',
+      '--repo',
+      repoRoot,
       '--claim',
       claimPath,
       '--todo',
       '.brownie/todo.md',
       '--breakdown',
       '.brownie/todo-breakdown.md',
+      '--state-dir',
+      path.join(repoRoot, '.brownie/private/phase-loop'),
+      '--diagnostic',
+      diagnosticText,
       '--run-stamp',
-      new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z')
+      String(diagnostic.phase_loop?.run_id ?? new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z'))
     ], {
       BROWNIE_REPAIR_TODO_REPO_ROOT: repoRoot
     });
-    steps.push({ step: 'deterministic_todo_repair', ok: Boolean(repairResult.applied), result: repairResult });
+    steps.push({
+      step: 'deterministic_todo_repair_with_formal_rebaseline',
+      ok: true,
+      result: {
+        ...repairResult,
+        recovery_command: 'scripts/phase-loop-preclaim-recovery.mjs'
+      }
+    });
   } catch (repairError) {
     steps.push({
       step: 'deterministic_todo_repair',

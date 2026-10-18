@@ -8,6 +8,7 @@ import {
   trackedBreakdownReplanRecords,
   validateTodoQueueIntegrity
 } from './phase-loop-todo-queue-integrity.mjs';
+import { buildContractRebaselineReceipt } from './phase-loop-todo-contract-rebaseline.mjs';
 
 const e20a = `- [ ] E-20a-golden-journey-workspace-mutation: Patch only \`scripts/release-runtime-operational-evidence.mjs\` and \`scripts/guard-runtime-operational-evidence.test.mjs\`: make Golden Journey require mutation.
   Route: implementation.
@@ -78,20 +79,139 @@ test('allows a TODO checked in the live queue to serve as durable completion evi
   assert(result.completed_todo_ids.includes('E-20a-golden-journey-workspace-mutation'));
 });
 
-test('allows pruning every completed prerequisite from a dependent TODO and records a rebaseline warning', () => {
+test('rejects pruning a completed prerequisite without an approved contract rebaseline record', () => {
   const result = validateTodoQueueIntegrity({
     todoBefore: queue(e20a, e20b),
     todoAfter: queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.')),
     completedTodoIds: ['E-20a-golden-journey-workspace-mutation']
   });
 
+  assert.equal(result.valid, false);
+  assert.deepEqual(result.errors.find((error) => error.code === 'todo_contract_drift'), {
+    code: 'todo_contract_drift',
+    message: 'A surviving TODO changed protected contract fields before claim selection.',
+    todo_id: 'E-20b-stateful-soak-real-workload',
+    drift: ['depends_on']
+  });
+});
+
+test('allows pruning every completed prerequisite only with an exact approved contract rebaseline record', () => {
+  const before = queue(e20a, e20b);
+  const after = queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'));
+  const receipt = buildContractRebaselineReceipt({
+    repoRoot: process.cwd(),
+    beforeTodoText: before,
+    afterTodoText: after,
+    runStamp: 'fixture-run',
+    eventKey: 'fixture-event',
+    diagnostic: 'TODO queue integrity failed before claim; deterministic decomposition repair',
+    verification: {
+      repair_command: 'node scripts/repair-todo-decomposition.mjs',
+      guard_command: 'node scripts/guard-todo-decomposition.mjs',
+      integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+    }
+  });
+  const result = validateTodoQueueIntegrity({
+    todoBefore: before,
+    todoAfter: after,
+    completedTodoIds: ['E-20a-golden-journey-workspace-mutation'],
+    contractRebaselineRecords: [receipt]
+  });
+
   assert.equal(result.valid, true, JSON.stringify(result.errors));
   assert.deepEqual(result.warnings.find((warning) => warning.code === 'completed_dependency_pruned_rebaseline'), {
     code: 'completed_dependency_pruned_rebaseline',
-    message: 'A live TODO dependency was pruned only because every referenced prerequisite has durable completion evidence.',
+    message: 'A live TODO dependency was pruned only through an approved deterministic contract rebaseline with durable completion evidence.',
     todo_id: 'E-20b-stateful-soak-real-workload',
-    pruned_dependency_ids: ['E-20a-golden-journey-workspace-mutation']
+    pruned_dependency_ids: ['E-20a-golden-journey-workspace-mutation'],
+    contract_rebaseline_run_stamp: 'fixture-run'
   });
+});
+
+test('allows a surviving TODO to rebaseline onto a deterministic child frontier only with an exact approved receipt', () => {
+  const childOne = e20b.replace(
+    'E-20b-stateful-soak-real-workload:',
+    'E-20b-stateful-soak-real-workload-target-01:'
+  ).replace('  Route: implementation.', '  Route: implementation.\n  Source TODO: E-20b-stateful-soak-real-workload.')
+    .replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.');
+  const childTwo = e20b.replace(
+    'E-20b-stateful-soak-real-workload:',
+    'E-20b-stateful-soak-real-workload-target-02:'
+  ).replace('  Route: implementation.', '  Route: implementation.\n  Source TODO: E-20b-stateful-soak-real-workload.')
+    .replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.');
+  const before = queue(e20b, e20c);
+  const after = queue(childOne, childTwo, e20c.replace(
+    'Depends on: E-20b-stateful-soak-real-workload.',
+    'Depends on: E-20b-stateful-soak-real-workload-target-01, E-20b-stateful-soak-real-workload-target-02.'
+  ));
+  const receipt = buildContractRebaselineReceipt({
+    repoRoot: process.cwd(),
+    beforeTodoText: before,
+    afterTodoText: after,
+    runStamp: 'child-frontier-run',
+    eventKey: 'child-frontier-event',
+    diagnostic: 'phase-loop-todo-queue-integrity.mjs: TODO queue integrity failed before claim; todo-replan',
+    verification: {
+      repair_command: 'node scripts/phase-loop-preclaim-recovery.mjs',
+      guard_command: 'node scripts/guard-todo-decomposition.mjs',
+      integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+    },
+    todoIds: ['E-20c-release-contract-binding']
+  });
+  const result = validateTodoQueueIntegrity({
+    todoBefore: before,
+    todoAfter: after,
+    todoReplanRecords: [{
+      parent_todo_id: 'E-20b-stateful-soak-real-workload',
+      parent_status: 'superseded_by_children',
+      generated_child_ids: [
+        'E-20b-stateful-soak-real-workload-target-01',
+        'E-20b-stateful-soak-real-workload-target-02'
+      ]
+    }],
+    contractRebaselineRecords: [receipt]
+  });
+
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.deepEqual(result.warnings.find((warning) => warning.code === 'todo_dependency_rebaselined'), {
+    code: 'todo_dependency_rebaselined',
+    message: 'A live TODO dependency changed only through an approved deterministic contract rebaseline with durable decomposition evidence.',
+    todo_id: 'E-20c-release-contract-binding',
+    pruned_dependency_ids: ['E-20b-stateful-soak-real-workload'],
+    contract_rebaseline_run_stamp: 'child-frontier-run',
+    replacement_dependency_ids: [
+      'E-20b-stateful-soak-real-workload-target-01',
+      'E-20b-stateful-soak-real-workload-target-02'
+    ]
+  });
+});
+
+test('fails closed when an approved contract rebaseline record does not match the live before/after contracts', () => {
+  const before = queue(e20a, e20b);
+  const after = queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'));
+  const receipt = buildContractRebaselineReceipt({
+    repoRoot: process.cwd(),
+    beforeTodoText: before,
+    afterTodoText: after,
+    runStamp: 'fixture-mismatch-run',
+    eventKey: 'fixture-mismatch-event',
+    diagnostic: 'TODO queue integrity failed before claim; deterministic decomposition repair',
+    verification: {
+      repair_command: 'node scripts/repair-todo-decomposition.mjs',
+      guard_command: 'node scripts/guard-todo-decomposition.mjs',
+      integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+    }
+  });
+  receipt.contract_changes[0].after_contract.depends_on = 'E-20c-release-contract-binding';
+  const result = validateTodoQueueIntegrity({
+    todoBefore: before,
+    todoAfter: after,
+    completedTodoIds: ['E-20a-golden-journey-workspace-mutation'],
+    contractRebaselineRecords: [receipt]
+  });
+
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'todo_contract_drift' && error.todo_id === 'E-20b-stateful-soak-real-workload'));
 });
 
 test('rejects removing a TODO without completion evidence', () => {
@@ -369,13 +489,29 @@ test('rejects completed TODO reappearing as an unchecked live queue item', () =>
 });
 
 test('allows dependency pruning across a three-item queue only when the removed prerequisite is completed', () => {
+  const before = queue(e20a, e20b, e20c);
+  const after = queue(
+    e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'),
+    e20c
+  );
+  const receipt = buildContractRebaselineReceipt({
+    repoRoot: process.cwd(),
+    beforeTodoText: before,
+    afterTodoText: after,
+    runStamp: 'fixture-run-three-item',
+    eventKey: 'fixture-event-three-item',
+    diagnostic: 'TODO queue integrity failed before claim; deterministic decomposition repair',
+    verification: {
+      repair_command: 'node scripts/repair-todo-decomposition.mjs',
+      guard_command: 'node scripts/guard-todo-decomposition.mjs',
+      integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+    }
+  });
   const result = validateTodoQueueIntegrity({
-    todoBefore: queue(e20a, e20b, e20c),
-    todoAfter: queue(
-      e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'),
-      e20c
-    ),
-    completedTodoIds: ['E-20a-golden-journey-workspace-mutation']
+    todoBefore: before,
+    todoAfter: after,
+    completedTodoIds: ['E-20a-golden-journey-workspace-mutation'],
+    contractRebaselineRecords: [receipt]
   });
 
   assert.equal(result.valid, true, JSON.stringify(result.errors));
@@ -426,6 +562,26 @@ test('CLI accepts completed-dependency rebaseline against HEAD and emits an audi
   fs.writeFileSync(
     path.join(tmp, '.brownie/todo.md'),
     queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'))
+  );
+  const before = queue(e20a, e20b);
+  const after = queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'));
+  const receipt = buildContractRebaselineReceipt({
+    repoRoot: tmp,
+    beforeTodoText: before,
+    afterTodoText: after,
+    runStamp: 'fixture-cli-run',
+    eventKey: 'fixture-cli-event',
+    diagnostic: 'TODO queue integrity failed before claim; deterministic decomposition repair',
+    verification: {
+      repair_command: 'node scripts/repair-todo-decomposition.mjs',
+      guard_command: 'node scripts/guard-todo-decomposition.mjs',
+      integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+    }
+  });
+  fs.mkdirSync(path.join(tmp, '.brownie/private/phase-loop/todo-claims/contract-rebaselines'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, '.brownie/private/phase-loop/todo-claims/contract-rebaselines/fixture.json'),
+    `${JSON.stringify(receipt)}\n`
   );
 
   const output = execFileSync('node', [path.resolve('scripts/phase-loop-todo-queue-integrity.mjs'), '--repo', tmp, '--todo', '.brownie/todo.md'], {

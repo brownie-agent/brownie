@@ -3,6 +3,11 @@ set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHASE_LOOP="$REPO_ROOT/phase-loop.sh"
+# Claim smoke runs against temporary worker workspaces while the controller
+# source remains this checkout.  Pin the fixture baseline to the checked-out
+# controller so the smoke suite exercises controller behavior without
+# pretending that a PR branch already matches origin/main.
+export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="HEAD"
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
 # A fresh CI worker may spend more than 25 seconds in the first `run-once`
 # preparing the temporary Git workspace and Node helpers.  Keep an explicit
@@ -110,18 +115,6 @@ run_with_timeout() {
       fi
     fi
   fi
-  if [ -n "${CLAIM_SMOKE_REPO_TODO_SHA256:-}" ]; then
-    local current_todo_sha256
-    local current_breakdown_sha256
-    current_todo_sha256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
-    current_breakdown_sha256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
-    local current_private_state_sha256
-    current_private_state_sha256="$(claim_smoke_private_state_sha256)"
-    if [ "$current_todo_sha256" != "$CLAIM_SMOKE_REPO_TODO_SHA256" ] || [ "$current_breakdown_sha256" != "$CLAIM_SMOKE_REPO_BREAKDOWN_SHA256" ] || [ "$current_private_state_sha256" != "$CLAIM_SMOKE_REPO_PRIVATE_STATE_SHA256" ]; then
-      echo "phase-loop claim smoke leaked temporary controller state into the repository: todo=${PHASE_LOOP_TODO:-<default>} breakdown=${PHASE_LOOP_TODO_BREAKDOWN:-<default>} workspace=${PHASE_LOOP_WORKSPACE_ROOT:-<default>} state=${PHASE_LOOP_STATE_DIR:-<default>}" >&2
-      return 97
-    fi
-  fi
   return "$child_status"
 }
 
@@ -145,6 +138,8 @@ wait_for_pid_exit() {
 }
 
 assert_contains "$PHASE_LOOP" "phase-loop-todo-queue-integrity\\.mjs"
+assert_contains "$PHASE_LOOP" 'local guard_script="\$ROOT_DIR/scripts/phase-loop-source-baseline-guard\.mjs"'
+assert_contains "$PHASE_LOOP" 'node "\$guard_script" --repo "\$ROOT_DIR" --baseline-ref "\$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE"'
 assert_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_WORKSPACE_ROOT"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$ROOT_DIR"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_STATE_DIR"'
@@ -185,9 +180,42 @@ claim_smoke_private_state_sha256() {
     printf '%s\n' absent
     return 0
   fi
-  find "$state_root" -type f -print | LC_ALL=C sort | while IFS= read -r state_file; do
-    shasum "$state_file"
-  done | shasum | awk '{print $1}'
+  find "$state_root" -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum | shasum | awk '{print $1}'
+}
+
+# Every scenario below must confine queue mutations to its own TODO/breakdown
+# paths.  A smoke fixture must never mutate the repository queue that CI later
+# validates, even when the scenario exits through a replan or repair path.
+CLAIM_SMOKE_REPO_TODO_SHA256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
+CLAIM_SMOKE_REPO_BREAKDOWN_SHA256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
+CLAIM_SMOKE_REPO_PRIVATE_STATE_SHA256="$(claim_smoke_private_state_sha256)"
+# Test invocations always use temporary queue/state paths; their durable
+# controller store must be isolated as well.  Otherwise phase-loop's default
+# store rooted at this repository can leave replan records that alter later
+# repository guards despite an unchanged fixture TODO.
+CLAIM_SMOKE_BROWNIE_STORE_ROOT="$(mktemp -d)"
+export PHASE_LOOP_BROWNIE_STORE_ROOT="$CLAIM_SMOKE_BROWNIE_STORE_ROOT"
+
+assert_repository_state_unchanged() {
+  local current_todo_sha256
+  local current_breakdown_sha256
+  current_todo_sha256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
+  current_breakdown_sha256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
+  local current_private_state_sha256
+  current_private_state_sha256="$(claim_smoke_private_state_sha256)"
+  if [ "$current_todo_sha256" != "$CLAIM_SMOKE_REPO_TODO_SHA256" ] || [ "$current_breakdown_sha256" != "$CLAIM_SMOKE_REPO_BREAKDOWN_SHA256" ] || [ "$current_private_state_sha256" != "$CLAIM_SMOKE_REPO_PRIVATE_STATE_SHA256" ]; then
+    echo "phase-loop claim smoke leaked temporary controller state into the repository: todo=${PHASE_LOOP_TODO:-<default>} breakdown=${PHASE_LOOP_TODO_BREAKDOWN:-<default>} workspace=${PHASE_LOOP_WORKSPACE_ROOT:-<default>} state=${PHASE_LOOP_STATE_DIR:-<default>}" >&2
+    return 97
+  fi
+}
+
+claim_smoke_private_state_sha256() {
+  local state_root="$REPO_ROOT/.brownie/private/phase-loop"
+  if [ ! -d "$state_root" ]; then
+    printf '%s\n' absent
+    return 0
+  fi
+  find "$state_root" -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum | shasum | awk '{print $1}'
 }
 
 # Every scenario below must confine queue mutations to its own TODO/breakdown
@@ -2530,4 +2558,5 @@ assert "not selected_decomposition_active" in phase_loop, phase_loop
 assert "^\\s*Route:\\s*todo-decomposition\\.?\\s*$" in phase_loop, phase_loop
 PY
 
+assert_repository_state_unchanged
 echo "phase-loop claim smoke passed"

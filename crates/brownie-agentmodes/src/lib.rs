@@ -3131,37 +3131,48 @@ customModes:
     fn compatibility_git_retry_is_bounded_and_preserves_external_diagnostics() {
         let temp = tempfile::tempdir().expect("tempdir");
         let counter = temp.path().join("attempts");
-        let git_fixture = temp.path().join("git-fixture");
-        std::fs::write(
-            &git_fixture,
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let write_executable_fixture = |prefix: &str, source: String| -> tempfile::TempPath {
+            let mut fixture = tempfile::Builder::new()
+                .prefix(prefix)
+                .tempfile_in(temp.path())
+                .expect("fixture tempfile");
+            fixture
+                .as_file_mut()
+                .write_all(source.as_bytes())
+                .expect("fixture source");
+            fixture.as_file_mut().sync_all().expect("fixture sync");
+            std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("fixture permissions");
+            fixture.into_temp_path()
+        };
+
+        let git_fixture = write_executable_fixture(
+            "brownie-git-fixture-",
             format!(
                 "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nif [ \"$count\" -lt 2 ]; then echo 'Could not resolve host: fixture.invalid' >&2; exit 128; fi\nexit 0\n",
                 counter.display(),
                 counter.display(),
                 counter.display()
             ),
-        )
-        .expect("fixture script");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&git_fixture, std::fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions");
+        );
 
         run_git_with_retries("fixture git operation", || {
-            std::process::Command::new(&git_fixture)
+            let path: &std::path::Path = git_fixture.as_ref();
+            std::process::Command::new(path)
         })
         .expect("transient fixture failure should retry");
         assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "2");
 
-        let always_fail = temp.path().join("git-always-fails");
-        std::fs::write(
-            &always_fail,
-            "#!/bin/sh\necho 'Could not resolve host: fixture.invalid' >&2\nexit 128\n",
-        )
-        .expect("always-fail script");
-        std::fs::set_permissions(&always_fail, std::fs::Permissions::from_mode(0o700))
-            .expect("always-fail permissions");
+        let always_fail = write_executable_fixture(
+            "brownie-git-always-fails-",
+            "#!/bin/sh\necho 'Could not resolve host: fixture.invalid' >&2\nexit 128\n".to_string(),
+        );
         let error = run_git_with_retries("fixture blocked operation", || {
-            std::process::Command::new(&always_fail)
+            let path: &std::path::Path = always_fail.as_ref();
+            std::process::Command::new(path)
         })
         .expect_err("persistent external failure should classify as blocked");
         assert!(error.contains("fixture blocked operation"));
