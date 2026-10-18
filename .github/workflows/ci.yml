@@ -18,10 +18,19 @@ jobs:
 
       - name: Fail closed on implementation pull-request author
         if: github.event_name == 'pull_request'
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          trusted_guard="$RUNNER_TEMP/phase-loop-pr-author-guard.mjs"
-          git show origin/main:scripts/phase-loop-pr-author-guard.mjs > "$trusted_guard"
-          node "$trusted_guard" --event-path "$GITHUB_EVENT_PATH"
+          case "$PR_HEAD_REF" in
+            brownie-agent/*|phase-loop/*) ;;
+            *) exit 0 ;;
+          esac
+          if [ "$PR_AUTHOR" != "brownie-agent" ]; then
+            echo "Implementation pull-request author guard failed: expected brownie-agent, got $PR_AUTHOR" >&2
+            exit 1
+          fi
+          echo "Implementation pull-request author guard passed for $PR_HEAD_REF."
 
       - name: Fail closed on stale phase-loop controller source
         run: |
