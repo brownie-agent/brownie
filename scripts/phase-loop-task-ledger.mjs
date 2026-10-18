@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readClaimSnapshot } from './phase-loop-claim-lifecycle.mjs';
 
 export const TASK_STATES = new Set(['queued', 'claimed', 'running', 'completed', 'blocked', 'replanned', 'failed']);
 const TERMINAL_STATES = new Set(['completed', 'blocked', 'replanned', 'failed']);
@@ -32,6 +33,7 @@ export function readTaskLedger(repoRoot) {
           return Array.isArray(record.events) && record.events.length > 1 && record.events.every((event) => event?.task_id && TASK_STATES.has(event?.to_state))
             ? record.events : [];
         }
+        if (record?.kind === 'unclaimed_trajectory') return [];
         return [record];
       } catch { return []; }
     });
@@ -69,11 +71,26 @@ export function validateTransition({ previous, toState, to_state: snakeCaseToSta
 }
 
 export function appendTaskTransition(repoRoot, input) {
-  const events = readTaskLedger(repoRoot);
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
   const current = taskProjection(events).get(input.task_id);
   const toState = input.to_state ?? input.toState;
   const verdict = validateTransition({ previous: current, toState, ...input });
-  if (!verdict.ok) return verdict;
+  if (!verdict.ok) {
+    const duplicate = input.claim_id != null && events.find((event) => (
+      event?.task_id === input.task_id
+      && event?.to_state === toState
+      && event?.claim_id === input.claim_id
+      && (event?.task_spec_sha256 ?? null) === (input.task_spec_sha256 ?? null)
+      && (event?.reason ?? null) === (input.reason ?? null)
+    ));
+    if (duplicate) return { ok: true, code: 'duplicate_transition', event: duplicate };
+    return verdict;
+  }
   const event = {
     schema_version: 1,
     event_id: crypto.randomUUID(),
@@ -86,12 +103,60 @@ export function appendTaskTransition(repoRoot, input) {
     claim_id: input.claim_id ?? null,
     reason: input.reason ?? null,
     replaces: input.replaces ?? [],
-    task_spec_sha256: input.task_spec_sha256 ?? null
+    task_spec_sha256: input.task_spec_sha256 ?? null,
+    parent_task_id: input.parent_task_id ?? current?.parent_task_id ?? null
   };
   const file = taskLedgerPath(repoRoot);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   fs.appendFileSync(file, `${JSON.stringify(event)}\n`, { encoding: 'utf8', mode: 0o600 });
   return { ok: true, event };
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]));
+  }
+  return value ?? null;
+}
+
+function semanticEqual(left, right) {
+  return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right));
+}
+
+function sameTaskIdSet(left, right) {
+  return semanticEqual([...left].sort(), [...right].sort());
+}
+
+function replacementChildMatches(event, child, parentTaskId, runId) {
+  return event?.task_id === child?.task_id
+    && event?.from_state === null
+    && event?.to_state === 'queued'
+    && (event?.run_id ?? null) === (runId ?? null)
+    && event?.claim_id === null
+    && event?.reason === `replacement_for:${parentTaskId}`
+    && Array.isArray(event?.replaces)
+    && event.replaces.length === 0
+    && (event?.task_spec_sha256 ?? null) === (child?.task_spec_sha256 ?? null)
+    && semanticEqual(event?.patch_targets, child?.patch_targets)
+    && semanticEqual(event?.verification_commands, child?.verification_commands)
+    && semanticEqual(event?.route, child?.route)
+    && event?.parent_task_id === parentTaskId;
+}
+
+function exactReplanEvents(events, parentEvent, children, parentTaskId, runId) {
+  const childIds = children.map((child) => child?.task_id);
+  if (!sameTaskIdSet(parentEvent?.replaces ?? [], childIds)) return null;
+  const replacementEvents = events.filter((event) => (
+    event?.parent_task_id === parentTaskId
+    && event?.to_state === 'queued'
+    && (event?.run_id ?? null) === (runId ?? null)
+    && event?.claim_id === null
+  ));
+  if (replacementEvents.length !== children.length) return null;
+  const matchedChildren = children.map((child) => replacementEvents.find((event) => replacementChildMatches(event, child, parentTaskId, runId)));
+  if (matchedChildren.some((event) => !event)) return null;
+  return [parentEvent, ...matchedChildren];
 }
 
 // Replanning is a single ledger commit: the original task becomes terminal
@@ -100,10 +165,33 @@ export function appendTaskTransition(repoRoot, input) {
 // must not infer task state from it.
 export function replanTaskWithChildren(repoRoot, { task_id, reason, children, run_id = null, claim_id = null, task_spec_sha256 = null, at }) {
   if (!Array.isArray(children) || children.length === 0) return { ok: false, code: 'replan_requires_reason_and_children' };
-  const events = readTaskLedger(repoRoot);
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
   const projection = taskProjection(events);
-  const parent = projection.get(task_id);
   const childIds = children.map((child) => child?.task_id);
+  const duplicateCandidates = events.filter((event) => (
+    event?.task_id === task_id
+    && event?.to_state === 'replanned'
+    && (event?.run_id ?? null) === run_id
+    && (event?.claim_id ?? null) === claim_id
+    && (event?.task_spec_sha256 ?? null) === (task_spec_sha256 ?? null)
+    && (event?.reason ?? null) === reason
+  ));
+  if (duplicateCandidates.length > 0) {
+    const exact = duplicateCandidates.map((parentEvent) => exactReplanEvents(events, parentEvent, children, task_id, run_id)).find(Boolean);
+    if (exact) return { ok: true, code: 'duplicate_replan', events: exact, duplicate: true };
+    return {
+      ok: false,
+      code: 'replan_duplicate_mismatch',
+      task_id,
+      reason: 'immutable_replan_parent_matches_but_replacement_children_differ'
+    };
+  }
+  const parent = projection.get(task_id);
   if (new Set(childIds).size !== childIds.length || childIds.some((id) => !id)) return { ok: false, code: 'replan_children_must_have_unique_ids' };
   const parentVerdict = validateTransition({ previous: parent, toState: 'replanned', reason, replaces: childIds });
   if (!parentVerdict.ok) return parentVerdict;
@@ -159,11 +247,202 @@ export function taskIsExecutable(task) {
   return { ok: missing.length === 0, missing };
 }
 
-function taskIdFromClaim(claimPath) {
-  const claim = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
+function appendLedgerRecord(repoRoot, record) {
+  const file = taskLedgerPath(repoRoot);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+function unclaimedTrajectoryRecord({ type, runId, claimPath, claimState, errorCode = null, errorMessage = null, at }) {
+  return {
+    schema_version: 1,
+    kind: 'unclaimed_trajectory',
+    event_id: crypto.randomUUID(),
+    task_id: null,
+    claim_id: null,
+    trajectory_type: type,
+    run_id: runId ?? null,
+    claim_path: claimPath,
+    claim_state: claimState,
+    error_code: errorCode,
+    error_message: errorMessage,
+    at: at ?? new Date().toISOString()
+  };
+}
+
+export function recordTrajectory(repoRoot, {
+  claimPath,
+  todoPath,
+  type,
+  runId,
+  payloadRaw,
+  at,
+  readClaim = readClaimSnapshot
+}) {
+  let snapshot;
+  try {
+    snapshot = readClaim(claimPath);
+  } catch (error) {
+    snapshot = {
+      ok: false,
+      state: error?.code === 'ENOENT' ? 'absent' : 'unreadable',
+      error
+    };
+  }
+  if (!snapshot.ok) {
+    const errorCode = snapshot.state === 'absent'
+      ? 'claim_absent'
+      : snapshot.state === 'malformed' ? 'claim_malformed' : 'claim_unreadable';
+    const record = unclaimedTrajectoryRecord({
+      type,
+      runId,
+      claimPath,
+      claimState: snapshot.state,
+      errorCode,
+      errorMessage: snapshot.error?.message ?? null,
+      at
+    });
+    try {
+      appendLedgerRecord(repoRoot, record);
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'ledger_append_failed',
+        claim_state: snapshot.state,
+        error: error.message,
+        record
+      };
+    }
+    if (snapshot.state === 'absent') {
+      return { ok: true, code: 'unclaimed_empty', record };
+    }
+    return { ok: false, code: errorCode, error: snapshot.error?.message ?? errorCode, record };
+  }
+
+  const claimPathForId = claimPath;
+  const claim = snapshot.claim;
   const first = String(claim.selected_todo ?? '').split('\n')[0] ?? '';
   const match = first.match(/^(?:[-*]|\d+[.)])\s+\[\s\]\s+([^:\s]+)/u);
-  return { sourceTaskId: match?.[1] ?? '', claimId: claim.claim_id ?? null, spec: String(claim.selected_todo ?? '') };
+  const sourceTaskId = match?.[1] ?? '';
+  const claimId = claim.claim_id ?? null;
+  const spec = String(claim.selected_todo ?? '');
+  if (!claimId || !spec || !sourceTaskId) {
+    const record = unclaimedTrajectoryRecord({
+      type,
+      runId,
+      claimPath: claimPathForId,
+      claimState: 'malformed',
+      errorCode: 'claim_fields_missing',
+      errorMessage: 'claim_id and selected_todo with a TODO id are required',
+      at
+    });
+    try {
+      appendLedgerRecord(repoRoot, record);
+    } catch (error) {
+      return { ok: false, code: 'ledger_append_failed', error: error.message, record };
+    }
+    return { ok: false, code: 'claim_fields_missing', error: record.error_message, record };
+  }
+
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
+  const projectedSourceTask = taskProjection(events).get(sourceTaskId);
+  // Replan creates the replacement child as the durable queued task itself.
+  // Once that child is claimed, keep transitioning the raw child id so the
+  // parent -> replacement -> terminal graph remains connected.  A terminal
+  // replacement is deliberately not reopened: a later retry gets its own
+  // immutable task attempt, just like an ordinary TODO retry.
+  const replacementParentTaskId = projectedSourceTask?.parent_task_id ?? null;
+  const continuesSameReplacementClaim = replacementParentTaskId
+    && !isTerminalTaskState(projectedSourceTask.to_state)
+    && ((projectedSourceTask.claim_id ?? null) === null
+      || (projectedSourceTask.claim_id ?? null) === (claimId ?? null));
+  const taskId = continuesSameReplacementClaim
+    ? sourceTaskId
+    : taskAttemptId(sourceTaskId, claimId);
+  if (replacementParentTaskId
+    && !isTerminalTaskState(projectedSourceTask.to_state)
+    && projectedSourceTask.claim_id
+    && projectedSourceTask.claim_id !== claimId) {
+    let abandoned;
+    try {
+      abandoned = appendTaskTransition(repoRoot, {
+        task_id: sourceTaskId,
+        to_state: 'failed',
+        run_id: runId,
+        claim_id: projectedSourceTask.claim_id,
+        reason: 'stale_claim_replaced',
+        parent_task_id: replacementParentTaskId
+      });
+    } catch (error) {
+      return { ok: false, code: 'ledger_append_failed', error: error.message };
+    }
+    if (!abandoned.ok) {
+      return { ok: false, code: 'ledger_transition_rejected', task_id: sourceTaskId, rejected: abandoned };
+    }
+  }
+  const specHash = crypto.createHash('sha256').update(spec).digest('hex');
+  if (type === 'todo.replanned') {
+    let payload = {};
+    try { payload = JSON.parse(payloadRaw ?? '{}'); } catch { /* use the event name below */ }
+    const reason = String(payload.reason ?? 'trajectory_replanned');
+    const children = replacementChildren(todoPath, sourceTaskId);
+    if (children.length === 0) return { ok: true, code: 'trajectory_without_replacement', task_id: taskId };
+    let result;
+    try {
+      result = replanTaskWithChildren(repoRoot, {
+        task_id: taskId,
+        reason,
+        children,
+        run_id: runId,
+        claim_id: claimId,
+        task_spec_sha256: specHash,
+        at
+      });
+    } catch (error) {
+      return { ok: false, code: 'ledger_append_failed', error: error.message };
+    }
+    if (!result.ok) return { ok: false, code: 'ledger_transition_rejected', task_id: taskId, rejected: result };
+    if (result.duplicate) return { ok: true, code: 'duplicate_trajectory', task_id: taskId, duplicate: result };
+    return result;
+  }
+  const transitions = {
+    'todo.claimed': ['queued', 'claimed'],
+    'workflow.routed': ['running'],
+    'todo.completed': ['completed'],
+    'todo.blocked': ['blocked'],
+    'todo.failed': ['failed']
+  }[type] ?? [];
+  const transitionStates = type === 'todo.claimed' && taskId === sourceTaskId
+    ? ['claimed']
+    : transitions;
+  let duplicate = false;
+  for (const to_state of transitionStates) {
+    let result;
+    try {
+      result = appendTaskTransition(repoRoot, {
+        task_id: taskId,
+        to_state,
+        at,
+        run_id: runId,
+        claim_id: claimId,
+        task_spec_sha256: specHash,
+        parent_task_id: replacementParentTaskId,
+        reason: to_state === 'blocked' ? 'trajectory_blocked' : to_state === 'failed' ? 'trajectory_failed' : undefined
+      });
+    } catch (error) {
+      return { ok: false, code: 'ledger_append_failed', error: error.message };
+    }
+    if (!result.ok) {
+      return { ok: false, code: 'ledger_transition_rejected', task_id: taskId, rejected: result };
+    }
+    duplicate ||= result.code === 'duplicate_transition';
+  }
+  return { ok: true, code: duplicate ? 'duplicate_trajectory' : 'trajectory_recorded', task_id: taskId };
 }
 
 // A TODO can be retried after an interrupted or failed claim. The ledger is
@@ -200,47 +479,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   const todoPath = args.get('todo');
   const payloadRaw = args.get('payload');
   if (!repo || !claimPath || !type) process.exit(2);
-  const { sourceTaskId, claimId, spec } = taskIdFromClaim(claimPath);
-  if (!sourceTaskId) process.exit(0);
-  const taskId = taskAttemptId(sourceTaskId, claimId);
-  const specHash = crypto.createHash('sha256').update(spec).digest('hex');
-  if (type === 'todo.replanned') {
-    let payload = {};
-    try { payload = JSON.parse(payloadRaw ?? '{}'); } catch { /* use the event name below */ }
-    const reason = String(payload.reason ?? 'trajectory_replanned');
-    const children = replacementChildren(todoPath, sourceTaskId);
-    // `todo.replanned` is also emitted for repair feedback that deliberately
-    // keeps the same claim in progress. A durable replan exists only when
-    // replacement children are present; otherwise preserve the nonterminal
-    // attempt so a later routed/completed event remains valid.
-    if (children.length === 0) process.exit(0);
-    const result = replanTaskWithChildren(repo, {
-        task_id: taskId,
-        reason,
-        children,
-        run_id: runId,
-        claim_id: claimId,
-        task_spec_sha256: specHash
-      });
-    if (!result.ok && result.code !== 'terminal_task_cannot_transition') process.exit(1);
-    process.exit(0);
-  }
-  const transitions = {
-    'todo.claimed': ['queued', 'claimed'],
-    'workflow.routed': ['running'],
-    'todo.completed': ['completed'],
-    'todo.blocked': ['blocked'],
-    'todo.failed': ['failed']
-  }[type] ?? [];
-  for (const to_state of transitions) {
-    const result = appendTaskTransition(repo, {
-      task_id: taskId,
-      to_state,
-      run_id: runId,
-      claim_id: claimId,
-      task_spec_sha256: specHash,
-      reason: to_state === 'blocked' ? 'trajectory_blocked' : to_state === 'failed' ? 'trajectory_failed' : undefined
-    });
-    if (!result.ok && result.code !== 'terminal_task_cannot_transition') process.exit(1);
-  }
+  const result = recordTrajectory(repo, {
+    claimPath,
+    todoPath,
+    type,
+    runId,
+    payloadRaw
+  });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (!result.ok) process.exit(78);
 }

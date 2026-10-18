@@ -16,6 +16,22 @@ jobs:
       - name: Fetch approved phase-loop controller baseline
         run: git fetch --no-tags origin main:refs/remotes/origin/main
 
+      - name: Fail closed on implementation pull-request author
+        if: github.event_name == 'pull_request'
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          case "$PR_HEAD_REF" in
+            brownie-agent/*|phase-loop/*) ;;
+            *) exit 0 ;;
+          esac
+          if [ "$PR_AUTHOR" != "brownie-agent" ]; then
+            echo "Implementation pull-request author guard failed: expected brownie-agent, got $PR_AUTHOR" >&2
+            exit 1
+          fi
+          echo "Implementation pull-request author guard passed for $PR_HEAD_REF."
+
       - name: Fail closed on stale phase-loop controller source
         run: |
           node --test scripts/phase-loop-source-baseline-guard.test.mjs

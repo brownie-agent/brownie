@@ -141,6 +141,8 @@ assert_contains "$PHASE_LOOP" "phase-loop-todo-queue-integrity\\.mjs"
 assert_contains "$PHASE_LOOP" 'local guard_script="\$ROOT_DIR/scripts/phase-loop-source-baseline-guard\.mjs"'
 assert_contains "$PHASE_LOOP" 'node "\$guard_script" --repo "\$ROOT_DIR" --baseline-ref "\$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE"'
 assert_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_WORKSPACE_ROOT"'
+assert_contains "$PHASE_LOOP" "phase-loop-run-state\.mjs"
+assert_contains "$PHASE_LOOP" "refusing to leave status running"
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$ROOT_DIR"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_STATE_DIR"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$STATE_DIR"'
@@ -2256,19 +2258,23 @@ PHASE_LOOP_TODO="$no_eligible_split_workspace/.brownie/todo.md" \
 PHASE_LOOP_TODO_BREAKDOWN="$no_eligible_split_workspace/.brownie/todo-breakdown.md" \
 PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_MUTATE_TODO_AFTER_PROMPT=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/.brownie/todo-breakdown.md" "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/private/phase-loop/todo-replans" <<'PY'
+python3 - "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/.brownie/todo-breakdown.md" "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/private/phase-loop/todo-replans" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 todo = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 breakdown = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 status = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
 replan_dir = pathlib.Path(sys.argv[4])
+ledger_path = pathlib.Path(sys.argv[5])
 records = list(replan_dir.glob("*.json"))
+claim_archives = list(pathlib.Path(sys.argv[3]).parent.glob("todo-claims/completed-no-eligible-multitarget-split-*.json"))
 assert "- [x] E-20g-final-judgment-sync:" in todo, todo
 assert "- [ ] E-20g-final-judgment-sync-target-01: Patch only `docs/a.md`" in todo, todo
 assert "- [ ] E-20g-final-judgment-sync-target-02: Patch only `scripts/b.mjs`" in todo, todo
@@ -2283,6 +2289,24 @@ record_text = "\n".join(path.read_text(encoding="utf-8") for path in records)
 assert "deterministic_no_eligible_multitarget_split" in record_text, record_text
 assert '"record_type": "todo_replan"' in record_text, record_text
 assert '"parent_status": "superseded_by_children"' in record_text, record_text
+assert claim_archives, "missing completed no-eligible claim archive"
+archived_claim = json.loads(claim_archives[-1].read_text(encoding="utf-8"))
+selected_first = str(archived_claim["selected_todo"]).splitlines()[0]
+task_match = re.match(r"^\s*- \[ \]\s+([^:\s]+)", selected_first)
+assert task_match, archived_claim
+attempt_id = f"{task_match.group(1)}@{archived_claim['claim_id']}"
+ledger_events = []
+for line in ledger_path.read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get("kind") == "replan_transaction":
+        ledger_events.extend(record.get("events", []))
+    else:
+        ledger_events.append(record)
+terminal_events = [event for event in ledger_events if event.get("task_id") == attempt_id and event.get("to_state") in {"completed", "blocked", "failed", "replanned"}]
+assert terminal_events and terminal_events[-1]["to_state"] == "replanned", (attempt_id, ledger_events)
+assert not any(event.get("kind") == "unclaimed_trajectory" and event.get("trajectory_type") == "todo.replanned" for event in ledger_events), ledger_events
 PY
 
 repair_feedback_state="$(mktemp -d)"
@@ -2557,6 +2581,106 @@ assert "concrete_replacements" not in phase_loop, phase_loop
 assert "not selected_decomposition_active" in phase_loop, phase_loop
 assert "^\\s*Route:\\s*todo-decomposition\\.?\\s*$" in phase_loop, phase_loop
 PY
+
+# A controller-only ledger failure must terminalize the run.  In particular,
+# the task-ledger path is made a directory so the first append fails after the
+# claim has been created; this exercises the same downstream failure surface
+# that previously left status.json at `running`.
+ledger_failure_workspace="$(mktemp -d)"
+git -C "$ledger_failure_workspace" init -b main >/dev/null
+git -C "$ledger_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$ledger_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl"
+ledger_failure_state="$(mktemp -d)"
+ledger_failure_prompt="$(mktemp)"
+ledger_failure_todo="$(mktemp)"
+printf 'base prompt\n' > "$ledger_failure_prompt"
+printf -- '- [ ] L-01: task-ledger failure terminalization\n' > "$ledger_failure_todo"
+
+if PHASE_LOOP_STATE_DIR="$ledger_failure_state" \
+  PHASE_LOOP_PROMPT="$ledger_failure_prompt" \
+  PHASE_LOOP_TODO="$ledger_failure_todo" \
+  PHASE_LOOP_WORKSPACE_ROOT="$ledger_failure_workspace" \
+  BROWNIE_BIN="$fake_brownie_json" \
+  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null 2>/dev/null; then
+  echo "expected task-ledger append failure to fail run-once" >&2
+  exit 1
+fi
+python3 - "$ledger_failure_state/status.json" <<'PY'
+import json
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["status"] != "running", status
+assert status["status"] == "blocked", status
+assert status["exit_code"] == "78", status
+assert status["consecutive_failures"] >= 1, status
+assert "Task ledger failed" in status["detail"], status
+assert "stdout=" in status["detail"], status
+assert "stderr=" in status["detail"], status
+PY
+
+run_status_write_signal_regression() {
+  local signal_name="$1"
+  local expected_exit_code="$2"
+  local signal_state signal_prompt signal_todo signal_marker signal_run_pid signal_exit_code
+  signal_state="$(mktemp -d)"
+  signal_prompt="$(mktemp)"
+  signal_todo="$(mktemp)"
+  signal_marker="$signal_state/status-write.started"
+  printf 'base prompt\n' > "$signal_prompt"
+  printf -- '- [ ] S-01: signal during status write\n' > "$signal_todo"
+  PHASE_LOOP_STATE_DIR="$signal_state" \
+  PHASE_LOOP_PROMPT="$signal_prompt" \
+  PHASE_LOOP_TODO="$signal_todo" \
+  PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+  PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+  PHASE_LOOP_TEST_STATUS_WRITE_MARKER="$signal_marker" \
+  PHASE_LOOP_TEST_STATUS_WRITE_DELAY_SECONDS=2 \
+  BROWNIE_BIN="$fake_brownie_json" \
+  python3 -c 'import os,signal,sys; signal.signal(signal.SIGINT, signal.SIG_DFL); signal.signal(signal.SIGTERM, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])' "$PHASE_LOOP" run-once >/dev/null 2>/dev/null &
+  signal_run_pid="$!"
+  for _ in $(seq 1 40); do
+    if [ -f "$signal_marker" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [ ! -f "$signal_marker" ]; then
+    echo "status write test window was not reached for SIG$signal_name" >&2
+    kill -KILL "$signal_run_pid" 2>/dev/null || true
+    wait "$signal_run_pid" 2>/dev/null || true
+    exit 1
+  fi
+  kill -"$signal_name" "$signal_run_pid"
+  set +e
+  wait "$signal_run_pid"
+  signal_exit_code="$?"
+  set -e
+  if kill -0 "$signal_run_pid" 2>/dev/null; then
+    echo "physical process remained after deferred SIG$signal_name" >&2
+    exit 1
+  fi
+  if [ "$signal_exit_code" -ne "$expected_exit_code" ]; then
+    echo "expected deferred SIG$signal_name to exit $expected_exit_code, got $signal_exit_code" >&2
+    exit 1
+  fi
+  python3 - "$signal_state/status.json" "$expected_exit_code" <<'PY'
+import json
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["status"] == "blocked", status
+assert status["exit_code"] == sys.argv[2], status
+assert status["consecutive_failures"] >= 1, status
+assert "terminalized status before process exit" in status["detail"], status
+PY
+}
+
+# Signals delivered during the atomic status-write window must be deferred
+# until the replacement is visible, then terminalize the run instead of
+# leaving status.json at `running`.
+run_status_write_signal_regression TERM 143
+run_status_write_signal_regression INT 130
 
 assert_repository_state_unchanged
 echo "phase-loop claim smoke passed"

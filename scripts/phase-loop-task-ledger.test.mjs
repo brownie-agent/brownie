@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { appendTaskTransition, readTaskLedger, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
+import { appendTaskTransition, readTaskLedger, recordTrajectory, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
 
 test('task ledger enforces a terminal state machine', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
@@ -47,6 +47,161 @@ test('replan atomically records a terminal parent and executable queued children
   assert.equal(projection.get('T-5b').parent_task_id, 'T-5');
 });
 
+test('accepts only an exact duplicate replan transaction', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  appendTaskTransition(repo, { task_id: 'T-5x', to_state: 'queued' });
+  const children = [
+    { task_id: 'T-5xa', route: 'implementation', patch_targets: ['a.rs'], verification_commands: ['cargo test'], task_spec_sha256: 'child-a' },
+    { task_id: 'T-5xb', route: 'documentation', patch_targets: ['docs/a.md'], verification_commands: ['pnpm check'], task_spec_sha256: 'child-b' }
+  ];
+  const input = { task_id: 'T-5x', reason: 'over_broad', children, run_id: 'run-replan', claim_id: 'claim-replan', task_spec_sha256: 'parent-spec' };
+  assert.equal(replanTaskWithChildren(repo, input).ok, true);
+  const ledger = path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl');
+  const before = fs.readFileSync(ledger, 'utf8');
+  const duplicate = replanTaskWithChildren(repo, { ...input, at: 'later' });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.code, 'duplicate_replan');
+  assert.equal(duplicate.events.length, 3);
+  assert.equal(fs.readFileSync(ledger, 'utf8'), before);
+
+  const changedChild = replanTaskWithChildren(repo, {
+    ...input,
+    children: [{ ...children[0], patch_targets: ['different.rs'] }, children[1]]
+  });
+  assert.equal(changedChild.ok, false);
+  assert.equal(changedChild.code, 'replan_duplicate_mismatch');
+
+  for (const changed of [
+    { ...children[0], verification_commands: ['cargo test --locked'] },
+    { ...children[0], route: 'documentation' },
+    { ...children[0], task_spec_sha256: 'child-a-changed' }
+  ]) {
+    const mismatch = replanTaskWithChildren(repo, {
+      ...input,
+      children: [changed, children[1]]
+    });
+    assert.equal(mismatch.ok, false);
+    assert.equal(mismatch.code, 'replan_duplicate_mismatch');
+  }
+
+  const changedSet = replanTaskWithChildren(repo, {
+    ...input,
+    children: [children[0], { ...children[1], task_id: 'T-5xc' }]
+  });
+  assert.equal(changedSet.ok, false);
+  assert.equal(changedSet.code, 'replan_duplicate_mismatch');
+  assert.equal(fs.readFileSync(ledger, 'utf8'), before);
+});
+
+test('continues a replacement child claim on the queued child task id', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, [
+    '- [ ] P-1: broad parent task',
+    '  Route: todo-decomposition.',
+    '  Verification: run `pnpm check`.',
+    '',
+    '- [ ] C-1: replacement child task',
+    '  Route: implementation.',
+    '  Source TODO: P-1.',
+    '  Patch only `scripts/child.mjs`.',
+    '  Verification: run `node --check scripts/child.mjs`.',
+    ''
+  ].join('\n'));
+  const parentClaim = path.join(repo, 'parent-claim.json');
+  fs.writeFileSync(parentClaim, JSON.stringify({
+    claim_id: 'claim-parent',
+    selected_todo: '- [ ] P-1: broad parent task\n  Route: todo-decomposition.\n  Verification: run `pnpm check`.'
+  }));
+  assert.equal(recordTrajectory(repo, { claimPath: parentClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-parent' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: parentClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-parent' }).ok, true);
+  assert.equal(recordTrajectory(repo, {
+    claimPath: parentClaim,
+    todoPath: todo,
+    type: 'todo.replanned',
+    runId: 'run-parent',
+    payloadRaw: '{"reason":"split_parent"}'
+  }).ok, true);
+
+  const childClaim = path.join(repo, 'child-claim.json');
+  fs.writeFileSync(childClaim, JSON.stringify({
+    claim_id: 'claim-child',
+    selected_todo: '- [ ] C-1: replacement child task\n  Route: implementation.\n  Source TODO: P-1.\n  Patch only `scripts/child.mjs`.\n  Verification: run `node --check scripts/child.mjs`.'
+  }));
+  assert.equal(recordTrajectory(repo, { claimPath: childClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-child' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: childClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-child' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: childClaim, todoPath: todo, type: 'todo.completed', runId: 'run-child' }).ok, true);
+
+  const events = readTaskLedger(repo);
+  const childEvents = events.filter((event) => event.task_id === 'C-1');
+  assert.deepEqual(childEvents.map((event) => event.to_state), ['queued', 'claimed', 'running', 'completed']);
+  assert.equal(events.some((event) => event.task_id === 'C-1@claim-child'), false);
+  for (const event of childEvents.slice(1)) {
+    assert.equal(event.parent_task_id, 'P-1@claim-parent');
+    assert.equal(event.claim_id, 'claim-child');
+    assert.equal(event.run_id, 'run-child');
+  }
+  assert.equal(validateTaskLedger(events).ok, true);
+});
+
+test('starts a fresh attempt when a replacement child claim is stale', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, [
+    '- [ ] P-stale: broad parent task',
+    '  Route: todo-decomposition.',
+    '  Verification: run `pnpm check`.',
+    '',
+    '- [ ] C-stale: replacement child task',
+    '  Route: implementation.',
+    '  Source TODO: P-stale.',
+    '  Patch only `scripts/child.mjs`.',
+    '  Verification: run `node --check scripts/child.mjs`.',
+    ''
+  ].join('\n'));
+  const parentClaim = path.join(repo, 'parent-claim.json');
+  fs.writeFileSync(parentClaim, JSON.stringify({
+    claim_id: 'claim-parent-stale',
+    selected_todo: '- [ ] P-stale: broad parent task\n  Route: todo-decomposition.\n  Verification: run `pnpm check`.'
+  }));
+  recordTrajectory(repo, { claimPath: parentClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-parent-stale' });
+  recordTrajectory(repo, { claimPath: parentClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-parent-stale' });
+  recordTrajectory(repo, {
+    claimPath: parentClaim,
+    todoPath: todo,
+    type: 'todo.replanned',
+    runId: 'run-parent-stale',
+    payloadRaw: '{"reason":"split_parent"}'
+  });
+
+  const staleClaim = path.join(repo, 'stale-child-claim.json');
+  fs.writeFileSync(staleClaim, JSON.stringify({
+    claim_id: 'claim-child-stale',
+    selected_todo: '- [ ] C-stale: replacement child task\n  Route: implementation.\n  Source TODO: P-stale.\n  Patch only `scripts/child.mjs`.\n  Verification: run `node --check scripts/child.mjs`.'
+  }));
+  recordTrajectory(repo, { claimPath: staleClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-child-stale' });
+  recordTrajectory(repo, { claimPath: staleClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-child-stale' });
+
+  const freshClaim = path.join(repo, 'fresh-child-claim.json');
+  fs.writeFileSync(freshClaim, JSON.stringify({
+    claim_id: 'claim-child-fresh',
+    selected_todo: '- [ ] C-stale: replacement child task\n  Route: implementation.\n  Source TODO: P-stale.\n  Patch only `scripts/child.mjs`.\n  Verification: run `node --check scripts/child.mjs`.'
+  }));
+  assert.equal(recordTrajectory(repo, { claimPath: freshClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-child-fresh' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: freshClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-child-fresh' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: freshClaim, todoPath: todo, type: 'todo.completed', runId: 'run-child-fresh' }).ok, true);
+
+  const events = readTaskLedger(repo);
+  const rawChild = events.filter((event) => event.task_id === 'C-stale');
+  const freshChild = events.filter((event) => event.task_id === 'C-stale@claim-child-fresh');
+  assert.equal(rawChild.at(-1).to_state, 'failed');
+  assert.deepEqual(freshChild.map((event) => event.to_state), ['queued', 'claimed', 'running', 'completed']);
+  assert.equal(freshChild.at(-1).parent_task_id, 'P-stale@claim-parent-stale');
+  assert.equal(validateTaskLedger(events).ok, true);
+});
+
 test('replan leaves the ledger unchanged when a child fails the execution gate', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   appendTaskTransition(repo, { task_id: 'T-6', to_state: 'queued' });
@@ -80,6 +235,132 @@ test('records repeated claims as separate immutable task attempts', () => {
   const projection = taskProjection(readTaskLedger(repo));
   assert.equal(projection.get(taskAttemptId('T-8', 'claim-one')).to_state, 'claimed');
   assert.equal(projection.get(taskAttemptId('T-8', 'claim-two')).to_state, 'claimed');
+});
+
+test('keeps duplicate routed trajectory events nonfatal while preserving the valid task state', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const claim = path.join(repo, 'claim.json');
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: 'claim-duplicate-route', selected_todo: '- [ ] T-duplicate-route: bounded task' }));
+  assert.equal(recordTrajectory(repo, { claimPath: claim, type: 'todo.claimed', runId: 'run-duplicate' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-duplicate' }).ok, true);
+  const duplicate = recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-duplicate' });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.code, 'duplicate_trajectory');
+  assert.equal(taskProjection(readTaskLedger(repo)).get(taskAttemptId('T-duplicate-route', 'claim-duplicate-route')).to_state, 'running');
+});
+
+test('treats a same-claim continuation route as a duplicate across run ids', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const claim = path.join(repo, 'claim.json');
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: 'claim-continuation', selected_todo: '- [ ] T-continuation: bounded task' }));
+  assert.equal(recordTrajectory(repo, { claimPath: claim, type: 'todo.claimed', runId: 'run-first' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-first' }).ok, true);
+  const duplicate = recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-continuation' });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.code, 'duplicate_trajectory');
+  assert.equal(taskProjection(readTaskLedger(repo)).get(taskAttemptId('T-continuation', 'claim-continuation')).to_state, 'running');
+});
+
+test('fails closed on an out-of-order completion after the ledger was truncated', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const claim = path.join(repo, 'claim.json');
+  const ledger = path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl');
+  fs.mkdirSync(path.dirname(ledger), { recursive: true });
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: 'claim-truncated', selected_todo: '- [ ] T-truncated: bounded task' }));
+  const result = recordTrajectory(repo, { claimPath: claim, type: 'todo.completed', runId: 'run-truncated' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'ledger_transition_rejected');
+  assert.equal(result.rejected.code, 'task_must_start_queued');
+  assert.equal(fs.existsSync(ledger), false);
+});
+
+test('fails closed on a non-duplicate out-of-order routed transition', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const claim = path.join(repo, 'claim.json');
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: 'claim-out-of-order', selected_todo: '- [ ] T-out-of-order: bounded task' }));
+  assert.equal(appendTaskTransition(repo, { task_id: taskAttemptId('T-out-of-order', 'claim-out-of-order'), to_state: 'queued' }).ok, true);
+  const result = recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-out-of-order' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'ledger_transition_rejected');
+  assert.equal(result.rejected.code, 'invalid_task_transition');
+  assert.equal(taskProjection(readTaskLedger(repo)).get(taskAttemptId('T-out-of-order', 'claim-out-of-order')).to_state, 'queued');
+});
+
+test('records an absent claim as an explicit empty task-ledger trajectory without recreating a claim', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const result = recordTrajectory(repo, {
+    claimPath: path.join(repo, 'missing-claim.json'),
+    todoPath: path.join(repo, '.brownie/todo.md'),
+    type: 'todo.blocked',
+    runId: 'run-absent',
+    at: '2026-10-18T00:00:00.000Z'
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'unclaimed_empty');
+  assert.equal(fs.existsSync(path.join(repo, 'missing-claim.json')), false);
+  const raw = fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl'), 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(raw[0], {
+    schema_version: 1,
+    kind: 'unclaimed_trajectory',
+    event_id: raw[0].event_id,
+    task_id: null,
+    claim_id: null,
+    trajectory_type: 'todo.blocked',
+    run_id: 'run-absent',
+    claim_path: path.join(repo, 'missing-claim.json'),
+    claim_state: 'absent',
+    error_code: 'claim_absent',
+    error_message: raw[0].error_message,
+    at: '2026-10-18T00:00:00.000Z'
+  });
+  assert.deepEqual(readTaskLedger(repo), []);
+  assert.equal(appendTaskTransition(repo, { task_id: 'T-after-absent', to_state: 'queued' }).ok, true);
+});
+
+test('fails malformed claims without mutating TODO state or inventing a task attempt', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const claim = path.join(repo, 'claim.json');
+  fs.writeFileSync(claim, '{not-json');
+  const result = recordTrajectory(repo, {
+    claimPath: claim,
+    type: 'todo.claimed',
+    runId: 'run-malformed'
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'claim_malformed');
+  assert.deepEqual(readTaskLedger(repo), []);
+  assert.match(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl'), 'utf8'), /"claim_state":"malformed"/u);
+});
+
+test('treats claim deletion during the read as an unclaimed race, not as a recreated claim', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const result = recordTrajectory(repo, {
+    claimPath: path.join(repo, 'claim.json'),
+    type: 'todo.completed',
+    runId: 'run-race',
+    readClaim: () => { const error = new Error('claim deleted during read'); error.code = 'ENOENT'; throw error; }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'unclaimed_empty');
+  assert.equal(fs.existsSync(path.join(repo, 'claim.json')), false);
+  assert.deepEqual(readTaskLedger(repo), []);
+});
+
+test('surfaces downstream task-ledger append failures to the controller', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const ledger = path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl');
+  fs.mkdirSync(ledger, { recursive: true });
+  const claim = path.join(repo, 'claim.json');
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: 'claim-ledger-error', selected_todo: '- [ ] T-ledger-error: bounded task' }));
+  const result = recordTrajectory(repo, {
+    claimPath: claim,
+    type: 'todo.claimed',
+    runId: 'run-ledger-error'
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'ledger_append_failed');
+  assert.match(result.error, /directory|EISDIR|is a directory/iu);
 });
 
 test('keeps a repair-only replan nonterminal when replacement children are absent', () => {
