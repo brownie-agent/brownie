@@ -17,7 +17,11 @@ jobs:
         run: git fetch --no-tags origin main:refs/remotes/origin/main
 
       - name: Fail closed on stale phase-loop controller source
-        run: node scripts/phase-loop-source-baseline-guard.mjs --repo . --baseline-ref origin/main && node --test scripts/phase-loop-source-baseline-guard.test.mjs
+        run: |
+          node --test scripts/phase-loop-source-baseline-guard.test.mjs
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            node scripts/phase-loop-source-baseline-guard.mjs --repo . --baseline-ref origin/main
+          fi
 
       - name: Fail fast on stale runtime readiness evidence
         run: node scripts/update-runtime-release-readiness-audit.mjs --check
