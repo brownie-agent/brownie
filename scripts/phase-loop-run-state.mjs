@@ -94,10 +94,11 @@ function readOwner(ownerFile) {
   return readJson(ownerFile) || null;
 }
 
-function ownerMatches({ status, pid, owner, ownerPid, ownerGeneration }) {
+function ownerMatches({ status, pid, owner, ownerPid, ownerGeneration, rootDir, ownerRootDir }) {
   if (!status || !owner || !pid) return false;
   if (status.supervisor_pid !== pid || owner.pid !== pid) return false;
   if (!status.supervisor_generation || status.supervisor_generation !== owner.generation) return false;
+  if (!rootDir || !ownerRootDir || rootDir !== ownerRootDir) return false;
   if (Number.isInteger(ownerPid) && ownerPid !== pid) return false;
   if (ownerGeneration && ownerGeneration !== owner.generation) return false;
   return true;
@@ -118,11 +119,34 @@ export function inspectSupervisorOwnership({
   const pid = readPid(pidFile);
   const owner = readOwner(ownerFile);
   const livePid = pid && processExists(pid);
-  const matchingOwner = ownerMatches({ status, pid, owner, ownerPid, ownerGeneration });
+  const canonicalizeRoot = (value) => {
+    if (!value) return '';
+    try {
+      return fs.realpathSync.native(value);
+    } catch {
+      return path.resolve(value);
+    }
+  };
+  const canonicalRootDir = canonicalizeRoot(rootDir);
+  const canonicalOwnerRootDir = canonicalizeRoot(owner?.root_dir);
+  const matchingOwner = ownerMatches({
+    status,
+    pid,
+    owner,
+    ownerPid,
+    ownerGeneration,
+    rootDir: canonicalRootDir,
+    ownerRootDir: canonicalOwnerRootDir
+  });
   const command = livePid
     ? (getProcessCommand === processCommand ? processCommand(pid) : getProcessCommand(pid))
     : '';
-  const commandLooksLikeSupervisor = /phase-loop\.sh.*\bsupervise\b/u.test(command);
+  const commandScriptPath = canonicalRootDir === '/' ? '/phase-loop.sh' : `${canonicalRootDir}/phase-loop.sh`;
+  const commandLooksLikeSupervisor = Boolean(
+    canonicalRootDir
+    && command.includes(commandScriptPath)
+    && /phase-loop\.sh.*\bsupervise\b/u.test(command)
+  );
   const supervisors = [...new Set(listSupervisors().filter((candidate) => Number.isInteger(candidate) && candidate > 1))];
   const liveSupervisors = supervisors.filter((candidate) => processExists(candidate));
   return {

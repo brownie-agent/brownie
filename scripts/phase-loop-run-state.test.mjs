@@ -52,7 +52,7 @@ test('refuses to normalize a status whose PID is still alive', () => {
   fs.writeFileSync(statusPath, JSON.stringify({ status: 'running', run_id: 'live-run', pid_file: pidPath, supervisor_pid: 1234, supervisor_generation: 'generation-1' }));
   fs.writeFileSync(pidPath, '1234');
   writeOwner(path.join(stateDir, 'phase-loop-owner.json'));
-  const result = normalizeStaleRunningStatus({ stateDir, pidFile: pidPath, processExists: () => true, getProcessCommand: () => 'bash /repo/phase-loop.sh supervise', listSupervisors: () => [1234] });
+  const result = normalizeStaleRunningStatus({ stateDir, pidFile: pidPath, rootDir: '/repo', processExists: () => true, getProcessCommand: () => 'bash /repo/phase-loop.sh supervise', listSupervisors: () => [1234] });
   assert.deepEqual(result, { ok: false, code: 'run_already_running', pid: 1234, run_id: 'live-run' });
   assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
   assert.equal(fs.existsSync(path.join(stateDir, 'run-state-recovery.jsonl')), false);
@@ -74,6 +74,7 @@ test('allows the owning supervisor to resume an authorized continuation', () => 
   const result = normalizeStaleRunningStatus({
     stateDir,
     pidFile: pidPath,
+    rootDir: '/repo',
     ownerPid: 1234,
     processExists: () => true,
     getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
@@ -105,6 +106,7 @@ test('fails closed when a different live process owns the continuation state', (
   const result = normalizeStaleRunningStatus({
     stateDir,
     pidFile: pidPath,
+    rootDir: '/repo',
     ownerPid: 1234,
     processExists: () => true,
     getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
@@ -156,9 +158,34 @@ test('fails closed when status, pid file, and owner generation disagree', () => 
   const result = normalizeStaleRunningStatus({
     stateDir,
     pidFile: pidPath,
+    rootDir: '/repo',
     processExists: () => true,
     getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
     listSupervisors: () => [5678]
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'supervisor_ownership_conflict');
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+});
+
+test('fails closed when a live supervisor command belongs to another root', () => {
+  const { stateDir, statusPath, pidPath, ownerPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'foreign-root',
+    pid_file: pidPath,
+    supervisor_pid: 1234,
+    supervisor_generation: 'generation-1'
+  }));
+  fs.writeFileSync(pidPath, '1234');
+  writeOwner(ownerPath);
+  const result = normalizeStaleRunningStatus({
+    stateDir,
+    pidFile: pidPath,
+    rootDir: '/repo',
+    processExists: () => true,
+    getProcessCommand: () => 'bash /repo-evil/phase-loop.sh supervise',
+    listSupervisors: () => [1234]
   });
   assert.equal(result.ok, false);
   assert.equal(result.code, 'supervisor_ownership_conflict');
@@ -182,6 +209,7 @@ test('keeps an authorized continuation within the watchdog deadline', () => {
     stateDir,
     pidFile: pidPath,
     ownerFile: ownerPath,
+    rootDir: '/repo',
     now: '2026-10-18T01:10:00.000Z',
     maxAgeSeconds: 900,
     processExists: () => true,
@@ -209,6 +237,7 @@ test('audits and terminalizes an expired continuation for redelegation', () => {
     stateDir,
     pidFile: pidPath,
     ownerFile: ownerPath,
+    rootDir: '/repo',
     now: '2026-10-18T01:20:01.000Z',
     maxAgeSeconds: 900,
     runStamp: 'watchdog-run',

@@ -14073,10 +14073,6 @@ normalize_stale_running_before_start() {
 }
 
 start() {
-  if is_running; then
-    echo "phase-loop already running: pid $(cat "$PID_FILE")"
-    exit 0
-  fi
   local watchdog_status
   if phase_loop_watch_continuation_liveness "startup-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"; then
     watchdog_status=0
@@ -14086,6 +14082,10 @@ start() {
   if [ "$watchdog_status" -ne 0 ]; then
     printf '%s\n' "Continuation watchdog refused startup: ownership could not be proven." >&2
     exit "$watchdog_status"
+  fi
+  if is_running; then
+    echo "phase-loop already running: pid $(cat "$PID_FILE")"
+    exit 0
   fi
   normalize_stale_running_before_start
   local startup_normalization_status=$?
