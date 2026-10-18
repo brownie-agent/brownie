@@ -62,7 +62,7 @@ export function normalizeStaleRunningStatus({
   runStamp,
   ownerPid = null,
   now = new Date().toISOString(),
-  processExists = processIsAlive
+  processExists = (pid) => processIsAlive(pid)
 }) {
   const statusPath = path.join(stateDir, 'status.json');
   const auditPath = path.join(stateDir, 'run-state-recovery.jsonl');
