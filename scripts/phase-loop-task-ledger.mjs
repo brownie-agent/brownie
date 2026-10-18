@@ -76,11 +76,10 @@ export function appendTaskTransition(repoRoot, input) {
   const toState = input.to_state ?? input.toState;
   const verdict = validateTransition({ previous: current, toState, ...input });
   if (!verdict.ok) {
-    const duplicate = input.run_id != null && input.claim_id != null && events.find((event) => (
+    const duplicate = input.claim_id != null && events.find((event) => (
       event?.task_id === input.task_id
       && event?.to_state === toState
-      && (event?.run_id ?? null) === (input.run_id ?? null)
-      && (event?.claim_id ?? null) === (input.claim_id ?? null)
+      && event?.claim_id === input.claim_id
       && (event?.task_spec_sha256 ?? null) === (input.task_spec_sha256 ?? null)
       && (event?.reason ?? null) === (input.reason ?? null)
     ));

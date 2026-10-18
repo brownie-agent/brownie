@@ -94,6 +94,18 @@ test('keeps duplicate routed trajectory events nonfatal while preserving the val
   assert.equal(taskProjection(readTaskLedger(repo)).get(taskAttemptId('T-duplicate-route', 'claim-duplicate-route')).to_state, 'running');
 });
 
+test('treats a same-claim continuation route as a duplicate across run ids', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const claim = path.join(repo, 'claim.json');
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: 'claim-continuation', selected_todo: '- [ ] T-continuation: bounded task' }));
+  assert.equal(recordTrajectory(repo, { claimPath: claim, type: 'todo.claimed', runId: 'run-first' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-first' }).ok, true);
+  const duplicate = recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-continuation' });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.code, 'duplicate_trajectory');
+  assert.equal(taskProjection(readTaskLedger(repo)).get(taskAttemptId('T-continuation', 'claim-continuation')).to_state, 'running');
+});
+
 test('fails closed on an out-of-order completion after the ledger was truncated', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   const claim = path.join(repo, 'claim.json');
