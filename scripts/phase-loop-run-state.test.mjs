@@ -3,12 +3,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { normalizeStaleRunningStatus, rollbackStaleRunningRecovery } from './phase-loop-run-state.mjs';
+import { inspectSupervisorOwnership, normalizeStaleRunningStatus, rollbackStaleRunningRecovery, watchdogContinuationLiveness } from './phase-loop-run-state.mjs';
 
 function fixture() {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-run-state-'));
   fs.mkdirSync(stateDir, { recursive: true });
-  return { stateDir, statusPath: path.join(stateDir, 'status.json'), pidPath: path.join(stateDir, 'phase-loop.pid') };
+  return { stateDir, statusPath: path.join(stateDir, 'status.json'), pidPath: path.join(stateDir, 'phase-loop.pid'), ownerPath: path.join(stateDir, 'phase-loop-owner.json') };
+}
+
+function writeOwner(ownerPath, pid = 1234, generation = 'generation-1') {
+  fs.writeFileSync(ownerPath, JSON.stringify({ schema_version: 1, pid, generation, root_dir: '/repo' }));
 }
 
 test('normalizes a stale running status with an atomic replacement and two-phase audit', () => {
@@ -45,9 +49,10 @@ test('normalizes a stale running status with an atomic replacement and two-phase
 
 test('refuses to normalize a status whose PID is still alive', () => {
   const { stateDir, statusPath, pidPath } = fixture();
-  fs.writeFileSync(statusPath, JSON.stringify({ status: 'running', run_id: 'live-run', pid_file: pidPath }));
+  fs.writeFileSync(statusPath, JSON.stringify({ status: 'running', run_id: 'live-run', pid_file: pidPath, supervisor_pid: 1234, supervisor_generation: 'generation-1' }));
   fs.writeFileSync(pidPath, '1234');
-  const result = normalizeStaleRunningStatus({ stateDir, pidFile: pidPath, processExists: () => true });
+  writeOwner(path.join(stateDir, 'phase-loop-owner.json'));
+  const result = normalizeStaleRunningStatus({ stateDir, pidFile: pidPath, processExists: () => true, getProcessCommand: () => 'bash /repo/phase-loop.sh supervise', listSupervisors: () => [1234] });
   assert.deepEqual(result, { ok: false, code: 'run_already_running', pid: 1234, run_id: 'live-run' });
   assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
   assert.equal(fs.existsSync(path.join(stateDir, 'run-state-recovery.jsonl')), false);
@@ -60,21 +65,27 @@ test('allows the owning supervisor to resume an authorized continuation', () => 
     run_id: 'continuation-run',
     pid_file: pidPath,
     continuation_required: true,
-    controller_action: 'resume'
+    controller_action: 'resume',
+    supervisor_pid: 1234,
+    supervisor_generation: 'generation-1'
   }));
   fs.writeFileSync(pidPath, '1234');
+  writeOwner(path.join(stateDir, 'phase-loop-owner.json'));
   const result = normalizeStaleRunningStatus({
     stateDir,
     pidFile: pidPath,
     ownerPid: 1234,
-    processExists: () => true
+    processExists: () => true,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    listSupervisors: () => [1234]
   });
   assert.deepEqual(result, {
     ok: true,
     normalized: false,
     reason: 'owned_continuation_resume',
     pid: 1234,
-    run_id: 'continuation-run'
+    run_id: 'continuation-run',
+    generation: 'generation-1'
   });
   assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
   assert.equal(fs.existsSync(path.join(stateDir, 'run-state-recovery.jsonl')), false);
@@ -90,13 +101,19 @@ test('fails closed when a different live process owns the continuation state', (
     controller_action: 'resume'
   }));
   fs.writeFileSync(pidPath, '5678');
+  fs.writeFileSync(path.join(stateDir, 'phase-loop-owner.json'), JSON.stringify({ schema_version: 1, pid: 5678, generation: 'generation-1', root_dir: '/repo' }));
   const result = normalizeStaleRunningStatus({
     stateDir,
     pidFile: pidPath,
     ownerPid: 1234,
-    processExists: () => true
+    processExists: () => true,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    listSupervisors: () => [5678]
   });
-  assert.deepEqual(result, { ok: false, code: 'run_already_running', pid: 5678, run_id: 'competing-run' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'supervisor_ownership_conflict');
+  assert.equal(result.pid, 5678);
+  assert.equal(result.run_id, 'competing-run');
 });
 
 test('leaves non-running status untouched', () => {
@@ -125,6 +142,91 @@ test('supports guarded rollback of the latest recovery for audit and operator co
   assert.match(fs.readFileSync(path.join(stateDir, 'run-state-recovery.jsonl'), 'utf8'), /"phase":"rolled_back"/u);
 });
 
+test('fails closed when status, pid file, and owner generation disagree', () => {
+  const { stateDir, statusPath, pidPath, ownerPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'generation-mismatch',
+    pid_file: pidPath,
+    supervisor_pid: 1234,
+    supervisor_generation: 'status-generation'
+  }));
+  fs.writeFileSync(pidPath, '5678');
+  writeOwner(ownerPath, 5678, 'owner-generation');
+  const result = normalizeStaleRunningStatus({
+    stateDir,
+    pidFile: pidPath,
+    processExists: () => true,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    listSupervisors: () => [5678]
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'supervisor_ownership_conflict');
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+});
+
+test('keeps an authorized continuation within the watchdog deadline', () => {
+  const { stateDir, statusPath, pidPath, ownerPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'continuation-fresh',
+    updated_at: '2026-10-18T01:00:00.000Z',
+    continuation_required: true,
+    controller_action: 'resume',
+    supervisor_pid: 1234,
+    supervisor_generation: 'generation-1'
+  }));
+  fs.writeFileSync(pidPath, '1234');
+  writeOwner(ownerPath);
+  const result = watchdogContinuationLiveness({
+    stateDir,
+    pidFile: pidPath,
+    ownerFile: ownerPath,
+    now: '2026-10-18T01:10:00.000Z',
+    maxAgeSeconds: 900,
+    processExists: () => true,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    listSupervisors: () => [1234]
+  });
+  assert.equal(result.expired, false);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+});
+
+test('audits and terminalizes an expired continuation for redelegation', () => {
+  const { stateDir, statusPath, pidPath, ownerPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'continuation-stale',
+    updated_at: '2026-10-18T01:00:00.000Z',
+    continuation_required: true,
+    controller_action: 'resume',
+    supervisor_pid: 1234,
+    supervisor_generation: 'generation-1'
+  }));
+  fs.writeFileSync(pidPath, '1234');
+  writeOwner(ownerPath);
+  const result = watchdogContinuationLiveness({
+    stateDir,
+    pidFile: pidPath,
+    ownerFile: ownerPath,
+    now: '2026-10-18T01:20:01.000Z',
+    maxAgeSeconds: 900,
+    runStamp: 'watchdog-run',
+    processExists: () => true,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    listSupervisors: () => [1234]
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.redelegate, true);
+  const replacement = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+  assert.equal(replacement.status, 'blocked');
+  assert.equal(replacement.continuation_required, false);
+  assert.equal(replacement.stop_reason, 'continuation_watchdog_expired');
+  const audit = fs.readFileSync(path.join(stateDir, 'run-state-recovery.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(audit.map((record) => record.phase), ['prepared', 'applied']);
+  assert.equal(audit[0].kind, 'phase_loop_continuation_watchdog');
+});
+
 test('run-once installs exit and signal terminalization hooks after entering running state', () => {
   const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
   const controller = fs.readFileSync(path.join(repoRoot, 'phase-loop.sh'), 'utf8');
@@ -140,4 +242,9 @@ test('run-once installs exit and signal terminalization hooks after entering run
   assert.match(controller, /mv "\$tmp_status" "\$STATUS_FILE"[\s\S]*PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0[\s\S]*if \[ "\$\{PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0\}"/u);
   assert.match(controller, /PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0[\s\S]*if \[ -n "\$force_status_exit_code" \]; then\n    exit "\$force_status_exit_code"/u);
   assert.match(controller, /normalize_stale_running_before_start[\s\S]*write_status "starting"/u);
+  assert.match(controller, /SUPERVISOR_OWNER_FILE=/u);
+  assert.match(controller, /write_supervisor_owner/gu);
+  assert.match(controller, /phase_loop_watch_continuation_liveness/gu);
+  assert.match(controller, /PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS/u);
+  assert.match(controller, /--owner-generation/u);
 });

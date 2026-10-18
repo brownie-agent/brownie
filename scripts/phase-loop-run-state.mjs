@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -56,13 +57,97 @@ function processIsAlive(pid, kill = process.kill) {
   }
 }
 
+function processCommand(pid) {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function liveSupervisorPids(rootDir) {
+  let output = '';
+  try {
+    output = execFileSync('ps', ['-axo', 'pid=', '-o', 'command='], { encoding: 'utf8' });
+  } catch {
+    return [];
+  }
+  return output.split('\n').flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(.*)$/u);
+    if (!match || !match[2].includes('phase-loop.sh') || !match[2].includes(' supervise')) return [];
+    if (rootDir && !match[2].includes(rootDir)) return [];
+    return [Number.parseInt(match[1], 10)];
+  });
+}
+
+function readPid(file) {
+  try {
+    const pid = Number.parseInt(fs.readFileSync(file, 'utf8').trim(), 10);
+    return Number.isInteger(pid) && pid > 1 ? pid : null;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function readOwner(ownerFile) {
+  return readJson(ownerFile) || null;
+}
+
+function ownerMatches({ status, pid, owner, ownerPid, ownerGeneration }) {
+  if (!status || !owner || !pid) return false;
+  if (status.supervisor_pid !== pid || owner.pid !== pid) return false;
+  if (!status.supervisor_generation || status.supervisor_generation !== owner.generation) return false;
+  if (Number.isInteger(ownerPid) && ownerPid !== pid) return false;
+  if (ownerGeneration && ownerGeneration !== owner.generation) return false;
+  return true;
+}
+
+export function inspectSupervisorOwnership({
+  stateDir,
+  pidFile = path.join(stateDir, 'phase-loop.pid'),
+  ownerFile = path.join(stateDir, 'phase-loop-owner.json'),
+  rootDir = '',
+  ownerPid = null,
+  ownerGeneration = null,
+  processExists = (pid) => processIsAlive(pid),
+  getProcessCommand = processCommand,
+  listSupervisors = () => liveSupervisorPids(rootDir)
+}) {
+  const status = readJson(path.join(stateDir, 'status.json'));
+  const pid = readPid(pidFile);
+  const owner = readOwner(ownerFile);
+  const livePid = pid && processExists(pid);
+  const matchingOwner = ownerMatches({ status, pid, owner, ownerPid, ownerGeneration });
+  const command = livePid ? getProcessCommand(pid) : '';
+  const commandLooksLikeSupervisor = /phase-loop\.sh.*\bsupervise\b/u.test(command);
+  const supervisors = [...new Set(listSupervisors().filter((candidate) => Number.isInteger(candidate) && candidate > 1))];
+  const liveSupervisors = supervisors.filter((candidate) => processExists(candidate));
+  return {
+    status,
+    pid,
+    owner,
+    live_pid: livePid ? pid : null,
+    matching_owner: matchingOwner,
+    command,
+    command_looks_like_supervisor: commandLooksLikeSupervisor,
+    live_supervisors: liveSupervisors,
+    ownership_ok: Boolean(livePid && matchingOwner && commandLooksLikeSupervisor)
+  };
+}
+
 export function normalizeStaleRunningStatus({
   stateDir,
   pidFile = path.join(stateDir, 'phase-loop.pid'),
   runStamp,
   ownerPid = null,
+  ownerGeneration = null,
+  ownerFile = path.join(stateDir, 'phase-loop-owner.json'),
+  rootDir = '',
   now = new Date().toISOString(),
-  processExists = (pid) => processIsAlive(pid)
+  processExists = (pid) => processIsAlive(pid),
+  getProcessCommand = processCommand,
+  listSupervisors = () => liveSupervisorPids(rootDir)
 }) {
   const statusPath = path.join(stateDir, 'status.json');
   const auditPath = path.join(stateDir, 'run-state-recovery.jsonl');
@@ -73,20 +158,42 @@ export function normalizeStaleRunningStatus({
   const referencedPidFile = status.pid_file || pidFile;
   let pid = null;
   try {
-    pid = Number.parseInt(fs.readFileSync(referencedPidFile, 'utf8').trim(), 10);
+    pid = readPid(referencedPidFile);
   } catch (error) {
     if (error?.code !== 'ENOENT') return { ok: false, code: 'pid_read_failed', error: error.message };
   }
-  if (processExists(pid)) {
+  const ownership = inspectSupervisorOwnership({
+    stateDir,
+    pidFile: referencedPidFile,
+    ownerFile,
+    rootDir,
+    ownerPid,
+    ownerGeneration,
+    processExists,
+    getProcessCommand,
+    listSupervisors
+  });
+  if (ownership.ownership_ok) {
     if (
-      Number.isInteger(ownerPid)
-      && pid === ownerPid
-      && status.continuation_required === true
+      status.continuation_required === true
       && status.controller_action === 'resume'
     ) {
-      return { ok: true, normalized: false, reason: 'owned_continuation_resume', pid, run_id: status.run_id ?? null };
+      return { ok: true, normalized: false, reason: 'owned_continuation_resume', pid, run_id: status.run_id ?? null, generation: ownership.owner.generation };
     }
     return { ok: false, code: 'run_already_running', pid, run_id: status.run_id ?? null };
+  }
+  if (ownership.live_supervisors.length > 0 || ownership.live_pid) {
+    return {
+      ok: false,
+      code: 'supervisor_ownership_conflict',
+      pid,
+      run_id: status.run_id ?? null,
+      status_pid: status.supervisor_pid ?? null,
+      status_generation: status.supervisor_generation ?? null,
+      owner_pid: ownership.owner?.pid ?? null,
+      owner_generation: ownership.owner?.generation ?? null,
+      live_supervisors: ownership.live_supervisors
+    };
   }
 
   const recoveryId = crypto.randomUUID();
@@ -157,7 +264,94 @@ export function rollbackStaleRunningRecovery({ stateDir, recoveryId, now = new D
   return { ok: true, rolled_back: true, restored_status: restored };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname) && ['normalize-stale-running', 'rollback-stale-running'].includes(process.argv[2])) {
+export function watchdogContinuationLiveness({
+  stateDir,
+  pidFile = path.join(stateDir, 'phase-loop.pid'),
+  ownerFile = path.join(stateDir, 'phase-loop-owner.json'),
+  rootDir = '',
+  maxAgeSeconds = 900,
+  now = new Date().toISOString(),
+  runStamp = null,
+  processExists = (pid) => processIsAlive(pid),
+  getProcessCommand = processCommand,
+  listSupervisors = () => liveSupervisorPids(rootDir)
+}) {
+  const statusPath = path.join(stateDir, 'status.json');
+  const auditPath = path.join(stateDir, 'run-state-recovery.jsonl');
+  const status = readJson(statusPath);
+  if (!status || status.continuation_required !== true || status.controller_action !== 'resume') {
+    return { ok: true, expired: false, reason: 'continuation_not_pending' };
+  }
+  const updatedAt = Date.parse(status.updated_at || '');
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(updatedAt) || !Number.isFinite(nowMs)) {
+    return { ok: false, code: 'continuation_timestamp_invalid', run_id: status.run_id ?? null };
+  }
+  const ageSeconds = Math.max(0, Math.floor((nowMs - updatedAt) / 1000));
+  if (ageSeconds < Number(maxAgeSeconds)) {
+    return { ok: true, expired: false, age_seconds: ageSeconds, reason: 'continuation_within_deadline' };
+  }
+  const ownership = inspectSupervisorOwnership({
+    stateDir,
+    pidFile,
+    ownerFile,
+    rootDir,
+    processExists,
+    getProcessCommand,
+    listSupervisors
+  });
+  if (!ownership.matching_owner
+    || (ownership.live_pid && !ownership.command_looks_like_supervisor)
+    || ownership.live_supervisors.some((pid) => pid !== ownership.pid)) {
+    return {
+      ok: false,
+      code: 'continuation_ownership_unproven',
+      age_seconds: ageSeconds,
+      run_id: status.run_id ?? null,
+      live_supervisors: ownership.live_supervisors,
+      pid: ownership.pid,
+      status_generation: status.supervisor_generation ?? null,
+      owner_generation: ownership.owner?.generation ?? null
+    };
+  }
+  const recoveryId = crypto.randomUUID();
+  const previous = { ...status };
+  const replacement = {
+    ...status,
+    status: 'blocked',
+    detail: `Continuation resume watchdog expired after ${ageSeconds}s; terminalized for audited redelegation. recovery_id=${recoveryId}`,
+    exit_code: '78',
+    continuation_required: false,
+    controller_action: 'stop',
+    stop_class: 'terminal_failure',
+    stop_reason: 'continuation_watchdog_expired',
+    recovery_id: recoveryId,
+    recovery_audit: auditPath,
+    updated_at: now
+  };
+  const prepared = {
+    schema_version: 1,
+    kind: 'phase_loop_continuation_watchdog',
+    recovery_id: recoveryId,
+    phase: 'prepared',
+    reason: 'continuation_watchdog_expired',
+    previous_status: previous,
+    replacement_status: replacement,
+    age_seconds: ageSeconds,
+    requested_run_stamp: runStamp,
+    at: now
+  };
+  try {
+    appendJsonLine(auditPath, prepared);
+    writeJsonAtomically(statusPath, replacement);
+    appendJsonLine(auditPath, { ...prepared, phase: 'applied', applied_at: now });
+  } catch (error) {
+    return { ok: false, code: 'continuation_watchdog_apply_failed', recovery_id: recoveryId, error: error.message };
+  }
+  return { ok: true, expired: true, redelegate: true, recovery_id: recoveryId, age_seconds: ageSeconds, owner_pid: ownership.pid, run_id: status.run_id ?? null };
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname) && ['normalize-stale-running', 'rollback-stale-running', 'watch-continuation'].includes(process.argv[2])) {
   const args = new Map(process.argv.slice(3).reduce((pairs, value, index, values) => (
     value.startsWith('--') ? [...pairs, [value.slice(2), values[index + 1]]] : pairs
   ), []));
@@ -165,12 +359,24 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   if (!stateDir) process.exit(2);
   const result = process.argv[2] === 'rollback-stale-running'
     ? rollbackStaleRunningRecovery({ stateDir, recoveryId: args.get('recovery-id') })
-    : normalizeStaleRunningStatus({
+    : process.argv[2] === 'watch-continuation'
+      ? watchdogContinuationLiveness({
+        stateDir,
+        pidFile: args.get('pid-file') || path.join(stateDir, 'phase-loop.pid'),
+        ownerFile: args.get('owner-file') || path.join(stateDir, 'phase-loop-owner.json'),
+        rootDir: args.get('root-dir') || '',
+        maxAgeSeconds: Number.parseInt(args.get('max-age-seconds') || '900', 10),
+        runStamp: args.get('run-stamp')
+      })
+      : normalizeStaleRunningStatus({
       stateDir,
       pidFile: args.get('pid-file') || path.join(stateDir, 'phase-loop.pid'),
       ownerPid: args.has('owner-pid') ? Number.parseInt(args.get('owner-pid'), 10) : null,
+      ownerGeneration: args.get('owner-generation') || null,
+      ownerFile: args.get('owner-file') || path.join(stateDir, 'phase-loop-owner.json'),
+      rootDir: args.get('root-dir') || '',
       runStamp: args.get('run-stamp')
     });
   process.stdout.write(`${JSON.stringify(result)}\n`);
-  if (!result.ok) process.exit(result.code === 'run_already_running' ? 75 : 78);
+  if (!result.ok) process.exit(result.code === 'run_already_running' || result.code === 'supervisor_ownership_conflict' || result.code === 'continuation_ownership_unproven' ? 75 : 78);
 }
