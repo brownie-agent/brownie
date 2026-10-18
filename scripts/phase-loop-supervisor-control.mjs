@@ -18,7 +18,8 @@ function parseArgs(argv) {
     write: true,
     repair: true,
     start: false,
-    selfUpdateRequest: null
+    selfUpdateRequest: null,
+    workerLaunchReceiptPath: null
   };
   for (let index = 2; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -40,6 +41,8 @@ function parseArgs(argv) {
       args.start = false;
     } else if (arg === '--self-update-request') {
       args.selfUpdateRequest = argv[++index];
+    } else if (arg === '--worker-launch-receipt') {
+      args.workerLaunchReceiptPath = argv[++index];
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -2595,7 +2598,129 @@ function maybeWriteInvalidPatchRepairFeedback(repoRoot, diagnostic) {
   }
 }
 
-function maybeStartPhaseLoop(repoRoot, enabled, diagnostic) {
+const defaultWorkerLaunchReceiptPath = '.brownie/private/phase-loop/worker-launch-receipt.json';
+const defaultWorkerLaunchReceiptDirectory = '.brownie/private/phase-loop/worker-launch-receipts';
+
+function parseIsoTimestamp(value) {
+  if (typeof value !== 'string' || Number.isNaN(Date.parse(value))) return null;
+  return new Date(value);
+}
+
+function workerLaunchReceiptPath(repoRoot, receiptPath = defaultWorkerLaunchReceiptPath) {
+  const absolute = path.resolve(repoRoot, receiptPath);
+  if (absolute !== repoRoot && !absolute.startsWith(repoRoot + path.sep)) {
+    throw new Error('worker launch receipt path must remain inside the repository');
+  }
+  return absolute;
+}
+
+export function inspectWorkerLaunchReceipt(repoRoot, options = {}) {
+  const receiptPath = workerLaunchReceiptPath(repoRoot, options.receiptPath);
+  const now = options.now instanceof Date ? options.now : new Date(options.now ?? Date.now());
+  const claim = readJsonOrNull(path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json')) ?? {};
+  const feedback = readJsonOrNull(path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json')) ?? {};
+  const delegation = feedback.delegation && typeof feedback.delegation === 'object' ? feedback.delegation : {};
+  if (!fs.existsSync(receiptPath)) {
+    return { ok: false, reason: 'dispatch_not_started', receipt_path: path.relative(repoRoot, receiptPath) };
+  }
+  const receipt = readJsonOrNull(receiptPath);
+  if (!receipt || receipt.kind !== 'phase_loop_worker_launch_receipt') {
+    return { ok: false, reason: 'dispatch_not_started', receipt_path: path.relative(repoRoot, receiptPath) };
+  }
+  const required = ['launch_id', 'actor', 'started_at', 'expires_at', 'last_heartbeat_at', 'heartbeat_interval_seconds', 'idempotency_key'];
+  if (required.some((key) => !receipt[key])) {
+    return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_receipt_missing_required_field', receipt_path: path.relative(repoRoot, receiptPath) };
+  }
+  if (receipt.actor !== 'brownie-agent') {
+    return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_actor_mismatch', actor: receipt.actor };
+  }
+  if (receipt.status && receipt.status !== 'active') {
+    return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_receipt_not_active', status: receipt.status };
+  }
+  const startedAt = parseIsoTimestamp(receipt.started_at);
+  const expiresAt = parseIsoTimestamp(receipt.expires_at);
+  const heartbeatAt = parseIsoTimestamp(receipt.last_heartbeat_at);
+  const heartbeatInterval = Number(receipt.heartbeat_interval_seconds);
+  if (!startedAt || !expiresAt || !heartbeatAt || !Number.isFinite(heartbeatInterval) || heartbeatInterval <= 0) {
+    return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_receipt_invalid_time_contract' };
+  }
+  if (startedAt > now || expiresAt <= now || heartbeatAt > now) {
+    return { ok: false, reason: 'worker_liveness_missing', detail: 'worker_launch_receipt_expired_or_future' };
+  }
+  if (now.getTime() - heartbeatAt.getTime() > heartbeatInterval * 2000) {
+    return { ok: false, reason: 'worker_liveness_missing', detail: 'worker_heartbeat_expired' };
+  }
+  const receiptClaimId = typeof receipt.claim_id === 'string' ? receipt.claim_id.trim() : '';
+  const currentClaimId = typeof claim.claim_id === 'string' ? claim.claim_id.trim() : '';
+  if (currentClaimId && receiptClaimId !== currentClaimId) {
+    return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_claim_mismatch', claim_id: receiptClaimId };
+  }
+  const targetPr = typeof receipt.target_pr_url === 'string' ? receipt.target_pr_url.trim() : '';
+  const delegatedPr = typeof delegation.issue_or_pr_url === 'string' ? delegation.issue_or_pr_url.trim() : '';
+  if (!receiptClaimId && !targetPr) {
+    return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_target_missing' };
+  }
+  if (delegatedPr && targetPr !== delegatedPr) {
+    return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_pr_mismatch', target_pr_url: targetPr };
+  }
+  const receiptDirectory = path.join(repoRoot, defaultWorkerLaunchReceiptDirectory);
+  let historical = [];
+  try {
+    historical = fs.readdirSync(receiptDirectory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+      .map((entry) => readJsonOrNull(path.join(receiptDirectory, entry.name)))
+      .filter(Boolean);
+  } catch {
+    historical = [];
+  }
+  const duplicate = historical.find((candidate) => (
+    candidate.idempotency_key === receipt.idempotency_key && candidate.launch_id !== receipt.launch_id
+  ));
+  if (duplicate) {
+    return { ok: false, reason: 'duplicate_worker_launch', idempotency_key: receipt.idempotency_key, existing_launch_id: duplicate.launch_id, launch_id: receipt.launch_id };
+  }
+  return {
+    ok: true,
+    reason: 'worker_liveness_verified',
+    receipt_path: path.relative(repoRoot, receiptPath),
+    launch_id: receipt.launch_id,
+    actor: receipt.actor,
+    claim_id: receiptClaimId || null,
+    target_pr_url: targetPr || null,
+    idempotency_key: receipt.idempotency_key
+  };
+}
+
+export function registerWorkerLaunchReceipt(repoRoot, receipt, options = {}) {
+  const receiptPath = workerLaunchReceiptPath(repoRoot, options.receiptPath);
+  const receiptDirectory = path.join(repoRoot, defaultWorkerLaunchReceiptDirectory);
+  if (!receipt || typeof receipt !== 'object' || receipt.kind !== 'phase_loop_worker_launch_receipt') {
+    return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_receipt_invalid' };
+  }
+  fs.mkdirSync(receiptDirectory, { recursive: true, mode: 0o700 });
+  const historical = fs.readdirSync(receiptDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+    .map((entry) => readJsonOrNull(path.join(receiptDirectory, entry.name)))
+    .filter(Boolean);
+  const duplicate = historical.find((candidate) => (
+    candidate.idempotency_key === receipt.idempotency_key && candidate.launch_id !== receipt.launch_id
+  ));
+  if (duplicate) {
+    return { ok: false, reason: 'duplicate_worker_launch', existing_launch_id: duplicate.launch_id, idempotency_key: receipt.idempotency_key };
+  }
+  const current = readJsonOrNull(receiptPath);
+  if (current?.idempotency_key === receipt.idempotency_key && current?.launch_id === receipt.launch_id) {
+    return { ok: true, replayed: true, receipt_path: path.relative(repoRoot, receiptPath) };
+  }
+  fs.writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  const archivePath = path.join(receiptDirectory, String(receipt.launch_id).replace(/[^A-Za-z0-9_.-]+/gu, '-') + '.json');
+  fs.writeFileSync(archivePath, JSON.stringify(receipt, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  fsyncFileAndParent(receiptPath);
+  fsyncFileAndParent(archivePath);
+  return { ok: true, replayed: false, receipt_path: path.relative(repoRoot, receiptPath), archive_path: path.relative(repoRoot, archivePath) };
+}
+
+function maybeStartPhaseLoop(repoRoot, enabled, diagnostic, options = {}) {
   if (!enabled) {
     return { attempted: false, reason: 'start_not_requested' };
   }
@@ -2616,6 +2741,17 @@ function maybeStartPhaseLoop(repoRoot, enabled, diagnostic) {
   const status = diagnostic.phase_loop?.status;
   if (diagnostic.summary?.healthy && (status === 'running' || status === 'last_run_succeeded')) {
     return { attempted: false, reason: 'phase_loop_already_healthy' };
+  }
+  const workerLaunch = inspectWorkerLaunchReceipt(repoRoot, {
+    receiptPath: options.workerLaunchReceiptPath,
+    now: options.now
+  });
+  if (!workerLaunch.ok) {
+    return {
+      attempted: false,
+      reason: workerLaunch.reason,
+      worker_launch_receipt: workerLaunch
+    };
   }
   try {
     const stdout = runTextCommand(repoRoot, './phase-loop.sh', ['start']);
@@ -2924,7 +3060,10 @@ export function controlPhaseLoop(options = {}) {
           reason: 'terminal_no_eligible_claim_requires_verified_baseline',
           terminal_claim_repair: terminalNoEligibleClaimRepair
         }
-    : maybeStartPhaseLoop(repoRoot, Boolean(options.start), afterResolvedRepairFeedback);
+    : maybeStartPhaseLoop(repoRoot, Boolean(options.start), afterResolvedRepairFeedback, {
+      workerLaunchReceiptPath: options.workerLaunchReceiptPath,
+      now: options.now
+    });
   const final = start.attempted && start.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterResolvedRepairFeedback;
@@ -2977,7 +3116,8 @@ if (process.argv[1] === __filename) {
     write: args.write,
     repair: args.repair,
     start: args.start,
-    selfUpdateRequest: args.selfUpdateRequest
+    selfUpdateRequest: args.selfUpdateRequest,
+    workerLaunchReceiptPath: args.workerLaunchReceiptPath
   });
   console.log(JSON.stringify(result, null, 2));
   process.exit(result.final_summary.healthy ? 0 : 1);

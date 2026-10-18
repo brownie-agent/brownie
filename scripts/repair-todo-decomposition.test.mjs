@@ -899,6 +899,76 @@ test('rebases a dependency on an unresolved superseded parent to its live child 
   }
 });
 
+test('fails closed when a superseded dependency has an incomplete child frontier', () => {
+  const root = makeTempRepo();
+  try {
+    const tick = String.fromCharCode(96);
+    const parentId = 'E-23a-parent';
+    const liveChildId = parentId + '-target-01';
+    const missingChildId = parentId + '-target-02';
+    const downstreamSourceId = 'E-23b-release-work';
+    const downstreamId = downstreamSourceId + '-target-01';
+    const liveChild = '- [ ] ' + liveChildId + ': Patch only ' + tick + 'scripts/guard-release-contract.mjs' + tick + ' for the parent fixture:\n'
+      + '  Route: implementation.\n'
+      + '  Source TODO: ' + parentId + '.\n'
+      + '  Depends on: <none>.\n'
+      + '  Completion condition: preserve the parent work as an executable child.\n'
+      + '  Forbidden changes: do not edit unrelated files.\n'
+      + '  Verification: run ' + tick + 'pnpm --workspace-root guard:release-contract' + tick + '.';
+    const downstream = '- [ ] ' + downstreamId + ': Patch only ' + tick + 'scripts/guard-runtime-release-readiness.mjs' + tick + ' after the parent fixture:\n'
+      + '  Route: implementation.\n'
+      + '  Source TODO: ' + downstreamSourceId + '.\n'
+      + '  Depends on: ' + parentId + '.\n'
+      + '  Completion condition: retain the predecessor ordering through an executable dependency.\n'
+      + '  Forbidden changes: do not edit unrelated files.\n'
+      + '  Verification: run ' + tick + 'pnpm --workspace-root guard:runtime-release-readiness' + tick + '.';
+    fs.writeFileSync(path.join(root, '.brownie/todo.md'), [
+      '- [x] ' + parentId + ': Patch only ' + tick + 'scripts/guard-release-contract.mjs' + tick + '.',
+      '  Route: implementation.',
+      '  Source TODO: fixture.',
+      '  Depends on: <none>.',
+      '  Completion condition: parent fixture.',
+      '  Forbidden changes: do not edit unrelated files.',
+      '  Verification: run ' + tick + 'pnpm --workspace-root guard:release-contract' + tick + '.',
+      '', liveChild, '', downstream, ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(root, '.brownie/todo-breakdown.md'), [
+      '# TODO breakdown', '', '## ' + parentId + ' incomplete split', '',
+      'Parent TODO: ' + parentId, '', 'Dependency graph:',
+      '- ' + liveChildId + ': <none>', '- ' + downstreamId + ': ' + parentId,
+      '', 'Verification ledger:',
+      '- ' + liveChildId + ': run ' + tick + 'pnpm --workspace-root guard:release-contract' + tick,
+      '- ' + downstreamId + ': run ' + tick + 'pnpm --workspace-root guard:runtime-release-readiness' + tick,
+      '', 'Quality rubric:', '- ' + liveChildId + ': executable child.',
+      '- ' + downstreamId + ': ordered successor.', '', 'History:', ''
+    ].join('\n'));
+    fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-replans'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.brownie/private/phase-loop/todo-replans/incomplete.json'),
+      JSON.stringify({
+        schema_version: 1,
+        record_type: 'todo_replan',
+        operation: 'split_parent_into_children',
+        parent_status: 'superseded_by_children',
+        parent_todo_id: parentId,
+        generated_child_ids: [liveChildId, missingChildId],
+        generated_leaf_ids: [liveChildId, missingChildId]
+      }, null, 2)
+    );
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-claims/current.json'), JSON.stringify({
+      schema_version: 1, claim_id: 'claim-incomplete-frontier', selected_todo: downstream
+    }, null, 2));
+
+    const result = runRepair(root);
+    assert.notEqual(result.status, 0, result.stdout + '\n' + result.stderr);
+    assert.match(result.stdout, /superseded_dependency_has_incomplete_child_frontier/u);
+    const todoText = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8');
+    assert.match(todoText, new RegExp('Depends on: ' + parentId + '\\.'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('atomically repairs a derived leaf dependency and missing breakdown entries after a stale claim', () => {
   const root = makeTempRepo();
   try {

@@ -65,6 +65,7 @@ run_with_timeout() {
   "$@" &
   local child_pid="$!"
   local elapsed=0
+  local timed_out=0
   while kill -0 "$child_pid" 2>/dev/null; do
     if [ "$elapsed" -ge "$seconds" ]; then
       echo "command timed out after ${seconds}s: $*" >&2
@@ -72,13 +73,16 @@ run_with_timeout() {
       sleep 1
       kill -KILL "$child_pid" 2>/dev/null || true
       wait "$child_pid" 2>/dev/null || true
-      return 124
+      timed_out=1
+      break
     fi
     sleep 1
     elapsed=$((elapsed + 1))
   done
   local child_status=0
-  if wait "$child_pid"; then
+  if [ "$timed_out" -eq 1 ]; then
+    child_status=124
+  elif wait "$child_pid"; then
     child_status=0
   else
     child_status="$?"
@@ -164,6 +168,11 @@ assert_contains "$PHASE_LOOP" "selected_todo_dirty_baseline_verified_completion"
 assert_contains "$PHASE_LOOP" "selected_targets_already_dirty_and_verification_passed"
 assert_contains "$PHASE_LOOP" "pruned_completed_dependency_lines"
 assert_not_contains "$PHASE_LOOP" "breakdown_only_dependency_pruned"
+assert_contains "$PHASE_LOOP" "phase_loop_claim_id"
+assert_contains "$PHASE_LOOP" "phase_loop_selected_todo_first_line"
+assert_contains "$PHASE_LOOP" "feedback_identity_missing"
+assert_contains "$PHASE_LOOP" "progress_projection_claim_id_mismatch"
+assert_contains "${BASH_SOURCE[0]}" "timed_out=1"
 assert_contains "$PHASE_LOOP" "Every generated leaf ID must be unique within new_text"
 assert_contains "$PHASE_LOOP" "A leaf must never depend on itself"
 assert_contains "$PHASE_LOOP" "distinct prerequisite TODO ID already present in the live queue"
