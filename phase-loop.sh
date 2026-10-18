@@ -49,6 +49,7 @@ PHASE_LOOP_STOP_GRACE_SECONDS="${PHASE_LOOP_STOP_GRACE_SECONDS:-15}"
 PHASE_LOOP_STOP_FORCE_SECONDS="${PHASE_LOOP_STOP_FORCE_SECONDS:-5}"
 PHASE_LOOP_SLEEP_POLL_SECONDS="${PHASE_LOOP_SLEEP_POLL_SECONDS:-1}"
 PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES="${PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES:-3}"
+PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="${PHASE_LOOP_APPROVED_CONTROLLER_BASELINE:-origin/main}"
 PHASE_LOOP_CREATE_PR_AFTER_PROGRESS="${PHASE_LOOP_CREATE_PR_AFTER_PROGRESS:-0}"
 PHASE_LOOP_PR_REMOTE="${PHASE_LOOP_PR_REMOTE:-origin}"
 PHASE_LOOP_PR_BASE="${PHASE_LOOP_PR_BASE:-main}"
@@ -11277,6 +11278,30 @@ load_env() {
   set +a
 }
 
+phase_loop_require_approved_controller_baseline() {
+  local guard_script="$PHASE_LOOP_WORKSPACE_ROOT/scripts/phase-loop-source-baseline-guard.mjs"
+  if [ ! -f "$guard_script" ]; then
+    PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT="missing guard script: $guard_script"
+    printf '%s controller_source_baseline_guard_failed=true reason=guard_missing path=%s\n' "$(now_utc)" "$guard_script" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  local output status
+  set +e
+  output="$(
+    cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+    node "$guard_script" --repo "$PHASE_LOOP_WORKSPACE_ROOT" --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" 2>&1
+  )"
+  status=$?
+  set -e
+  PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT="$output"
+  if [ "$status" -ne 0 ]; then
+    printf '%s controller_source_baseline_guard_failed=true baseline=%s result=%s\n' "$(now_utc)" "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  printf '%s controller_source_baseline_guard_passed=true baseline=%s result=%s\n' "$(now_utc)" "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+  return 0
+}
+
 is_running() {
   if [ ! -f "$PID_FILE" ]; then
     return 1
@@ -11704,6 +11729,13 @@ run_brownie_once() {
   release_contract_before="$RUN_DIR/$run_stamp.runtime-release-contract.before.json"
   phase_value_manifest_before="$RUN_DIR/$run_stamp.phase-value-manifest.before.json"
   workspace_status_before="$RUN_DIR/$run_stamp.workspace-status.before"
+
+  if ! phase_loop_require_approved_controller_baseline; then
+    detail="Phase-loop controller source is not synchronized with the approved ${PHASE_LOOP_APPROVED_CONTROLLER_BASELINE} baseline; refusing to run the controller. ${PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT:-<no diagnostic>}"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
 
   write_status "running" "Brownie run started at $started_at" "$run_stamp" "" "${CONSECUTIVE_FAILURES:-0}"
   git_workspace_status_snapshot > "$workspace_status_before"
