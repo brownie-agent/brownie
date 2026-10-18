@@ -13,6 +13,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Fail fast on stale runtime readiness evidence
+        run: node scripts/update-runtime-release-readiness-audit.mjs --check
+
+      - name: Fail fast on stale runtime module assessment
+        run: node scripts/update-runtime-module-decomposition-assessment.mjs --check
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -85,6 +91,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Fail fast on stale runtime readiness evidence
+        run: node scripts/update-runtime-release-readiness-audit.mjs --check
+
+      - name: Fail fast on stale runtime module assessment
+        run: node scripts/update-runtime-module-decomposition-assessment.mjs --check
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -109,6 +121,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Fail fast on stale runtime readiness evidence
+        run: node scripts/update-runtime-release-readiness-audit.mjs --check
+
+      - name: Fail fast on stale runtime module assessment
+        run: node scripts/update-runtime-module-decomposition-assessment.mjs --check
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
