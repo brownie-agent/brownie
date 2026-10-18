@@ -145,6 +145,63 @@ test('continues a replacement child claim on the queued child task id', () => {
   assert.equal(validateTaskLedger(events).ok, true);
 });
 
+test('starts a fresh attempt when a replacement child claim is stale', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, [
+    '- [ ] P-stale: broad parent task',
+    '  Route: todo-decomposition.',
+    '  Verification: run `pnpm check`.',
+    '',
+    '- [ ] C-stale: replacement child task',
+    '  Route: implementation.',
+    '  Source TODO: P-stale.',
+    '  Patch only `scripts/child.mjs`.',
+    '  Verification: run `node --check scripts/child.mjs`.',
+    ''
+  ].join('\n'));
+  const parentClaim = path.join(repo, 'parent-claim.json');
+  fs.writeFileSync(parentClaim, JSON.stringify({
+    claim_id: 'claim-parent-stale',
+    selected_todo: '- [ ] P-stale: broad parent task\n  Route: todo-decomposition.\n  Verification: run `pnpm check`.'
+  }));
+  recordTrajectory(repo, { claimPath: parentClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-parent-stale' });
+  recordTrajectory(repo, { claimPath: parentClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-parent-stale' });
+  recordTrajectory(repo, {
+    claimPath: parentClaim,
+    todoPath: todo,
+    type: 'todo.replanned',
+    runId: 'run-parent-stale',
+    payloadRaw: '{"reason":"split_parent"}'
+  });
+
+  const staleClaim = path.join(repo, 'stale-child-claim.json');
+  fs.writeFileSync(staleClaim, JSON.stringify({
+    claim_id: 'claim-child-stale',
+    selected_todo: '- [ ] C-stale: replacement child task\n  Route: implementation.\n  Source TODO: P-stale.\n  Patch only `scripts/child.mjs`.\n  Verification: run `node --check scripts/child.mjs`.'
+  }));
+  recordTrajectory(repo, { claimPath: staleClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-child-stale' });
+  recordTrajectory(repo, { claimPath: staleClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-child-stale' });
+
+  const freshClaim = path.join(repo, 'fresh-child-claim.json');
+  fs.writeFileSync(freshClaim, JSON.stringify({
+    claim_id: 'claim-child-fresh',
+    selected_todo: '- [ ] C-stale: replacement child task\n  Route: implementation.\n  Source TODO: P-stale.\n  Patch only `scripts/child.mjs`.\n  Verification: run `node --check scripts/child.mjs`.'
+  }));
+  assert.equal(recordTrajectory(repo, { claimPath: freshClaim, todoPath: todo, type: 'todo.claimed', runId: 'run-child-fresh' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: freshClaim, todoPath: todo, type: 'workflow.routed', runId: 'run-child-fresh' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: freshClaim, todoPath: todo, type: 'todo.completed', runId: 'run-child-fresh' }).ok, true);
+
+  const events = readTaskLedger(repo);
+  const rawChild = events.filter((event) => event.task_id === 'C-stale');
+  const freshChild = events.filter((event) => event.task_id === 'C-stale@claim-child-fresh');
+  assert.equal(rawChild.at(-1).to_state, 'failed');
+  assert.deepEqual(freshChild.map((event) => event.to_state), ['queued', 'claimed', 'running', 'completed']);
+  assert.equal(freshChild.at(-1).parent_task_id, 'P-stale@claim-parent-stale');
+  assert.equal(validateTaskLedger(events).ok, true);
+});
+
 test('replan leaves the ledger unchanged when a child fails the execution gate', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   appendTaskTransition(repo, { task_id: 'T-6', to_state: 'queued' });

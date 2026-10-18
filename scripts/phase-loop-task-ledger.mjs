@@ -356,10 +356,35 @@ export function recordTrajectory(repoRoot, {
   // parent -> replacement -> terminal graph remains connected.  A terminal
   // replacement is deliberately not reopened: a later retry gets its own
   // immutable task attempt, just like an ordinary TODO retry.
-  const taskId = projectedSourceTask?.parent_task_id
+  const replacementParentTaskId = projectedSourceTask?.parent_task_id ?? null;
+  const continuesSameReplacementClaim = replacementParentTaskId
     && !isTerminalTaskState(projectedSourceTask.to_state)
+    && ((projectedSourceTask.claim_id ?? null) === null
+      || (projectedSourceTask.claim_id ?? null) === (claimId ?? null));
+  const taskId = continuesSameReplacementClaim
     ? sourceTaskId
     : taskAttemptId(sourceTaskId, claimId);
+  if (replacementParentTaskId
+    && !isTerminalTaskState(projectedSourceTask.to_state)
+    && projectedSourceTask.claim_id
+    && projectedSourceTask.claim_id !== claimId) {
+    let abandoned;
+    try {
+      abandoned = appendTaskTransition(repoRoot, {
+        task_id: sourceTaskId,
+        to_state: 'failed',
+        run_id: runId,
+        claim_id: projectedSourceTask.claim_id,
+        reason: 'stale_claim_replaced',
+        parent_task_id: replacementParentTaskId
+      });
+    } catch (error) {
+      return { ok: false, code: 'ledger_append_failed', error: error.message };
+    }
+    if (!abandoned.ok) {
+      return { ok: false, code: 'ledger_transition_rejected', task_id: sourceTaskId, rejected: abandoned };
+    }
+  }
   const specHash = crypto.createHash('sha256').update(spec).digest('hex');
   if (type === 'todo.replanned') {
     let payload = {};
@@ -406,6 +431,7 @@ export function recordTrajectory(repoRoot, {
         run_id: runId,
         claim_id: claimId,
         task_spec_sha256: specHash,
+        parent_task_id: replacementParentTaskId,
         reason: to_state === 'blocked' ? 'trajectory_blocked' : to_state === 'failed' ? 'trajectory_failed' : undefined
       });
     } catch (error) {
