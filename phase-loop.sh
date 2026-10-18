@@ -13975,6 +13975,7 @@ phase_loop_watch_continuation_liveness() {
 }
 
 supervise() {
+  load_env
   if ! acquire_lock; then
     write_status "already_running" "Another phase-loop.sh instance holds the lock." "" "" 0
     exit 0
@@ -14073,6 +14074,7 @@ normalize_stale_running_before_start() {
 }
 
 start() {
+  load_env
   local watchdog_status
   if phase_loop_watch_continuation_liveness "startup-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"; then
     watchdog_status=0

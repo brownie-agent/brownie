@@ -332,15 +332,6 @@ export function watchdogContinuationLiveness({
       run_id: status.run_id ?? null
     };
   }
-  const updatedAt = Date.parse(status.updated_at || '');
-  const nowMs = Date.parse(now);
-  if (!Number.isFinite(updatedAt) || !Number.isFinite(nowMs)) {
-    return { ok: false, code: 'continuation_timestamp_invalid', run_id: status.run_id ?? null };
-  }
-  const ageSeconds = Math.max(0, Math.floor((nowMs - updatedAt) / 1000));
-  if (ageSeconds < normalizedMaxAgeSeconds) {
-    return { ok: true, expired: false, age_seconds: ageSeconds, reason: 'continuation_within_deadline' };
-  }
   const ownership = inspectSupervisorOwnership({
     stateDir,
     pidFile,
@@ -356,13 +347,21 @@ export function watchdogContinuationLiveness({
     return {
       ok: false,
       code: 'continuation_ownership_unproven',
-      age_seconds: ageSeconds,
       run_id: status.run_id ?? null,
       live_supervisors: ownership.live_supervisors,
       pid: ownership.pid,
       status_generation: status.supervisor_generation ?? null,
       owner_generation: ownership.owner?.generation ?? null
     };
+  }
+  const updatedAt = Date.parse(status.updated_at || '');
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(updatedAt) || !Number.isFinite(nowMs)) {
+    return { ok: false, code: 'continuation_timestamp_invalid', run_id: status.run_id ?? null };
+  }
+  const ageSeconds = Math.max(0, Math.floor((nowMs - updatedAt) / 1000));
+  if (ageSeconds < normalizedMaxAgeSeconds) {
+    return { ok: true, expired: false, age_seconds: ageSeconds, reason: 'continuation_within_deadline' };
   }
   const currentStatus = readJson(statusPath);
   if (continuationVersion(currentStatus) !== continuationVersion(status)) {

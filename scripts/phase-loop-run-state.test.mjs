@@ -247,6 +247,34 @@ test('keeps an authorized continuation within the watchdog deadline', () => {
   assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
 });
 
+test('fails closed on an unowned fresh continuation before the deadline', () => {
+  const { stateDir, statusPath, pidPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'continuation-unowned-fresh',
+    updated_at: '2026-10-18T01:19:59.000Z',
+    continuation_required: true,
+    controller_action: 'resume',
+    supervisor_pid: 5678,
+    supervisor_generation: 'generation-1'
+  }));
+  fs.writeFileSync(pidPath, '5678');
+  const result = watchdogContinuationLiveness({
+    stateDir,
+    pidFile: pidPath,
+    rootDir: '/repo',
+    now: '2026-10-18T01:20:01.000Z',
+    maxAgeSeconds: 900,
+    processExists: () => true,
+    getProcessCommand: () => 'bash /other-repo/phase-loop.sh supervise',
+    listSupervisors: () => [5678]
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'continuation_ownership_unproven');
+  assert.equal(result.age_seconds, undefined);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+});
+
 test('rejects an invalid watchdog duration without expiring a continuation', () => {
   const { stateDir, statusPath } = fixture();
   fs.writeFileSync(statusPath, JSON.stringify({
