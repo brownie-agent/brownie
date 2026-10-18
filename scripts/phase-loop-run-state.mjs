@@ -119,7 +119,9 @@ export function inspectSupervisorOwnership({
   const owner = readOwner(ownerFile);
   const livePid = pid && processExists(pid);
   const matchingOwner = ownerMatches({ status, pid, owner, ownerPid, ownerGeneration });
-  const command = livePid ? getProcessCommand(pid) : '';
+  const command = livePid
+    ? (getProcessCommand === processCommand ? processCommand(pid) : getProcessCommand(pid))
+    : '';
   const commandLooksLikeSupervisor = /phase-loop\.sh.*\bsupervise\b/u.test(command);
   const supervisors = [...new Set(listSupervisors().filter((candidate) => Number.isInteger(candidate) && candidate > 1))];
   const liveSupervisors = supervisors.filter((candidate) => processExists(candidate));
