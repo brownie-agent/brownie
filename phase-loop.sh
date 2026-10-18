@@ -32,6 +32,7 @@ PHASE_LOOP_ACTIVE_RUN_ID=""
 PHASE_LOOP_ACTIVE_STDOUT_LOG=""
 PHASE_LOOP_ACTIVE_STDERR_LOG=""
 PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
+PHASE_LOOP_SUPERVISOR_PID=""
 
 BROWNIE_BIN="${BROWNIE_BIN:-"$ROOT_DIR/target/debug/brownie"}"
 PHASE_LOOP_DEFAULT_BROWNIE_BIN="$ROOT_DIR/target/debug/brownie"
@@ -257,6 +258,7 @@ write_status() {
   local exit_code="${4:-}"
   local consecutive_failures="${5:-0}"
   local force_status_exit_code=""
+  local continuation_required="${7:-false}"
   if [ "${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED:-0}" = "1" ] && [ "$status" = "last_run_succeeded" ]; then
     status="no_progress"
     detail="Completed TODO removal was reverted because the resulting TODO queue failed guard validation; keeping the active claim in_progress. guard=${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL:-unknown} previous_success_detail=$detail"
@@ -305,6 +307,8 @@ write_status() {
   "run_id": "$escaped_run",
   "exit_code": "$exit_code",
   "consecutive_failures": $consecutive_failures,
+  "continuation_required": $continuation_required,
+  "controller_action": "$([ "$continuation_required" = "true" ] && printf 'resume' || printf '')",
   "updated_at": "$timestamp",
   "pid_file": "$PID_FILE",
   "stop_file": "$STOP_FILE",
@@ -11805,7 +11809,7 @@ _run_brownie_once() {
 
   if [ -f "$ROOT_DIR/scripts/phase-loop-run-state.mjs" ]; then
     local stale_running_output stale_running_status
-    if stale_running_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" normalize-stale-running --state-dir "$STATE_DIR" --pid-file "$PID_FILE" --run-stamp "$run_stamp" 2>&1)"; then
+    if stale_running_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" normalize-stale-running --state-dir "$STATE_DIR" --pid-file "$PID_FILE" --owner-pid "${PHASE_LOOP_SUPERVISOR_PID:-}" --run-stamp "$run_stamp" 2>&1)"; then
       if [ -n "$stale_running_output" ]; then
         printf '%s run=%s stale_running_normalization=%s\n' "$(now_utc)" "$run_stamp" "$stale_running_output" >> "$SUPERVISOR_LOG"
       fi
@@ -13691,7 +13695,7 @@ PY
         ;;
       continuation_required)
         detail="Brownie prepared an authorized continuation; the next supervisor iteration will run resume. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
-        write_status "running" "$detail" "$run_id" "$exit_code" "0"
+        write_status "running" "$detail" "$run_id" "$exit_code" "0" "" "true"
         printf '%s run=%s continuation_required=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
         write_bdk_trajectory_event "$run_stamp" "workflow.routed" '{"source":"runtime","bdk_state":"continuation_required","llm_route":"resume"}'
         ;;
@@ -13783,6 +13787,7 @@ supervise() {
   fi
 
   echo "$$" > "$PID_FILE"
+  PHASE_LOOP_SUPERVISOR_PID="$$"
   write_status "supervising" "Supervisor started." "" "" 0
   printf '%s supervisor pid=%s started\n' "$(now_utc)" "$$" >> "$SUPERVISOR_LOG"
 

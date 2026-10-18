@@ -53,6 +53,52 @@ test('refuses to normalize a status whose PID is still alive', () => {
   assert.equal(fs.existsSync(path.join(stateDir, 'run-state-recovery.jsonl')), false);
 });
 
+test('allows the owning supervisor to resume an authorized continuation', () => {
+  const { stateDir, statusPath, pidPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'continuation-run',
+    pid_file: pidPath,
+    continuation_required: true,
+    controller_action: 'resume'
+  }));
+  fs.writeFileSync(pidPath, '1234');
+  const result = normalizeStaleRunningStatus({
+    stateDir,
+    pidFile: pidPath,
+    ownerPid: 1234,
+    processExists: () => true
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    normalized: false,
+    reason: 'owned_continuation_resume',
+    pid: 1234,
+    run_id: 'continuation-run'
+  });
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+  assert.equal(fs.existsSync(path.join(stateDir, 'run-state-recovery.jsonl')), false);
+});
+
+test('fails closed when a different live process owns the continuation state', () => {
+  const { stateDir, statusPath, pidPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'competing-run',
+    pid_file: pidPath,
+    continuation_required: true,
+    controller_action: 'resume'
+  }));
+  fs.writeFileSync(pidPath, '5678');
+  const result = normalizeStaleRunningStatus({
+    stateDir,
+    pidFile: pidPath,
+    ownerPid: 1234,
+    processExists: () => true
+  });
+  assert.deepEqual(result, { ok: false, code: 'run_already_running', pid: 5678, run_id: 'competing-run' });
+});
+
 test('leaves non-running status untouched', () => {
   const { stateDir, statusPath } = fixture();
   fs.writeFileSync(statusPath, JSON.stringify({ status: 'last_run_failed', run_id: 'finished' }));
@@ -86,4 +132,6 @@ test('run-once installs exit and signal terminalization hooks after entering run
   assert.ok(controller.includes("trap 'phase_loop_handle_run_signal INT' INT"));
   assert.ok(controller.includes("trap 'phase_loop_handle_run_signal TERM' TERM"));
   assert.match(controller, /Unexpected phase-loop run-once exit; terminalized status/u);
+  assert.match(controller, /--owner-pid "\$\{PHASE_LOOP_SUPERVISOR_PID:-\}"/u);
+  assert.match(controller, /continuation_required\)\n[\s\S]*write_status "running"[^\n]*"true"/u);
 });

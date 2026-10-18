@@ -3131,10 +3131,10 @@ customModes:
     fn compatibility_git_retry_is_bounded_and_preserves_external_diagnostics() {
         let temp = tempfile::tempdir().expect("tempdir");
         let counter = temp.path().join("attempts");
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
 
-        let write_executable_fixture = |prefix: &str, source: String| -> tempfile::TempPath {
+        let write_executable_fixture = |prefix: &str, source: String| -> std::path::PathBuf {
             let mut fixture = tempfile::Builder::new()
                 .prefix(prefix)
                 .tempfile_in(temp.path())
@@ -3146,7 +3146,33 @@ customModes:
             fixture.as_file_mut().sync_all().expect("fixture sync");
             std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("fixture permissions");
-            fixture.into_temp_path()
+            let source_path = fixture.into_temp_path();
+            let executable_path = temp.path().join(format!(
+                "{}ready-{}",
+                prefix,
+                source_path
+                    .file_name()
+                    .expect("fixture filename")
+                    .to_string_lossy()
+            ));
+            std::fs::rename(&source_path, &executable_path).expect("publish closed fixture");
+            executable_path
+        };
+
+        let assert_executable_stable = |path: &std::path::Path| {
+            let before = std::fs::metadata(path).expect("fixture metadata before exec");
+            let mut file = std::fs::File::open(path).expect("fixture open before exec");
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)
+                .expect("fixture read before exec");
+            drop(file);
+            let after = std::fs::metadata(path).expect("fixture metadata after exec");
+            assert_eq!(
+                before.len(),
+                after.len(),
+                "fixture changed during publication"
+            );
+            assert_eq!(before.permissions().mode(), after.permissions().mode());
         };
 
         let git_fixture = write_executable_fixture(
@@ -3160,7 +3186,8 @@ customModes:
         );
 
         run_git_with_retries("fixture git operation", || {
-            let path: &std::path::Path = git_fixture.as_ref();
+            let path = git_fixture.as_path();
+            assert_executable_stable(path);
             std::process::Command::new(path)
         })
         .expect("transient fixture failure should retry");
@@ -3171,7 +3198,8 @@ customModes:
             "#!/bin/sh\necho 'Could not resolve host: fixture.invalid' >&2\nexit 128\n".to_string(),
         );
         let error = run_git_with_retries("fixture blocked operation", || {
-            let path: &std::path::Path = always_fail.as_ref();
+            let path = always_fail.as_path();
+            assert_executable_stable(path);
             std::process::Command::new(path)
         })
         .expect_err("persistent external failure should classify as blocked");

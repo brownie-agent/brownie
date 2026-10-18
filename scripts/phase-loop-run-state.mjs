@@ -60,6 +60,7 @@ export function normalizeStaleRunningStatus({
   stateDir,
   pidFile = path.join(stateDir, 'phase-loop.pid'),
   runStamp,
+  ownerPid = null,
   now = new Date().toISOString(),
   processExists = processIsAlive
 }) {
@@ -77,6 +78,14 @@ export function normalizeStaleRunningStatus({
     if (error?.code !== 'ENOENT') return { ok: false, code: 'pid_read_failed', error: error.message };
   }
   if (processExists(pid)) {
+    if (
+      Number.isInteger(ownerPid)
+      && pid === ownerPid
+      && status.continuation_required === true
+      && status.controller_action === 'resume'
+    ) {
+      return { ok: true, normalized: false, reason: 'owned_continuation_resume', pid, run_id: status.run_id ?? null };
+    }
     return { ok: false, code: 'run_already_running', pid, run_id: status.run_id ?? null };
   }
 
@@ -159,6 +168,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
     : normalizeStaleRunningStatus({
       stateDir,
       pidFile: args.get('pid-file') || path.join(stateDir, 'phase-loop.pid'),
+      ownerPid: args.has('owner-pid') ? Number.parseInt(args.get('owner-pid'), 10) : null,
       runStamp: args.get('run-stamp')
     });
   process.stdout.write(`${JSON.stringify(result)}\n`);
