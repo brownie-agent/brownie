@@ -75,7 +75,18 @@ export function appendTaskTransition(repoRoot, input) {
   const current = taskProjection(events).get(input.task_id);
   const toState = input.to_state ?? input.toState;
   const verdict = validateTransition({ previous: current, toState, ...input });
-  if (!verdict.ok) return verdict;
+  if (!verdict.ok) {
+    const duplicate = input.run_id != null && input.claim_id != null && events.find((event) => (
+      event?.task_id === input.task_id
+      && event?.to_state === toState
+      && (event?.run_id ?? null) === (input.run_id ?? null)
+      && (event?.claim_id ?? null) === (input.claim_id ?? null)
+      && (event?.task_spec_sha256 ?? null) === (input.task_spec_sha256 ?? null)
+      && (event?.reason ?? null) === (input.reason ?? null)
+    ));
+    if (duplicate) return { ok: true, code: 'duplicate_transition', event: duplicate };
+    return verdict;
+  }
   const event = {
     schema_version: 1,
     event_id: crypto.randomUUID(),
@@ -104,6 +115,15 @@ export function replanTaskWithChildren(repoRoot, { task_id, reason, children, ru
   if (!Array.isArray(children) || children.length === 0) return { ok: false, code: 'replan_requires_reason_and_children' };
   const events = readTaskLedger(repoRoot);
   const projection = taskProjection(events);
+  const duplicate = events.find((event) => (
+    event?.task_id === task_id
+    && event?.to_state === 'replanned'
+    && (event?.run_id ?? null) === run_id
+    && (event?.claim_id ?? null) === claim_id
+    && (event?.task_spec_sha256 ?? null) === (task_spec_sha256 ?? null)
+    && (event?.reason ?? null) === reason
+  ));
+  if (duplicate) return { ok: true, code: 'duplicate_replan', events: [duplicate], duplicate: true };
   const parent = projection.get(task_id);
   const childIds = children.map((child) => child?.task_id);
   if (new Set(childIds).size !== childIds.length || childIds.some((id) => !id)) return { ok: false, code: 'replan_children_must_have_unique_ids' };
@@ -280,14 +300,8 @@ export function recordTrajectory(repoRoot, {
     } catch (error) {
       return { ok: false, code: 'ledger_append_failed', error: error.message };
     }
-    if (!result.ok) {
-      return {
-        ok: true,
-        code: 'ledger_transition_rejected',
-        task_id: taskId,
-        rejected: result
-      };
-    }
+    if (!result.ok) return { ok: false, code: 'ledger_transition_rejected', task_id: taskId, rejected: result };
+    if (result.duplicate) return { ok: true, code: 'duplicate_trajectory', task_id: taskId, duplicate: result };
     return result;
   }
   const transitions = {
@@ -297,7 +311,7 @@ export function recordTrajectory(repoRoot, {
     'todo.blocked': ['blocked'],
     'todo.failed': ['failed']
   }[type] ?? [];
-  let rejected = null;
+  let duplicate = false;
   for (const to_state of transitions) {
     let result;
     try {
@@ -314,12 +328,11 @@ export function recordTrajectory(repoRoot, {
       return { ok: false, code: 'ledger_append_failed', error: error.message };
     }
     if (!result.ok) {
-      rejected ??= result;
-      continue;
+      return { ok: false, code: 'ledger_transition_rejected', task_id: taskId, rejected: result };
     }
+    duplicate ||= result.code === 'duplicate_transition';
   }
-  if (rejected) return { ok: true, code: 'ledger_transition_rejected', task_id: taskId, rejected };
-  return { ok: true, code: 'trajectory_recorded', task_id: taskId };
+  return { ok: true, code: duplicate ? 'duplicate_trajectory' : 'trajectory_recorded', task_id: taskId };
 }
 
 // A TODO can be retried after an interrupted or failed claim. The ledger is

@@ -33,6 +33,9 @@ PHASE_LOOP_ACTIVE_STDOUT_LOG=""
 PHASE_LOOP_ACTIVE_STDERR_LOG=""
 PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 PHASE_LOOP_SUPERVISOR_PID=""
+PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
+PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
+PHASE_LOOP_FINALIZING=0
 
 BROWNIE_BIN="${BROWNIE_BIN:-"$ROOT_DIR/target/debug/brownie"}"
 PHASE_LOOP_DEFAULT_BROWNIE_BIN="$ROOT_DIR/target/debug/brownie"
@@ -299,6 +302,12 @@ write_status() {
     claim_id_json="\"$escaped_claim_id\""
   fi
   PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=1
+  if [ -n "${PHASE_LOOP_TEST_STATUS_WRITE_MARKER:-}" ]; then
+    : > "$PHASE_LOOP_TEST_STATUS_WRITE_MARKER"
+  fi
+  if [ -n "${PHASE_LOOP_TEST_STATUS_WRITE_DELAY_SECONDS:-}" ]; then
+    sleep "$PHASE_LOOP_TEST_STATUS_WRITE_DELAY_SECONDS" || true
+  fi
   tmp_status="$STATUS_FILE.$$.$RANDOM.tmp"
   cat > "$tmp_status" <<EOF
 {
@@ -332,6 +341,9 @@ EOF
     exit "$force_status_exit_code"
   fi
   PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
+  if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -eq 1 ] && [ "${PHASE_LOOP_FINALIZING:-0}" -eq 0 ]; then
+    phase_loop_drain_deferred_signal
+  fi
 }
 
 sync_parent_dir() {
@@ -13756,8 +13768,11 @@ run_brownie_once() {
 phase_loop_finalize_unexpected_exit() {
   local exit_code="${1:-1}"
   if [ "${PHASE_LOOP_STATUS_WRITE_IN_PROGRESS:-0}" -eq 1 ]; then
+    PHASE_LOOP_DEFERRED_SIGNAL_PENDING=1
+    PHASE_LOOP_DEFERRED_SIGNAL_CODE="$exit_code"
     return 0
   fi
+  PHASE_LOOP_FINALIZING=1
   local current_status
   current_status="$(status_field status 2>/dev/null || true)"
   if [ "$current_status" = "running" ]; then
@@ -13769,11 +13784,28 @@ phase_loop_finalize_unexpected_exit() {
   fi
 }
 
+phase_loop_drain_deferred_signal() {
+  if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -ne 1 ]; then
+    return 0
+  fi
+  local deferred_code="${PHASE_LOOP_DEFERRED_SIGNAL_CODE:-143}"
+  PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
+  PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
+  phase_loop_finalize_unexpected_exit "$deferred_code"
+  trap - INT TERM EXIT
+  exit "$deferred_code"
+}
+
 phase_loop_handle_run_signal() {
   local signal_name="$1"
   local signal_code=143
   if [ "$signal_name" = "INT" ]; then
     signal_code=130
+  fi
+  if [ "${PHASE_LOOP_STATUS_WRITE_IN_PROGRESS:-0}" -eq 1 ]; then
+    PHASE_LOOP_DEFERRED_SIGNAL_PENDING=1
+    PHASE_LOOP_DEFERRED_SIGNAL_CODE="$signal_code"
+    return 0
   fi
   phase_loop_finalize_unexpected_exit "$signal_code"
   trap - INT TERM EXIT

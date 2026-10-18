@@ -90,8 +90,33 @@ test('keeps duplicate routed trajectory events nonfatal while preserving the val
   assert.equal(recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-duplicate' }).ok, true);
   const duplicate = recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-duplicate' });
   assert.equal(duplicate.ok, true);
-  assert.equal(duplicate.code, 'ledger_transition_rejected');
+  assert.equal(duplicate.code, 'duplicate_trajectory');
   assert.equal(taskProjection(readTaskLedger(repo)).get(taskAttemptId('T-duplicate-route', 'claim-duplicate-route')).to_state, 'running');
+});
+
+test('fails closed on an out-of-order completion after the ledger was truncated', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const claim = path.join(repo, 'claim.json');
+  const ledger = path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl');
+  fs.mkdirSync(path.dirname(ledger), { recursive: true });
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: 'claim-truncated', selected_todo: '- [ ] T-truncated: bounded task' }));
+  const result = recordTrajectory(repo, { claimPath: claim, type: 'todo.completed', runId: 'run-truncated' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'ledger_transition_rejected');
+  assert.equal(result.rejected.code, 'task_must_start_queued');
+  assert.equal(fs.existsSync(ledger), false);
+});
+
+test('fails closed on a non-duplicate out-of-order routed transition', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const claim = path.join(repo, 'claim.json');
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: 'claim-out-of-order', selected_todo: '- [ ] T-out-of-order: bounded task' }));
+  assert.equal(appendTaskTransition(repo, { task_id: taskAttemptId('T-out-of-order', 'claim-out-of-order'), to_state: 'queued' }).ok, true);
+  const result = recordTrajectory(repo, { claimPath: claim, type: 'workflow.routed', runId: 'run-out-of-order' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'ledger_transition_rejected');
+  assert.equal(result.rejected.code, 'invalid_task_transition');
+  assert.equal(taskProjection(readTaskLedger(repo)).get(taskAttemptId('T-out-of-order', 'claim-out-of-order')).to_state, 'queued');
 });
 
 test('records an absent claim as an explicit empty task-ledger trajectory without recreating a claim', () => {
