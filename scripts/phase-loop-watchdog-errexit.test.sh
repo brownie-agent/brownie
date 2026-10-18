@@ -126,3 +126,19 @@ printf '%s\n' 'phase-loop supervisor terminalizes watchdog ownership failure (75
 printf '%s\n' 'phase-loop supervisor terminalizes generic watchdog failure (78 -> blocked/78)'
 printf '%s\n' 'phase-loop startup checks continuation watchdog before live-owner return'
 printf '%s\n' 'phase-loop is_running fails closed on foreign owner metadata'
+
+restart_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-restart.XXXXXX")"
+trap 'rm -rf "$restart_case_dir"' EXIT
+mkdir -p "$restart_case_dir/logs" "$restart_case_dir/phase-loop.lock"
+set +e
+PHASE_LOOP_STATE_DIR="$restart_case_dir" STATE_DIR="$restart_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  printf "%s\n" "$$" > "$STATE_DIR/phase-loop.pid"
+  bash "$ROOT_DIR/phase-loop.sh" restart
+' bash
+restart_status=$?
+set -e
+[ "$restart_status" -eq 75 ]
+[ -f "$restart_case_dir/phase-loop.pid" ]
+[ -d "$restart_case_dir/phase-loop.lock" ]
+printf '%s\n' 'phase-loop restart refuses to delete a live unowned supervisor'
