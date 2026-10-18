@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateTodoDecompositionText } from './guard-todo-decomposition.mjs';
+import { loadTodoState } from './phase-loop-todo-state.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -79,30 +80,10 @@ function readTodoReplanRecords() {
   return records;
 }
 
-function readTodoCompletionIds() {
-  const absoluteDir = path.resolve(repoRoot, '.brownie/private/phase-loop/todo-completions');
-  let entries = [];
-  try {
-    entries = fs.readdirSync(absoluteDir, { withFileTypes: true });
-  } catch {
-    return new Set();
-  }
-  const ids = new Set();
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) {
-      continue;
-    }
-    try {
-      const record = JSON.parse(fs.readFileSync(path.join(absoluteDir, entry.name), 'utf8'));
-      const id = typeof record?.selected_todo_id === 'string' ? record.selected_todo_id.trim() : '';
-      if (id) {
-        ids.add(id);
-      }
-    } catch {
-      // Malformed completion records must not authorize dependency rewrites.
-    }
-  }
-  return ids;
+function canonicalTodoState(todoText, breakdownPath) {
+  return loadTodoState(repoRoot, todoText, {
+    breakdownPath: path.resolve(repoRoot, breakdownPath)
+  });
 }
 
 function writeTransitiveReplanRecords({ removedParentIds, replacementSourceTodoId, generatedChildIds, runStamp }) {
@@ -207,23 +188,84 @@ function routeValue(block) {
 }
 
 function patchOnlyScopes(block) {
-  const first = firstLine(block);
-  const start = first.indexOf('Patch only');
-  if (start < 0) {
-    return [];
-  }
-  const rest = first.slice(start + 'Patch only'.length);
-  return [...rest.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
+  return boundedScopeClauses(block)
+    .filter((clause) => clause.operation === 'Patch')
+    .flatMap((clause) => clause.targets);
 }
 
 function createOnlyScopes(block) {
-  const first = firstLine(block);
-  const start = first.indexOf('Create only');
-  if (start < 0) {
-    return [];
+  return boundedScopeClauses(block)
+    .filter((clause) => clause.operation === 'Create')
+    .flatMap((clause) => clause.targets);
+}
+
+function leadingBacktickedScopes(text) {
+  const scopes = [];
+  let cursor = 0;
+  while (true) {
+    const leading = text.slice(cursor).match(/^\s*/u)?.[0] ?? '';
+    cursor += leading.length;
+    if (text[cursor] !== '`') break;
+    const end = text.indexOf('`', cursor + 1);
+    if (end < 0) break;
+    scopes.push(text.slice(cursor + 1, end));
+    cursor = end + 1;
+    const separator = text.slice(cursor).match(/^\s*(?:,|and\b|&)\s*/u)?.[0];
+    if (!separator || text[cursor + separator.length] !== '`') break;
+    cursor += separator.length;
   }
-  const rest = first.slice(start + 'Create only'.length);
-  return [...rest.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
+  return { scopes, end: cursor };
+}
+
+function leadingCreateOnlyScopes(block) {
+  return boundedScopeClauses(block)
+    .filter((clause) => clause.operation === 'Create')
+    .flatMap((clause) => clause.targets);
+}
+
+function boundedScopeClauses(block) {
+  const line = firstLine(block);
+  const clauses = [];
+  const markerPattern = /\b(Patch|Create) only\b/gu;
+  let marker;
+  while ((marker = markerPattern.exec(line)) !== null) {
+    const parsed = leadingBacktickedScopes(line.slice(marker.index + marker[0].length));
+    if (parsed.scopes.length === 0) {
+      continue;
+    }
+    clauses.push({
+      operation: marker[1],
+      targets: parsed.scopes,
+      start: marker.index,
+      end: marker.index + marker[0].length + parsed.end
+    });
+  }
+  return clauses;
+}
+
+function normalizeExistingCreateOnlyScopes(block) {
+  const line = firstLine(block);
+  const parsedClauses = boundedScopeClauses(block);
+  const createClauses = parsedClauses.filter(({ operation }) => operation === 'Create');
+  if (createClauses.length === 0) return block;
+  const existingCreateScopes = createClauses
+    .flatMap(({ targets }) => targets)
+    .filter((scope) => !scope.endsWith('/') && existingFile(scope));
+  if (existingCreateScopes.length === 0) return block;
+  const patchScopes = parsedClauses
+    .filter(({ operation }) => operation === 'Patch')
+    .flatMap(({ targets }) => targets);
+  const missing = createClauses
+    .flatMap(({ targets }) => targets)
+    .filter((scope) => !existingCreateScopes.includes(scope));
+  const existing = [...new Set([...patchScopes, ...existingCreateScopes])];
+  const rebuiltClauses = [];
+  if (existing.length > 0) rebuiltClauses.push(`Patch only ${existing.map((scope) => `\`${scope}\``).join(' and ')}`);
+  if (missing.length > 0) rebuiltClauses.push(`Create only ${missing.map((scope) => `\`${scope}\``).join(' and ')}`);
+  const scopeStart = Math.min(...parsedClauses.map(({ start }) => start));
+  const scopeEnd = Math.max(...parsedClauses.map(({ end }) => end));
+  const replacement = `${line.slice(0, scopeStart)}${rebuiltClauses.join(' and ')}${line.slice(scopeEnd)}`;
+  return block.replace(line, replacement);
 }
 
 function boundedScopes(block) {
@@ -234,6 +276,18 @@ function extractBacktickedPaths(text) {
   return [...text.matchAll(/`([^`]+)`/g)]
     .map((match) => match[1])
     .filter((value) => value.includes('/') || value.startsWith('.brownie/'));
+}
+
+function verificationScriptPaths(block) {
+  return block
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('Verification:'))
+    .flatMap((line) => [...line.matchAll(/`([^`]+)`/g)].map((match) => match[1]))
+    .flatMap((command) => {
+      const match = command.match(/^node\s+(?:--test\s+)?(scripts\/[^\s]+)/u);
+      return match ? [match[1]] : [];
+    });
 }
 
 function replaceBacktickedPath(text, from, to) {
@@ -927,7 +981,86 @@ function replaceFirst(text, needle, replacement) {
   return text.slice(0, index) + replacement + text.slice(index + needle.length);
 }
 
-function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPath, breakdownPath }) {
+function repairSourceSiblingContracts({ todoText, breakdownText, todoPath, breakdownPath, completedTodoIds, invalidCheckedTodoIds }) {
+  const blocks = uncheckedTodoBlocks(todoText);
+  const groups = new Map();
+  for (const block of blocks) {
+    const sourceId = sourceTodoId(block);
+    if (!sourceId) continue;
+    groups.set(sourceId, [...(groups.get(sourceId) ?? []), block]);
+  }
+  let updatedTodo = todoText;
+  let updatedBreakdown = breakdownText;
+  const normalizations = [];
+  const unresolvedCycles = [];
+  for (const [sourceId, siblings] of groups) {
+    const siblingIds = new Set(siblings.map(todoId));
+    const siblingDependencies = new Map(siblings.map((block) => [
+      todoId(block),
+      parseDependsOn(block).filter((dependency) => siblingIds.has(dependency))
+    ]));
+    const reachesSibling = (fromId, targetId, seen = new Set()) => {
+      if (seen.has(fromId)) return false;
+      if (fromId === targetId) return true;
+      return (siblingDependencies.get(fromId) ?? []).some((dependency) =>
+        reachesSibling(dependency, targetId, new Set([...seen, fromId]))
+      );
+    };
+    const hasCycle = siblings.length > 1 && [...siblingIds].some((start) => {
+      const visit = (id, seen) => (siblingDependencies.get(id) ?? []).some((dependency) =>
+        dependency === start || (!seen.has(dependency) && visit(dependency, new Set([...seen, dependency])))
+      );
+      return visit(start, new Set([start]));
+    });
+    const hasExistingCreateOnlyTarget = siblings.some((block) => leadingCreateOnlyScopes(block).some(existingFile));
+    if (!hasCycle && !hasExistingCreateOnlyTarget) continue;
+    for (let index = 0; index < siblings.length; index += 1) {
+      const original = siblings[index];
+      let normalized = normalizeExistingCreateOnlyScopes(original);
+      const existingDependencies = parseDependsOn(normalized);
+      const expectedDependencies = existingDependencies.filter((dependency) => {
+        if (!hasCycle || !siblingIds.has(dependency) || !reachesSibling(dependency, todoId(original))) return true;
+        const verifierIsOnRemovedEdgeCyclePath = siblings.some((verifier) => {
+          const verifierId = todoId(verifier);
+          return verifier !== original
+            && leadingCreateOnlyScopes(original).some((target) => !target.endsWith('/') && verificationScriptPaths(verifier).includes(target))
+            // Do not let a verifier reached through the original leaf's own
+            // cycle justify removing an unrelated prerequisite edge.
+            && reachesSibling(dependency, verifierId, new Set([todoId(original)]))
+            && reachesSibling(verifierId, todoId(original));
+        });
+        return !verifierIsOnRemovedEdgeCyclePath;
+      });
+      normalized = replaceDependsOn(normalized, expectedDependencies).block;
+      if (normalized === original) continue;
+      updatedTodo = replaceFirst(updatedTodo, original, normalized) ?? updatedTodo;
+      const id = todoId(original);
+      const graphPattern = new RegExp(`(^-\\s+${id.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}:\\s*).*(\\s*$)`, 'mu');
+      updatedBreakdown = updatedBreakdown.replace(graphPattern, `$1${expectedDependencies.join(', ') || '<none>'}$2`);
+      normalizations.push({ sourceId, id, dependencies: expectedDependencies });
+    }
+    if (hasCycle && normalizations.filter((normalization) => normalization.sourceId === sourceId).length === 0) {
+      unresolvedCycles.push(sourceId);
+    }
+  }
+  if (normalizations.length === 0) {
+    return unresolvedCycles.length > 0
+      ? { applied: false, eligible: true, reason: 'unrepairable_source_sibling_cycle', sourceIds: unresolvedCycles }
+      : { applied: false, eligible: false, reason: 'no_source_sibling_contract_drift' };
+  }
+  const validationErrors = validateTodoDecompositionText(updatedTodo, {
+    path: todoPath, repoRoot, packageScripts: packageScripts(), breakdownPath, breakdownText: updatedBreakdown,
+    completedTodoIds,
+    invalidCheckedTodoIds,
+    productReady: false, releaseBlockersRemaining: true
+  });
+  if (validationErrors.length > 0) return { applied: false, eligible: true, reason: 'source_sibling_contract_repair_failed_guard', validationErrors, normalizations };
+  writeAtomic(todoPath, updatedTodo);
+  writeAtomic(breakdownPath, updatedBreakdown);
+  return { applied: true, operation: 'deterministic_source_sibling_contract_rebaseline', todoPath, breakdownPath, normalizations };
+}
+
+function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPath, breakdownPath, completedTodoIds, invalidCheckedTodoIds }) {
   const selected = claim.selected_todo;
   if (typeof selected !== 'string') {
     return { applied: false, eligible: false, reason: 'selected_todo_missing' };
@@ -1094,7 +1227,7 @@ function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPa
   }
 
   const ids = existingIds(todoText);
-  const completedIds = readTodoCompletionIds();
+  const completedIds = completedTodoIds ?? canonicalTodoState(todoText, breakdownPath).resolvedIds;
   const dependencies = parseDependsOn(normalizedBlock);
   const liveDependencies = dependencies.filter((dependency) => ids.has(dependency) || completedIds.has(dependency));
   const removedDependencies = dependencies.filter((dependency) => !ids.has(dependency) && !completedIds.has(dependency));
@@ -1128,6 +1261,7 @@ function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPa
     breakdownPath,
     breakdownText,
     completedTodoIds: completedIds,
+    invalidCheckedTodoIds,
     productReady: false,
     releaseBlockersRemaining: true
   });
@@ -1157,10 +1291,40 @@ function repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPa
 function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, breakdownPath, additionalSourceIds = [] }) {
   const blocks = uncheckedTodoBlocks(todoText);
   const ids = existingIds(todoText);
-  const completedIds = readTodoCompletionIds();
+  const todoState = canonicalTodoState(todoText, breakdownPath);
+  const completedIds = todoState.resolvedIds;
   const notes = [];
   let updatedTodo = todoText;
   let updatedBreakdown = breakdownText;
+
+  // A checked parent that has been superseded by children is deliberately not
+  // a completion receipt.  Downstream leaves must wait on the live child
+  // frontier, rather than retain an unschedulable dependency on that parent.
+  // Resolve recursively because a repair can itself be superseded later.
+  const executableFrontier = (parentId, seen = new Set()) => {
+    if (seen.has(parentId)) return { frontier: [], complete: false };
+    const nextSeen = new Set(seen);
+    nextSeen.add(parentId);
+    const children = [...(todoState.childrenByParent.get(parentId) ?? [])];
+    if (children.length === 0) return { frontier: [], complete: false };
+    const result = { frontier: [], complete: true };
+    for (const childId of children) {
+      if (todoState.resolvedIds.has(childId)) continue;
+      if (todoState.supersededIds.has(childId)) {
+        const childResult = executableFrontier(childId, nextSeen);
+        result.frontier.push(...childResult.frontier);
+        result.complete = result.complete && childResult.complete;
+      } else if (todoState.liveIds.has(childId)) {
+        result.frontier.push(childId);
+      } else {
+        // A replan record naming a child that is neither live nor resolved is
+        // an incomplete frontier. Never drop that branch because another
+        // generated child happens to remain executable.
+        result.complete = false;
+      }
+    }
+    return { frontier: [...new Set(result.frontier)], complete: result.complete };
+  };
 
   for (const block of blocks) {
     const id = todoId(block);
@@ -1168,12 +1332,29 @@ function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, bre
       continue;
     }
     const dependencies = parseDependsOn(block);
+    const supersededDependencies = dependencies.filter((dependency) => (
+      todoState.supersededIds.has(dependency) && !todoState.resolvedIds.has(dependency)
+    ));
+    const dependencyFrontiers = new Map(supersededDependencies.map((dependency) => [dependency, executableFrontier(dependency)]));
     const danglingDependencies = dependencies.filter((dependency) => !ids.has(dependency) && !completedIds.has(dependency));
     const breakdownOnlyDependencies = danglingDependencies.filter((dependency) => breakdownText.includes(dependency));
-    if (breakdownOnlyDependencies.length === 0) {
+    if (breakdownOnlyDependencies.length === 0 && supersededDependencies.length === 0) {
       continue;
     }
-    const liveDependencies = dependencies.filter((dependency) => ids.has(dependency) || completedIds.has(dependency));
+    const liveDependencies = [...new Set(dependencies.flatMap((dependency) => {
+      if (dependencyFrontiers.has(dependency)) return dependencyFrontiers.get(dependency).frontier;
+      return (ids.has(dependency) || completedIds.has(dependency)) ? [dependency] : [];
+    }))];
+    if (supersededDependencies.some((dependency) => !dependencyFrontiers.get(dependency).complete)) {
+      return {
+        applied: false,
+        eligible: true,
+        reason: 'superseded_dependency_has_incomplete_child_frontier',
+        todoId: id,
+        supersededDependencies,
+        dependencyFrontiers: Object.fromEntries([...dependencyFrontiers].map(([parent, result]) => [parent, result]))
+      };
+    }
     const replaced = replaceDependsOn(block, liveDependencies);
     if (!replaced.changed) {
       continue;
@@ -1193,8 +1374,11 @@ function repairDanglingLiveDependencies({ todoText, breakdownText, todoPath, bre
     updatedBreakdown = updatedBreakdown.replace(graphPattern, `$1${liveDependencies.join(', ') || '<none>'}$2`);
     notes.push({
       todo_id: id,
-      normalization: 'removed_breakdown_only_dependency',
+      normalization: supersededDependencies.length > 0
+        ? 'rebased_superseded_parent_dependency_to_live_child_frontier'
+        : 'removed_breakdown_only_dependency',
       removed: breakdownOnlyDependencies,
+      superseded_parents: supersededDependencies,
       remaining: liveDependencies
     });
   }
@@ -1321,7 +1505,25 @@ export function repairTodoDecomposition({
   const selected = claim.selected_todo;
   const todoText = readText(todoPath);
   const breakdownText = fs.existsSync(path.resolve(repoRoot, breakdownPath)) ? readText(breakdownPath) : '# TODO breakdown\n';
-  const leafRepair = repairSelectedLeafTodoContract({ claim, todoText, breakdownText, todoPath, breakdownPath });
+  const todoState = canonicalTodoState(todoText, breakdownPath);
+  const unresolvedSupersededIds = new Set(
+    [...todoState.supersededIds].filter((id) => !todoState.resolvedIds.has(id))
+  );
+  const siblingRepair = repairSourceSiblingContracts({
+    todoText, breakdownText, todoPath, breakdownPath,
+    completedTodoIds: todoState.resolvedIds,
+    invalidCheckedTodoIds: unresolvedSupersededIds
+  });
+  if (siblingRepair.applied || siblingRepair.eligible) return siblingRepair;
+  const leafRepair = repairSelectedLeafTodoContract({
+    claim,
+    todoText,
+    breakdownText,
+    todoPath,
+    breakdownPath,
+    completedTodoIds: todoState.resolvedIds,
+    invalidCheckedTodoIds: unresolvedSupersededIds
+  });
   if (leafRepair.applied || leafRepair.eligible) {
     if (leafRepair.reason === 'selected_leaf_missing_from_todo') {
       // The runtime may have replaced the claimed decomposition leaf. Repair

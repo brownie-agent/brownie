@@ -6,7 +6,12 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { controlPhaseLoop, inspectDelegationFeedback } from './phase-loop-supervisor-control.mjs';
+import {
+  controlPhaseLoop,
+  inspectDelegationFeedback,
+  inspectWorkerLaunchReceipt,
+  registerWorkerLaunchReceipt
+} from './phase-loop-supervisor-control.mjs';
 import { readTrackedBreakdownReplanRecords } from './phase-loop-todo-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -77,6 +82,67 @@ test('delegation feedback parsing preserves acknowledgements and fails closed on
     delegation: { status: 'acknowledged', required_actor: 'brownie-agent' }
   });
   assert.equal(inspectDelegationFeedback(feedbackPath).state, 'acknowledged');
+});
+
+function workerReceipt(overrides = {}) {
+  return {
+    schema_version: 1,
+    kind: 'phase_loop_worker_launch_receipt',
+    status: 'active',
+    launch_id: 'launch-01',
+    actor: 'brownie-agent',
+    claim_id: 'claim-worker',
+    target_pr_url: 'https://github.com/globalpocket/brownie/pull/643',
+    started_at: '2026-10-18T00:00:00.000Z',
+    expires_at: '2026-10-18T01:00:00.000Z',
+    last_heartbeat_at: '2026-10-18T00:20:00.000Z',
+    heartbeat_interval_seconds: 30,
+    idempotency_key: 'instruction-fingerprint-01',
+    ...overrides
+  };
+}
+
+test('requires a live worker-launch receipt and rejects missing, expired, mismatched, and duplicate launches', () => {
+  const repo = makeRepo();
+  const now = new Date('2026-10-18T00:20:10.000Z');
+  assert.equal(inspectWorkerLaunchReceipt(repo, { now }).reason, 'dispatch_not_started');
+
+  const receipt = workerReceipt();
+  assert.equal(registerWorkerLaunchReceipt(repo, receipt).ok, true);
+  assert.equal(inspectWorkerLaunchReceipt(repo, { now }).ok, true);
+  assert.equal(registerWorkerLaunchReceipt(repo, receipt).replayed, true);
+
+  writeJson(repo, '.brownie/private/phase-loop/worker-launch-receipt.json', workerReceipt({
+    launch_id: 'launch-expired',
+    expires_at: '2026-10-18T00:20:00.000Z'
+  }));
+  assert.equal(inspectWorkerLaunchReceipt(repo, { now }).reason, 'worker_liveness_missing');
+
+  writeJson(repo, '.brownie/private/phase-loop/worker-launch-receipt.json', workerReceipt({
+    launch_id: 'launch-actor-mismatch',
+    actor: 'globalpocket'
+  }));
+  assert.equal(inspectWorkerLaunchReceipt(repo, { now }).reason, 'dispatch_not_started');
+
+  const duplicate = workerReceipt({
+    launch_id: 'launch-duplicate',
+    idempotency_key: 'instruction-fingerprint-01'
+  });
+  assert.equal(registerWorkerLaunchReceipt(repo, duplicate).reason, 'duplicate_worker_launch');
+});
+
+test('controller refuses normal loop start when worker launch evidence is absent', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const result = controlPhaseLoop({
+    repoRoot: repo,
+    write: false,
+    repair: false,
+    start: true
+  });
+  assert.equal(result.start.attempted, false, JSON.stringify(result, null, 2));
+  assert.equal(result.start.reason, 'dispatch_not_started', JSON.stringify(result, null, 2));
+  assert.equal(result.start.worker_launch_receipt.reason, 'dispatch_not_started');
 });
 
 function writeTodo(repo) {
