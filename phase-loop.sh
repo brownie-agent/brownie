@@ -13200,13 +13200,28 @@ PY
     if verification_completion="$(complete_applied_todo_after_verification "$stdout_log" "$run_stamp" 2>&1)"; then
       save_active_target_known_good "selected_todo_verification_passed" || true
       clear_repair_feedback
+      # Record the terminal ledger event while the claim and TODO are still
+      # live. If the append fails, leave the claim in progress so retry can
+      # close the same attempt instead of silently removing the TODO first.
+      write_bdk_trajectory_event "$run_stamp" "verification.run" "$verification_completion"
+      if [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 1 ]; then
+        detail="Task ledger failed before objective-apply completion; leaving the claim in progress for retry. ${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL}"
+        write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+        write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+        return 78
+      fi
+      write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"objective_apply_verified"}'
+      if [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 1 ]; then
+        detail="Task ledger failed before objective-apply queue completion; leaving the claim in progress for retry. ${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL}"
+        write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+        write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+        return 78
+      fi
       write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
       remove_completed_todo_claim_from_queue "$run_stamp" >> "$SUPERVISOR_LOG"
       detail="Brownie applied a workspace patch and selected TODO verification passed; marked TODO completed. verification=$verification_completion stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
       write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
       printf '%s run=%s objective_apply_verified=true verification=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$verification_completion" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
-      write_bdk_trajectory_event "$run_stamp" "verification.run" "$verification_completion"
-      write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"objective_apply_verified"}'
       phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
       return 0
     else
@@ -13910,10 +13925,37 @@ supervise() {
   done
 }
 
+normalize_stale_running_before_start() {
+  if [ ! -f "$ROOT_DIR/scripts/phase-loop-run-state.mjs" ]; then
+    return 0
+  fi
+  local start_run_stamp="start-$(date -u +%Y%m%dT%H%M%SZ)"
+  local normalization_output normalization_status
+  normalization_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" normalize-stale-running --state-dir "$STATE_DIR" --pid-file "$PID_FILE" --owner-pid "" --run-stamp "$start_run_stamp" 2>&1)"
+  normalization_status=$?
+  if [ -n "$normalization_output" ]; then
+    printf '%s startup_stale_running_normalization=%s\n' "$(now_utc)" "$normalization_output" >> "$SUPERVISOR_LOG"
+  fi
+  if [ "$normalization_status" -eq 75 ]; then
+    printf '%s\n' "${normalization_output:-A live phase-loop supervisor is still running; refusing startup.}" >&2
+    return 75
+  fi
+  if [ "$normalization_status" -ne 0 ]; then
+    printf '%s\n' "${normalization_output:-Unable to normalize stale phase-loop state before startup.}" >&2
+    return 78
+  fi
+  return 0
+}
+
 start() {
   if is_running; then
     echo "phase-loop already running: pid $(cat "$PID_FILE")"
     exit 0
+  fi
+  normalize_stale_running_before_start
+  local startup_normalization_status=$?
+  if [ "$startup_normalization_status" -ne 0 ]; then
+    exit "$startup_normalization_status"
   fi
   rm -f "$STOP_FILE"
   write_status "starting" "Supervisor launch requested." "" "" 0

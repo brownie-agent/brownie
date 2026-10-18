@@ -13,12 +13,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Fail closed on implementation pull-request author
-        if: github.event_name == 'pull_request'
-        run: node scripts/phase-loop-pr-author-guard.mjs --event-path "$GITHUB_EVENT_PATH"
-
       - name: Fetch approved phase-loop controller baseline
         run: git fetch --no-tags origin main:refs/remotes/origin/main
+
+      - name: Fail closed on implementation pull-request author
+        if: github.event_name == 'pull_request'
+        run: |
+          trusted_guard="$RUNNER_TEMP/phase-loop-pr-author-guard.mjs"
+          git show origin/main:scripts/phase-loop-pr-author-guard.mjs > "$trusted_guard"
+          node "$trusted_guard" --event-path "$GITHUB_EVENT_PATH"
 
       - name: Fail closed on stale phase-loop controller source
         run: |
