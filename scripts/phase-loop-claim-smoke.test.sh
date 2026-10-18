@@ -685,9 +685,10 @@ assert claim["selected_todo"].startswith("- [ ] B-01: durable claim task"), clai
 assert claim["queue_generation"] == 1, claim
 assert claim["queue_fingerprint"] == queue_state["fingerprint"], (claim, queue_state)
 assert queue_state["generation"] == 1, queue_state
-assert progress_state["classification"] == "progress", progress_state
-assert progress_state["meaningful_progress"] is True, progress_state
+assert progress_state["classification"] == "non_progress_success", progress_state
+assert progress_state["meaningful_progress"] is False, progress_state
 assert progress_state["continuation_required"] is False, progress_state
+assert progress_state["workspace_changed"] is False, progress_state
 assert progress_state["progress_projection"]["closure"] == "budget_exhausted", progress_state
 assert progress_state["progress_projection"]["stop_class"] == "continuation_required", progress_state
 assert progress_state["progress_projection"]["controller_action"] == "resume", progress_state
