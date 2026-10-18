@@ -73,7 +73,7 @@
 - [ ] E-23b-release-artifact-download-roundtrip: Create only `scripts/release-artifact-roundtrip-e2e.mjs` and `scripts/release-artifact-roundtrip-e2e.test.mjs`, then patch only `package.json` and `.github/workflows/release.yml` to invoke them:
   Route: implementation.
   Source TODO: 2026-10-06 external review: CI executes the pre-upload file but does not download, extract, checksum, and execute the uploaded artifact.
-  Depends on: E-23a-release-artifact-portable-archive.
+  Depends on: E-23a-release-artifact-portable-archive-target-03.
   Completion condition: CI downloads the uploaded package into a fresh directory, verifies package and binary SHA bindings, extracts it, and successfully starts the packaged CLI with its Runtime companion on Linux, macOS, and Windows.
   Forbidden changes: do not validate the original build directory in place of the downloaded package, do not bypass checksum failures, and do not require publication credentials.
   Verification: run `node --test scripts/release-artifact-roundtrip-e2e.test.mjs` and the Release Workflow matrix.
