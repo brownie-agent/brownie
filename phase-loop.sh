@@ -12052,6 +12052,7 @@ PY
       write_status "blocked" "$detail" "$run_stamp" "75" "${CONSECUTIVE_FAILURES:-0}"
       return 75
     fi
+    write_bdk_trajectory_event "$run_stamp" "todo.claimed" '{"source":"phase-loop","reason":"stale_todo_claim_refreshed"}'
     if ! build_effective_prompt "$effective_prompt"; then
       detail="Failed to rebuild effective prompt after stale TODO claim refresh: $effective_prompt"
       printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
