@@ -332,6 +332,15 @@ test('honors terminal failure retry caps before stable suppression', () => {
     blockedPath: blocked,
     controllerFingerprint: 'controller-rebased'
   }), todo);
+
+  const changedTodo = todo.replace(
+    'scripts/retry-cap.mjs',
+    'scripts/retry-cap-v2.mjs'
+  );
+  assert.equal(selectFirstSchedulableTodo(changedTodo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-retry-cap'
+  }), changedTodo);
 });
 
 test('does not treat a stable blocked record as dependency completion evidence', () => {

@@ -208,7 +208,7 @@ export function needsTodoDecomposition(block) {
 }
 
 function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint = '') {
-  if (!blockedPath || !fs.existsSync(blockedPath)) {
+  if (!blockedPath || !fs.existsSync(blockedPath) || !fs.statSync(blockedPath).isFile()) {
     return {
       hashes: new Set(),
       firstLines: new Set(),
@@ -263,6 +263,10 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
           continue;
         }
         if (blockedId && terminalRuntimeFailure && matchesController) {
+          // Terminal retry suppression is keyed by the complete TODO
+          // specification hash and controller. Do not add the ID to
+          // stableIds: a materially changed task with the same ID must get a
+          // fresh retry budget instead of inheriting the old suppression.
           const todoHash = typeof record.selected_todo_sha256 === 'string' && record.selected_todo_sha256
             ? record.selected_todo_sha256
             : sha256Text(record.selected_todo_first_line);
@@ -283,9 +287,6 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
           previous.retry_cap = retryCap;
           previous.blocked_id = blockedId;
           terminalFailureAttempts.set(key, previous);
-          if (previous.count > previous.retry_cap) {
-            stableIds.add(blockedId);
-          }
           continue;
         }
         if (
@@ -393,8 +394,6 @@ export function selectFirstSchedulableTodo(text, options = {}) {
       dependencyBlockedIds.add(id);
       continue;
     }
-    const blockedInCurrentQueue = blocked.hashes.has(blockHash) || blocked.firstLines.has(firstLine);
-    const blockedByCurrentController = blocked.currentControllerHashes.has(blockHash) || blocked.currentControllerFirstLines.has(firstLine);
     const terminalFailureAttempt = [...blocked.terminalFailureAttempts.values()].find((entry) => (
       entry.todo_hash === blockHash
       && (!options.controllerFingerprint || entry.controller_fingerprint === options.controllerFingerprint)
@@ -402,6 +401,12 @@ export function selectFirstSchedulableTodo(text, options = {}) {
     const terminalFailureRetryAvailable = Boolean(
       terminalFailureAttempt && terminalFailureAttempt.count <= terminalFailureAttempt.retry_cap
     );
+    const blockedInCurrentQueue = blocked.hashes.has(blockHash)
+      || blocked.firstLines.has(firstLine)
+      || Boolean(terminalFailureAttempt);
+    const blockedByCurrentController = blocked.currentControllerHashes.has(blockHash)
+      || blocked.currentControllerFirstLines.has(firstLine)
+      || Boolean(terminalFailureAttempt);
     const sourceId = sourceTodoId(block);
     const sourceIsGeneratedParent = Boolean(productPrefix(sourceId));
     const canRetryAfterControllerRepair = blockedInCurrentQueue && !blockedByCurrentController && !isExplicitBlockerTodo(block) && !sourceIsGeneratedParent && !id.includes('-leaf');
