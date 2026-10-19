@@ -64,6 +64,65 @@ assert_not_contains() {
   fi
 }
 
+assert_terminal_failure_claim_archived() {
+  local claim_dir="$1"
+  local blocked_path="$2"
+  local ledger_path="$3"
+  local selected_prefix="$4"
+  local expected_archive_count="$5"
+  python3 - "$claim_dir" "$blocked_path" "$ledger_path" "$selected_prefix" "$expected_archive_count" <<'PY'
+import json
+import pathlib
+import sys
+
+claim_dir = pathlib.Path(sys.argv[1])
+blocked_path = pathlib.Path(sys.argv[2])
+ledger_path = pathlib.Path(sys.argv[3])
+selected_prefix = sys.argv[4]
+expected_archive_count = int(sys.argv[5])
+current_path = claim_dir / "current.json"
+assert not current_path.exists(), current_path
+archives = sorted(claim_dir.glob("stale-*.json"))
+assert len(archives) == expected_archive_count, archives
+archived = [json.loads(path.read_text(encoding="utf-8")) for path in archives]
+matching = [claim for claim in archived if selected_prefix in str(claim.get("selected_todo", ""))]
+assert len(matching) == expected_archive_count, matching
+assert all(claim.get("status") == "failed" for claim in matching), matching
+assert all(claim.get("archive_reason") == "terminal_failure_retry" for claim in matching), matching
+claim_ids = {str(claim.get("claim_id") or "") for claim in matching}
+assert all(claim_ids), matching
+blocked = [
+    json.loads(line)
+    for line in blocked_path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+assert any(
+    record.get("terminal_failure") is True
+    and record.get("claim_id") in claim_ids
+    and selected_prefix in str(record.get("selected_todo", ""))
+    for record in blocked
+), blocked
+ledger_records = [
+    json.loads(line)
+    for line in ledger_path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+terminal_events = []
+for record in ledger_records:
+    if record.get("kind") == "terminal_failure_transaction":
+        terminal_events.extend(record.get("events", []))
+assert all(
+    any(
+        event.get("claim_id") == claim_id
+        and selected_prefix in str(event.get("selected_todo", ""))
+        and "@" in str(event.get("task_id", ""))
+        for event in terminal_events
+    )
+    for claim_id in claim_ids
+), (claim_ids, terminal_events)
+PY
+}
+
 run_with_timeout() {
   local seconds="$1"
   shift
@@ -973,7 +1032,12 @@ case "$retry_cap_exhausted_exit" in
   65|75|76) ;;
   *) echo "unexpected retry-cap exhaustion exit=$retry_cap_exhausted_exit" >&2; exit 1 ;;
 esac
-python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/todo-claims" "$state_terminal_retry_cap/status.json" "$state_terminal_retry_cap/progress-state.json" "$state_terminal_retry_cap/todo-claims/blocked.jsonl" <<'PY'
+assert_terminal_failure_claim_archived \
+  "$state_terminal_retry_cap/todo-claims" \
+  "$state_terminal_retry_cap/todo-claims/blocked.jsonl" \
+  "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" \
+  'E-retry-cap:' 2
+python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/status.json" "$state_terminal_retry_cap/progress-state.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -987,34 +1051,8 @@ same_todo = [
     if any('E-retry-cap:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
 ]
 assert len(same_todo) == 2, same_todo
-claim_dir = pathlib.Path(sys.argv[2])
-current_path = claim_dir / 'current.json'
-archives = sorted(claim_dir.glob('stale-*.json'))
-assert len(archives) == 2, archives
-archived = [json.loads(path.read_text(encoding='utf-8')) for path in archives]
-archived_ids = {str(claim.get('claim_id') or '') for claim in archived}
-failed_claim_ids = {
-    next(event['claim_id'] for event in record.get('events', []) if 'E-retry-cap:' in str(event.get('selected_todo', '')))
-    for record in same_todo
-}
-assert archived_ids == failed_claim_ids, (archived_ids, failed_claim_ids)
-assert all(claim.get('status') == 'failed' for claim in archived), archived
-assert all(claim.get('archive_reason') == 'terminal_failure_retry' for claim in archived), archived
-assert all('E-retry-cap:' in str(claim.get('selected_todo', '')) for claim in archived), archived
-assert not current_path.exists(), current_path
-blocked = [
-    json.loads(line) for line in pathlib.Path(sys.argv[5]).read_text(encoding='utf-8').splitlines()
-    if line.strip()
-]
-assert blocked, blocked
-assert any(
-    record.get('terminal_failure') is True
-    and record.get('claim_id') in failed_claim_ids
-    and 'E-retry-cap:' in str(record.get('selected_todo_first_line', ''))
-    for record in blocked
-), blocked
-status = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'))
-progress = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding='utf-8'))
+status = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+progress = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'))
 assert status['status'] == 'blocked', status
 assert progress['progress_projection']['cli_status'] == 'no_eligible_task', progress
 assert progress['progress_projection']['closure'] == 'no_eligible_task', progress
@@ -2745,16 +2783,20 @@ assert terminal_events and terminal_events[-1]["to_state"] == "replanned", (atte
 assert not any(event.get("kind") == "unclaimed_trajectory" and event.get("trajectory_type") == "todo.replanned" for event in ledger_events), ledger_events
 PY
 else
-python3 - "$no_eligible_split_state/status.json" "$no_eligible_split_state/progress-state.json" "$no_eligible_split_state/todo-claims/current.json" "$no_eligible_split_state/todo-claims/blocked.jsonl" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+assert_terminal_failure_claim_archived \
+  "$no_eligible_split_state/todo-claims" \
+  "$no_eligible_split_state/todo-claims/blocked.jsonl" \
+  "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" \
+  'E-20g-final-judgment-sync:' 1
+python3 - "$no_eligible_split_state/status.json" "$no_eligible_split_state/progress-state.json" "$no_eligible_split_state/todo-claims/blocked.jsonl" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
 import sys
 
 status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 progress = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-claim = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
-blocked = [json.loads(line) for line in pathlib.Path(sys.argv[4]).read_text(encoding="utf-8").splitlines() if line.strip()]
-ledger = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").splitlines() if line.strip()]
+ledger = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
 assert status["status"] == "blocked", status
 assert status["exit_code"] in {"75", "76"}, status
 assert progress["progress_projection"]["cli_status"] == "no_eligible_task", progress
@@ -2764,7 +2806,6 @@ if status["exit_code"] == "75":
 else:
     assert "terminal_task_failed" in status["detail"], status
     assert progress["classification"] == "terminal_failure", progress
-assert claim["status"] == "failed", claim
 assert blocked and blocked[-1]["terminal_failure"] is True, blocked
 assert blocked[-1]["block_reason"] == "terminal_runtime_failure", blocked
 assert "terminal_failure_transaction" in ledger, ledger
