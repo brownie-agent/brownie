@@ -709,6 +709,44 @@ cat <<'JSON'
 JSON
 SH
 chmod +x "$fake_brownie_completed"
+fake_brownie_completed_tracked_workspace_change="$(mktemp)"
+cat > "$fake_brownie_completed_tracked_workspace_change" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ "${2:-}" = "run" ]; then
+  printf 'completed workspace change from Brownie phase-loop\n' > README.md
+fi
+cat <<'JSON'
+{
+  "command": "run",
+  "ok": true,
+  "run": {
+    "automation": {
+      "schema_version": 1,
+      "status": "completed",
+      "controller_action": "stop",
+      "stop_class": "completed",
+      "stop_reason": "task_completed",
+      "completed": true,
+      "blocked": false,
+      "retryable": false,
+      "terminal_failure": false
+    },
+    "status": "completed",
+    "completion_closure_status": "completed",
+    "completed": true,
+    "blocked": false,
+    "retryable": false,
+    "terminal_failure": false,
+    "controller_action": "stop",
+    "stop_class": "completed",
+    "stop_reason": "task_completed",
+    "next_action": "inspect_progress_overview"
+  }
+}
+JSON
+SH
+chmod +x "$fake_brownie_completed_tracked_workspace_change"
 fake_brownie_objective_apply_pending="$(mktemp)"
 cat > "$fake_brownie_objective_apply_pending" <<'SH'
 #!/usr/bin/env bash
@@ -1451,7 +1489,7 @@ terminal_claim_absent_exit="$?"
 set -e
 test "$terminal_claim_absent_exit" = "76"
 test ! -f "$state_terminal_claim_absent/todo-claims/current.json"
-python3 - "$state_terminal_claim_absent/status.json" "$state_terminal_claim_absent/todo-claims/blocked.jsonl" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+python3 - "$state_terminal_claim_absent/status.json" "$state_terminal_claim_absent/todo-claims/blocked.jsonl" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_claim_absent/bdk-trajectory.jsonl" <<'PY'
 import json
 import pathlib
 import sys
@@ -1459,6 +1497,16 @@ import sys
 status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
 blocked = [json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines() if line.strip()]
 ledger = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+ledger_records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines()
+    if line.strip()
+]
+bdk_records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines()
+    if line.strip()
+]
 assert status['status'] == 'blocked', status
 assert blocked and blocked[-1]['block_reason'] == 'terminal_runtime_failure', blocked
 assert blocked[-1]['terminal_failure'] is True, blocked
@@ -1471,6 +1519,19 @@ assert 'controller_fingerprint' in ledger, ledger
 assert '"claim_absent":true' in ledger, ledger
 assert 'scripts/provider-target.mjs' in ledger, ledger
 assert 'node --check scripts/provider-target.mjs' in ledger, ledger
+claim_id = blocked[-1]['claim_id']
+assert any(
+    event.get('claim_id') == claim_id
+    and event.get('to_state') == 'failed'
+    and str(event.get('task_id', '')).endswith('@' + claim_id)
+    for record in ledger_records
+    for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])
+), ledger_records
+assert any(
+    record.get('claim_id') == claim_id
+    and any(event.get('type') == 'todo.blocked' for event in record.get('events', []))
+    for record in bdk_records
+), bdk_records
 PY
 PHASE_LOOP_STATE_DIR="$state_terminal_claim_absent" \
 PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
@@ -2119,6 +2180,52 @@ remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "origin/b
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
 assert "create PR from tracked Brownie progress" in message, message
+PY
+
+# A normal Runtime completion must publish tracked workspace progress before
+# returning success when PR creation is enabled; completion is not an early
+# return that bypasses the commit/push/PR path.
+state_pr_completed_progress="$(mktemp -d)"
+prompt_pr_completed_progress="$(mktemp)"
+todo_pr_completed_progress="$(mktemp)"
+workspace_pr_completed_progress="$(mktemp -d)"
+remote_pr_completed_progress="$(mktemp -d)"
+git -C "$workspace_pr_completed_progress" init -b main >/dev/null
+mkdir -p "$workspace_pr_completed_progress/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$workspace_pr_completed_progress/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$workspace_pr_completed_progress/README.md"
+git -C "$workspace_pr_completed_progress" add README.md
+git -C "$workspace_pr_completed_progress" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$remote_pr_completed_progress" init --bare >/dev/null
+git -C "$workspace_pr_completed_progress" remote add origin "$remote_pr_completed_progress"
+git -C "$workspace_pr_completed_progress" push -u origin main >/dev/null
+git -C "$workspace_pr_completed_progress" switch -c brownie-agent/smoke-pr-completed >/dev/null
+printf 'base prompt\n' > "$prompt_pr_completed_progress"
+printf -- '- [ ] B-01: create PR from completed tracked Brownie progress\n' > "$todo_pr_completed_progress"
+
+PATH="$fake_bin_dir:$PATH" \
+PHASE_LOOP_STATE_DIR="$state_pr_completed_progress" \
+PHASE_LOOP_PROMPT="$prompt_pr_completed_progress" \
+PHASE_LOOP_TODO="$todo_pr_completed_progress" \
+BROWNIE_BIN="$fake_brownie_completed_tracked_workspace_change" \
+PHASE_LOOP_WORKSPACE_ROOT="$workspace_pr_completed_progress" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+python3 - "$state_pr_completed_progress/status.json" "$workspace_pr_completed_progress" <<'PY'
+import json
+import subprocess
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+workspace = sys.argv[2]
+assert status["status"] == "pr_created", status
+assert "pull/9999" in status["detail"], status
+head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
+remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "origin/brownie-agent/smoke-pr-completed"], text=True).strip()
+assert head == remote, (head, remote)
+message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
+assert "create PR from completed tracked Brownie progress" in message, message
 PY
 
 state_pr_supervise="$(mktemp -d)"

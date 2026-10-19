@@ -14234,7 +14234,15 @@ PY
         return 78
       fi
       detail="Brownie reported the selected TODO completed and its queue entry was removed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
-      write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
+      if ! phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+        detail="Brownie reported the selected TODO completed, but publishing the tracked workspace progress as a PR failed; the TODO was already durably completed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s runtime_completion_pr_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      if [ "$(status_field status 2>/dev/null || true)" != "pr_created" ]; then
+        write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
+      fi
       printf '%s run=%s runtime_completion_recorded=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
       return 0
     elif python3 - "$stdout_log" <<'PY'
