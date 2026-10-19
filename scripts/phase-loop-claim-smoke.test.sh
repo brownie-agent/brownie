@@ -2911,6 +2911,18 @@ cat > "$todo_empty_queue_guard" <<'EOF'
   any other line.
 EOF
 
+empty_queue_guard_ledger="$empty_queue_guard_workspace/.brownie/private/phase-loop/task-ledger.jsonl"
+empty_queue_guard_runtime_marker="$state_empty_queue_guard/runtime-invoked"
+fake_brownie_empty_queue_cleanup_must_not_run="$(mktemp)"
+cat > "$fake_brownie_empty_queue_cleanup_must_not_run" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$empty_queue_guard_runtime_marker"
+echo "Brownie must not run during completed TODO cleanup-only retry" >&2
+exit 99
+SH
+chmod +x "$fake_brownie_empty_queue_cleanup_must_not_run"
+
 set +e
 PHASE_LOOP_STATE_DIR="$state_empty_queue_guard" \
 PHASE_LOOP_PROMPT="$prompt_empty_queue_guard" \
@@ -2931,11 +2943,62 @@ claim = json.load(open(sys.argv[1], encoding="utf-8"))
 todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 supervisor_log = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 target = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
-assert claim["status"] == "in_progress", claim
+assert claim["status"] == "completed", claim
+assert claim["completion_cleanup_pending"] is True, claim
 assert "E-empty-queue-exact" in todo, todo
 assert "completed_todo_removal_reverted=true" in supervisor_log, supervisor_log
 assert "Empty or non-executable TODO queue" in supervisor_log, supervisor_log
 assert "  fixture_path: fixtureRoot,\n  lifecycle_evidence: lifecycleEvidence,\n  commands," in target, target
+PY
+
+python3 - "$empty_queue_guard_ledger" "$state_empty_queue_guard/todo-claims/current.json" <<'PY'
+import json
+import pathlib
+import sys
+
+ledger = pathlib.Path(sys.argv[1])
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+claim_id = claim["claim_id"]
+records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+events = [
+    event
+    for record in records
+    for event in (record.get("events", []) if record.get("kind") in ("replan_transaction", "terminal_failure_transaction") else [record])
+]
+source_attempt = [event for event in events if event.get("task_id") == f"E-empty-queue-exact@{claim_id}"]
+assert source_attempt, events
+assert source_attempt[-1]["to_state"] == "completed", source_attempt
+assert all(event["to_state"] in ("claimed", "running", "completed") for event in source_attempt), source_attempt
+PY
+
+# Once the decomposition guard condition is repaired, the next invocation must
+# retry only queue cleanup. It must not restart Runtime for the completed
+# source claim, and it must clear the cleanup marker after successful removal.
+printf '{"product_ready":true}\n' > "$empty_queue_guard_workspace/docs/architecture/phase-value-manifest.json"
+set +e
+PHASE_LOOP_STATE_DIR="$state_empty_queue_guard" \
+PHASE_LOOP_PROMPT="$prompt_empty_queue_guard" \
+PHASE_LOOP_TODO="$todo_empty_queue_guard" \
+BROWNIE_BIN="$fake_brownie_empty_queue_cleanup_must_not_run" \
+PHASE_LOOP_WORKSPACE_ROOT="$empty_queue_guard_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75 "$PHASE_LOOP" run-once >/dev/null
+empty_queue_guard_cleanup_exit="$?"
+set -e
+test "$empty_queue_guard_cleanup_exit" = "75"
+test ! -e "$empty_queue_guard_runtime_marker"
+
+python3 - "$state_empty_queue_guard/todo-claims/current.json" "$todo_empty_queue_guard" "$state_empty_queue_guard/logs/supervisor.log" <<'PY'
+import json
+import pathlib
+import sys
+
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+supervisor_log = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+assert claim["status"] == "completed", claim
+assert claim["completion_cleanup_pending"] is False, claim
+assert "E-empty-queue-exact" not in todo, todo
+assert "completed_todo_cleanup_retry_succeeded=true" in supervisor_log, supervisor_log
 PY
 
 verified_noop_e19_workspace="$(mktemp -d)"
@@ -2955,7 +3018,7 @@ cat > "$verified_noop_e19_workspace/.brownie/todo.md" <<'EOF'
   Route: implementation.
   Source TODO: empty-queue-regression-follow-up-2026-09-22.
   Depends on: <none>.
-  Completion condition: release blocker queues cannot become empty while Product Ready is false; attempted completion removal is reverted and the durable claim remains in_progress when the guard rejects the resulting queue.
+  Completion condition: release blocker queues cannot become empty while Product Ready is false; attempted completion removal is reverted while the durable claim remains completed with cleanup pending when the guard rejects the resulting queue.
   Forbidden changes: do not weaken `scripts/guard-todo-decomposition.mjs`, do not declare Runtime Product Ready or Runtime Release Ready, and do not remove remaining release blocker TODOs.
   Verification: run `pnpm --workspace-root phase-loop:claim-smoke`, `pnpm --workspace-root guard:todo-decomposition:test`, and `pnpm --workspace-root guard:todo-decomposition`.
 
