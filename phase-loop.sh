@@ -13932,7 +13932,23 @@ sys.exit(0 if payload.get("completed") is True or completed_by_no_actionable_aft
 PY
     then
       write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
-      remove_completed_todo_claim_from_queue "$run_stamp" >> "$SUPERVISOR_LOG"
+      local runtime_completion_removal_output runtime_completion_removal_status
+      if runtime_completion_removal_output="$(remove_completed_todo_claim_from_queue "$run_stamp" 2>&1)"; then
+        runtime_completion_removal_status=0
+      else
+        runtime_completion_removal_status=$?
+      fi
+      if [ "$runtime_completion_removal_status" -ne 0 ]; then
+        detail="Brownie reported completion but selected TODO removal failed; kept the claim retryable. removal=$runtime_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "no_progress" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s runtime_completion_removal_failed=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 76
+      fi
+      write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"runtime_reported_completed"}'
+      detail="Brownie reported the selected TODO completed and its queue entry was removed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+      write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
+      printf '%s run=%s runtime_completion_recorded=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+      return 0
     elif python3 - "$stdout_log" <<'PY'
 import json, sys
 root = json.load(open(sys.argv[1], encoding="utf-8"))
