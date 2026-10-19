@@ -271,6 +271,31 @@ test('records repeated claims as separate immutable task attempts', () => {
   assert.equal(projection.get(taskAttemptId('T-8', 'claim-two')).to_state, 'claimed');
 });
 
+test('records a failed retry and its later completion as unique task attempts', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, '- [ ] T-8-success: retryable bounded task\n');
+  const script = path.join(process.cwd(), 'scripts', 'phase-loop-task-ledger.mjs');
+  const record = (claimId, terminalType, runId) => {
+    const claim = path.join(repo, `${claimId}.json`);
+    fs.writeFileSync(claim, JSON.stringify({ claim_id: claimId, selected_todo: '- [ ] T-8-success: retryable bounded task' }));
+    for (const type of ['todo.claimed', 'workflow.routed', terminalType]) {
+      execFileSync(process.execPath, [script, 'record-trajectory', '--repo', repo, '--claim', claim, '--todo', todo, '--type', type, '--run', runId], { stdio: 'pipe' });
+    }
+  };
+  record('claim-failed', 'todo.failed', 'run-failed');
+  record('claim-completed', 'todo.completed', 'run-completed');
+
+  const events = readTaskLedger(repo);
+  const failed = taskProjection(events).get(taskAttemptId('T-8-success', 'claim-failed'));
+  const completed = taskProjection(events).get(taskAttemptId('T-8-success', 'claim-completed'));
+  assert.equal(failed.to_state, 'failed');
+  assert.equal(completed.to_state, 'completed');
+  assert.notEqual(failed.task_id, completed.task_id);
+  assert.equal(validateTaskLedger(events).ok, true);
+});
+
 test('keeps duplicate routed trajectory events nonfatal while preserving the valid task state', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   const claim = path.join(repo, 'claim.json');

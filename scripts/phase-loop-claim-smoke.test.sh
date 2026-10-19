@@ -537,6 +537,68 @@ cat <<'JSON'
 JSON
 SH
 chmod +x "$fake_brownie_terminal_no_eligible"
+fake_brownie_terminal_retry_then_success="$(mktemp)"
+cat > "$fake_brownie_terminal_retry_then_success" <<SH
+#!/usr/bin/env bash
+set -eu
+attempt_file="\$PHASE_LOOP_STATE_DIR/terminal-retry-then-success.attempt"
+attempt="\$(python3 - "\$attempt_file" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+attempt = int(path.read_text(encoding='utf-8')) if path.exists() else 0
+attempt += 1
+path.write_text(str(attempt), encoding='utf-8')
+print(attempt)
+PY
+)"
+if [ "\$attempt" -ge 2 ]; then
+  python3 - "\$PHASE_LOOP_TODO" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding='utf-8')
+updated, count = re.subn(r'(?m)^- \[ \] E-retry-success:', '- [x] E-retry-success:', text, count=1)
+assert count == 1, text
+path.write_text(updated, encoding='utf-8')
+PY
+  cat <<'JSON'
+{
+  "command": "run",
+  "ok": true,
+  "run": {
+    "automation": {
+      "schema_version": 1,
+      "status": "completed",
+      "controller_action": "stop",
+      "stop_class": "completed",
+      "stop_reason": "task_completed",
+      "completed": true,
+      "blocked": false,
+      "retryable": false,
+      "terminal_failure": false
+    },
+    "status": "completed",
+    "completion_closure_status": "completed",
+    "completed": true,
+    "blocked": false,
+    "retryable": false,
+    "terminal_failure": false,
+    "controller_action": "stop",
+    "stop_class": "completed",
+    "stop_reason": "task_completed",
+    "next_action": "inspect_progress_overview"
+  }
+}
+JSON
+else
+  exec "$fake_brownie_terminal_no_eligible" "\$@"
+fi
+SH
+chmod +x "$fake_brownie_terminal_retry_then_success"
 fake_brownie_objective_apply_pending="$(mktemp)"
 cat > "$fake_brownie_objective_apply_pending" <<'SH'
 #!/usr/bin/env bash
@@ -889,6 +951,12 @@ same_todo = [
 ]
 assert len(same_todo) == 2, same_todo
 assert all(event.get('retry_cap') == 1 for record in same_todo for event in record.get('events', [])), same_todo
+claim_ids = [
+    next(event['claim_id'] for event in record.get('events', []) if 'E-retry-cap:' in str(event.get('selected_todo', '')))
+    for record in same_todo
+]
+assert len(set(claim_ids)) == 2, claim_ids
+assert claim_ids[0] != claim_ids[1], claim_ids
 PY
 set +e
 PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
@@ -932,6 +1000,72 @@ else:
     assert status['exit_code'] == '76', status
     assert 'terminal_task_failed' in status['detail'], status
     assert progress['classification'] == 'terminal_failure', progress
+PY
+
+# A retry-cap allowance must permit the next execution to complete with a
+# fresh claim/attempt rather than colliding with the failed terminal attempt.
+state_terminal_retry_success="$(mktemp -d)"
+prompt_terminal_retry_success="$(mktemp)"
+todo_terminal_retry_success="$(mktemp)"
+todo_breakdown_terminal_retry_success="$(mktemp)"
+terminal_retry_success_workspace="$(mktemp -d)"
+git -C "$terminal_retry_success_workspace" init -b main >/dev/null
+git -C "$terminal_retry_success_workspace" config user.name Brownie
+git -C "$terminal_retry_success_workspace" config user.email brownie@example.invalid
+mkdir -p "$terminal_retry_success_workspace/scripts"
+printf 'export const retrySuccess = true;\n' > "$terminal_retry_success_workspace/scripts/retry-success.mjs"
+git -C "$terminal_retry_success_workspace" add .
+git -C "$terminal_retry_success_workspace" commit -m init >/dev/null
+printf 'base prompt\n' > "$prompt_terminal_retry_success"
+printf -- '- [ ] E-retry-success: Patch only `scripts/retry-success.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-success.mjs`.\n' > "$todo_terminal_retry_success"
+printf '# Breakdown\n' > "$todo_breakdown_terminal_retry_success"
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_retry_success" \
+PHASE_LOOP_PROMPT="$prompt_terminal_retry_success" \
+PHASE_LOOP_TODO="$todo_terminal_retry_success" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_retry_success" \
+BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+retry_success_first_exit="$?"
+set -e
+test "$retry_success_first_exit" = "76"
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_retry_success" \
+PHASE_LOOP_PROMPT="$prompt_terminal_retry_success" \
+PHASE_LOOP_TODO="$todo_terminal_retry_success" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_retry_success" \
+BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+retry_success_second_exit="$?"
+set -e
+test "$retry_success_second_exit" = "0"
+python3 "$terminal_retry_success_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$todo_terminal_retry_success" <<'PY'
+import json
+import pathlib
+import sys
+
+ledger = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get('kind') == 'terminal_failure_transaction':
+        ledger.extend(record.get('events', []))
+    else:
+        ledger.append(record)
+attempts = [event for event in ledger if 'E-retry-success:' in str(event.get('selected_todo', ''))]
+failed = [event for event in attempts if event.get('to_state') == 'failed']
+completed = [event for event in attempts if event.get('to_state') == 'completed']
+assert failed, attempts
+assert completed, attempts
+assert failed[-1]['claim_id'] != completed[-1]['claim_id'], attempts
+assert pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').startswith('- [x] E-retry-success:'), pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
 PY
 
 # Terminal recovery remains durable when the runtime removes the active claim
@@ -1003,6 +1137,74 @@ same_todo = [
     if any('E-15b-provider-terminal:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
 ]
 assert len(same_todo) == 1, same_todo
+PY
+
+# A stale active claim can be replaced before Runtime starts. If Runtime then
+# removes current.json, terminal recovery must use the replacement claim
+# snapshot rather than the displaced claim's target/identity.
+state_stale_replacement_claim_absent="$(mktemp -d)"
+prompt_stale_replacement_claim_absent="$(mktemp)"
+todo_stale_replacement_claim_absent="$(mktemp)"
+todo_breakdown_stale_replacement_claim_absent="$(mktemp)"
+stale_replacement_workspace="$(mktemp -d)"
+git -C "$stale_replacement_workspace" init -b main >/dev/null
+git -C "$stale_replacement_workspace" config user.name Brownie
+git -C "$stale_replacement_workspace" config user.email brownie@example.invalid
+mkdir -p "$stale_replacement_workspace/.brownie" "$stale_replacement_workspace/scripts"
+printf 'old target\n' > "$stale_replacement_workspace/scripts/old.mjs"
+printf 'new target\n' > "$stale_replacement_workspace/scripts/new.mjs"
+git -C "$stale_replacement_workspace" add .
+git -C "$stale_replacement_workspace" commit -m init >/dev/null
+printf 'base prompt\n' > "$prompt_stale_replacement_claim_absent"
+printf -- '- [ ] E-stale-replacement-new: Patch only `scripts/new.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/new.mjs`.\n' > "$todo_stale_replacement_claim_absent"
+printf '# Breakdown\n' > "$todo_breakdown_stale_replacement_claim_absent"
+mkdir -p "$state_stale_replacement_claim_absent/todo-claims"
+cat > "$state_stale_replacement_claim_absent/todo-claims/current.json" <<'JSON'
+{
+  "schema_version": 1,
+  "claim_id": "todo-g1-old-stale-replacement",
+  "selected_todo": "- [ ] E-stale-replacement-old: Patch only `scripts/old.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/old.mjs`.\n",
+  "status": "in_progress",
+  "queue_generation": 1,
+  "queue_fingerprint": "old-queue-fingerprint"
+}
+JSON
+set +e
+PHASE_LOOP_STATE_DIR="$state_stale_replacement_claim_absent" \
+PHASE_LOOP_PROMPT="$prompt_stale_replacement_claim_absent" \
+PHASE_LOOP_TODO="$todo_stale_replacement_claim_absent" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_stale_replacement_claim_absent" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$stale_replacement_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+stale_replacement_exit="$?"
+set -e
+test "$stale_replacement_exit" = "76"
+python3 - "$state_stale_replacement_claim_absent/todo-claims" "$stale_replacement_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+claim_dir = pathlib.Path(sys.argv[1])
+ledger_path = pathlib.Path(sys.argv[2])
+archives = sorted(claim_dir.glob('stale-*.json'))
+assert archives, archives
+old_claim = json.loads(archives[0].read_text(encoding='utf-8'))
+assert old_claim['claim_id'] == 'todo-g1-old-stale-replacement', old_claim
+records = []
+for line in ledger_path.read_text(encoding='utf-8').splitlines():
+    if line.strip():
+        record = json.loads(line)
+        if record.get('kind') == 'terminal_failure_transaction':
+            records.append(record)
+assert len(records) == 1, records
+events = records[0]['events']
+failed = events[-1]
+assert 'E-stale-replacement-new:' in failed['selected_todo'], failed
+assert failed['claim_id'] != old_claim['claim_id'], (failed, old_claim)
+assert failed['claim_id'].startswith('todo-g'), failed
 PY
 
 state_objective_apply_stalled="$(mktemp -d)"

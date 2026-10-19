@@ -8442,6 +8442,47 @@ PY
   PHASE_LOOP_LAST_CLAIM_ARCHIVE="$archive_path"
 }
 
+archive_failed_todo_claim_for_retry() {
+  local run_stamp="$1"
+  local archive_path="$TODO_CLAIM_DIR/stale-$run_stamp.json"
+  local archive_suffix=1
+  if [ ! -f "$TODO_CLAIM_FILE" ] || [ "$(claim_status 2>/dev/null || true)" != "failed" ]; then
+    return 0
+  fi
+  while [ -e "$archive_path" ]; do
+    archive_path="$TODO_CLAIM_DIR/stale-$run_stamp-$archive_suffix.json"
+    archive_suffix=$((archive_suffix + 1))
+  done
+  python3 - "$TODO_CLAIM_FILE" "$archive_path" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+current_path = pathlib.Path(sys.argv[1])
+archive_path = pathlib.Path(sys.argv[2])
+run_stamp = sys.argv[3]
+timestamp = sys.argv[4]
+with open(current_path, encoding="utf-8") as handle:
+    claim = json.load(handle)
+claim["archive_reason"] = "terminal_failure_retry"
+claim["archived_at"] = timestamp
+claim["archive_run_stamp"] = run_stamp
+tmp = archive_path.with_suffix(".tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, archive_path)
+os.chmod(archive_path, 0o600)
+current_path.unlink()
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+  PHASE_LOOP_LAST_CLAIM_ARCHIVE="$archive_path"
+}
+
 git_workspace_fingerprint() {
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 1
@@ -9408,6 +9449,10 @@ claim_first_pending_todo() {
       fi
     fi
   fi
+  # A terminally failed claim is an immutable attempt. Retain it as a stale
+  # archive before selecting the next attempt so claim_first_pending_todo can
+  # derive a unique retry id instead of reusing current.json's id.
+  archive_failed_todo_claim_for_retry "$run_stamp"
 
   for attempt in 1 2 3; do
     queue_state="$(refresh_todo_queue_state)"
@@ -12404,9 +12449,6 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"stably_blocked"}'
     return 0
   fi
-  claim_snapshot_before_runtime="$RUN_DIR/$run_stamp.claim.before-runtime.json"
-  cp "$TODO_CLAIM_FILE" "$claim_snapshot_before_runtime"
-  chmod 600 "$claim_snapshot_before_runtime" 2>/dev/null || true
   if [ "$use_resume" -ne 1 ]; then
     if ! build_effective_prompt "$effective_prompt"; then
       detail="Failed to build effective phase-loop prompt: $effective_prompt"
@@ -12464,13 +12506,21 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"stably_blocked"}'
     return 0
   fi
+  # Capture the claim only after every stale-queue check and replacement has
+  # settled. If the runtime removes current.json, terminal recovery must use
+  # this replacement claim rather than the pre-replacement snapshot.
+  claim_snapshot_before_runtime="$RUN_DIR/$run_stamp.claim.before-runtime.json"
+  cp "$TODO_CLAIM_FILE" "$claim_snapshot_before_runtime"
+  chmod 600 "$claim_snapshot_before_runtime" 2>/dev/null || true
   active_target_path="$(active_claim_patch_only_target 2>/dev/null || true)"
-  if [ -z "${active_target_snapshot:-}" ] && [ -n "$active_target_path" ]; then
-    if [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
-      active_target_snapshot="$RUN_DIR/$run_stamp.target.before"
-      cp "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" "$active_target_snapshot"
-      chmod 600 "$active_target_snapshot" 2>/dev/null || true
-    fi
+  # Re-snapshot after claim replacement/refresh so recovery and target repair
+  # are bound to the live claim, TODO contract, and target selected for this
+  # runtime invocation.
+  active_target_snapshot=""
+  if [ -n "$active_target_path" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
+    active_target_snapshot="$RUN_DIR/$run_stamp.target.before"
+    cp "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" "$active_target_snapshot"
+    chmod 600 "$active_target_snapshot" 2>/dev/null || true
   fi
   local deterministic_todo_decomposition_output deterministic_todo_decomposition_status
   if deterministic_todo_decomposition_output="$(try_deterministic_todo_decomposition_repair "$run_stamp" 2>&1)"; then
