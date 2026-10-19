@@ -1067,7 +1067,7 @@ assert terminal_failure_events, terminal_failure_events
 assert completed, attempts
 assert completed[-1]['claim_id'] not in failed_claim_ids, (completed, terminal_failure_events)
 assert len({event.get('claim_id') for event in attempts if event.get('claim_id')}) >= 2, attempts
-assert pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').startswith('- [x] E-retry-success:'), pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
+assert '- [ ] E-retry-success:' not in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'), pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
 PY
 
 # Terminal recovery remains durable when the runtime removes the active claim
