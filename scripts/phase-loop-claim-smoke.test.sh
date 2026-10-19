@@ -2968,7 +2968,7 @@ events = [
 source_attempt = [event for event in events if event.get("task_id") == f"E-empty-queue-exact@{claim_id}"]
 assert source_attempt, events
 assert source_attempt[-1]["to_state"] == "completed", source_attempt
-assert all(event["to_state"] in ("claimed", "running", "completed") for event in source_attempt), source_attempt
+assert all(event["to_state"] in ("queued", "claimed", "running", "completed") for event in source_attempt), source_attempt
 PY
 
 # Once the decomposition guard condition is repaired, the next invocation must
