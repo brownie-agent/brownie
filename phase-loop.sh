@@ -316,7 +316,7 @@ write_status() {
   local continuation_required="${7:-false}"
   if [ "${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED:-0}" = "1" ] && [ "$status" = "last_run_succeeded" ]; then
     status="no_progress"
-    detail="Completed TODO removal was reverted because the resulting TODO queue failed guard validation; keeping the active claim in_progress. guard=${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL:-unknown} previous_success_detail=$detail"
+    detail="Completed TODO removal was reverted because the resulting TODO queue failed guard validation; keeping the completed claim for cleanup retry. guard=${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL:-unknown} previous_success_detail=$detail"
     exit_code="76"
     force_status_exit_code="76"
     if [ "$consecutive_failures" = "0" ]; then
@@ -1792,6 +1792,15 @@ PY
     blocked_record_status=$?
   fi
   if [ "$blocked_record_status" -ne 0 ]; then
+    # The recovery task is already durable, but the retry evidence is not. End
+    # the original source@claim attempt before archiving or suppressing its
+    # retry identity so a failed blocked-evidence append cannot leave it
+    # projected as running.
+    local terminal_transition_status=0
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure_blocked_evidence_failed","terminal_failure":true}' "todo.failed" || terminal_transition_status=$?
+    if [ "${PHASE_LOOP_TASK_LEDGER_FAILURE:-0}" -eq 1 ]; then
+      terminal_transition_status=78
+    fi
     local blocked_failure_archive_status=1
     if [ -f "$TODO_CLAIM_FILE" ]; then
       if archive_terminal_failure_claim_snapshot "$TODO_CLAIM_FILE" "$run_stamp" terminal_failure_blocked_evidence_failed false "$recovery_id"; then
@@ -1805,7 +1814,7 @@ PY
       fi
     fi
     PHASE_LOOP_TASK_LEDGER_FAILURE=1
-    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure blocked evidence append failed: status=$blocked_record_status archive_status=$blocked_failure_archive_status; retry is suppressed."
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure blocked evidence append failed: status=$blocked_record_status source_transition_status=$terminal_transition_status archive_status=$blocked_failure_archive_status; retry is suppressed."
     printf '%s\n' "$PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL" >&2
     return 78
   fi
@@ -2055,6 +2064,10 @@ record_stably_blocked_todo_claim() {
 
 remove_completed_todo_claim_from_queue() {
   local run_stamp="$1"
+  if [ "${PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL:-0}" = "1" ]; then
+    printf '%s run=%s completed_todo_removal_test_failure=true\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
   if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$PHASE_LOOP_TODO" ]; then
     return 0
   fi
@@ -2125,7 +2138,7 @@ codes={str(error.get("code")) for error in payload.get("errors", []) if isinstan
 sys.exit(0 if codes & {"completion_record_missing_selected_targets","completion_record_target_not_changed","selected_target_not_changed"} else 1)
 '; then
         write_repair_feedback "$run_stamp" "$completion_record_output" "" "" || true
-        write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+        mark_completed_todo_cleanup_pending "$run_stamp"
         printf '%s run=%s completed_todo_removal_refused=true repair_feedback_recorded=true guard=%s\n' "$(now_utc)" "$run_stamp" "$completion_record_output" >> "$SUPERVISOR_LOG"
       else
         printf '%s run=%s completed_todo_removal_refused=true repair_feedback_skipped_for_non_actionable_guard=true guard=%s\n' "$(now_utc)" "$run_stamp" "$completion_record_output" >> "$SUPERVISOR_LOG"
@@ -2293,7 +2306,7 @@ PY
       fi
       printf '%s run=%s completed_todo_removal_integrated_supervisor_guard_failed=true guard=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_guard_output" >> "$SUPERVISOR_LOG"
       cp "$todo_backup" "$PHASE_LOOP_TODO"
-      write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+      mark_completed_todo_cleanup_pending "$run_stamp"
       PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED=1
       PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL="$todo_guard_output"
       printf '%s run=%s completed_todo_removal_reverted=true guard=%s\n' "$(now_utc)" "$run_stamp" "$todo_guard_output" >> "$SUPERVISOR_LOG"
@@ -9676,6 +9689,87 @@ PY
   sync_parent_dir "$TODO_CLAIM_DIR"
 }
 
+completed_todo_cleanup_pending() {
+  [ "$(claim_status 2>/dev/null || true)" = "completed" ] &&
+    [ "$(claim_field completion_cleanup_pending 2>/dev/null || true)" = "true" ]
+}
+
+mark_completed_todo_cleanup_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+claim["completion_cleanup_pending"] = True
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": "completed",
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "queue_removal_cleanup_pending",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.cleanup-pending.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+clear_completed_todo_cleanup_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+claim["completion_cleanup_pending"] = False
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": "completed",
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "queue_removal_cleanup_completed",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.cleanup-complete.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
 claim_first_pending_todo() {
   local run_stamp="$1"
   local selected_todo queue_fingerprint queue_generation queue_state selected_hash claim_id claim_retry_suffix reread_fingerprint attempt
@@ -12686,6 +12780,26 @@ PY
     cd "$PHASE_LOOP_WORKSPACE_ROOT" && git rev-parse HEAD 2>/dev/null || true
   )"
   clear_inconsistent_repair_feedback_for_active_claim
+  if completed_todo_cleanup_pending; then
+    local completed_cleanup_output completed_cleanup_status
+    if completed_cleanup_output="$(remove_completed_todo_claim_from_queue "$run_stamp" 2>&1)"; then
+      completed_cleanup_status=0
+    else
+      completed_cleanup_status=$?
+    fi
+    if [ "$completed_cleanup_status" -ne 0 ]; then
+      detail="A previously completed TODO still needs queue-removal cleanup, but cleanup failed; keeping the completed claim without rerunning Runtime. removal=$completed_cleanup_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+      printf '%s run=%s completed_todo_cleanup_retry_failed=true removal=%s\n' "$(now_utc)" "$run_stamp" "$completed_cleanup_output" >> "$SUPERVISOR_LOG"
+      return 78
+    fi
+    clear_completed_todo_cleanup_pending "$run_stamp"
+    printf '%s run=%s completed_todo_cleanup_retry_succeeded=true removal=%s\n' "$(now_utc)" "$run_stamp" "$completed_cleanup_output" >> "$SUPERVISOR_LOG"
+    if [ "$(todo_pending_count)" -eq 0 ]; then
+      stop_if_todo_empty "${CONSECUTIVE_FAILURES:-0}"
+      return $?
+    fi
+  fi
   if phase_loop_should_resume_active_claim; then
     use_resume=1
   fi
@@ -14227,8 +14341,8 @@ PY
         runtime_completion_removal_status=$?
       fi
       if [ "$runtime_completion_removal_status" -ne 0 ]; then
-        write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
-        detail="Brownie reported completion but selected TODO removal failed; kept the claim in progress for retry. removal=$runtime_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        mark_completed_todo_cleanup_pending "$run_stamp" || true
+        detail="Brownie reported completion but selected TODO removal failed; kept the completed claim for cleanup-only retry. removal=$runtime_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
         printf '%s run=%s runtime_completion_removal_failed=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
         return 78

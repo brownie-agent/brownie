@@ -206,6 +206,31 @@ test('skips previously blocked generated leaf ids across queue fingerprints', ()
   assert(selected.startsWith('- [ ] E-15f-next:'), selected);
 });
 
+test('rebaselines a generated leaf blocked by an older controller', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const leaf = `- [ ] E-15e-release-contract-audit-doc-sync-leaf: Patch only \`docs/architecture/runtime-release-contract.json\` to resynchronize one release contract field:
+  Route: documentation.
+  Source TODO: TODO-decompose-broad-todo-fbbca34905ac.
+  Depends on: <none>.
+  Completion condition: one release contract field is synchronized while release readiness remains fail-closed.
+  Verification: run \`pnpm --workspace-root guard:release-contract\`.`;
+  fs.writeFileSync(blocked, `${JSON.stringify({
+    block_reason: 'stalled_leaf_contract_replan',
+    controller_fingerprint: 'old-controller',
+    queue_fingerprint: createHash('sha256').update(leaf).digest('hex'),
+    selected_todo_sha256: createHash('sha256').update(leaf).digest('hex'),
+    selected_todo_first_line: leaf.split('\n')[0],
+    target_scope_key: 'docs/architecture/runtime-release-contract.json',
+    verification_command: 'run \\`pnpm --workspace-root guard:release-contract\\`'
+  })}\n`);
+
+  assert.equal(selectFirstSchedulableTodo(leaf, {
+    blockedPath: blocked,
+    controllerFingerprint: 'new-controller'
+  }), leaf);
+});
+
 test('skips stalled replan blocked IDs across queue fingerprints regardless of TODO shape', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');

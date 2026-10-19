@@ -409,7 +409,7 @@ export function selectFirstSchedulableTodo(text, options = {}) {
       || Boolean(terminalFailureAttempt);
     const sourceId = sourceTodoId(block);
     const sourceIsGeneratedParent = Boolean(productPrefix(sourceId));
-    const canRetryAfterControllerRepair = blockedInCurrentQueue && !blockedByCurrentController && !isExplicitBlockerTodo(block) && !sourceIsGeneratedParent && !id.includes('-leaf');
+    const canRetryAfterControllerRepair = blockedInCurrentQueue && !blockedByCurrentController && !isExplicitBlockerTodo(block) && !sourceIsGeneratedParent;
     if (!blockedInCurrentQueue || canRetryAfterControllerRepair || terminalFailureRetryAvailable) {
       return block;
     }

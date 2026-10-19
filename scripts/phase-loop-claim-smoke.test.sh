@@ -1406,6 +1406,19 @@ assert archive['retry_eligible'] is False, archive
 assert not (claim_dir / 'current.json').exists()
 assert (claim_dir / 'blocked.jsonl').is_dir()
 assert 'terminal_failure_transaction' in ledger, ledger
+claim_id = archive['claim_id']
+ledger_records = [
+    json.loads(line)
+    for line in ledger.splitlines()
+    if line.strip()
+]
+assert any(
+    event.get('claim_id') == claim_id
+    and event.get('to_state') == 'failed'
+    and str(event.get('task_id', '')).endswith('@' + claim_id)
+    for record in ledger_records
+    for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])
+), ledger_records
 assert status['status'] == 'blocked', status
 assert status['exit_code'] == '78', status
 assert 'blocked evidence append failed' in status['detail'], status
@@ -1464,6 +1477,76 @@ assert 'terminal ledger transition failed' in status['detail'], status
 assert claim['status'] == 'in_progress', claim
 assert '- [ ] E-completion-ledger-failure:' in todo, todo
 assert ledger_path.is_dir(), ledger_path
+PY
+
+# A completion ledger record does not authorize reverting the claim to
+# in_progress when queue cleanup fails. Preserve the completed claim and make
+# cleanup the only retryable operation on the next controller invocation.
+completion_removal_failure_state="$(mktemp -d)"
+completion_removal_failure_workspace="$(mktemp -d)"
+completion_removal_failure_prompt="$(mktemp)"
+completion_removal_failure_todo="$(mktemp)"
+git -C "$completion_removal_failure_workspace" init -b main >/dev/null
+git -C "$completion_removal_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$completion_removal_failure_prompt"
+printf -- '- [ ] E-completion-removal-failure: Patch only `scripts/completion-removal-failure.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/completion-removal-failure.mjs`.\n' > "$completion_removal_failure_todo"
+completion_removal_failure_runtime_count="$completion_removal_failure_state/runtime-count"
+completion_removal_failure_brownie="$(mktemp)"
+cat > "$completion_removal_failure_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_removal_failure_runtime_count"
+exit 99
+SH
+chmod +x "$completion_removal_failure_brownie"
+set +e
+PHASE_LOOP_STATE_DIR="$completion_removal_failure_state" \
+PHASE_LOOP_PROMPT="$completion_removal_failure_prompt" \
+PHASE_LOOP_TODO="$completion_removal_failure_todo" \
+BROWNIE_BIN="$fake_brownie_completed" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_removal_failure_workspace" \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_removal_failure_exit="$?"
+set -e
+test "$completion_removal_failure_exit" = "78"
+python3 - "$completion_removal_failure_state/status.json" "$completion_removal_failure_state/todo-claims/current.json" "$completion_removal_failure_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '78', status
+assert claim['status'] == 'completed', claim
+assert claim['completion_cleanup_pending'] is True, claim
+assert '- [ ] E-completion-removal-failure:' in todo, todo
+PY
+
+set +e
+PHASE_LOOP_STATE_DIR="$completion_removal_failure_state" \
+PHASE_LOOP_PROMPT="$completion_removal_failure_prompt" \
+PHASE_LOOP_TODO="$completion_removal_failure_todo" \
+BROWNIE_BIN="$completion_removal_failure_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_removal_failure_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75 "$PHASE_LOOP" run-once >/dev/null
+completion_removal_cleanup_exit="$?"
+set -e
+test "$completion_removal_cleanup_exit" = "75"
+python3 - "$completion_removal_failure_state/status.json" "$completion_removal_failure_state/todo-claims/current.json" "$completion_removal_failure_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'stopped', status
+assert claim['status'] == 'completed', claim
+assert claim['completion_cleanup_pending'] is False, claim
+assert '- [ ] E-completion-removal-failure:' not in todo, todo
 PY
 
 # Terminal recovery remains durable when the runtime removes the active claim
