@@ -216,7 +216,8 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
       currentControllerFirstLines: new Set(),
       stableIds: new Set(),
       stablePrefixes: new Set(),
-      stableScopeContracts: new Set()
+      stableScopeContracts: new Set(),
+      terminalFailureAttempts: new Map()
     };
   }
   const hashes = new Set();
@@ -226,6 +227,7 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
   const stableIds = new Set();
   const stablePrefixes = new Set();
   const stableScopeContracts = new Set();
+  const terminalFailureAttempts = new Map();
   for (const line of fs.readFileSync(blockedPath, 'utf8').split('\n')) {
     if (!line.trim()) {
       continue;
@@ -261,7 +263,29 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
           continue;
         }
         if (blockedId && terminalRuntimeFailure && matchesController) {
-          stableIds.add(blockedId);
+          const todoHash = typeof record.selected_todo_sha256 === 'string' && record.selected_todo_sha256
+            ? record.selected_todo_sha256
+            : sha256Text(record.selected_todo_first_line);
+          const recordController = String(record.controller_fingerprint || controllerFingerprint || '');
+          const key = `${todoHash}\u0000${recordController}`;
+          const retryCapValue = Number(record.retry_cap);
+          const retryCap = Number.isFinite(retryCapValue) && retryCapValue >= 0
+            ? Math.floor(retryCapValue)
+            : 0;
+          const previous = terminalFailureAttempts.get(key) ?? {
+            count: 0,
+            retry_cap: retryCap,
+            todo_hash: todoHash,
+            controller_fingerprint: recordController,
+            blocked_id: blockedId
+          };
+          previous.count += 1;
+          previous.retry_cap = retryCap;
+          previous.blocked_id = blockedId;
+          terminalFailureAttempts.set(key, previous);
+          if (previous.count > previous.retry_cap) {
+            stableIds.add(blockedId);
+          }
           continue;
         }
         if (
@@ -284,7 +308,7 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
       // Ignore corrupt historical blocked entries; the phase-loop guard remains fail-closed elsewhere.
     }
   }
-  return { hashes, firstLines, currentControllerHashes, currentControllerFirstLines, stableIds, stablePrefixes, stableScopeContracts };
+  return { hashes, firstLines, currentControllerHashes, currentControllerFirstLines, stableIds, stablePrefixes, stableScopeContracts, terminalFailureAttempts };
 }
 
 export function selectFirstSchedulableTodo(text, options = {}) {
@@ -371,10 +395,17 @@ export function selectFirstSchedulableTodo(text, options = {}) {
     }
     const blockedInCurrentQueue = blocked.hashes.has(blockHash) || blocked.firstLines.has(firstLine);
     const blockedByCurrentController = blocked.currentControllerHashes.has(blockHash) || blocked.currentControllerFirstLines.has(firstLine);
+    const terminalFailureAttempt = [...blocked.terminalFailureAttempts.values()].find((entry) => (
+      entry.todo_hash === blockHash
+      && (!options.controllerFingerprint || entry.controller_fingerprint === options.controllerFingerprint)
+    ));
+    const terminalFailureRetryAvailable = Boolean(
+      terminalFailureAttempt && terminalFailureAttempt.count <= terminalFailureAttempt.retry_cap
+    );
     const sourceId = sourceTodoId(block);
     const sourceIsGeneratedParent = Boolean(productPrefix(sourceId));
     const canRetryAfterControllerRepair = blockedInCurrentQueue && !blockedByCurrentController && !isExplicitBlockerTodo(block) && !sourceIsGeneratedParent && !id.includes('-leaf');
-    if (!blockedInCurrentQueue || canRetryAfterControllerRepair) {
+    if (!blockedInCurrentQueue || canRetryAfterControllerRepair || terminalFailureRetryAvailable) {
       return block;
     }
     dependencyBlockedIds.add(id);

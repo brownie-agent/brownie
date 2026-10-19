@@ -38,6 +38,8 @@ PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 PHASE_LOOP_SUPERVISOR_PID=""
 PHASE_LOOP_SUPERVISOR_GENERATION=""
 PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS="${PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS:-900}"
+# Zero means the first terminal failure is stable/blocked. A positive value is
+# the number of additional executions permitted before the failure is stable.
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-0}"
 PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
 PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
@@ -1610,7 +1612,7 @@ PY
 record_terminal_failure_todo_claim() {
   local run_stamp="$1"
   local progress_file="$2"
-  local context selected_todo claim_id queue_generation queue_fingerprint provider_failure_fingerprint claim_absent recovery_output recovery_status recovery_id
+  local context selected_todo claim_id queue_generation queue_fingerprint provider_failure_fingerprint claim_absent recovery_output recovery_status recovery_id controller_fingerprint
   context="$(python3 - "$TODO_CLAIM_FILE" "$progress_file" "$PHASE_LOOP_TODO" "$TODO_QUEUE_STATE_FILE" "$RUN_DIR/$run_stamp.claim.before-runtime.json" <<'PY'
 import json
 import pathlib
@@ -1673,6 +1675,7 @@ PY
   queue_fingerprint="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["queue_fingerprint"])')"
   provider_failure_fingerprint="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["provider_failure_fingerprint"])')"
   claim_absent="$(printf '%s' "$context" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)["claim_absent"] else "false")')"
+  controller_fingerprint="$(phase_loop_controller_fingerprint)"
   recovery_output="$(
     node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-terminal-failure \
       --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
@@ -1683,6 +1686,7 @@ PY
       --queue-fingerprint "$queue_fingerprint" \
       --provider-failure-fingerprint "$provider_failure_fingerprint" \
       --retry-cap "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP" \
+      --controller-fingerprint "$controller_fingerprint" \
       --claim-absent "$claim_absent" \
       --blocked-reason terminal_runtime_failure 2>&1
   )"

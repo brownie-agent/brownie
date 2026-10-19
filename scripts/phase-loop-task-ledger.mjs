@@ -249,6 +249,7 @@ export function recordTerminalFailureRecovery(repoRoot, {
   queue_fingerprint = null,
   provider_failure_fingerprint = null,
   retry_cap = 0,
+  controller_fingerprint = null,
   recovery_id = null,
   claim_absent = false,
   blocked_reason = 'terminal_runtime_failure',
@@ -258,12 +259,20 @@ export function recordTerminalFailureRecovery(repoRoot, {
     return { ok: false, code: 'terminal_failure_selected_todo_missing' };
   }
   const resolvedRecoveryId = recovery_id || crypto.createHash('sha256')
-    .update(JSON.stringify({ selected_todo, queue_generation, queue_fingerprint, provider_failure_fingerprint, blocked_reason }))
+    .update(JSON.stringify({
+      selected_todo,
+      claim_id,
+      run_id,
+      queue_generation,
+      queue_fingerprint,
+      provider_failure_fingerprint,
+      retry_cap,
+      controller_fingerprint,
+      blocked_reason
+    }))
     .digest('hex')
     .slice(0, 24);
-  const taskId = claim_id
-    ? `${selectedTodoId(selected_todo) || 'unknown-task'}@${claim_id}`
-    : terminalFailureRecoveryTaskId(selected_todo, resolvedRecoveryId);
+  const taskId = terminalFailureRecoveryTaskId(selected_todo, resolvedRecoveryId);
   const specHash = crypto.createHash('sha256').update(selected_todo).digest('hex');
   const targetScope = selected_todo.match(/\b(?:Patch|Create) only\b([^\n]*)/u)?.[1] ?? '';
   const targetFiles = [...targetScope.matchAll(/`([^`]+)`/gu)]
@@ -301,6 +310,7 @@ export function recordTerminalFailureRecovery(repoRoot, {
     queue_fingerprint,
     provider_failure_fingerprint,
     retry_cap: Number.isInteger(Number(retry_cap)) ? Number(retry_cap) : 0,
+    controller_fingerprint,
     claim_absent: Boolean(claim_absent),
     terminal_failure: true,
     blocked_evidence: true,
@@ -329,6 +339,7 @@ export function recordTerminalFailureRecovery(repoRoot, {
     kind: 'terminal_failure_transaction',
     transaction_id: crypto.randomUUID(),
     recovery_id: resolvedRecoveryId,
+    controller_fingerprint,
     events: eventsToWrite
   };
   try {
@@ -616,6 +627,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
     queue_fingerprint: args.get('queue-fingerprint') || null,
     provider_failure_fingerprint: args.get('provider-failure-fingerprint') || null,
     retry_cap: args.get('retry-cap') || 0,
+    controller_fingerprint: args.get('controller-fingerprint') || null,
     recovery_id: args.get('recovery-id') || null,
     claim_absent: args.get('claim-absent') === 'true',
     blocked_reason: args.get('blocked-reason') || 'terminal_runtime_failure'

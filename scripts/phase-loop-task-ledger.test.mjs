@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { appendTaskTransition, readTaskLedger, recordTrajectory, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
+import { appendTaskTransition, readTaskLedger, recordTerminalFailureRecovery, recordTrajectory, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
 
 test('task ledger enforces a terminal state machine', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
@@ -219,6 +219,40 @@ test('ignores an incomplete replan journal instead of exposing a parent-only rep
   fs.mkdirSync(path.dirname(ledger), { recursive: true });
   fs.writeFileSync(ledger, '{"kind":"replan_transaction","events":[{"task_id":"T-7","to_state":"replanned"}]}\n');
   assert.deepEqual(readTaskLedger(repo), []);
+});
+
+test('binds terminal failure recovery identity to controller and execution attempt', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const selectedTodo = '- [ ] E-retry: Patch only `scripts/retry.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry.mjs`.';
+  const base = {
+    selected_todo: selectedTodo,
+    claim_id: 'claim-retry',
+    run_id: 'run-retry-1',
+    queue_generation: 4,
+    queue_fingerprint: 'queue-retry',
+    provider_failure_fingerprint: 'provider-retry',
+    retry_cap: 1,
+    controller_fingerprint: 'controller-old',
+    at: '2026-10-19T08:00:00Z'
+  };
+
+  const first = recordTerminalFailureRecovery(repo, base);
+  assert.equal(first.ok, true);
+  const duplicate = recordTerminalFailureRecovery(repo, base);
+  assert.equal(duplicate.code, 'duplicate_terminal_failure_recovery');
+
+  const rebased = recordTerminalFailureRecovery(repo, {
+    ...base,
+    controller_fingerprint: 'controller-new',
+    at: '2026-10-19T08:01:00Z'
+  });
+  assert.equal(rebased.ok, true);
+  assert.notEqual(rebased.recovery_id, first.recovery_id);
+
+  const events = readTaskLedger(repo).filter((event) => event.to_state === 'failed');
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map((event) => event.controller_fingerprint), ['controller-old', 'controller-new']);
+  assert.equal(validateTaskLedger(readTaskLedger(repo)).ok, true);
 });
 
 test('records repeated claims as separate immutable task attempts', () => {

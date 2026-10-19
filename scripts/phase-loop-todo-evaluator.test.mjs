@@ -291,6 +291,49 @@ test('retries a stalled TODO after the controller fingerprint changes', () => {
   assert.equal(selected, stalled);
 });
 
+test('honors terminal failure retry caps before stable suppression', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const todo = `- [ ] E-retry-cap: Patch only \`scripts/retry-cap.mjs\`:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: the retry cap is enforced.
+  Verification: run \`node --check scripts/retry-cap.mjs\`.`;
+  const record = (run, retryCap) => JSON.stringify({
+    block_reason: 'terminal_runtime_failure',
+    controller_fingerprint: 'controller-retry-cap',
+    selected_todo_sha256: createHash('sha256').update(todo).digest('hex'),
+    selected_todo_first_line: todo.split('\n')[0],
+    provider_failure_fingerprint: 'provider-terminal',
+    retry_cap: retryCap,
+    run_stamp: run
+  });
+
+  fs.writeFileSync(blocked, `${record('run-1', 1)}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-retry-cap'
+  }), todo);
+
+  fs.appendFileSync(blocked, `${record('run-2', 1)}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-retry-cap'
+  }), '');
+
+  const zeroCap = path.join(dir, 'zero-cap.jsonl');
+  fs.writeFileSync(zeroCap, `${record('run-zero', 0)}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: zeroCap,
+    controllerFingerprint: 'controller-retry-cap'
+  }), '');
+
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-rebased'
+  }), todo);
+});
+
 test('does not treat a stable blocked record as dependency completion evidence', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');

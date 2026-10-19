@@ -143,6 +143,8 @@ assert_contains "$PHASE_LOOP" 'node "\$guard_script" --repo "\$ROOT_DIR" --basel
 assert_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_WORKSPACE_ROOT"'
 assert_contains "$PHASE_LOOP" "phase-loop-run-state\.mjs"
 assert_contains "$PHASE_LOOP" "\.brownie/headless-\*"
+assert_contains "$PHASE_LOOP" 'controller-fingerprint "$controller_fingerprint"'
+assert_contains "$PHASE_LOOP" "Zero means the first terminal failure is stable/blocked"
 assert_contains "$PHASE_LOOP" "refusing to leave status running"
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$ROOT_DIR"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_STATE_DIR"'
@@ -826,6 +828,69 @@ assert feedback["claim_id"] == claim["claim_id"], feedback
 assert feedback["reason"] == "runtime_terminal_failure", feedback
 PY
 
+# A positive terminal-failure retry cap permits the configured number of
+# additional executions, then suppresses the same TODO on the next claim.
+state_terminal_retry_cap="$(mktemp -d)"
+prompt_terminal_retry_cap="$(mktemp)"
+todo_terminal_retry_cap="$(mktemp)"
+terminal_retry_cap_workspace="$(mktemp -d)"
+git -C "$terminal_retry_cap_workspace" init -b main >/dev/null
+git -C "$terminal_retry_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$prompt_terminal_retry_cap"
+printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n' > "$todo_terminal_retry_cap"
+for retry_run in 1 2; do
+  set +e
+  PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
+  PHASE_LOOP_PROMPT="$prompt_terminal_retry_cap" \
+  PHASE_LOOP_TODO="$todo_terminal_retry_cap" \
+  BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+  PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
+  PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
+  PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+  retry_exit="$?"
+  set -e
+  test "$retry_exit" = "76"
+done
+python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+transactions = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get('kind') == 'terminal_failure_transaction':
+        transactions.append(record)
+assert len(transactions) == 2, transactions
+assert all(event.get('retry_cap') == 1 for record in transactions for event in record.get('events', [])), transactions
+PY
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
+PHASE_LOOP_PROMPT="$prompt_terminal_retry_cap" \
+PHASE_LOOP_TODO="$todo_terminal_retry_cap" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
+PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+retry_cap_exhausted_exit="$?"
+set -e
+test "$retry_cap_exhausted_exit" = "75"
+python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+transactions = [
+    json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()
+    if line.strip() and json.loads(line).get('kind') == 'terminal_failure_transaction'
+]
+assert len(transactions) == 2, transactions
+PY
+
 # Terminal recovery remains durable when the runtime removes the active claim
 # before the controller emits its final trajectory. The next run must not
 # recreate the same queue-generation/target attempt.
@@ -861,9 +926,11 @@ assert status['status'] == 'blocked', status
 assert blocked and blocked[-1]['block_reason'] == 'terminal_runtime_failure', blocked
 assert blocked[-1]['terminal_failure'] is True, blocked
 assert blocked[-1]['provider_failure_fingerprint'] == 'sha256:provider-terminal-no-content', blocked
+assert len(blocked[-1]['controller_fingerprint']) == 64, blocked
 assert 'terminal_failure_transaction' in ledger, ledger
 assert 'E-15b-provider-terminal' in ledger, ledger
 assert 'provider-terminal-no-content' in ledger, ledger
+assert 'controller_fingerprint' in ledger, ledger
 assert '"claim_absent":true' in ledger, ledger
 assert 'scripts/provider-target.mjs' in ledger, ledger
 assert 'node --check scripts/provider-target.mjs' in ledger, ledger
