@@ -918,7 +918,7 @@ terminal_retry_cap_workspace="$(mktemp -d)"
 git -C "$terminal_retry_cap_workspace" init -b main >/dev/null
 git -C "$terminal_retry_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
 printf 'base prompt\n' > "$prompt_terminal_retry_cap"
-printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n' > "$todo_terminal_retry_cap"
+printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n\n- [ ] E-retry-cap-deferred: Blocker: unavailable prerequisite is controlled outside the workspace.\n  Route: documentation.\n  Completion condition: the owner supplies the prerequisite evidence.\n  Verification: blocker: exact missing evidence is named, and no workspace file is patched until it is available.\n' > "$todo_terminal_retry_cap"
 for retry_run in 1 2; do
   set +e
   PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
@@ -966,14 +966,14 @@ BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
 PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75,76 "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 65,75,76 "$PHASE_LOOP" run-once >/dev/null
 retry_cap_exhausted_exit="$?"
 set -e
 case "$retry_cap_exhausted_exit" in
-  75|76) ;;
+  65|75|76) ;;
   *) echo "unexpected retry-cap exhaustion exit=$retry_cap_exhausted_exit" >&2; exit 1 ;;
 esac
-python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/todo-claims/current.json" "$state_terminal_retry_cap/status.json" "$state_terminal_retry_cap/progress-state.json" <<'PY'
+python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/todo-claims" "$state_terminal_retry_cap/status.json" "$state_terminal_retry_cap/progress-state.json" "$state_terminal_retry_cap/todo-claims/blocked.jsonl" <<'PY'
 import json
 import pathlib
 import sys
@@ -987,8 +987,32 @@ same_todo = [
     if any('E-retry-cap:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
 ]
 assert len(same_todo) == 2, same_todo
-claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
-assert 'E-retry-cap:' not in claim.get('selected_todo', ''), claim
+claim_dir = pathlib.Path(sys.argv[2])
+current_path = claim_dir / 'current.json'
+archives = sorted(claim_dir.glob('stale-*.json'))
+assert len(archives) == 2, archives
+archived = [json.loads(path.read_text(encoding='utf-8')) for path in archives]
+archived_ids = {str(claim.get('claim_id') or '') for claim in archived}
+failed_claim_ids = {
+    next(event['claim_id'] for event in record.get('events', []) if 'E-retry-cap:' in str(event.get('selected_todo', '')))
+    for record in same_todo
+}
+assert archived_ids == failed_claim_ids, (archived_ids, failed_claim_ids)
+assert all(claim.get('status') == 'failed' for claim in archived), archived
+assert all(claim.get('archive_reason') == 'terminal_failure_retry' for claim in archived), archived
+assert all('E-retry-cap:' in str(claim.get('selected_todo', '')) for claim in archived), archived
+assert not current_path.exists(), current_path
+blocked = [
+    json.loads(line) for line in pathlib.Path(sys.argv[5]).read_text(encoding='utf-8').splitlines()
+    if line.strip()
+]
+assert blocked, blocked
+assert any(
+    record.get('terminal_failure') is True
+    and record.get('claim_id') in failed_claim_ids
+    and 'E-retry-cap:' in str(record.get('selected_todo_first_line', ''))
+    for record in blocked
+), blocked
 status = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'))
 progress = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding='utf-8'))
 assert status['status'] == 'blocked', status
@@ -996,6 +1020,8 @@ assert progress['progress_projection']['cli_status'] == 'no_eligible_task', prog
 assert progress['progress_projection']['closure'] == 'no_eligible_task', progress
 if status['exit_code'] == '75':
     assert 'Failed to claim first pending TODO' in status['detail'], status
+elif status['exit_code'] == '65':
+    assert 'explicit owner-controlled blocker TODO' in status['detail'], status
 else:
     assert status['exit_code'] == '76', status
     assert 'terminal_task_failed' in status['detail'], status
