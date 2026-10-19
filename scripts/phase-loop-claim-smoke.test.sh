@@ -1051,20 +1051,22 @@ import pathlib
 import sys
 
 ledger = []
+terminal_failure_events = []
 for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
     if not line.strip():
         continue
     record = json.loads(line)
     if record.get('kind') == 'terminal_failure_transaction':
-        ledger.extend(record.get('events', []))
+        terminal_failure_events.extend(record.get('events', []))
     else:
         ledger.append(record)
-attempts = [event for event in ledger if 'E-retry-success:' in str(event.get('selected_todo', ''))]
-failed = [event for event in attempts if event.get('to_state') == 'failed']
+attempts = [event for event in ledger if str(event.get('task_id', '')).startswith('E-retry-success@')]
 completed = [event for event in attempts if event.get('to_state') == 'completed']
-assert failed, attempts
+failed_claim_ids = {event.get('claim_id') for event in terminal_failure_events}
+assert terminal_failure_events, terminal_failure_events
 assert completed, attempts
-assert failed[-1]['claim_id'] != completed[-1]['claim_id'], attempts
+assert completed[-1]['claim_id'] not in failed_claim_ids, (completed, terminal_failure_events)
+assert len({event.get('claim_id') for event in attempts if event.get('claim_id')}) >= 2, attempts
 assert pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').startswith('- [x] E-retry-success:'), pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
 PY
 
