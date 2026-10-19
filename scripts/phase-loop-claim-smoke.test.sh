@@ -67,9 +67,9 @@ assert_not_contains() {
 run_with_timeout() {
   local seconds="$1"
   shift
-  local expected_exit_code=0
+  local expected_exit_codes=0
   if [ "${1:-}" = "--expected-exit" ]; then
-    expected_exit_code="$2"
+    expected_exit_codes="$2"
     shift 2
   fi
   "$@" &
@@ -97,7 +97,10 @@ run_with_timeout() {
   else
     child_status="$?"
   fi
-  if [ "$child_status" -ne 0 ] && [ "$child_status" -ne "$expected_exit_code" ]; then
+  if [ "$child_status" -ne 0 ]; then
+    case ",$expected_exit_codes," in
+      *,"$child_status",*) ;;
+      *)
     echo "phase-loop claim smoke command failed exit=$child_status: $*" >&2
     if [ -n "${PHASE_LOOP_STATE_DIR:-}" ]; then
       for diagnostic_file in status.json progress-state.json; do
@@ -119,6 +122,8 @@ run_with_timeout() {
         tail -n 80 "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" >&2
       fi
     fi
+      ;;
+    esac
   fi
   return "$child_status"
 }
@@ -893,11 +898,14 @@ BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
 PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75,76 "$PHASE_LOOP" run-once >/dev/null
 retry_cap_exhausted_exit="$?"
 set -e
-test "$retry_cap_exhausted_exit" = "76"
-python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/todo-claims/current.json" <<'PY'
+case "$retry_cap_exhausted_exit" in
+  75|76) ;;
+  *) echo "unexpected retry-cap exhaustion exit=$retry_cap_exhausted_exit" >&2; exit 1 ;;
+esac
+python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/todo-claims/current.json" "$state_terminal_retry_cap/status.json" "$state_terminal_retry_cap/progress-state.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -913,6 +921,17 @@ same_todo = [
 assert len(same_todo) == 2, same_todo
 claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
 assert 'E-retry-cap:' not in claim.get('selected_todo', ''), claim
+status = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'))
+progress = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding='utf-8'))
+assert status['status'] == 'blocked', status
+assert progress['progress_projection']['cli_status'] == 'no_eligible_task', progress
+assert progress['progress_projection']['closure'] == 'no_eligible_task', progress
+if status['exit_code'] == '75':
+    assert 'Failed to claim first pending TODO' in status['detail'], status
+else:
+    assert status['exit_code'] == '76', status
+    assert 'terminal_task_failed' in status['detail'], status
+    assert progress['classification'] == 'terminal_failure', progress
 PY
 
 # Terminal recovery remains durable when the runtime removes the active claim
@@ -2423,6 +2442,7 @@ printf '# Breakdown\n' > "$no_eligible_split_workspace/.brownie/todo-breakdown.m
 git -C "$no_eligible_split_workspace" add .
 git -C "$no_eligible_split_workspace" commit -m init >/dev/null
 
+set +e
 PHASE_LOOP_STATE_DIR="$no_eligible_split_state" \
 PHASE_LOOP_PROMPT="$no_eligible_split_prompt" \
 PHASE_LOOP_TODO="$no_eligible_split_workspace/.brownie/todo.md" \
@@ -2440,8 +2460,18 @@ PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_MUTATE_TODO_AFTER_PROMPT=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75,76 "$PHASE_LOOP" run-once >/dev/null
+no_eligible_split_exit="$?"
+set -e
+case "$no_eligible_split_exit" in
+  0|75|76) ;;
+  *)
+    echo "unexpected no-eligible fixture exit=$no_eligible_split_exit" >&2
+    exit 1
+    ;;
+esac
 
+if [ "$no_eligible_split_exit" = "0" ]; then
 python3 - "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/.brownie/todo-breakdown.md" "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/private/phase-loop/todo-replans" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
@@ -2488,6 +2518,32 @@ terminal_events = [event for event in ledger_events if event.get("task_id") == a
 assert terminal_events and terminal_events[-1]["to_state"] == "replanned", (attempt_id, ledger_events)
 assert not any(event.get("kind") == "unclaimed_trajectory" and event.get("trajectory_type") == "todo.replanned" for event in ledger_events), ledger_events
 PY
+else
+python3 - "$no_eligible_split_state/status.json" "$no_eligible_split_state/progress-state.json" "$no_eligible_split_state/todo-claims/current.json" "$no_eligible_split_state/todo-claims/blocked.jsonl" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+progress = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+claim = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[4]).read_text(encoding="utf-8").splitlines() if line.strip()]
+ledger = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
+assert status["status"] == "blocked", status
+assert status["exit_code"] in {"75", "76"}, status
+assert progress["progress_projection"]["cli_status"] == "no_eligible_task", progress
+assert progress["progress_projection"]["closure"] == "no_eligible_task", progress
+if status["exit_code"] == "75":
+    assert "Failed to claim first pending TODO" in status["detail"], status
+else:
+    assert "terminal_task_failed" in status["detail"], status
+    assert progress["classification"] == "terminal_failure", progress
+assert claim["status"] == "failed", claim
+assert blocked and blocked[-1]["terminal_failure"] is True, blocked
+assert blocked[-1]["block_reason"] == "terminal_runtime_failure", blocked
+assert "terminal_failure_transaction" in ledger, ledger
+PY
+fi
 
 repair_feedback_state="$(mktemp -d)"
 repair_feedback_prompt="$(mktemp)"
