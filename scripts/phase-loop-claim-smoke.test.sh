@@ -612,6 +612,9 @@ path.write_text(str(attempt), encoding='utf-8')
 print(attempt)
 PY
 )"
+if [ "\$attempt" -eq 1 ] && [ "\${PHASE_LOOP_TEST_REMOVE_CLAIM:-0}" = "1" ]; then
+  rm -f "\$PHASE_LOOP_STATE_DIR/todo-claims/current.json"
+fi
 if [ "\$attempt" -ge 2 ]; then
   python3 - "\$PHASE_LOOP_TODO" <<'PY'
 import pathlib
@@ -1091,11 +1094,13 @@ PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_retry_success" \
 BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 retry_success_first_exit="$?"
 set -e
 test "$retry_success_first_exit" = "76"
+test ! -f "$state_terminal_retry_success/todo-claims/current.json"
 set +e
 PHASE_LOOP_STATE_DIR="$state_terminal_retry_success" \
 PHASE_LOOP_PROMPT="$prompt_terminal_retry_success" \
@@ -1104,12 +1109,13 @@ PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_retry_success" \
 BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 retry_success_second_exit="$?"
 set -e
 test "$retry_success_second_exit" = "0"
-python3 - "$terminal_retry_success_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$todo_terminal_retry_success" <<'PY'
+python3 - "$terminal_retry_success_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_success/todo-claims" "$todo_terminal_retry_success" <<'PY'
 import json
 import pathlib
 import sys
@@ -1124,6 +1130,15 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
         terminal_failure_events.extend(record.get('events', []))
     else:
         ledger.append(record)
+claim_dir = pathlib.Path(sys.argv[2])
+archives = sorted(claim_dir.glob('stale-*.json'))
+assert len(archives) == 1, archives
+archived_claim = json.loads(archives[0].read_text(encoding='utf-8'))
+assert archived_claim['status'] == 'failed', archived_claim
+assert archived_claim['archive_reason'] == 'terminal_failure_retry', archived_claim
+assert archived_claim['retry_eligible'] is True, archived_claim
+assert archived_claim['terminal_recovery_id'], archived_claim
+assert archived_claim['selected_todo'].startswith('- [ ] E-retry-success:'), archived_claim
 attempts = [event for event in ledger if str(event.get('task_id', '')).startswith('E-retry-success@')]
 completed = [event for event in attempts if event.get('to_state') == 'completed']
 failed_claim_ids = {event.get('claim_id') for event in terminal_failure_events}
@@ -1131,7 +1146,82 @@ assert terminal_failure_events, terminal_failure_events
 assert completed, attempts
 assert completed[-1]['claim_id'] not in failed_claim_ids, (completed, terminal_failure_events)
 assert len({event.get('claim_id') for event in attempts if event.get('claim_id')}) >= 2, attempts
-assert '- [ ] E-retry-success:' not in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'), pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
+assert '- [ ] E-retry-success:' not in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'), pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+PY
+
+# Invalid retry caps must fail before claim, ledger, archive, or blocked-state
+# writes, and must never invoke the runtime.
+invalid_cap_state="$(mktemp -d)"
+invalid_cap_workspace="$(mktemp -d)"
+invalid_cap_prompt="$(mktemp)"
+invalid_cap_todo="$(mktemp)"
+git -C "$invalid_cap_workspace" init -b main >/dev/null
+git -C "$invalid_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$invalid_cap_prompt"
+printf -- '- [ ] E-invalid-cap: Patch only `scripts/invalid-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/invalid-cap.mjs`.\n' > "$invalid_cap_todo"
+invalid_cap_diagnostic="$invalid_cap_state/invalid-cap.stderr"
+set +e
+PHASE_LOOP_STATE_DIR="$invalid_cap_state" \
+PHASE_LOOP_PROMPT="$invalid_cap_prompt" \
+PHASE_LOOP_TODO="$invalid_cap_todo" \
+BROWNIE_BIN="$fake_brownie_must_not_run" \
+PHASE_LOOP_WORKSPACE_ROOT="$invalid_cap_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP='not-an-integer' \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null 2>"$invalid_cap_diagnostic"
+invalid_cap_exit="$?"
+set -e
+test "$invalid_cap_exit" = "78"
+assert_contains "$invalid_cap_diagnostic" 'Invalid PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=not-an-integer'
+test ! -f "$invalid_cap_state/status.json"
+test ! -f "$invalid_cap_state/todo-claims/current.json"
+test ! -e "$invalid_cap_state/todo-claims/blocked.jsonl"
+test ! -e "$invalid_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl"
+
+# A terminal recovery ledger write failure must not append blocked evidence or
+# leave a retry-eligible claim behind.
+ledger_terminal_failure_state="$(mktemp -d)"
+ledger_terminal_failure_workspace="$(mktemp -d)"
+ledger_terminal_failure_prompt="$(mktemp)"
+ledger_terminal_failure_todo="$(mktemp)"
+git -C "$ledger_terminal_failure_workspace" init -b main >/dev/null
+git -C "$ledger_terminal_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$ledger_terminal_failure_prompt"
+printf -- '- [ ] E-ledger-terminal-failure: Patch only `scripts/ledger-terminal-failure.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/ledger-terminal-failure.mjs`.\n\n- [ ] E-ledger-terminal-blocker: Blocker: external recovery evidence is unavailable.\n  Route: documentation.\n  Completion condition: the owner supplies the recovery evidence.\n  Verification: blocker: exact missing evidence is named before any workspace patch.\n' > "$ledger_terminal_failure_todo"
+set +e
+PHASE_LOOP_STATE_DIR="$ledger_terminal_failure_state" \
+PHASE_LOOP_PROMPT="$ledger_terminal_failure_prompt" \
+PHASE_LOOP_TODO="$ledger_terminal_failure_todo" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$ledger_terminal_failure_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+PHASE_LOOP_TEST_FAIL_TERMINAL_LEDGER=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+ledger_terminal_failure_exit="$?"
+set -e
+test "$ledger_terminal_failure_exit" = "78"
+python3 - "$ledger_terminal_failure_state/status.json" "$ledger_terminal_failure_state/todo-claims" "$ledger_terminal_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim_dir = pathlib.Path(sys.argv[2])
+ledger_path = pathlib.Path(sys.argv[3])
+archives = sorted(claim_dir.glob('stale-*.json'))
+assert len(archives) == 1, archives
+archive = json.loads(archives[0].read_text(encoding='utf-8'))
+assert archive['archive_reason'] == 'terminal_failure_ledger_failed', archive
+assert archive['retry_eligible'] is False, archive
+assert archive['status'] == 'failed', archive
+assert not (claim_dir / 'current.json').exists()
+blocked_path = claim_dir / 'blocked.jsonl'
+assert not blocked_path.exists() or not blocked_path.read_text(encoding='utf-8').strip(), blocked_path
+ledger = ledger_path.read_text(encoding='utf-8')
+assert 'terminal_failure_transaction' not in ledger, ledger
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '78', status
+assert 'could not be fully recorded' in status['detail'], status
+assert 'refusing to retry' in status['detail'], status
 PY
 
 # Terminal recovery remains durable when the runtime removes the active claim

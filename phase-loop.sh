@@ -1675,25 +1675,58 @@ PY
   queue_fingerprint="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["queue_fingerprint"])')"
   provider_failure_fingerprint="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["provider_failure_fingerprint"])')"
   claim_absent="$(printf '%s' "$context" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)["claim_absent"] else "false")')"
+  if [ -z "$claim_id" ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure recovery could not prove a durable claim identity; refusing retry."
+    return 78
+  fi
   controller_fingerprint="$(phase_loop_controller_fingerprint)"
-  recovery_output="$(
-    node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-terminal-failure \
-      --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
-      --selected-todo "$selected_todo" \
-      --claim-id "$claim_id" \
-      --run "$run_stamp" \
-      --queue-generation "$queue_generation" \
-      --queue-fingerprint "$queue_fingerprint" \
-      --provider-failure-fingerprint "$provider_failure_fingerprint" \
-      --retry-cap "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP" \
-      --controller-fingerprint "$controller_fingerprint" \
-      --claim-absent "$claim_absent" \
-      --blocked-reason terminal_runtime_failure 2>&1
-  )"
-  recovery_status=$?
+  if [ "${PHASE_LOOP_TEST_FAIL_TERMINAL_LEDGER:-0}" = "1" ]; then
+    recovery_output='{"ok":false,"code":"test_terminal_failure_ledger_append_failed"}'
+    recovery_status=78
+  else
+    recovery_output="$(
+      node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-terminal-failure \
+        --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
+        --selected-todo "$selected_todo" \
+        --claim-id "$claim_id" \
+        --run "$run_stamp" \
+        --queue-generation "$queue_generation" \
+        --queue-fingerprint "$queue_fingerprint" \
+        --provider-failure-fingerprint "$provider_failure_fingerprint" \
+        --retry-cap "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP" \
+        --controller-fingerprint "$controller_fingerprint" \
+        --claim-absent "$claim_absent" \
+        --blocked-reason terminal_runtime_failure 2>&1
+    )"
+    recovery_status=$?
+  fi
   recovery_id="$(printf '%s' "$recovery_output" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("recovery_id", ""))
 except Exception: print("")' 2>/dev/null || true)"
+  local terminal_claim_snapshot="$RUN_DIR/$run_stamp.claim.before-runtime.json"
+  if [ "$recovery_status" -ne 0 ] || [ -z "$recovery_id" ]; then
+    local recording_failure_archive_status=1
+    if [ -f "$TODO_CLAIM_FILE" ]; then
+      if archive_terminal_failure_claim_snapshot "$TODO_CLAIM_FILE" "$run_stamp" terminal_failure_ledger_failed false "$recovery_id"; then
+        recording_failure_archive_status=0
+      fi
+    elif [ -f "$terminal_claim_snapshot" ]; then
+      if archive_terminal_failure_claim_snapshot "$terminal_claim_snapshot" "$run_stamp" terminal_failure_ledger_failed false "$recovery_id"; then
+        recording_failure_archive_status=0
+      fi
+    fi
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure ledger recording failed: ${recovery_output:-<no output>} archive_status=$recording_failure_archive_status; retry is suppressed."
+    return 78
+  fi
+  if [ "$claim_absent" = "true" ]; then
+    if ! archive_terminal_failure_claim_snapshot "$terminal_claim_snapshot" "$run_stamp" terminal_failure_retry true "$recovery_id"; then
+      PHASE_LOOP_TASK_LEDGER_FAILURE=1
+      PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure ledger recorded but durable retry identity could not be archived; retry is suppressed."
+      return 78
+    fi
+  fi
   python3 - "$TODO_BLOCKED_FILE" "$selected_todo" "$claim_id" "$queue_generation" "$queue_fingerprint" "$provider_failure_fingerprint" "$recovery_id" "$run_stamp" "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP" "$claim_absent" "$(phase_loop_controller_fingerprint)" <<'PY'
 import hashlib
 import json
@@ -1742,11 +1775,6 @@ if not recovery_id or not any(item.get("recovery_id") == recovery_id for item in
         import os
         os.fsync(handle.fileno())
 PY
-  if [ "$recovery_status" -ne 0 ]; then
-    PHASE_LOOP_TASK_LEDGER_FAILURE=1
-    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure ledger recording failed: ${recovery_output:-<no output>}"
-    return 78
-  fi
   printf '%s\n' "$recovery_output"
   return 0
 }
@@ -8442,32 +8470,50 @@ PY
   PHASE_LOOP_LAST_CLAIM_ARCHIVE="$archive_path"
 }
 
-archive_failed_todo_claim_for_retry() {
-  local run_stamp="$1"
+archive_terminal_failure_claim_snapshot() {
+  local snapshot_path="$1"
+  local run_stamp="$2"
+  local archive_reason="$3"
+  local retry_eligible="$4"
+  local recovery_id="${5:-}"
   local archive_path="$TODO_CLAIM_DIR/stale-$run_stamp.json"
   local archive_suffix=1
-  if [ ! -f "$TODO_CLAIM_FILE" ] || [ "$(claim_status 2>/dev/null || true)" != "failed" ]; then
-    return 0
+  if [ ! -f "$snapshot_path" ]; then
+    return 1
   fi
   while [ -e "$archive_path" ]; do
     archive_path="$TODO_CLAIM_DIR/stale-$run_stamp-$archive_suffix.json"
     archive_suffix=$((archive_suffix + 1))
   done
-  python3 - "$TODO_CLAIM_FILE" "$archive_path" "$run_stamp" "$(now_utc)" <<'PY'
+  if ! python3 - "$snapshot_path" "$archive_path" "$run_stamp" "$(now_utc)" "$archive_reason" "$retry_eligible" "$recovery_id" <<'PY'
 import json
 import os
 import pathlib
 import sys
 
-current_path = pathlib.Path(sys.argv[1])
+snapshot_path = pathlib.Path(sys.argv[1])
 archive_path = pathlib.Path(sys.argv[2])
 run_stamp = sys.argv[3]
 timestamp = sys.argv[4]
-with open(current_path, encoding="utf-8") as handle:
-    claim = json.load(handle)
-claim["archive_reason"] = "terminal_failure_retry"
+archive_reason = sys.argv[5]
+retry_eligible = sys.argv[6] == "true"
+recovery_id = sys.argv[7]
+try:
+    claim = json.loads(snapshot_path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or not str(claim.get("claim_id") or ""):
+    raise SystemExit(1)
+claim["status"] = "failed"
+claim["archive_reason"] = archive_reason
+claim["retry_eligible"] = retry_eligible
 claim["archived_at"] = timestamp
 claim["archive_run_stamp"] = run_stamp
+if recovery_id:
+    claim["terminal_recovery_id"] = recovery_id
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({"status": "failed", "run_stamp": run_stamp, "updated_at": timestamp})
 tmp = archive_path.with_suffix(".tmp")
 with open(tmp, "w", encoding="utf-8") as handle:
     json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
@@ -8477,10 +8523,50 @@ with open(tmp, "w", encoding="utf-8") as handle:
 os.chmod(tmp, 0o600)
 os.replace(tmp, archive_path)
 os.chmod(archive_path, 0o600)
-current_path.unlink()
 PY
+  then
+    return 1
+  fi
+  if [ "$snapshot_path" = "$TODO_CLAIM_FILE" ]; then
+    if ! rm -f "$snapshot_path"; then
+      return 1
+    fi
+  fi
   sync_parent_dir "$TODO_CLAIM_DIR"
   PHASE_LOOP_LAST_CLAIM_ARCHIVE="$archive_path"
+  return 0
+}
+
+archive_failed_todo_claim_for_retry() {
+  local run_stamp="$1"
+  if [ ! -f "$TODO_CLAIM_FILE" ] || [ "$(claim_status 2>/dev/null || true)" != "failed" ]; then
+    return 0
+  fi
+  archive_terminal_failure_claim_snapshot "$TODO_CLAIM_FILE" "$run_stamp" terminal_failure_retry true ""
+}
+
+terminal_failure_retry_suppressed_for_todo() {
+  local selected_todo="$1"
+  python3 - "$TODO_CLAIM_DIR" "$selected_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+claim_dir = pathlib.Path(sys.argv[1])
+selected = sys.argv[2]
+for path in sorted(claim_dir.glob("stale-*.json")):
+    try:
+        claim = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if (
+        claim.get("archive_reason") == "terminal_failure_ledger_failed"
+        and claim.get("retry_eligible") is False
+        and claim.get("selected_todo") == selected
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 git_workspace_fingerprint() {
@@ -9460,6 +9546,10 @@ claim_first_pending_todo() {
     queue_fingerprint="$(printf '%s' "$queue_state" | awk '{ print $2 }')"
     selected_todo="$(todo_first_pending_item)"
     if [ -z "$selected_todo" ]; then
+      return 1
+    fi
+    if terminal_failure_retry_suppressed_for_todo "$selected_todo"; then
+      printf '%s terminal_failure_retry_suppressed=true selected_todo=%s\n' "$(now_utc)" "$selected_todo" >> "$SUPERVISOR_LOG"
       return 1
     fi
     reread_fingerprint="$(todo_queue_fingerprint)"
@@ -11619,6 +11709,30 @@ load_env() {
   set +a
 }
 
+validate_terminal_failure_retry_cap() {
+  local raw_cap="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-0}"
+  local normalized_cap
+  if ! normalized_cap="$(python3 - "$raw_cap" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1]
+if not re.fullmatch(r"[0-9]+", raw):
+    raise SystemExit(1)
+value = int(raw)
+if value > 9007199254740991:
+    raise SystemExit(1)
+print(value)
+PY
+)"; then
+    PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP_VALIDATION_DETAIL="Invalid PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=${raw_cap}; expected a finite non-negative integer."
+    printf '%s\n' "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP_VALIDATION_DETAIL" >&2
+    return 78
+  fi
+  PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP="$normalized_cap"
+  return 0
+}
+
 phase_loop_require_approved_controller_baseline() {
   local guard_script="$ROOT_DIR/scripts/phase-loop-source-baseline-guard.mjs"
   if [ ! -f "$guard_script" ]; then
@@ -12222,6 +12336,9 @@ PY
 
 _run_brownie_once() {
   load_env
+  if ! validate_terminal_failure_retry_cap; then
+    return 78
+  fi
   local started_at run_stamp stdout_log stderr_log effective_prompt exit_code run_id detail brownie_timeout_seconds
   local workspace_before workspace_after head_commit validation progress_summary progress_classification
   local release_contract_before release_contract_repair_output release_contract_repair_status
@@ -14030,14 +14147,14 @@ PY
         if active_todo_claim_exists; then
           write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
         fi
-        write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed" || true
+        if [ "$terminal_failure_recovery_status" -ne 0 ]; then
+          write_status "blocked" "Terminal runtime failure could not be fully recorded; refusing to retry the selected TODO. ledger=${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL:-ledger transaction failed} recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+          return 78
+        fi
         if active_todo_claim_exists; then
           write_todo_claim "$(claim_field claim_id)" "failed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
         fi
-        if [ "$terminal_failure_recovery_status" -ne 0 ]; then
-          write_status "blocked" "Terminal runtime failure could not be fully recorded; refusing to retry the selected TODO. recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
-          return 78
-        fi
+        write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed" || true
         detail="Brownie reported terminal_task_failed with no_eligible_task; retired the selected claim and recorded durable blocked evidence without treating the product queue as complete. recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"
         printf '%s run=%s terminal_runtime_failure_recorded=true recovery=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$terminal_failure_recovery_output" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
