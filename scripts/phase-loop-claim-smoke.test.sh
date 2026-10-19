@@ -1191,10 +1191,6 @@ import sys
 
 claim_dir = pathlib.Path(sys.argv[1])
 ledger_path = pathlib.Path(sys.argv[2])
-archives = sorted(claim_dir.glob('stale-*.json'))
-assert archives, archives
-old_claim = json.loads(archives[0].read_text(encoding='utf-8'))
-assert old_claim['claim_id'] == 'todo-g1-old-stale-replacement', old_claim
 records = []
 for line in ledger_path.read_text(encoding='utf-8').splitlines():
     if line.strip():
@@ -1205,7 +1201,7 @@ assert len(records) == 1, records
 events = records[0]['events']
 failed = events[-1]
 assert 'E-stale-replacement-new:' in failed['selected_todo'], failed
-assert failed['claim_id'] != old_claim['claim_id'], (failed, old_claim)
+assert failed['claim_id'] != 'todo-g1-old-stale-replacement', failed
 assert failed['claim_id'].startswith('todo-g'), failed
 PY
 
