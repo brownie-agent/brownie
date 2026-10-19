@@ -143,7 +143,7 @@ assert_contains "$PHASE_LOOP" 'node "\$guard_script" --repo "\$ROOT_DIR" --basel
 assert_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_WORKSPACE_ROOT"'
 assert_contains "$PHASE_LOOP" "phase-loop-run-state\.mjs"
 assert_contains "$PHASE_LOOP" "\.brownie/headless-\*"
-assert_contains "$PHASE_LOOP" 'controller-fingerprint "$controller_fingerprint"'
+assert_contains "$PHASE_LOOP" 'controller-fingerprint "\$controller_fingerprint"'
 assert_contains "$PHASE_LOOP" "Zero means the first terminal failure is stable/blocked"
 assert_contains "$PHASE_LOOP" "refusing to leave status running"
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$ROOT_DIR"'
