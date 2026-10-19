@@ -1821,6 +1821,352 @@ remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'origin/b
 assert head == remote, (head, remote)
 PY
 
+# Repeated cleanup failure must reassert cleanup_pending without clearing an
+# already durable completion_pr_pending marker or any of its workspace/log
+# metadata. The third run must complete cleanup and publish that same PR.
+completion_pr_marker_preservation_state="$(mktemp -d)"
+completion_pr_marker_preservation_prompt="$(mktemp)"
+completion_pr_marker_preservation_todo="$(mktemp)"
+completion_pr_marker_preservation_workspace="$(mktemp -d)"
+completion_pr_marker_preservation_remote="$(mktemp -d)"
+completion_pr_marker_preservation_bin="$(mktemp -d)"
+completion_pr_marker_preservation_count="$completion_pr_marker_preservation_state/pr-create-count"
+completion_pr_marker_preservation_runtime_count="$completion_pr_marker_preservation_state/runtime-count"
+git -C "$completion_pr_marker_preservation_workspace" init -b main >/dev/null
+mkdir -p "$completion_pr_marker_preservation_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$completion_pr_marker_preservation_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$completion_pr_marker_preservation_workspace/README.md"
+git -C "$completion_pr_marker_preservation_workspace" add .
+git -C "$completion_pr_marker_preservation_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$completion_pr_marker_preservation_remote" init --bare >/dev/null
+git -C "$completion_pr_marker_preservation_workspace" remote add origin "$completion_pr_marker_preservation_remote"
+git -C "$completion_pr_marker_preservation_workspace" push -u origin main >/dev/null
+git -C "$completion_pr_marker_preservation_workspace" switch -c brownie-agent/smoke-completion-pr-marker-preservation >/dev/null
+printf 'base prompt\n' > "$completion_pr_marker_preservation_prompt"
+printf -- '- [ ] E-completion-pr-marker-preservation: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_marker_preservation_todo"
+cat > "$completion_pr_marker_preservation_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$completion_pr_marker_preservation_bin/pnpm"
+cat > "$completion_pr_marker_preservation_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "${1:-} ${2:-}" in
+  "api user") printf 'brownie-agent\n' ;;
+  "auth token") printf 'fake-token\n' ;;
+  "pr view") exit 1 ;;
+  "pr create")
+    printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
+    printf 'https://github.com/globalpocket/brownie/pull/10003\n'
+    ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$completion_pr_marker_preservation_bin/gh"
+completion_pr_marker_preservation_brownie="$(mktemp)"
+cat > "$completion_pr_marker_preservation_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_pr_marker_preservation_runtime_count"
+exec "$fake_brownie_completed_tracked_workspace_change" "\$@"
+SH
+chmod +x "$completion_pr_marker_preservation_brownie"
+set +e
+PATH="$completion_pr_marker_preservation_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_marker_preservation_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_marker_preservation_state" \
+PHASE_LOOP_PROMPT="$completion_pr_marker_preservation_prompt" \
+PHASE_LOOP_TODO="$completion_pr_marker_preservation_todo" \
+BROWNIE_BIN="$completion_pr_marker_preservation_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_marker_preservation_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_pr_marker_preservation_first_exit="$?"
+set -e
+test "$completion_pr_marker_preservation_first_exit" = "78"
+python3 - "$completion_pr_marker_preservation_state/todo-claims/current.json" <<'PY'
+import json
+import pathlib
+import sys
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+assert claim['completion_cleanup_pending'] is True, claim
+assert claim['completion_pr_pending'] is True, claim
+assert claim['completion_pr_workspace_before'], claim
+assert claim['completion_pr_workspace_after'], claim
+assert claim['completion_pr_stdout_log'], claim
+assert claim['completion_pr_stderr_log'], claim
+PY
+set +e
+PATH="$completion_pr_marker_preservation_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_marker_preservation_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_marker_preservation_state" \
+PHASE_LOOP_PROMPT="$completion_pr_marker_preservation_prompt" \
+PHASE_LOOP_TODO="$completion_pr_marker_preservation_todo" \
+BROWNIE_BIN="$completion_pr_marker_preservation_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_marker_preservation_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_pr_marker_preservation_second_exit="$?"
+set -e
+test "$completion_pr_marker_preservation_second_exit" = "78"
+python3 - "$completion_pr_marker_preservation_state/todo-claims/current.json" "$completion_pr_marker_preservation_state/status.json" "$completion_pr_marker_preservation_runtime_count" "$completion_pr_marker_preservation_count" <<'PY'
+import json
+import pathlib
+import sys
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+status = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+runtime_count = pathlib.Path(sys.argv[3])
+pr_count = pathlib.Path(sys.argv[4])
+assert status['status'] == 'blocked', status
+assert claim['completion_cleanup_pending'] is True, claim
+assert claim['completion_pr_pending'] is True, claim
+assert claim['completion_pr_workspace_before'], claim
+assert claim['completion_pr_workspace_after'], claim
+assert claim['completion_pr_stdout_log'], claim
+assert claim['completion_pr_stderr_log'], claim
+assert runtime_count.read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], runtime_count
+assert not pr_count.exists(), pr_count
+PY
+test ! -e "$completion_pr_marker_preservation_state/stop"
+set +e
+PATH="$completion_pr_marker_preservation_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_marker_preservation_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_marker_preservation_state" \
+PHASE_LOOP_PROMPT="$completion_pr_marker_preservation_prompt" \
+PHASE_LOOP_TODO="$completion_pr_marker_preservation_todo" \
+BROWNIE_BIN="$completion_pr_marker_preservation_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_marker_preservation_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_pr_marker_preservation_third_exit="$?"
+set -e
+test "$completion_pr_marker_preservation_third_exit" = "0"
+python3 - "$completion_pr_marker_preservation_state/status.json" "$completion_pr_marker_preservation_state/todo-claims/current.json" "$completion_pr_marker_preservation_todo" "$completion_pr_marker_preservation_count" "$completion_pr_marker_preservation_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'pr_created', status
+assert claim['completion_cleanup_pending'] is False, claim
+assert claim['completion_pr_pending'] is False, claim
+assert '- [ ] E-completion-pr-marker-preservation:' not in todo, todo
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['1'], pathlib.Path(sys.argv[4]).read_text()
+assert pathlib.Path(sys.argv[5]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[5]).read_text()
+PY
+test ! -e "$completion_pr_marker_preservation_state/stop"
+
+# If cleanup removes the final TODO and the process is interrupted before
+# clearing cleanup_pending, the next run must recover the marker before the
+# empty-queue stop gate and publish without Runtime or a stop file.
+completion_cleanup_interrupt_state="$(mktemp -d)"
+completion_cleanup_interrupt_prompt="$(mktemp)"
+completion_cleanup_interrupt_todo="$(mktemp)"
+completion_cleanup_interrupt_workspace="$(mktemp -d)"
+completion_cleanup_interrupt_remote="$(mktemp -d)"
+completion_cleanup_interrupt_bin="$(mktemp -d)"
+completion_cleanup_interrupt_count="$completion_cleanup_interrupt_state/pr-create-count"
+completion_cleanup_interrupt_runtime_count="$completion_cleanup_interrupt_state/runtime-count"
+git -C "$completion_cleanup_interrupt_workspace" init -b main >/dev/null
+mkdir -p "$completion_cleanup_interrupt_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$completion_cleanup_interrupt_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$completion_cleanup_interrupt_workspace/README.md"
+git -C "$completion_cleanup_interrupt_workspace" add .
+git -C "$completion_cleanup_interrupt_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$completion_cleanup_interrupt_remote" init --bare >/dev/null
+git -C "$completion_cleanup_interrupt_workspace" remote add origin "$completion_cleanup_interrupt_remote"
+git -C "$completion_cleanup_interrupt_workspace" push -u origin main >/dev/null
+git -C "$completion_cleanup_interrupt_workspace" switch -c brownie-agent/smoke-completion-cleanup-interrupt >/dev/null
+printf 'base prompt\n' > "$completion_cleanup_interrupt_prompt"
+printf -- '- [ ] E-completion-cleanup-interrupt: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_cleanup_interrupt_todo"
+cat > "$completion_cleanup_interrupt_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$completion_cleanup_interrupt_bin/pnpm"
+cat > "$completion_cleanup_interrupt_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "${1:-} ${2:-}" in
+  "api user") printf 'brownie-agent\n' ;;
+  "auth token") printf 'fake-token\n' ;;
+  "pr view") exit 1 ;;
+  "pr create")
+    printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
+    printf 'https://github.com/globalpocket/brownie/pull/10004\n'
+    ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$completion_cleanup_interrupt_bin/gh"
+completion_cleanup_interrupt_brownie="$(mktemp)"
+cat > "$completion_cleanup_interrupt_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_cleanup_interrupt_runtime_count"
+exec "$fake_brownie_completed_tracked_workspace_change" "\$@"
+SH
+chmod +x "$completion_cleanup_interrupt_brownie"
+set +e
+PATH="$completion_cleanup_interrupt_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_cleanup_interrupt_count" \
+PHASE_LOOP_STATE_DIR="$completion_cleanup_interrupt_state" \
+PHASE_LOOP_PROMPT="$completion_cleanup_interrupt_prompt" \
+PHASE_LOOP_TODO="$completion_cleanup_interrupt_todo" \
+BROWNIE_BIN="$completion_cleanup_interrupt_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_cleanup_interrupt_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_cleanup_interrupt_first_exit="$?"
+set -e
+test "$completion_cleanup_interrupt_first_exit" = "78"
+set +e
+PATH="$completion_cleanup_interrupt_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_cleanup_interrupt_count" \
+PHASE_LOOP_STATE_DIR="$completion_cleanup_interrupt_state" \
+PHASE_LOOP_PROMPT="$completion_cleanup_interrupt_prompt" \
+PHASE_LOOP_TODO="$completion_cleanup_interrupt_todo" \
+BROWNIE_BIN="$completion_cleanup_interrupt_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_cleanup_interrupt_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_INTERRUPT_AFTER_COMPLETED_TODO_REMOVAL=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_cleanup_interrupt_second_exit="$?"
+set -e
+test "$completion_cleanup_interrupt_second_exit" = "78"
+python3 - "$completion_cleanup_interrupt_state/todo-claims/current.json" "$completion_cleanup_interrupt_todo" "$completion_cleanup_interrupt_runtime_count" "$completion_cleanup_interrupt_count" <<'PY'
+import json
+import pathlib
+import sys
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
+assert claim['completion_cleanup_pending'] is True, claim
+assert claim['completion_pr_pending'] is True, claim
+assert '- [ ] E-completion-cleanup-interrupt:' not in todo, todo
+assert pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[3]).read_text()
+assert not pathlib.Path(sys.argv[4]).exists(), pathlib.Path(sys.argv[4])
+PY
+test ! -e "$completion_cleanup_interrupt_state/stop"
+set +e
+PATH="$completion_cleanup_interrupt_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_cleanup_interrupt_count" \
+PHASE_LOOP_STATE_DIR="$completion_cleanup_interrupt_state" \
+PHASE_LOOP_PROMPT="$completion_cleanup_interrupt_prompt" \
+PHASE_LOOP_TODO="$completion_cleanup_interrupt_todo" \
+BROWNIE_BIN="$completion_cleanup_interrupt_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_cleanup_interrupt_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_cleanup_interrupt_third_exit="$?"
+set -e
+test "$completion_cleanup_interrupt_third_exit" = "0"
+python3 - "$completion_cleanup_interrupt_state/status.json" "$completion_cleanup_interrupt_state/todo-claims/current.json" "$completion_cleanup_interrupt_todo" "$completion_cleanup_interrupt_count" "$completion_cleanup_interrupt_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'pr_created', status
+assert claim['completion_cleanup_pending'] is False, claim
+assert claim['completion_pr_pending'] is False, claim
+assert '- [ ] E-completion-cleanup-interrupt:' not in todo, todo
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['1'], pathlib.Path(sys.argv[4]).read_text()
+assert pathlib.Path(sys.argv[5]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[5]).read_text()
+PY
+test ! -e "$completion_cleanup_interrupt_state/stop"
+
+# If recovery and blocked evidence are durable but the final source todo.failed
+# transition fails, retain the source claim and close that transition on the
+# next run without invoking Runtime a second time.
+terminal_source_transition_pending_state="$(mktemp -d)"
+terminal_source_transition_pending_prompt="$(mktemp)"
+terminal_source_transition_pending_todo="$(mktemp)"
+terminal_source_transition_pending_workspace="$(mktemp -d)"
+terminal_source_transition_pending_runtime_count="$terminal_source_transition_pending_state/runtime-count"
+git -C "$terminal_source_transition_pending_workspace" init -b main >/dev/null
+git -C "$terminal_source_transition_pending_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$terminal_source_transition_pending_prompt"
+printf -- '- [ ] E-final-source-transition-pending: Patch only `scripts/provider-target.mjs`:\n  Route: implementation.\n  Completion condition: provider terminal failure is durably blocked.\n  Verification: run `node --check scripts/provider-target.mjs`.\n' > "$terminal_source_transition_pending_todo"
+terminal_source_transition_pending_brownie="$(mktemp)"
+cat > "$terminal_source_transition_pending_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$terminal_source_transition_pending_runtime_count"
+exec "$fake_brownie_terminal_no_eligible" "\$@"
+SH
+chmod +x "$terminal_source_transition_pending_brownie"
+set +e
+PHASE_LOOP_STATE_DIR="$terminal_source_transition_pending_state" \
+PHASE_LOOP_PROMPT="$terminal_source_transition_pending_prompt" \
+PHASE_LOOP_TODO="$terminal_source_transition_pending_todo" \
+BROWNIE_BIN="$terminal_source_transition_pending_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_transition_pending_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TEST_FAIL_FINAL_SOURCE_TODO_FAILED_LEDGER=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+terminal_source_transition_pending_first_exit="$?"
+set -e
+test "$terminal_source_transition_pending_first_exit" = "78"
+python3 - "$terminal_source_transition_pending_state/todo-claims/current.json" "$terminal_source_transition_pending_state/todo-claims/blocked.jsonl" "$terminal_source_transition_pending_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$terminal_source_transition_pending_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines() if line.strip()]
+ledger = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert claim['status'] == 'in_progress', claim
+assert claim['terminal_failure_source_transition_pending'] is True, claim
+assert claim['terminal_failure_source_transition_recovery_id'], claim
+assert blocked and blocked[-1]['terminal_failure'] is True, blocked
+assert any(record.get('kind') == 'terminal_failure_transaction' for record in ledger), ledger
+source_task = 'E-final-source-transition-pending@' + claim['claim_id']
+assert not any(event.get('task_id') == source_task and event.get('to_state') == 'failed' for record in ledger for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])), ledger
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[4]).read_text()
+PY
+test ! -e "$terminal_source_transition_pending_state/stop"
+set +e
+PHASE_LOOP_STATE_DIR="$terminal_source_transition_pending_state" \
+PHASE_LOOP_PROMPT="$terminal_source_transition_pending_prompt" \
+PHASE_LOOP_TODO="$terminal_source_transition_pending_todo" \
+BROWNIE_BIN="$terminal_source_transition_pending_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_transition_pending_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+terminal_source_transition_pending_second_exit="$?"
+set -e
+test "$terminal_source_transition_pending_second_exit" = "76"
+python3 - "$terminal_source_transition_pending_state/status.json" "$terminal_source_transition_pending_state/todo-claims/current.json" "$terminal_source_transition_pending_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$terminal_source_transition_pending_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+ledger = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '76', status
+assert claim['status'] == 'failed', claim
+assert claim['terminal_failure_source_transition_pending'] is False, claim
+assert any(item.get('note') == 'terminal_failure_source_transition_completed' for item in claim['status_history']), claim
+source_task = 'E-final-source-transition-pending@' + claim['claim_id']
+assert any(event.get('task_id') == source_task and event.get('to_state') == 'failed' and event.get('from_state') in ('claimed', 'running') for record in ledger for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])), ledger
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[4]).read_text()
+PY
+test ! -e "$terminal_source_transition_pending_state/stop"
+
 # Terminal recovery remains durable when the runtime removes the active claim
 # before the controller emits its final trajectory. The next run must not
 # recreate the same queue-generation/target attempt.
