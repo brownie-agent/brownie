@@ -13452,12 +13452,12 @@ PY
     printf '%s\n' "$pre_guard_exact_fast_path_output" > "$stdout_log"
     : > "$stderr_log"
     write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"exact_line"}'
+    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"exact_line_fast_path"}'
     remove_completed_todo_claim_from_queue "$run_stamp" >> "$SUPERVISOR_LOG"
     detail="Applied deterministic exact-line TODO fast path before guard checks: $pre_guard_exact_fast_path_output"
     write_status "last_run_succeeded" "$detail" "exact-line-$run_stamp" "0" "0"
     printf '%s run=%s exact_line_fast_path=true phase=pre_guard result=%s\n' "$(now_utc)" "exact-line-$run_stamp" "$pre_guard_exact_fast_path_output" >> "$SUPERVISOR_LOG"
-    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"exact_line"}'
-    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"exact_line_fast_path"}'
     phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
     return 0
   elif [ "$pre_guard_exact_fast_path_status" -eq 1 ]; then
@@ -13515,12 +13515,12 @@ PY
     printf '%s\n' "$exact_fast_path_output" > "$stdout_log"
     : > "$stderr_log"
     write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"exact_line"}'
+    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"exact_line_fast_path"}'
     remove_completed_todo_claim_from_queue "$run_stamp" >> "$SUPERVISOR_LOG"
     detail="Applied deterministic exact-line TODO fast path without LLM generation: $exact_fast_path_output"
     write_status "last_run_succeeded" "$detail" "exact-line-$run_stamp" "0" "0"
     printf '%s run=%s exact_line_fast_path=true result=%s\n' "$(now_utc)" "exact-line-$run_stamp" "$exact_fast_path_output" >> "$SUPERVISOR_LOG"
-    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"exact_line"}'
-    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"exact_line_fast_path"}'
     phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
     return 0
   elif [ "$exact_fast_path_status" -eq 1 ]; then
