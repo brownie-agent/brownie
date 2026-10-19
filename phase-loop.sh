@@ -1722,6 +1722,18 @@ try: print(json.load(sys.stdin).get("recovery_id", ""))
 except Exception: print("")' 2>/dev/null || true)"
   local terminal_claim_snapshot="$RUN_DIR/$run_stamp.claim.before-runtime.json"
   if [ "$recovery_status" -ne 0 ] || [ -z "$recovery_id" ]; then
+    # Do not archive a failed claim as non-retryable while its source attempt
+    # is still projected as running. The recovery transaction may fail before
+    # it can append blocked evidence, but the source attempt must still reach
+    # todo.failed first; otherwise the next audit sees a permanently running
+    # task with no durable recovery path.
+    local recovery_failure_transition_status=0
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure_recovery_recording_failed","terminal_failure":true}' "todo.failed" || recovery_failure_transition_status=$?
+    if [ "$recovery_failure_transition_status" -ne 0 ]; then
+      PHASE_LOOP_TASK_LEDGER_FAILURE=1
+      PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure recovery recording failed and source attempt could not be terminalized: recovery_status=$recovery_status transition_status=$recovery_failure_transition_status; keeping claim recoverable."
+      return 78
+    fi
     local recording_failure_archive_status=1
     if [ -f "$TODO_CLAIM_FILE" ]; then
       if archive_terminal_failure_claim_snapshot "$TODO_CLAIM_FILE" "$run_stamp" terminal_failure_ledger_failed false "$recovery_id"; then
@@ -9559,15 +9571,21 @@ This PR was created by the external phase-loop controller after Brownie produced
       return 1
     fi
     if [ "$PHASE_LOOP_PR_DRAFT" = "1" ]; then
-      pr_url="$(
-        cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-        gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body" --draft
-      )"
+      if ! pr_url="$(
+          cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+          gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body" --draft
+        )"; then
+        printf '%s pr_create_skipped reason=gh_pr_create_failed branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
+        return 1
+      fi
     else
-      pr_url="$(
-        cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-        gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body"
-      )"
+      if ! pr_url="$(
+          cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+          gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body"
+        )"; then
+        printf '%s pr_create_skipped reason=gh_pr_create_failed branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
+        return 1
+      fi
     fi
   fi
   printf '%s pr_created branch=%s url=%s\n' "$(now_utc)" "$branch" "$pr_url" >> "$SUPERVISOR_LOG"
@@ -9778,6 +9796,50 @@ if isinstance(history, list):
         "note": "queue_removal_cleanup_completed",
     })
 tmp = path.with_name(f"{path.name}.{os.getpid()}.cleanup-complete.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+mark_completed_todo_pr_pending() {
+  local run_stamp="$1"
+  local stdout_log="${2:-}" stderr_log="${3:-}" workspace_before="${4:-}" workspace_after="${5:-}"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+claim["completion_pr_pending"] = True
+claim["completion_pr_run_stamp"] = sys.argv[2]
+claim["completion_pr_stdout_log"] = sys.argv[4]
+claim["completion_pr_stderr_log"] = sys.argv[5]
+claim["completion_pr_workspace_before"] = sys.argv[6]
+claim["completion_pr_workspace_after"] = sys.argv[7]
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": "completed",
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "completion_pr_publish_pending",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.completion-pr-pending.tmp")
 with open(tmp, "w", encoding="utf-8") as handle:
     json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
     handle.write("\n")
@@ -12727,6 +12789,14 @@ _run_brownie_once() {
   git_workspace_status_snapshot > "$workspace_status_before"
   chmod 600 "$workspace_status_before" 2>/dev/null || true
 
+  # A completed claim can outlive queue removal while its tracked completion
+  # PR is pending. Publish it before the empty-queue stop gate so this retry
+  # cannot be mistaken for a fresh no-work run or invoke Runtime.
+  if completed_todo_pr_pending && ! completed_todo_cleanup_pending; then
+    publish_pending_completed_todo_pr "$run_stamp"
+    return $?
+  fi
+
   local todo_status
   stop_if_todo_empty "${CONSECUTIVE_FAILURES:-0}"
   todo_status=$?
@@ -14427,7 +14497,12 @@ PY
         runtime_completion_removal_status=$?
       fi
       if [ "$runtime_completion_removal_status" -ne 0 ]; then
-        mark_completed_todo_cleanup_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
+        if ! mark_completed_todo_cleanup_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+          detail="Brownie reported completion and queue cleanup failed, but the durable cleanup/PR retry marker could not be saved; refusing Runtime restart. removal=$runtime_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+          write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+          printf '%s run=%s runtime_completion_cleanup_marker_failed=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+          return 78
+        fi
         detail="Brownie reported completion but selected TODO removal failed; kept the completed claim for cleanup-only retry. removal=$runtime_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
         printf '%s run=%s runtime_completion_removal_failed=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
@@ -14435,9 +14510,15 @@ PY
       fi
       detail="Brownie reported the selected TODO completed and its queue entry was removed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
       if ! phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+        if ! mark_completed_todo_pr_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+          detail="Brownie reported the selected TODO completed, but PR publication failed and its durable retry marker could not be saved; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+          write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+          printf '%s run=%s runtime_completion_pr_marker_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+          return 78
+        fi
         detail="Brownie reported the selected TODO completed, but publishing the tracked workspace progress as a PR failed; the TODO was already durably completed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
-        printf '%s run=%s runtime_completion_pr_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        printf '%s run=%s runtime_completion_pr_failed=true completion_pr_pending=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
         return 78
       fi
       if [ "$(status_field status 2>/dev/null || true)" != "pr_created" ]; then

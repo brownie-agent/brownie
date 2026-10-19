@@ -1346,6 +1346,15 @@ blocked_path = claim_dir / 'blocked.jsonl'
 assert not blocked_path.exists() or (blocked_path.is_file() and not blocked_path.read_text(encoding='utf-8').strip()), blocked_path
 ledger = ledger_path.read_text(encoding='utf-8')
 assert 'terminal_failure_transaction' not in ledger, ledger
+ledger_records = [json.loads(line) for line in ledger.splitlines() if line.strip()]
+claim_id = archive['claim_id']
+assert any(
+    event.get('claim_id') == claim_id
+    and event.get('to_state') == 'failed'
+    and event.get('from_state') in ('claimed', 'running')
+    and str(event.get('task_id', '')).endswith('@' + claim_id)
+    for event in ledger_records
+), ledger_records
 assert status['status'] == 'blocked', status
 assert status['exit_code'] == '78', status
 assert 'could not be fully recorded' in status['detail'], status
@@ -1677,6 +1686,139 @@ remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'origin/b
 assert head == remote, (head, remote)
 supervisor = pathlib.Path(pathlib.Path(sys.argv[1]).parent / 'logs' / 'supervisor.log').read_text(encoding='utf-8')
 assert 'completed_todo_pr_publish_retry_succeeded=true' in supervisor, supervisor
+PY
+
+# A normal completion whose PR publication fails after queue completion must
+# retain a durable pending-publish marker. The next invocation publishes the
+# same completion without invoking Runtime or selecting another TODO.
+completion_pr_publish_failure_state="$(mktemp -d)"
+completion_pr_publish_failure_prompt="$(mktemp)"
+completion_pr_publish_failure_todo="$(mktemp)"
+completion_pr_publish_failure_workspace="$(mktemp -d)"
+completion_pr_publish_failure_remote="$(mktemp -d)"
+completion_pr_publish_failure_bin="$(mktemp -d)"
+completion_pr_publish_failure_count="$completion_pr_publish_failure_state/pr-create-attempts"
+completion_pr_publish_failure_runtime_count="$completion_pr_publish_failure_state/runtime-count"
+git -C "$completion_pr_publish_failure_workspace" init -b main >/dev/null
+mkdir -p "$completion_pr_publish_failure_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$completion_pr_publish_failure_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$completion_pr_publish_failure_workspace/README.md"
+git -C "$completion_pr_publish_failure_workspace" add .
+git -C "$completion_pr_publish_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$completion_pr_publish_failure_remote" init --bare >/dev/null
+git -C "$completion_pr_publish_failure_workspace" remote add origin "$completion_pr_publish_failure_remote"
+git -C "$completion_pr_publish_failure_workspace" push -u origin main >/dev/null
+git -C "$completion_pr_publish_failure_workspace" switch -c brownie-agent/smoke-completion-pr-retry >/dev/null
+printf 'base prompt\n' > "$completion_pr_publish_failure_prompt"
+printf -- '- [ ] E-completion-pr-retry: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_publish_failure_todo"
+cat > "$completion_pr_publish_failure_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$completion_pr_publish_failure_bin/pnpm"
+cat > "$completion_pr_publish_failure_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "${1:-} ${2:-}" in
+  "api user")
+    printf 'brownie-agent\n'
+    ;;
+  "auth token")
+    printf 'fake-token\n'
+    ;;
+  "pr view")
+    exit 1
+    ;;
+  "pr create")
+    attempts=0
+    if [ -f "${FAKE_GH_PR_CREATE_ATTEMPTS:?}" ]; then
+      attempts="$(wc -l < "${FAKE_GH_PR_CREATE_ATTEMPTS}")"
+    fi
+    printf 'attempt\n' >> "${FAKE_GH_PR_CREATE_ATTEMPTS}"
+    if [ "$attempts" -eq 0 ]; then
+      exit 1
+    fi
+    printf 'https://github.com/globalpocket/brownie/pull/10002\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+SH
+chmod +x "$completion_pr_publish_failure_bin/gh"
+completion_pr_publish_failure_brownie="$(mktemp)"
+cat > "$completion_pr_publish_failure_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_pr_publish_failure_runtime_count"
+exit 99
+SH
+chmod +x "$completion_pr_publish_failure_brownie"
+set +e
+PATH="$completion_pr_publish_failure_bin:$PATH" \
+FAKE_GH_PR_CREATE_ATTEMPTS="$completion_pr_publish_failure_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_publish_failure_state" \
+PHASE_LOOP_PROMPT="$completion_pr_publish_failure_prompt" \
+PHASE_LOOP_TODO="$completion_pr_publish_failure_todo" \
+BROWNIE_BIN="$fake_brownie_completed_tracked_workspace_change" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_publish_failure_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_pr_publish_failure_first_exit="$?"
+set -e
+test "$completion_pr_publish_failure_first_exit" = "78"
+python3 - "$completion_pr_publish_failure_state/status.json" "$completion_pr_publish_failure_state/todo-claims/current.json" "$completion_pr_publish_failure_todo" "$completion_pr_publish_failure_count" "$completion_pr_publish_failure_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+attempts = pathlib.Path(sys.argv[4])
+runtime_count = pathlib.Path(sys.argv[5])
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '78', status
+assert claim['status'] == 'completed', claim
+assert claim['completion_pr_pending'] is True, claim
+assert any(item.get('note') == 'completion_pr_publish_pending' for item in claim['status_history']), claim
+assert '- [ ] E-completion-pr-retry:' not in todo, todo
+assert attempts.read_text(encoding='utf-8').splitlines() == ['attempt'], attempts
+assert not runtime_count.exists(), runtime_count
+PY
+set +e
+PATH="$completion_pr_publish_failure_bin:$PATH" \
+FAKE_GH_PR_CREATE_ATTEMPTS="$completion_pr_publish_failure_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_publish_failure_state" \
+PHASE_LOOP_PROMPT="$completion_pr_publish_failure_prompt" \
+PHASE_LOOP_TODO="$completion_pr_publish_failure_todo" \
+BROWNIE_BIN="$completion_pr_publish_failure_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_publish_failure_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_pr_publish_failure_second_exit="$?"
+set -e
+test "$completion_pr_publish_failure_second_exit" = "0"
+python3 - "$completion_pr_publish_failure_state/status.json" "$completion_pr_publish_failure_state/todo-claims/current.json" "$completion_pr_publish_failure_count" "$completion_pr_publish_failure_runtime_count" "$completion_pr_publish_failure_workspace" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+attempts = pathlib.Path(sys.argv[3])
+runtime_count = pathlib.Path(sys.argv[4])
+workspace = sys.argv[5]
+assert status['status'] == 'pr_created', status
+assert 'pull/10002' in status['detail'], status
+assert claim['status'] == 'completed', claim
+assert claim['completion_pr_pending'] is False, claim
+assert attempts.read_text(encoding='utf-8').splitlines() == ['attempt', 'attempt'], attempts
+assert not runtime_count.exists(), runtime_count
+head = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'HEAD'], text=True).strip()
+remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'origin/brownie-agent/smoke-completion-pr-retry'], text=True).strip()
+assert head == remote, (head, remote)
 PY
 
 # Terminal recovery remains durable when the runtime removes the active claim
