@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { inspectSupervisorOwnership, normalizeStaleRunningStatus, rollbackStaleRunningRecovery, watchdogContinuationLiveness } from './phase-loop-run-state.mjs';
+import { allSupervisorProcessRecords, inspectSupervisorOwnership, migrateLegacyPhaseLoopState, normalizeStaleRunningStatus, quiesceLegacySupervisor, rollbackStaleRunningRecovery, terminateLegacySupervisor, watchdogContinuationLiveness } from './phase-loop-run-state.mjs';
 
 function fixture() {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-run-state-'));
@@ -391,6 +391,466 @@ test('run-once installs exit and signal terminalization hooks after entering run
   assert.match(controller, /SUPERVISOR_OWNER_FILE=/u);
   assert.match(controller, /write_supervisor_owner/gu);
   assert.match(controller, /phase_loop_watch_continuation_liveness/gu);
+  assert.match(controller, /phase_loop_migrate_legacy_state[\s\S]*phase_loop_watch_continuation_liveness/u);
   assert.match(controller, /PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS/u);
   assert.match(controller, /--owner-generation/u);
+});
+
+function writeLegacyFixture(stateDir, { pid = 48100, supervisorPid = 33061, rootDir = '/repo' } = {}) {
+  fs.writeFileSync(path.join(stateDir, 'status.json'), JSON.stringify({
+    status: 'running',
+    detail: 'legacy continuation after host loss',
+    run_id: 'legacy-continuation',
+    updated_at: '2026-10-18T16:37:00.000Z',
+    continuation_required: true,
+    controller_action: 'resume',
+    supervisor_pid: supervisorPid,
+    supervisor_generation: 'legacy-generation',
+    workspace_root: rootDir
+  }));
+  fs.writeFileSync(path.join(stateDir, 'phase-loop.pid'), `${pid}\n`);
+  fs.mkdirSync(path.join(stateDir, 'todo-claims'), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'todo-claims', 'current.json'), JSON.stringify({
+    claim_id: 'legacy-claim',
+    status: 'in_progress',
+    selected_todo: '- [ ] legacy migration fixture'
+  }));
+  fs.mkdirSync(path.join(stateDir, 'runs'), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'runs', 'legacy.target.before'), 'target-before\n');
+  fs.mkdirSync(path.join(stateDir, 'phase-loop.lock'), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'phase-loop.lock', 'pid'), `${supervisorPid}\n`);
+}
+
+function sameRootLegacyRecords(stateDir) {
+  return [{
+    pid: 33061,
+    command: 'bash /repo/phase-loop.sh supervise',
+    start_time: 'Sun Oct 18 16:30:00 2026',
+    state_dir: stateDir
+  }];
+}
+
+function defaultLegacyFixture() {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-default-root-'));
+  const stateDir = path.join(rootDir, '.brownie', 'private', 'phase-loop');
+  fs.mkdirSync(stateDir, { recursive: true });
+  return { rootDir, stateDir, statusPath: path.join(stateDir, 'status.json') };
+}
+
+test('archives and rebaselines a confirmed same-root legacy owner exactly once', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  let live = true;
+  let stopCalls = 0;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    now: '2026-10-18T17:00:00.000Z',
+    processExists: (pid) => live && pid === 33061,
+    getProcessCommand: (pid) => pid === 33061 ? 'bash /repo/phase-loop.sh supervise' : '',
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => live ? sameRootLegacyRecords(stateDir) : [],
+    stopSupervisor: ({ candidate }) => {
+      stopCalls += 1;
+      assert.equal(candidate.pid, 33061);
+      live = false;
+      fs.rmSync(path.join(stateDir, 'phase-loop.lock'), { recursive: true, force: true });
+      return { ok: true };
+    }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.migrated, true);
+  assert.equal(result.stopped_legacy_pid, 33061);
+  assert.equal(stopCalls, 1);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'recovered_legacy_state');
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).continuation_required, false);
+  assert.equal(fs.existsSync(path.join(stateDir, 'phase-loop.pid')), false);
+  assert.equal(fs.existsSync(path.join(stateDir, 'phase-loop-owner.json')), false);
+  assert.equal(fs.existsSync(path.join(stateDir, 'phase-loop.lock')), false);
+  const manifest = JSON.parse(fs.readFileSync(path.join(result.archive_path, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.kind, 'phase_loop_legacy_state_archive');
+  assert.ok(manifest.files.some((entry) => entry.category === 'claim'));
+  assert.ok(manifest.files.some((entry) => entry.category === 'target_snapshot'));
+});
+
+test('keeps an original manifest in the archive payload beside the recovery manifest', () => {
+  const { stateDir } = fixture();
+  writeLegacyFixture(stateDir);
+  fs.writeFileSync(path.join(stateDir, 'manifest.json'), 'legacy-manifest\n');
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: () => false,
+    listAllSupervisors: () => []
+  });
+  assert.equal(result.ok, true);
+  assert.equal(fs.readFileSync(path.join(result.archive_path, 'payload', 'manifest.json'), 'utf8'), 'legacy-manifest\n');
+  const manifest = JSON.parse(fs.readFileSync(path.join(result.archive_path, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.payload_root, 'payload');
+  assert.ok(manifest.files.some((entry) => entry.path === 'manifest.json'));
+});
+
+test('quiesces a confirmed legacy owner before enforcing archive snapshot stability', () => {
+  const { stateDir } = fixture();
+  writeLegacyFixture(stateDir);
+  let live = true;
+  let quiesced = false;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: (pid) => live && pid === 33061,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => live ? sameRootLegacyRecords(stateDir) : [],
+    quiesceSupervisor: () => {
+      quiesced = true;
+      return { ok: true, resume: () => { quiesced = false; return { ok: true }; } };
+    },
+    archiveSnapshot: () => {
+      assert.equal(quiesced, true);
+      return { fingerprint: 'stable', files: [], archive_path: 'archive', manifest_path: 'manifest' };
+    },
+    stateSnapshotReader: () => ({ fingerprint: 'stable', files: [] }),
+    stopSupervisor: () => {
+      assert.equal(quiesced, false);
+      live = false;
+      fs.rmSync(path.join(stateDir, 'phase-loop.lock'), { recursive: true, force: true });
+      return { ok: true };
+    }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(quiesced, false);
+});
+
+test('resumes processes already quiesced when a later identity check fails', () => {
+  const signals = [];
+  const result = quiesceLegacySupervisor({
+    candidate: { pid: 33061, start_time: 'candidate' },
+    processExists: () => true,
+    getProcessStartTime: (pid) => pid === 33061 ? 'candidate' : '',
+    listDescendants: () => [33062],
+    killProcess: (pid, signal) => { signals.push([pid, signal]); }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_process_identity_changed');
+  assert.deepEqual(signals, [[33061, 0], [33061, 'SIGSTOP'], [33061, 'SIGCONT']]);
+});
+
+test('blocks a live lock owned by a different PID before stopping the candidate', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  fs.writeFileSync(path.join(stateDir, 'phase-loop.lock', 'pid'), '33062\n');
+  let stopCalls = 0;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: (pid) => pid === 33061 || pid === 33062,
+    getProcessCommand: (pid) => pid === 33061 ? 'bash /repo/phase-loop.sh supervise' : 'node unrelated-lock-owner.mjs',
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => [{ pid: 33061, command: 'bash /repo/phase-loop.sh supervise', start_time: 'Sun Oct 18 16:30:00 2026', state_dir: stateDir }],
+    stopSupervisor: () => { stopCalls += 1; return { ok: true }; }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_state_ownership_unproven');
+  assert.equal(result.inspection.reason, 'legacy_live_lock_owner_unproven');
+  assert.equal(stopCalls, 0);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'blocked');
+});
+
+test('reuses an existing archive for a repeated blocked migration with the same state', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  const options = {
+    stateDir,
+    rootDir: '/repo',
+    processExists: (pid) => pid === 33061 || pid === 33062,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => [{ pid: 33061, command: 'bash /repo/phase-loop.sh supervise', start_time: 'Sun Oct 18 16:30:00 2026', state_dir: '/other-state' }]
+  };
+  const first = migrateLegacyPhaseLoopState(options);
+  const second = migrateLegacyPhaseLoopState(options);
+  assert.equal(first.ok, false);
+  assert.equal(second.ok, false);
+  assert.equal(second.recovery_id, first.recovery_id);
+  assert.equal(second.archive_path, first.archive_path);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).recovery_id, first.recovery_id);
+  assert.deepEqual(fs.readdirSync(path.join(stateDir, 'legacy-recovery')), [first.recovery_id]);
+});
+
+test('blocks a same-root supervisor whose state directory is different', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  const foreignState = [{
+    pid: 33061,
+    command: 'bash /repo/phase-loop.sh supervise',
+    start_time: 'Sun Oct 18 16:30:00 2026',
+    state_dir: '/other-state'
+  }];
+  let stopCalls = 0;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: () => true,
+    getProcessCommand: () => foreignState[0].command,
+    getProcessStartTime: () => foreignState[0].start_time,
+    listAllSupervisors: () => foreignState,
+    stopSupervisor: () => { stopCalls += 1; return { ok: true }; }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_state_ownership_unproven');
+  assert.equal(result.inspection.reason, 'legacy_foreign_supervisor');
+  assert.equal(stopCalls, 0);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'blocked');
+  assert.equal(fs.readFileSync(path.join(stateDir, 'phase-loop.pid'), 'utf8'), '48100\n');
+});
+
+test('confirms a default-state supervisor without an explicit state-dir environment value', () => {
+  const { rootDir, stateDir, statusPath } = defaultLegacyFixture();
+  writeLegacyFixture(stateDir, { rootDir });
+  let live = true;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir,
+    processExists: (pid) => live && pid === 33061,
+    getProcessCommand: () => `bash ${rootDir}/phase-loop.sh supervise`,
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => live ? [{
+      pid: 33061,
+      command: `bash ${rootDir}/phase-loop.sh supervise`,
+      start_time: 'Sun Oct 18 16:30:00 2026'
+    }] : [],
+    stopSupervisor: () => { live = false; fs.rmSync(path.join(stateDir, 'phase-loop.lock'), { recursive: true, force: true }); return { ok: true }; }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.migrated, true);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'recovered_legacy_state');
+});
+
+test('rescans descendants before force-killing a respawned legacy child', () => {
+  const live = new Set([33061, 44001, 44002]);
+  const signals = [];
+  let scans = 0;
+  const result = terminateLegacySupervisor({
+    candidate: { pid: 33061, start_time: 'candidate' },
+    processExists: (pid) => live.has(pid),
+    getProcessStartTime: (pid) => ({ 33061: 'candidate', 44001: 'child-1', 44002: 'child-2' }[pid] || ''),
+    listDescendants: () => {
+      scans += 1;
+      return scans <= 2 ? [44001] : [44001, 44002];
+    },
+    killProcess: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === 'SIGTERM' && pid === 44001) live.delete(pid);
+      if (signal === 'SIGKILL') live.delete(pid);
+    },
+    sleep: () => {}
+  });
+  assert.equal(result.ok, true);
+  assert.ok(scans > 2);
+  assert.ok(signals.some(([pid, signal]) => pid === 44002 && signal === 'SIGKILL'));
+});
+
+test('blocks and preserves state when a foreign supervisor is live', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  const foreign = [{ pid: 33061, command: 'bash /foreign/phase-loop.sh supervise', start_time: 'Sun Oct 18 16:30:00 2026' }];
+  let stopCalls = 0;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: () => true,
+    getProcessCommand: () => foreign[0].command,
+    getProcessStartTime: () => foreign[0].start_time,
+    listAllSupervisors: () => foreign,
+    stopSupervisor: () => { stopCalls += 1; return { ok: true }; }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_state_ownership_unproven');
+  assert.equal(result.inspection.reason, 'legacy_foreign_supervisor');
+  assert.equal(stopCalls, 0);
+  const blocked = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+  assert.equal(blocked.status, 'blocked');
+  assert.equal(blocked.continuation_required, true);
+  assert.equal(fs.readFileSync(path.join(stateDir, 'phase-loop.pid'), 'utf8'), '48100\n');
+  assert.ok(fs.existsSync(path.join(result.archive_path, 'manifest.json')));
+});
+
+test('ignores an unrelated foreign-checkout supervisor when this state does not reference it', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir, { supervisorPid: 33062 });
+  const unrelated = [{ pid: 33061, command: 'bash /foreign-checkout/phase-loop.sh supervise', start_time: 'Sun Oct 18 16:30:00 2026' }];
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: (pid) => pid === 33061,
+    getProcessCommand: () => unrelated[0].command,
+    getProcessStartTime: () => unrelated[0].start_time,
+    listAllSupervisors: () => unrelated
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.migrated, true);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'recovered_legacy_state');
+});
+
+test('blocks a foreign-root supervisor that explicitly reports this state directory', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir, { supervisorPid: 33062 });
+  const foreign = [{
+    pid: 33061,
+    command: 'bash /foreign-checkout/phase-loop.sh supervise',
+    start_time: 'Sun Oct 18 16:30:00 2026',
+    state_dir: stateDir
+  }];
+  let stopCalls = 0;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: () => true,
+    getProcessCommand: () => foreign[0].command,
+    getProcessStartTime: () => foreign[0].start_time,
+    listAllSupervisors: () => foreign,
+    stopSupervisor: () => { stopCalls += 1; return { ok: true }; }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_state_ownership_unproven');
+  assert.equal(result.inspection.reason, 'legacy_foreign_supervisor');
+  assert.equal(stopCalls, 0);
+  assert.equal(result.inspection.foreign_root_state_dir_supervisors.length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'blocked');
+});
+
+test('reads a large process table in one command and enriches supervisors only', () => {
+  const enriched = [];
+  const records = allSupervisorProcessRecords({
+    readProcessTable: () => `${Array.from({ length: 200 }, (_, index) => ` ${index + 100} worker-${index}`).join('\n')}\n 33061 bash /repo/phase-loop.sh supervise`,
+    processAlive: () => true,
+    getStartTime: (pid) => { enriched.push(['start', pid]); return 'supervisor-start'; },
+    getStateDir: (pid) => { enriched.push(['state', pid]); return '/state'; }
+  });
+  assert.deepEqual(records, [{ pid: 33061, command: 'bash /repo/phase-loop.sh supervise', start_time: 'supervisor-start', state_dir: '/state' }]);
+  assert.deepEqual(enriched, [['start', 33061], ['state', 33061]]);
+});
+
+test('binds supervisor command and start time from one process-table snapshot', () => {
+  const records = allSupervisorProcessRecords({
+    readProcessTable: () => ' 33061 Mon Oct  7 01:52:00 2026 bash /repo/phase-loop.sh supervise\n',
+    processAlive: () => true,
+    getStartTime: () => { throw new Error('start time must come from the process table'); },
+    getStateDir: () => '/state'
+  });
+  assert.deepEqual(records, [{
+    pid: 33061,
+    command: 'bash /repo/phase-loop.sh supervise',
+    start_time: 'Mon Oct  7 01:52:00 2026',
+    state_dir: '/state'
+  }]);
+});
+
+test('blocks PID reuse by a non-supervisor without deleting the lock or pidfile', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: (pid) => pid === 48100,
+    getProcessCommand: () => 'node unrelated-worker.mjs',
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => []
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_state_ownership_unproven');
+  assert.equal(result.inspection.reason, 'legacy_pid_reused_by_other_process');
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).continuation_required, true);
+  assert.equal(fs.existsSync(path.join(stateDir, 'phase-loop.lock')), true);
+  assert.equal(fs.readFileSync(path.join(stateDir, 'phase-loop.pid'), 'utf8'), '48100\n');
+});
+
+test('fails closed when the audit archive cannot be created', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  const before = fs.readFileSync(statusPath, 'utf8');
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: () => false,
+    listAllSupervisors: () => [],
+    archiveSnapshot: () => { throw new Error('archive disk full'); }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_state_archive_failed');
+  assert.equal(fs.readFileSync(statusPath, 'utf8'), before);
+  assert.equal(fs.existsSync(path.join(stateDir, 'legacy-recovery')), false);
+});
+
+test('refuses a status race discovered after the archive and never starts a second owner', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  let inspections = 0;
+  let stopCalls = 0;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: (pid) => pid === 33061,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => {
+      inspections += 1;
+      if (inspections === 2) {
+        const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+        status.updated_at = '2026-10-18T16:59:59.000Z';
+        fs.writeFileSync(statusPath, JSON.stringify(status));
+      }
+      return sameRootLegacyRecords(stateDir);
+    },
+    stopSupervisor: () => { stopCalls += 1; return { ok: true }; }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_state_changed_during_migration');
+  assert.equal(stopCalls, 0);
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+  assert.ok(fs.existsSync(path.join(result.archive_path, 'manifest.json')));
+});
+
+test('refuses rebaseline when stopping the legacy owner dirties claim state', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  let live = true;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: (pid) => live && pid === 33061,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => live ? sameRootLegacyRecords(stateDir) : [],
+    stopSupervisor: () => {
+      live = false;
+      fs.writeFileSync(path.join(stateDir, 'todo-claims', 'current.json'), JSON.stringify({ claim_id: 'changed-during-stop' }));
+      return { ok: true };
+    }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_supervisor_stop_race');
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+  assert.equal(fs.existsSync(path.join(stateDir, 'phase-loop.pid')), true);
+});
+
+test('leaves continuation blocked when reversible cleanup fails after owner stop', () => {
+  const { stateDir, statusPath } = fixture();
+  writeLegacyFixture(stateDir);
+  let live = true;
+  const result = migrateLegacyPhaseLoopState({
+    stateDir,
+    rootDir: '/repo',
+    processExists: (pid) => live && pid === 33061,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    getProcessStartTime: () => 'Sun Oct 18 16:30:00 2026',
+    listAllSupervisors: () => live ? sameRootLegacyRecords(stateDir) : [],
+    stopSupervisor: () => { live = false; return { ok: true }; },
+    runtimeCleaner: () => ({ ok: false, code: 'legacy_cleanup_fixture_failure' })
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'legacy_cleanup_fixture_failure');
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).continuation_required, true);
+  assert.equal(fs.existsSync(path.join(stateDir, 'phase-loop.pid')), true);
 });

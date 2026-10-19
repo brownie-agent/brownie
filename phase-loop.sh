@@ -8,6 +8,7 @@ LOG_DIR="$STATE_DIR/logs"
 PID_FILE="$STATE_DIR/phase-loop.pid"
 SUPERVISOR_OWNER_FILE="$STATE_DIR/phase-loop-owner.json"
 LOCK_DIR="$STATE_DIR/phase-loop.lock"
+LEGACY_MIGRATION_LOCK_DIR="$STATE_DIR/phase-loop-legacy-migration.lock"
 STOP_FILE="$STATE_DIR/stop"
 STATUS_FILE="$STATE_DIR/status.json"
 SUPERVISOR_LOG="$LOG_DIR/supervisor.log"
@@ -41,6 +42,7 @@ PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
 PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
 PHASE_LOOP_FINALIZING=0
 PHASE_LOOP_LAST_CLAIM_ARCHIVE=""
+PHASE_LOOP_LOCK_BLOCKER=""
 
 BROWNIE_BIN="${BROWNIE_BIN:-"$ROOT_DIR/target/debug/brownie"}"
 PHASE_LOOP_DEFAULT_BROWNIE_BIN="$ROOT_DIR/target/debug/brownie"
@@ -63,6 +65,7 @@ PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES="${PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES:-
 PHASE_LOOP_PROMPT_RETENTION_COUNT="${PHASE_LOOP_PROMPT_RETENTION_COUNT:-20}"
 PHASE_LOOP_STOP_GRACE_SECONDS="${PHASE_LOOP_STOP_GRACE_SECONDS:-15}"
 PHASE_LOOP_STOP_FORCE_SECONDS="${PHASE_LOOP_STOP_FORCE_SECONDS:-5}"
+PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS="${PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS:-30}"
 PHASE_LOOP_SLEEP_POLL_SECONDS="${PHASE_LOOP_SLEEP_POLL_SECONDS:-1}"
 PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES="${PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES:-3}"
 PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="${PHASE_LOOP_APPROVED_CONTROLLER_BASELINE:-origin/main}"
@@ -11812,12 +11815,157 @@ run_phase_loop_preflight() {
   return 0
 }
 
+phase_loop_legacy_migration_lock_identity() {
+  python3 - "$LEGACY_MIGRATION_LOCK_DIR" <<'PY'
+import os
+import sys
+
+try:
+    stat_result = os.stat(sys.argv[1])
+except OSError:
+    print("")
+    raise SystemExit(0)
+print(f"{stat_result.st_dev}:{stat_result.st_ino}")
+PY
+}
+
+phase_loop_legacy_migration_lock_ownerless_stale() {
+  python3 - "$LEGACY_MIGRATION_LOCK_DIR" "$PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS" <<'PY'
+import os
+import sys
+import time
+
+try:
+    lock_age = time.time() - os.stat(sys.argv[1]).st_mtime
+    grace = float(sys.argv[2])
+except (OSError, ValueError):
+    print("0")
+    raise SystemExit(0)
+print("1" if lock_age >= grace else "0")
+PY
+}
+
+phase_loop_legacy_migration_lock_active() {
+  if [ ! -d "$LEGACY_MIGRATION_LOCK_DIR" ]; then
+    return 1
+  fi
+  local migration_pid owner_file expected_start expected_command expected_root actual_start actual_command quarantine_dir
+  local inspected_lock_identity current_lock_identity
+  inspected_lock_identity="$(phase_loop_legacy_migration_lock_identity)"
+  if [ -z "$inspected_lock_identity" ]; then
+    return 0
+  fi
+  owner_file="$LEGACY_MIGRATION_LOCK_DIR/owner.json"
+  if [ -f "$owner_file" ]; then
+    migration_pid="$(python3 - "$owner_file" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        value = json.load(handle).get("pid")
+    print(value if isinstance(value, int) and value > 0 else "")
+except Exception:
+    print("")
+PY
+)"
+    if [ -z "$migration_pid" ]; then
+      return 0
+    fi
+    if ! kill -0 "$migration_pid" 2>/dev/null; then
+      migration_pid=""
+    else
+      expected_start="$(python3 - "$owner_file" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        value = json.load(handle).get("start_time")
+    print(value if isinstance(value, str) else "")
+except Exception:
+    print("")
+PY
+)"
+      expected_command="$(python3 - "$owner_file" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        value = json.load(handle).get("command")
+    print(value if isinstance(value, str) else "")
+except Exception:
+    print("")
+PY
+)"
+      expected_root="$(python3 - "$owner_file" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        value = json.load(handle).get("root_dir")
+    print(value if isinstance(value, str) else "")
+except Exception:
+    print("")
+PY
+)"
+      actual_start="$(ps -p "$migration_pid" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//')"
+      actual_command="$(ps -p "$migration_pid" -o command= 2>/dev/null | sed 's/^ *//;s/ *$//')"
+      if [ -n "$expected_start" ] && [ -n "$expected_command" ] && [ -n "$expected_root" ] &&
+        [ -n "$actual_start" ] && [ -n "$actual_command" ] &&
+        [ "$expected_start" = "$actual_start" ] &&
+        [ "$expected_command" = "$actual_command" ]; then
+        if [ "$expected_root" != "$ROOT_DIR" ] && [ -d "$LOG_DIR" ]; then
+          printf '%s legacy_state_migration_lock_foreign_root_verified=true owner_root=%s caller_root=%s\n' \
+            "$(now_utc)" "$expected_root" "$ROOT_DIR" >> "$SUPERVISOR_LOG"
+        fi
+        return 0
+      fi
+    fi
+  else
+    migration_pid="$(cat "$LEGACY_MIGRATION_LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -z "$migration_pid" ]; then
+      # Publication creates the canonical directory before moving both owner
+      # records into it. Keep a fresh ownerless directory active while that
+      # short publication window is possible, but reclaim an abandoned one
+      # after its lease so a crash cannot block migration forever.
+      if [ "$(phase_loop_legacy_migration_lock_ownerless_stale)" != "1" ]; then
+        return 0
+      fi
+    elif kill -0 "$migration_pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  # The inspected directory may have been replaced while PID metadata was
+  # being checked. Revalidate its filesystem identity immediately before the
+  # rename so a delayed stale-lock reclaimer cannot quarantine a newly
+  # published migration owner.
+  current_lock_identity="$(phase_loop_legacy_migration_lock_identity)"
+  if [ -z "$current_lock_identity" ] || [ "$current_lock_identity" != "$inspected_lock_identity" ]; then
+    return 0
+  fi
+  quarantine_dir="$STATE_DIR/phase-loop-legacy-migration.reclaim.$$.$RANDOM"
+  if mv "$LEGACY_MIGRATION_LOCK_DIR" "$quarantine_dir" 2>/dev/null; then
+    rm -rf "$quarantine_dir"
+    sync_parent_dir "$STATE_DIR"
+    return 1
+  fi
+  # Another migration either reclaimed the lock or published a new owner.
+  # Treat the result as active so this caller cannot race it.
+  return 0
+}
+
 acquire_lock() {
+  PHASE_LOOP_LOCK_BLOCKER=""
+  if phase_loop_legacy_migration_lock_active; then
+    PHASE_LOOP_LOCK_BLOCKER="legacy_migration"
+    return 1
+  fi
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "$$" > "$LOCK_DIR/pid"
     trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
     return 0
   fi
+  PHASE_LOOP_LOCK_BLOCKER="supervisor"
   local lock_pid
   lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
   if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
@@ -13995,9 +14143,123 @@ phase_loop_watch_continuation_liveness() {
   return 0
 }
 
+phase_loop_migrate_legacy_state() {
+  if [ ! -f "$ROOT_DIR/scripts/phase-loop-run-state.mjs" ]; then
+    return 0
+  fi
+  mkdir -p "$STATE_DIR"
+  if phase_loop_legacy_migration_lock_active; then
+    # The migration owner snapshots this directory. A contender must leave it
+    # byte-for-byte unchanged; the 75 result is the contention diagnostic.
+    return 75
+  fi
+  local migration_lock_staging
+  migration_lock_staging="$(mktemp -d "$STATE_DIR/phase-loop-legacy-migration.lock.$$.XXXXXX" 2>/dev/null || true)"
+  if [ -z "$migration_lock_staging" ]; then
+    printf '%s legacy_state_migration_lock_create_failed=true\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  local migration_start_time migration_command
+  migration_start_time="$(ps -p $$ -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//')"
+  migration_command="$(ps -p $$ -o command= 2>/dev/null | sed 's/^ *//;s/ *$//')"
+  if [ -z "$migration_start_time" ] || [ -z "$migration_command" ] || ! python3 - \
+    "$migration_lock_staging/owner.json" "$migration_lock_staging/pid" "$$" "$migration_start_time" "$migration_command" "$ROOT_DIR" <<'PY'
+import json
+import os
+import sys
+
+owner_path, pid_path, pid, start_time, command, root_dir = sys.argv[1:]
+payload = {
+    "pid": int(pid),
+    "start_time": start_time,
+    "command": command,
+    "root_dir": root_dir,
+}
+with open(owner_path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+with open(pid_path, "w", encoding="utf-8") as handle:
+    handle.write(f"{pid}\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+  then
+    rm -rf "$migration_lock_staging"
+    printf '%s legacy_state_migration_lock_owner_create_failed=true\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  if ! sync_parent_dir "$migration_lock_staging"; then
+    rm -rf "$migration_lock_staging"
+    printf '%s legacy_state_migration_lock_stage_sync_failed=true\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  # mkdir is the exclusive publication primitive here. A plain `mv` is not
+  # sufficient: on BSD/macOS, moving a directory onto an existing directory
+  # can succeed by nesting the source below the destination, which would let
+  # two concurrent callers believe they own the migration lock.
+  if ! mkdir "$LEGACY_MIGRATION_LOCK_DIR" 2>/dev/null; then
+    rm -rf "$migration_lock_staging"
+    printf '%s legacy_state_migration_lock_busy=true\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+    return 75
+  fi
+  if ! mv "$migration_lock_staging/owner.json" "$LEGACY_MIGRATION_LOCK_DIR/owner.json" 2>/dev/null ||
+    ! mv "$migration_lock_staging/pid" "$LEGACY_MIGRATION_LOCK_DIR/pid" 2>/dev/null; then
+    rm -rf "$migration_lock_staging" "$LEGACY_MIGRATION_LOCK_DIR"
+    sync_parent_dir "$STATE_DIR"
+    printf '%s legacy_state_migration_lock_publish_failed=true\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  rmdir "$migration_lock_staging" 2>/dev/null || true
+  sync_parent_dir "$LEGACY_MIGRATION_LOCK_DIR"
+  sync_parent_dir "$STATE_DIR"
+  phase_loop_release_legacy_migration_lock() {
+    if [ -d "$LEGACY_MIGRATION_LOCK_DIR" ] &&
+      [ "$(cat "$LEGACY_MIGRATION_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ] &&
+      [ -f "$LEGACY_MIGRATION_LOCK_DIR/owner.json" ]; then
+      rm -rf "$LEGACY_MIGRATION_LOCK_DIR"
+      sync_parent_dir "$STATE_DIR"
+    fi
+  }
+  phase_loop_migration_signal_handler() {
+    local signal_name="$1"
+    phase_loop_release_legacy_migration_lock
+    trap - INT TERM
+    if [ "$signal_name" = "INT" ]; then
+      exit 130
+    fi
+    exit 143
+  }
+  trap 'phase_loop_release_legacy_migration_lock' EXIT
+  trap 'phase_loop_migration_signal_handler INT' INT
+  trap 'phase_loop_migration_signal_handler TERM' TERM
+  local migration_output migration_status
+  if migration_output="$(node "$ROOT_DIR/scripts/phase-loop-run-state.mjs" migrate-legacy-state \
+    --state-dir "$STATE_DIR" \
+    --pid-file "$PID_FILE" \
+    --owner-file "$SUPERVISOR_OWNER_FILE" \
+    --root-dir "$ROOT_DIR" 2>&1)"; then
+    migration_status=0
+  else
+    migration_status=$?
+  fi
+  printf '%s legacy_state_migration_exit=%s result=%s\n' "$(now_utc)" "$migration_status" "${migration_output:-<no output>}" >> "$SUPERVISOR_LOG"
+  phase_loop_release_legacy_migration_lock
+  trap - EXIT INT TERM
+  if [ "$migration_status" -ne 0 ]; then
+    printf '%s\n' "${migration_output:-Legacy phase-loop state migration refused to continue.}" >&2
+    return "$migration_status"
+  fi
+  return 0
+}
+
 supervise() {
   load_env
   if ! acquire_lock; then
+    if [ "${PHASE_LOOP_LOCK_BLOCKER:-}" = "legacy_migration" ]; then
+      exit 75
+    fi
     write_status "already_running" "Another phase-loop.sh instance holds the lock." "" "" 0
     exit 0
   fi
@@ -14096,6 +14358,16 @@ normalize_stale_running_before_start() {
 
 start() {
   load_env
+  local migration_status
+  if phase_loop_migrate_legacy_state; then
+    migration_status=0
+  else
+    migration_status=$?
+  fi
+  if [ "$migration_status" -ne 0 ]; then
+    printf '%s\n' "Legacy phase-loop state migration refused startup." >&2
+    exit "$migration_status"
+  fi
   local watchdog_status
   if phase_loop_watch_continuation_liveness "startup-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"; then
     watchdog_status=0
@@ -14170,6 +14442,50 @@ status() {
   fi
 }
 
+restart() {
+  load_env
+  local migration_status
+  if phase_loop_migrate_legacy_state; then
+    migration_status=0
+  else
+    migration_status=$?
+  fi
+  if [ "$migration_status" -ne 0 ]; then
+    printf '%s\n' "Legacy phase-loop state migration refused restart." >&2
+    return "$migration_status"
+  fi
+
+  local restart_pid=""
+  if [ -f "$PID_FILE" ]; then
+    restart_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$restart_pid" ] && kill -0 "$restart_pid" 2>/dev/null && ! is_running; then
+      printf '%s\n' "phase-loop restart refused; live supervisor ownership could not be proven: pid $restart_pid" >&2
+      return 75
+    fi
+  fi
+  stop_loop
+  sleep 2
+  if [ -f "$PID_FILE" ]; then
+    local old_pid
+    old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      if ! is_running; then
+        printf '%s\n' "phase-loop restart refused; live supervisor ownership could not be proven: pid $old_pid" >&2
+        return 75
+      fi
+      kill "$old_pid" 2>/dev/null || true
+      sleep 1
+      if kill -0 "$old_pid" 2>/dev/null; then
+        printf '%s\n' "phase-loop restart refused; supervisor pid $old_pid is still running" >&2
+        return 75
+      fi
+    fi
+  fi
+  rm -f "$PID_FILE" "$STOP_FILE"
+  rm -rf "$LOCK_DIR"
+  start
+}
+
 case "${1:-status}" in
   start)
     start
@@ -14185,35 +14501,13 @@ case "${1:-status}" in
     phase_loop_watch_continuation_liveness "manual-watchdog-$(date -u +%Y%m%dT%H%M%SZ)"
     exit $?
     ;;
+  migrate-legacy)
+    load_env
+    phase_loop_migrate_legacy_state
+    exit $?
+    ;;
   restart)
-    restart_pid=""
-    if [ -f "$PID_FILE" ]; then
-      restart_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-      if [ -n "$restart_pid" ] && kill -0 "$restart_pid" 2>/dev/null && ! is_running; then
-        printf '%s\n' "phase-loop restart refused; live supervisor ownership could not be proven: pid $restart_pid" >&2
-        exit 75
-      fi
-    fi
-    stop_loop
-    sleep 2
-    if [ -f "$PID_FILE" ]; then
-      old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-      if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-        if ! is_running; then
-          printf '%s\n' "phase-loop restart refused; live supervisor ownership could not be proven: pid $old_pid" >&2
-          exit 75
-        fi
-        kill "$old_pid" 2>/dev/null || true
-        sleep 1
-        if kill -0 "$old_pid" 2>/dev/null; then
-          printf '%s\n' "phase-loop restart refused; supervisor pid $old_pid is still running" >&2
-          exit 75
-        fi
-      fi
-    fi
-    rm -f "$PID_FILE" "$STOP_FILE"
-    rm -rf "$LOCK_DIR"
-    start
+    restart
     ;;
   status)
     status
@@ -14233,7 +14527,7 @@ case "${1:-status}" in
     exit "$run_once_status"
     ;;
   *)
-    echo "usage: $0 {start|status|stop|restart|check-binary-freshness|run-once}" >&2
+    echo "usage: $0 {start|status|stop|restart|watchdog|migrate-legacy|check-binary-freshness|run-once}" >&2
     exit 64
     ;;
 esac

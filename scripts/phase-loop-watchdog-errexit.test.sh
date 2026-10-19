@@ -103,6 +103,41 @@ set -e
 [ "$start_status" -eq 75 ]
 [ ! -e "$start_case_dir/is-running-called" ]
 
+migration_start_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-migration-start.XXXXXX")"
+trap 'rm -rf "$migration_start_case_dir"' EXIT
+mkdir -p "$migration_start_case_dir/logs"
+set +e
+PHASE_LOOP_STATE_DIR="$migration_start_case_dir" STATE_DIR="$migration_start_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -e
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  phase_loop_migrate_legacy_state() { return 75; }
+  phase_loop_watch_continuation_liveness() { touch "$STATE_DIR/watchdog-called"; return 0; }
+  start
+' bash
+migration_start_status=$?
+set -e
+[ "$migration_start_status" -eq 75 ]
+[ ! -e "$migration_start_case_dir/watchdog-called" ]
+
+restart_migration_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-migration-restart.XXXXXX")"
+trap 'rm -rf "$restart_migration_case_dir"' EXIT
+mkdir -p "$restart_migration_case_dir/logs"
+set +e
+PHASE_LOOP_STATE_DIR="$restart_migration_case_dir" STATE_DIR="$restart_migration_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -e
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  phase_loop_migrate_legacy_state() { touch "$STATE_DIR/migration-called"; return 75; }
+  stop_loop() { touch "$STATE_DIR/stop-loop-called"; return 0; }
+  start() { touch "$STATE_DIR/start-called"; return 0; }
+  restart
+' bash
+restart_migration_status=$?
+set -e
+[ "$restart_migration_status" -eq 75 ]
+[ -e "$restart_migration_case_dir/migration-called" ]
+[ ! -e "$restart_migration_case_dir/stop-loop-called" ]
+[ ! -e "$restart_migration_case_dir/start-called" ]
+
 ownership_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-owner.XXXXXX")"
 trap 'rm -rf "$ownership_case_dir"' EXIT
 mkdir -p "$ownership_case_dir/logs"
@@ -125,7 +160,203 @@ printf '%s\n' 'phase-loop watchdog preserves caller errexit state (off/on)'
 printf '%s\n' 'phase-loop supervisor terminalizes watchdog ownership failure (75 -> blocked/78)'
 printf '%s\n' 'phase-loop supervisor terminalizes generic watchdog failure (78 -> blocked/78)'
 printf '%s\n' 'phase-loop startup checks continuation watchdog before live-owner return'
+printf '%s\n' 'phase-loop startup fails closed before watchdog when legacy migration is blocked'
 printf '%s\n' 'phase-loop is_running fails closed on foreign owner metadata'
+
+migration_lock_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-migration-lock.XXXXXX")"
+trap 'rm -rf "$migration_lock_case_dir"' EXIT
+mkdir -p "$migration_lock_case_dir/logs" "$migration_lock_case_dir/phase-loop-legacy-migration.lock"
+printf '%s\n' "$$" > "$migration_lock_case_dir/phase-loop-legacy-migration.lock/pid"
+PHASE_LOOP_STATE_DIR="$migration_lock_case_dir" STATE_DIR="$migration_lock_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  if acquire_lock; then
+    exit 1
+  fi
+  [ ! -d "$STATE_DIR/phase-loop.lock" ]
+' bash
+printf '%s\n' 'phase-loop supervisor lock acquisition is serialized against legacy migration cleanup'
+
+migration_supervise_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-migration-supervise.XXXXXX")"
+trap 'rm -rf "$migration_supervise_case_dir"' EXIT
+mkdir -p "$migration_supervise_case_dir/logs" "$migration_supervise_case_dir/phase-loop-legacy-migration.lock"
+set +e
+PHASE_LOOP_STATE_DIR="$migration_supervise_case_dir" STATE_DIR="$migration_supervise_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  printf "%s\n" "$$" > "$STATE_DIR/phase-loop-legacy-migration.lock/pid"
+  write_status() { touch "$STATE_DIR/status-write-called"; }
+  supervise
+' bash
+migration_supervise_status=$?
+set -e
+[ "$migration_supervise_status" -eq 75 ]
+[ ! -e "$migration_supervise_case_dir/status-write-called" ]
+[ ! -e "$migration_supervise_case_dir/logs/supervisor.log" ]
+printf '%s\n' 'phase-loop supervisor does not write status while migration owns the state'
+
+ownerless_migration_lock_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-ownerless-migration-lock.XXXXXX")"
+trap 'rm -rf "$ownerless_migration_lock_case_dir"' EXIT
+mkdir -p "$ownerless_migration_lock_case_dir/logs" "$ownerless_migration_lock_case_dir/phase-loop-legacy-migration.lock"
+PHASE_LOOP_STATE_DIR="$ownerless_migration_lock_case_dir" STATE_DIR="$ownerless_migration_lock_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  if ! phase_loop_legacy_migration_lock_active; then
+    exit 1
+  fi
+  [ -d "$STATE_DIR/phase-loop-legacy-migration.lock" ]
+' bash
+printf '%s\n' 'phase-loop keeps a fresh ownerless migration publication active'
+
+stale_ownerless_migration_lock_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-stale-ownerless-migration-lock.XXXXXX")"
+trap 'rm -rf "$stale_ownerless_migration_lock_case_dir"' EXIT
+mkdir -p "$stale_ownerless_migration_lock_case_dir/logs" "$stale_ownerless_migration_lock_case_dir/phase-loop-legacy-migration.lock"
+PHASE_LOOP_STATE_DIR="$stale_ownerless_migration_lock_case_dir" STATE_DIR="$stale_ownerless_migration_lock_case_dir" ROOT_DIR="$ROOT_DIR" PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS=0 bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  if phase_loop_legacy_migration_lock_active; then
+    exit 1
+  fi
+  [ ! -d "$STATE_DIR/phase-loop-legacy-migration.lock" ]
+' bash
+printf '%s\n' 'phase-loop reclaims an abandoned ownerless migration publication'
+
+stale_migration_lock_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-stale-migration-lock.XXXXXX")"
+trap 'rm -rf "$stale_migration_lock_case_dir"' EXIT
+mkdir -p "$stale_migration_lock_case_dir/logs" "$stale_migration_lock_case_dir/phase-loop-legacy-migration.lock"
+printf '%s\n' '999999999' > "$stale_migration_lock_case_dir/phase-loop-legacy-migration.lock/pid"
+PHASE_LOOP_STATE_DIR="$stale_migration_lock_case_dir" STATE_DIR="$stale_migration_lock_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  if phase_loop_legacy_migration_lock_active; then
+    exit 1
+  fi
+  [ ! -d "$STATE_DIR/phase-loop-legacy-migration.lock" ]
+' bash
+printf '%s\n' 'phase-loop migration reclaims a dead migration owner lock'
+
+replaced_migration_lock_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-replaced-migration-lock.XXXXXX")"
+trap 'rm -rf "$replaced_migration_lock_case_dir"' EXIT
+mkdir -p "$replaced_migration_lock_case_dir/logs" "$replaced_migration_lock_case_dir/phase-loop-legacy-migration.lock"
+printf '%s\n' '999999999' > "$replaced_migration_lock_case_dir/phase-loop-legacy-migration.lock/pid"
+PHASE_LOOP_STATE_DIR="$replaced_migration_lock_case_dir" STATE_DIR="$replaced_migration_lock_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  identity_calls_file="$STATE_DIR/identity-calls"
+  printf "%s\n" 0 > "$identity_calls_file"
+  phase_loop_legacy_migration_lock_identity() {
+    identity_calls=$(( $(cat "$identity_calls_file") + 1 ))
+    printf "%s\n" "$identity_calls" > "$identity_calls_file"
+    if [ "$identity_calls" -eq 1 ]; then
+      printf "%s\n" inspected-lock
+    else
+      printf "%s\n" replacement-lock
+    fi
+  }
+  if ! phase_loop_legacy_migration_lock_active; then
+    exit 1
+  fi
+  [ "$(cat "$identity_calls_file")" -eq 2 ]
+  [ -d "$STATE_DIR/phase-loop-legacy-migration.lock" ]
+' bash
+printf '%s\n' 'phase-loop does not reclaim a migration lock whose identity changed during inspection'
+
+reused_migration_lock_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-reused-migration-lock.XXXXXX")"
+trap 'rm -rf "$reused_migration_lock_case_dir"' EXIT
+mkdir -p "$reused_migration_lock_case_dir/logs" "$reused_migration_lock_case_dir/phase-loop-legacy-migration.lock"
+PHASE_LOOP_STATE_DIR="$reused_migration_lock_case_dir" STATE_DIR="$reused_migration_lock_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  printf "%s\n" "{\"pid\":$$,\"start_time\":\"pid-reused\",\"command\":\"foreign-command\",\"root_dir\":\"$ROOT_DIR\"}" > "$STATE_DIR/phase-loop-legacy-migration.lock/owner.json"
+  printf "%s\n" "$$" > "$STATE_DIR/phase-loop-legacy-migration.lock/pid"
+  if phase_loop_legacy_migration_lock_active; then
+    exit 1
+  fi
+  [ ! -d "$STATE_DIR/phase-loop-legacy-migration.lock" ]
+' bash
+printf '%s\n' 'phase-loop migration reclaims a PID-reused migration owner lock'
+
+foreign_root_migration_lock_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-migration-foreign-root.XXXXXX")"
+trap 'rm -rf "$foreign_root_migration_lock_case_dir"' EXIT
+mkdir -p "$foreign_root_migration_lock_case_dir/logs" "$foreign_root_migration_lock_case_dir/phase-loop-legacy-migration.lock"
+PHASE_LOOP_STATE_DIR="$foreign_root_migration_lock_case_dir" STATE_DIR="$foreign_root_migration_lock_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  owner_start="$(ps -p $$ -o lstart= 2>/dev/null | sed "s/^ *//;s/ *$//")"
+  owner_command="$(ps -p $$ -o command= 2>/dev/null | sed "s/^ *//;s/ *$//")"
+  python3 - "$STATE_DIR/phase-loop-legacy-migration.lock/owner.json" "$$" "$owner_start" "$owner_command" <<'PY'
+import json
+import sys
+
+owner_path, pid, start_time, command = sys.argv[1:]
+with open(owner_path, "w", encoding="utf-8") as handle:
+    json.dump({"pid": int(pid), "start_time": start_time, "command": command, "root_dir": "/foreign-checkout"}, handle)
+    handle.write("\n")
+PY
+  printf "%s\n" "$$" > "$STATE_DIR/phase-loop-legacy-migration.lock/pid"
+  if ! phase_loop_legacy_migration_lock_active; then
+    exit 1
+  fi
+  [ -d "$STATE_DIR/phase-loop-legacy-migration.lock" ]
+' bash
+printf '%s\n' 'phase-loop preserves a verified migration owner from a foreign root'
+
+signal_migration_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-migration-signal.XXXXXX")"
+trap 'rm -rf "$signal_migration_case_dir"' EXIT
+mkdir -p "$signal_migration_case_dir/logs"
+set +e
+PHASE_LOOP_STATE_DIR="$signal_migration_case_dir" STATE_DIR="$signal_migration_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  node() {
+    touch "$STATE_DIR/node-called"
+    kill -TERM "$$"
+  }
+  phase_loop_migrate_legacy_state
+' bash
+signal_migration_status=$?
+set -e
+[ "$signal_migration_status" -eq 143 ]
+[ -e "$signal_migration_case_dir/node-called" ]
+[ ! -d "$signal_migration_case_dir/phase-loop-legacy-migration.lock" ]
+printf '%s\n' 'phase-loop migration signal handler exits after releasing its lock'
+
+concurrent_migration_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-migration-concurrent.XXXXXX")"
+trap 'rm -rf "$concurrent_migration_case_dir"' EXIT
+mkdir -p "$concurrent_migration_case_dir/logs"
+set +e
+PHASE_LOOP_STATE_DIR="$concurrent_migration_case_dir" STATE_DIR="$concurrent_migration_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  node() {
+    sleep 1
+  }
+  phase_loop_migrate_legacy_state
+' bash >"$concurrent_migration_case_dir/first.log" 2>&1 &
+first_migration_pid=$!
+PHASE_LOOP_STATE_DIR="$concurrent_migration_case_dir" STATE_DIR="$concurrent_migration_case_dir" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  node() {
+    sleep 1
+  }
+  phase_loop_migrate_legacy_state
+' bash >"$concurrent_migration_case_dir/second.log" 2>&1 &
+second_migration_pid=$!
+wait "$first_migration_pid"
+first_migration_status=$?
+wait "$second_migration_pid"
+second_migration_status=$?
+set -e
+if [ "$first_migration_status" -eq 0 ] && [ "$second_migration_status" -eq 75 ]; then
+  :
+elif [ "$first_migration_status" -eq 75 ] && [ "$second_migration_status" -eq 0 ]; then
+  :
+else
+  exit 1
+fi
+[ ! -d "$concurrent_migration_case_dir/phase-loop-legacy-migration.lock" ]
+printf '%s\n' 'phase-loop migration lock publication admits only one concurrent owner'
 
 restart_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-restart.XXXXXX")"
 trap 'rm -rf "$restart_case_dir"' EXIT
