@@ -67,6 +67,11 @@ assert_not_contains() {
 run_with_timeout() {
   local seconds="$1"
   shift
+  local expected_exit_code=0
+  if [ "${1:-}" = "--expected-exit" ]; then
+    expected_exit_code="$2"
+    shift 2
+  fi
   "$@" &
   local child_pid="$!"
   local elapsed=0
@@ -92,7 +97,7 @@ run_with_timeout() {
   else
     child_status="$?"
   fi
-  if [ "$child_status" -ne 0 ]; then
+  if [ "$child_status" -ne 0 ] && [ "$child_status" -ne "$expected_exit_code" ]; then
     echo "phase-loop claim smoke command failed exit=$child_status: $*" >&2
     if [ -n "${PHASE_LOOP_STATE_DIR:-}" ]; then
       for diagnostic_file in status.json progress-state.json; do
@@ -803,19 +808,22 @@ PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_no_eligible" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 terminal_no_eligible_exit="$?"
 set -e
 test "$terminal_no_eligible_exit" = "76"
 test "$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')" = "$root_breakdown_before"
-python3 - "$state_terminal_no_eligible/status.json" "$state_terminal_no_eligible/progress-state.json" "$state_terminal_no_eligible/todo-claims/current.json" "$state_terminal_no_eligible/todo-claims/repair-feedback.json" <<'PY'
+python3 - "$state_terminal_no_eligible/status.json" "$state_terminal_no_eligible/progress-state.json" "$state_terminal_no_eligible/todo-claims/current.json" "$state_terminal_no_eligible/todo-claims/repair-feedback.json" "$state_terminal_no_eligible/todo-claims/blocked.jsonl" "$test_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
+import pathlib
 import sys
 
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 progress = json.load(open(sys.argv[2], encoding="utf-8"))
 claim = json.load(open(sys.argv[3], encoding="utf-8"))
 feedback = json.load(open(sys.argv[4], encoding="utf-8"))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").splitlines() if line.strip()]
+ledger = pathlib.Path(sys.argv[6]).read_text(encoding="utf-8")
 assert status["status"] == "blocked", status
 assert "terminal_task_failed" in status["detail"], status
 assert progress["classification"] == "terminal_failure", progress
@@ -824,8 +832,14 @@ assert progress["progress_projection"]["blocked_by_terminal_task_failure"] is Tr
 assert progress["progress_projection"]["provider_failure_fingerprint"] == "sha256:provider-terminal-no-content", progress
 assert progress["workspace_changed"] is False, progress
 assert claim["status"] == "failed", claim
+assert claim["status_history"][-1]["status"] == "failed", claim
 assert feedback["claim_id"] == claim["claim_id"], feedback
 assert feedback["reason"] == "runtime_terminal_failure", feedback
+assert blocked and blocked[-1]["block_reason"] == "terminal_runtime_failure", blocked
+assert blocked[-1]["terminal_failure"] is True, blocked
+assert blocked[-1]["retry_cap"] == 0, blocked
+assert "terminal_failure_transaction" in ledger, ledger
+assert '"retry_cap":0' in ledger, ledger
 PY
 
 # A positive terminal-failure retry cap permits the configured number of
@@ -847,7 +861,7 @@ for retry_run in 1 2; do
   PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
   PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
   PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
-  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
   retry_exit="$?"
   set -e
   test "$retry_exit" = "76"
@@ -864,8 +878,12 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
     record = json.loads(line)
     if record.get('kind') == 'terminal_failure_transaction':
         transactions.append(record)
-assert len(transactions) == 2, transactions
-assert all(event.get('retry_cap') == 1 for record in transactions for event in record.get('events', [])), transactions
+same_todo = [
+    record for record in transactions
+    if any('E-retry-cap:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
+]
+assert len(same_todo) == 2, same_todo
+assert all(event.get('retry_cap') == 1 for record in same_todo for event in record.get('events', [])), same_todo
 PY
 set +e
 PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
@@ -875,11 +893,11 @@ BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
 PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 retry_cap_exhausted_exit="$?"
 set -e
-test "$retry_cap_exhausted_exit" = "75"
-python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+test "$retry_cap_exhausted_exit" = "76"
+python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/todo-claims/current.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -888,7 +906,13 @@ transactions = [
     json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()
     if line.strip() and json.loads(line).get('kind') == 'terminal_failure_transaction'
 ]
-assert len(transactions) == 2, transactions
+same_todo = [
+    record for record in transactions
+    if any('E-retry-cap:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
+]
+assert len(same_todo) == 2, same_todo
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+assert 'E-retry-cap:' not in claim.get('selected_todo', ''), claim
 PY
 
 # Terminal recovery remains durable when the runtime removes the active claim
