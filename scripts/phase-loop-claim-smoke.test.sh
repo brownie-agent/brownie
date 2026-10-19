@@ -1045,7 +1045,7 @@ run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/
 retry_success_second_exit="$?"
 set -e
 test "$retry_success_second_exit" = "0"
-python3 "$terminal_retry_success_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$todo_terminal_retry_success" <<'PY'
+python3 - "$terminal_retry_success_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$todo_terminal_retry_success" <<'PY'
 import json
 import pathlib
 import sys
