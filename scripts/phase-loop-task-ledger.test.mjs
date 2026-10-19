@@ -255,6 +255,33 @@ test('binds terminal failure recovery identity to controller and execution attem
   assert.equal(validateTaskLedger(readTaskLedger(repo)).ok, true);
 });
 
+test('re-records an explicitly replayed terminal block after controller rebaseline', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const selectedTodo = '- [ ] E-rebaseline-explicit: Patch only `scripts/rebaseline.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/rebaseline.mjs`.';
+  const first = recordTerminalFailureRecovery(repo, {
+    selected_todo: selectedTodo,
+    claim_id: 'claim-rebaseline',
+    run_id: 'run-old',
+    retry_cap: 1,
+    controller_fingerprint: 'controller-old',
+    recovery_id: 'persisted-recovery-id'
+  });
+  const rebased = recordTerminalFailureRecovery(repo, {
+    selected_todo: selectedTodo,
+    claim_id: 'claim-rebaseline',
+    run_id: 'run-new',
+    retry_cap: 1,
+    controller_fingerprint: 'controller-new',
+    recovery_id: 'persisted-recovery-id'
+  });
+  assert.equal(first.ok, true);
+  assert.equal(rebased.ok, true);
+  assert.notEqual(rebased.recovery_id, first.recovery_id);
+  const failed = readTaskLedger(repo).filter((event) => event.to_state === 'failed');
+  assert.deepEqual(failed.map((event) => event.controller_fingerprint), ['controller-old', 'controller-new']);
+  assert.equal(validateTaskLedger(readTaskLedger(repo)).ok, true);
+});
+
 test('records repeated claims as separate immutable task attempts', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   const todo = path.join(repo, '.brownie', 'todo.md');

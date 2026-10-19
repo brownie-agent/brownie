@@ -1106,7 +1106,7 @@ blocked_hashes_for_current_queue = set()
 blocked_first_lines = set()
 stalled_leaf_ids = set()
 stalled_leaf_first_lines = set()
-if blocked_path.exists():
+if blocked_path.is_file():
     for line in blocked_path.read_text(encoding="utf-8").splitlines():
         try:
             record = json.loads(line)
@@ -1622,7 +1622,13 @@ PY
 record_terminal_failure_todo_claim() {
   local run_stamp="$1"
   local progress_file="$2"
-  local context selected_todo claim_id queue_generation queue_fingerprint provider_failure_fingerprint claim_absent recovery_output recovery_status recovery_id controller_fingerprint
+  local context selected_todo claim_id queue_generation queue_fingerprint provider_failure_fingerprint claim_absent recovery_output recovery_status recovery_id controller_fingerprint retry_cap
+  if ! validate_terminal_failure_retry_cap; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Invalid terminal failure retry cap before durable recovery recording: ${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP_VALIDATION_DETAIL:-unknown validation failure}"
+    return 78
+  fi
+  retry_cap="$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP"
   context="$(python3 - "$TODO_CLAIM_FILE" "$progress_file" "$PHASE_LOOP_TODO" "$TODO_QUEUE_STATE_FILE" "$RUN_DIR/$run_stamp.claim.before-runtime.json" <<'PY'
 import json
 import pathlib
@@ -1704,7 +1710,7 @@ PY
         --queue-generation "$queue_generation" \
         --queue-fingerprint "$queue_fingerprint" \
         --provider-failure-fingerprint "$provider_failure_fingerprint" \
-        --retry-cap "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP" \
+        --retry-cap "$retry_cap" \
         --controller-fingerprint "$controller_fingerprint" \
         --claim-absent "$claim_absent" \
         --blocked-reason terminal_runtime_failure 2>&1
@@ -1738,7 +1744,7 @@ except Exception: print("")' 2>/dev/null || true)"
     fi
   fi
   local blocked_record_status
-  if python3 - "$TODO_BLOCKED_FILE" "$selected_todo" "$claim_id" "$queue_generation" "$queue_fingerprint" "$provider_failure_fingerprint" "$recovery_id" "$run_stamp" "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP" "$claim_absent" "$(phase_loop_controller_fingerprint)" <<'PY'
+  if python3 - "$TODO_BLOCKED_FILE" "$selected_todo" "$claim_id" "$queue_generation" "$queue_fingerprint" "$provider_failure_fingerprint" "$recovery_id" "$run_stamp" "$retry_cap" "$claim_absent" "$(phase_loop_controller_fingerprint)" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -9461,15 +9467,15 @@ phase_loop_create_pr_for_progress() {
   local stderr_log="$3"
   local workspace_before="$4"
   local workspace_after="$5"
-  local title body pr_url branch push_rc
+  local title body pr_url branch push_rc pending_publish="${6:-0}"
   if [ "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" != "1" ]; then
     return 0
   fi
-  if [ "$workspace_before" = "$workspace_after" ]; then
+  if [ "$pending_publish" != "1" ] && [ "$workspace_before" = "$workspace_after" ]; then
     printf '%s pr_create_skipped reason=no_runtime_workspace_change\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 0
   fi
-  if ! tracked_workspace_diff_exists; then
+  if [ "$pending_publish" != "1" ] && ! tracked_workspace_diff_exists; then
     return 0
   fi
   (
@@ -9496,15 +9502,19 @@ This PR was created by the external phase-loop controller after Brownie produced
 
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    stage_runtime_applied_paths "$stdout_log"
-    if git diff --cached --quiet --exit-code; then
+    if tracked_workspace_diff_exists; then
+      stage_runtime_applied_paths "$stdout_log"
+      if git diff --cached --quiet --exit-code; then
+        exit 1
+      fi
+      GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Brownie}" \
+        GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-brownie-agent@users.noreply.github.com}" \
+        GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-Brownie}" \
+        GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-brownie-agent@users.noreply.github.com}" \
+        git commit -m "$title" >/dev/null
+    elif [ "$pending_publish" != "1" ]; then
       exit 1
     fi
-    GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Brownie}" \
-      GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-brownie-agent@users.noreply.github.com}" \
-      GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-Brownie}" \
-      GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-brownie-agent@users.noreply.github.com}" \
-      git commit -m "$title" >/dev/null
   ) || {
     printf '%s pr_create_skipped reason=commit_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 1
@@ -9696,7 +9706,8 @@ completed_todo_cleanup_pending() {
 
 mark_completed_todo_cleanup_pending() {
   local run_stamp="$1"
-  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+  local stdout_log="${2:-}" stderr_log="${3:-}" workspace_before="${4:-}" workspace_after="${5:-}"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" <<'PY'
 import json
 import os
 import pathlib
@@ -9710,6 +9721,15 @@ except Exception:
 if not isinstance(claim, dict) or claim.get("status") != "completed":
     raise SystemExit(1)
 claim["completion_cleanup_pending"] = True
+if sys.argv[4] == "1" and sys.argv[7] != sys.argv[8]:
+    claim["completion_pr_pending"] = True
+    claim["completion_pr_run_stamp"] = sys.argv[2]
+    claim["completion_pr_stdout_log"] = sys.argv[5]
+    claim["completion_pr_stderr_log"] = sys.argv[6]
+    claim["completion_pr_workspace_before"] = sys.argv[7]
+    claim["completion_pr_workspace_after"] = sys.argv[8]
+else:
+    claim["completion_pr_pending"] = False
 claim["updated_at"] = sys.argv[3]
 history = claim.setdefault("status_history", [])
 if isinstance(history, list):
@@ -9768,6 +9788,64 @@ os.replace(tmp, path)
 os.chmod(path, 0o600)
 PY
   sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+completed_todo_pr_pending() {
+  [ "$(claim_status 2>/dev/null || true)" = "completed" ] &&
+    [ "$(claim_field completion_pr_pending 2>/dev/null || true)" = "true" ]
+}
+
+clear_completed_todo_pr_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+claim["completion_pr_pending"] = False
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({"status": "completed", "run_stamp": sys.argv[2], "updated_at": sys.argv[3], "note": "completion_pr_published"})
+tmp = path.with_name(f"{path.name}.{os.getpid()}.completion-pr.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+publish_pending_completed_todo_pr() {
+  local run_stamp="$1"
+  if ! completed_todo_pr_pending; then
+    return 0
+  fi
+  local stdout_log stderr_log workspace_before workspace_after publish_output
+  stdout_log="$(claim_field completion_pr_stdout_log 2>/dev/null || true)"
+  stderr_log="$(claim_field completion_pr_stderr_log 2>/dev/null || true)"
+  workspace_before="$(claim_field completion_pr_workspace_before 2>/dev/null || true)"
+  workspace_after="$(claim_field completion_pr_workspace_after 2>/dev/null || true)"
+  if publish_output="$(phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" 1 2>&1)" && phase_loop_pr_created; then
+    clear_completed_todo_pr_pending "$run_stamp"
+    printf '%s run=%s completed_todo_pr_publish_retry_succeeded=true result=%s\n' "$(now_utc)" "$run_stamp" "$publish_output" >> "$SUPERVISOR_LOG"
+    return 0
+  fi
+  write_status "blocked" "A completed TODO cleanup succeeded, but its durable tracked completion PR is still pending; refusing Runtime restart. publish=${publish_output:-<no output>}" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+  printf '%s run=%s completed_todo_pr_publish_retry_failed=true result=%s\n' "$(now_utc)" "$run_stamp" "${publish_output:-<no output>}" >> "$SUPERVISOR_LOG"
+  return 78
 }
 
 claim_first_pending_todo() {
@@ -12795,10 +12873,18 @@ PY
     fi
     clear_completed_todo_cleanup_pending "$run_stamp"
     printf '%s run=%s completed_todo_cleanup_retry_succeeded=true removal=%s\n' "$(now_utc)" "$run_stamp" "$completed_cleanup_output" >> "$SUPERVISOR_LOG"
+    if completed_todo_pr_pending; then
+      publish_pending_completed_todo_pr "$run_stamp"
+      return $?
+    fi
     if [ "$(todo_pending_count)" -eq 0 ]; then
       stop_if_todo_empty "${CONSECUTIVE_FAILURES:-0}"
       return $?
     fi
+  fi
+  if completed_todo_pr_pending; then
+    publish_pending_completed_todo_pr "$run_stamp"
+    return $?
   fi
   if phase_loop_should_resume_active_claim; then
     use_resume=1
@@ -14341,7 +14427,7 @@ PY
         runtime_completion_removal_status=$?
       fi
       if [ "$runtime_completion_removal_status" -ne 0 ]; then
-        mark_completed_todo_cleanup_pending "$run_stamp" || true
+        mark_completed_todo_cleanup_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
         detail="Brownie reported completion but selected TODO removal failed; kept the completed claim for cleanup-only retry. removal=$runtime_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
         printf '%s run=%s runtime_completion_removal_failed=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"

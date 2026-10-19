@@ -258,7 +258,7 @@ export function recordTerminalFailureRecovery(repoRoot, {
   if (typeof selected_todo !== 'string' || !selected_todo.trim()) {
     return { ok: false, code: 'terminal_failure_selected_todo_missing' };
   }
-  const resolvedRecoveryId = recovery_id || crypto.createHash('sha256')
+  let resolvedRecoveryId = recovery_id || crypto.createHash('sha256')
     .update(JSON.stringify({
       selected_todo,
       claim_id,
@@ -272,6 +272,23 @@ export function recordTerminalFailureRecovery(repoRoot, {
     }))
     .digest('hex')
     .slice(0, 24);
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
+  const priorRecovery = events.find((event) => event?.recovery_id === resolvedRecoveryId && event?.to_state === 'failed');
+  // A caller may replay a persisted recovery id after the controller has
+  // rebaselined. Keep the old attempt immutable, but derive a new attempt for
+  // the new controller identity instead of treating the rebaseline as a
+  // duplicate forever.
+  if (priorRecovery && (priorRecovery.controller_fingerprint ?? null) !== (controller_fingerprint ?? null)) {
+    resolvedRecoveryId = crypto.createHash('sha256')
+      .update(JSON.stringify({ recovery_id: resolvedRecoveryId, controller_fingerprint }))
+      .digest('hex')
+      .slice(0, 24);
+  }
   const taskId = terminalFailureRecoveryTaskId(selected_todo, resolvedRecoveryId);
   const specHash = crypto.createHash('sha256').update(selected_todo).digest('hex');
   const targetScope = selected_todo.match(/\b(?:Patch|Create) only\b([^\n]*)/u)?.[1] ?? '';
@@ -281,12 +298,6 @@ export function recordTerminalFailureRecovery(repoRoot, {
   const verificationCommands = [...selected_todo.matchAll(/^\s*Verification:\s*run\s+`([^`]+)`/gmu)]
     .map((match) => match[1]);
   const parentTodoId = selected_todo.match(/^\s*(?:Source|Parent) TODO:\s*([^\s.]+)/mu)?.[1] ?? null;
-  let events;
-  try {
-    events = readTaskLedger(repoRoot);
-  } catch (error) {
-    return { ok: false, code: 'ledger_append_failed', error: error.message };
-  }
   if (events.some((event) => event?.recovery_id === resolvedRecoveryId && event?.to_state === 'failed')) {
     return { ok: true, code: 'duplicate_terminal_failure_recovery', task_id: taskId, recovery_id: resolvedRecoveryId };
   }

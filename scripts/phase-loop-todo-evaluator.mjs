@@ -234,13 +234,18 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
     }
     try {
       const record = JSON.parse(line);
-      if (record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_sha256 === 'string') {
+      const recordHasController = typeof record.controller_fingerprint === 'string' && record.controller_fingerprint;
+      const recordMatchesController = !controllerFingerprint || !recordHasController || record.controller_fingerprint === controllerFingerprint;
+      // Hash/first-line suppression predates controller-bound blocked records.
+      // Once a controller identity is present, stale generic suppression must
+      // not survive a controller rebaseline, especially for generated leaves.
+      if (recordMatchesController && record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_sha256 === 'string') {
         hashes.add(record.selected_todo_sha256);
         if (controllerFingerprint && record.controller_fingerprint === controllerFingerprint) {
           currentControllerHashes.add(record.selected_todo_sha256);
         }
       }
-      if (record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_first_line === 'string' && record.selected_todo_first_line) {
+      if (recordMatchesController && record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_first_line === 'string' && record.selected_todo_first_line) {
         firstLines.add(record.selected_todo_first_line);
         if (controllerFingerprint && record.controller_fingerprint === controllerFingerprint) {
           currentControllerFirstLines.add(record.selected_todo_first_line);
@@ -379,21 +384,6 @@ export function selectFirstSchedulableTodo(text, options = {}) {
     }
     const firstLine = block.split('\n')[0]?.trim() ?? '';
     const blockHash = sha256Text(block);
-    if (blocked.stableIds.has(id)) {
-      // A blocked record is not completion evidence. Dependents remain blocked
-      // until the shared TODO state marks this id completed or resolves a
-      // superseded parent through all of its generated children.
-      dependencyBlockedIds.add(id);
-      continue;
-    }
-    const scopeContract = `${targetScopeKey(block)}\u0000${verificationCommand(block)}`;
-    if (isDerivedLeaf(block) && blocked.stableScopeContracts.has(scopeContract)) {
-      // A replan may change IDs, but it must change the actual work contract.
-      // Otherwise the scheduler would repeatedly retry the same target and
-      // verification path while presenting it as new work.
-      dependencyBlockedIds.add(id);
-      continue;
-    }
     const terminalFailureAttempt = [...blocked.terminalFailureAttempts.values()].find((entry) => (
       entry.todo_hash === blockHash
       && (!options.controllerFingerprint || entry.controller_fingerprint === options.controllerFingerprint)
@@ -401,6 +391,27 @@ export function selectFirstSchedulableTodo(text, options = {}) {
     const terminalFailureRetryAvailable = Boolean(
       terminalFailureAttempt && terminalFailureAttempt.count <= terminalFailureAttempt.retry_cap
     );
+    if (blocked.stableIds.has(id)) {
+      // A blocked record is not completion evidence. Dependents remain blocked
+      // until the shared TODO state marks this id completed or resolves a
+      // superseded parent through all of its generated children. A terminal
+      // failure with retry budget is the explicit exception: it must be
+      // retried even if an older legacy stable-block record has the same leaf
+      // id.
+      if (terminalFailureRetryAvailable) {
+        return block;
+      }
+      dependencyBlockedIds.add(id);
+      continue;
+    }
+    const scopeContract = `${targetScopeKey(block)}\u0000${verificationCommand(block)}`;
+    if (isDerivedLeaf(block) && blocked.stableScopeContracts.has(scopeContract) && !terminalFailureRetryAvailable) {
+      // A replan may change IDs, but it must change the actual work contract.
+      // Otherwise the scheduler would repeatedly retry the same target and
+      // verification path while presenting it as new work.
+      dependencyBlockedIds.add(id);
+      continue;
+    }
     const blockedInCurrentQueue = blocked.hashes.has(blockHash)
       || blocked.firstLines.has(firstLine)
       || Boolean(terminalFailureAttempt);

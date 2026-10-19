@@ -1415,6 +1415,7 @@ ledger_records = [
 assert any(
     event.get('claim_id') == claim_id
     and event.get('to_state') == 'failed'
+    and event.get('from_state') in ('claimed', 'running')
     and str(event.get('task_id', '')).endswith('@' + claim_id)
     for record in ledger_records
     for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])
@@ -1549,6 +1550,135 @@ assert claim['completion_cleanup_pending'] is False, claim
 assert '- [ ] E-completion-removal-failure:' not in todo, todo
 PY
 
+# If completion cleanup is deferred after Runtime changed tracked workspace
+# files, retain a durable PR-publication obligation. A cleanup-only retry must
+# publish that already-created completion exactly once and must not invoke
+# Runtime again.
+completion_pr_cleanup_retry_state="$(mktemp -d)"
+completion_pr_cleanup_retry_prompt="$(mktemp)"
+completion_pr_cleanup_retry_todo="$(mktemp)"
+completion_pr_cleanup_retry_workspace="$(mktemp -d)"
+completion_pr_cleanup_retry_remote="$(mktemp -d)"
+completion_pr_cleanup_retry_bin="$(mktemp -d)"
+completion_pr_cleanup_retry_count="$completion_pr_cleanup_retry_state/pr-create-count"
+completion_pr_cleanup_retry_runtime_count="$completion_pr_cleanup_retry_state/runtime-count"
+git -C "$completion_pr_cleanup_retry_workspace" init -b main >/dev/null
+mkdir -p "$completion_pr_cleanup_retry_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$completion_pr_cleanup_retry_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$completion_pr_cleanup_retry_workspace/README.md"
+git -C "$completion_pr_cleanup_retry_workspace" add .
+git -C "$completion_pr_cleanup_retry_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$completion_pr_cleanup_retry_remote" init --bare >/dev/null
+git -C "$completion_pr_cleanup_retry_workspace" remote add origin "$completion_pr_cleanup_retry_remote"
+git -C "$completion_pr_cleanup_retry_workspace" push -u origin main >/dev/null
+git -C "$completion_pr_cleanup_retry_workspace" switch -c brownie-agent/smoke-completion-cleanup-pr >/dev/null
+printf 'base prompt\n' > "$completion_pr_cleanup_retry_prompt"
+printf -- '- [ ] E-completion-cleanup-pr: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_cleanup_retry_todo"
+cat > "$completion_pr_cleanup_retry_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$completion_pr_cleanup_retry_bin/pnpm"
+cat > "$completion_pr_cleanup_retry_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "${1:-} ${2:-}" in
+  "api user")
+    printf 'brownie-agent\n'
+    ;;
+  "auth token")
+    printf 'fake-token\n'
+    ;;
+  "pr view")
+    exit 1
+    ;;
+  "pr create")
+    printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
+    printf 'https://github.com/globalpocket/brownie/pull/10001\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+SH
+chmod +x "$completion_pr_cleanup_retry_bin/gh"
+completion_pr_cleanup_retry_brownie="$(mktemp)"
+cat > "$completion_pr_cleanup_retry_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_pr_cleanup_retry_runtime_count"
+exit 99
+SH
+chmod +x "$completion_pr_cleanup_retry_brownie"
+set +e
+PATH="$completion_pr_cleanup_retry_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_cleanup_retry_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_cleanup_retry_state" \
+PHASE_LOOP_PROMPT="$completion_pr_cleanup_retry_prompt" \
+PHASE_LOOP_TODO="$completion_pr_cleanup_retry_todo" \
+BROWNIE_BIN="$fake_brownie_completed_tracked_workspace_change" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_cleanup_retry_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_pr_cleanup_retry_first_exit="$?"
+set -e
+test "$completion_pr_cleanup_retry_first_exit" = "78"
+python3 - "$completion_pr_cleanup_retry_state/todo-claims/current.json" "$completion_pr_cleanup_retry_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
+assert claim['status'] == 'completed', claim
+assert claim['completion_cleanup_pending'] is True, claim
+assert claim['completion_pr_pending'] is True, claim
+assert claim['completion_pr_workspace_before'] != claim['completion_pr_workspace_after'], claim
+assert '- [ ] E-completion-cleanup-pr:' in todo, todo
+PY
+test ! -e "$completion_pr_cleanup_retry_count"
+set +e
+PATH="$completion_pr_cleanup_retry_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_cleanup_retry_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_cleanup_retry_state" \
+PHASE_LOOP_PROMPT="$completion_pr_cleanup_retry_prompt" \
+PHASE_LOOP_TODO="$completion_pr_cleanup_retry_todo" \
+BROWNIE_BIN="$completion_pr_cleanup_retry_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_cleanup_retry_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_pr_cleanup_retry_second_exit="$?"
+set -e
+test "$completion_pr_cleanup_retry_second_exit" = "0"
+python3 - "$completion_pr_cleanup_retry_state/status.json" "$completion_pr_cleanup_retry_state/todo-claims/current.json" "$completion_pr_cleanup_retry_todo" "$completion_pr_cleanup_retry_workspace" "$completion_pr_cleanup_retry_count" "$completion_pr_cleanup_retry_runtime_count" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+workspace = sys.argv[4]
+pr_count = pathlib.Path(sys.argv[5])
+runtime_count = pathlib.Path(sys.argv[6])
+assert status['status'] == 'pr_created', status
+assert 'pull/10001' in status['detail'], status
+assert claim['status'] == 'completed', claim
+assert claim['completion_cleanup_pending'] is False, claim
+assert claim['completion_pr_pending'] is False, claim
+assert any(item.get('note') == 'completion_pr_published' for item in claim['status_history']), claim
+assert '- [ ] E-completion-cleanup-pr:' not in todo, todo
+assert pr_count.read_text(encoding='utf-8').splitlines() == ['1'], pr_count
+assert not runtime_count.exists(), runtime_count
+head = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'HEAD'], text=True).strip()
+remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'origin/brownie-agent/smoke-completion-cleanup-pr'], text=True).strip()
+assert head == remote, (head, remote)
+supervisor = pathlib.Path(pathlib.Path(sys.argv[1]).parent / 'logs' / 'supervisor.log').read_text(encoding='utf-8')
+assert 'completed_todo_pr_publish_retry_succeeded=true' in supervisor, supervisor
+PY
+
 # Terminal recovery remains durable when the runtime removes the active claim
 # before the controller emits its final trajectory. The next run must not
 # recreate the same queue-generation/target attempt.
@@ -1606,6 +1736,7 @@ claim_id = blocked[-1]['claim_id']
 assert any(
     event.get('claim_id') == claim_id
     and event.get('to_state') == 'failed'
+    and event.get('from_state') in ('claimed', 'running')
     and str(event.get('task_id', '')).endswith('@' + claim_id)
     for record in ledger_records
     for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])

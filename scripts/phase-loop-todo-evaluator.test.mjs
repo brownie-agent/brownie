@@ -231,6 +231,63 @@ test('rebaselines a generated leaf blocked by an older controller', () => {
   }), leaf);
 });
 
+test('rebaselines a capped generated leaf without generic hash or first-line suppression', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const leaf = `- [ ] E-rebaseline-leaf: Patch only \`scripts/rebaseline-leaf.mjs\`:
+  Route: implementation.
+  Source TODO: TODO-decompose-broad-rebaseline.
+  Depends on: <none>.
+  Completion condition: the generated leaf is retried after controller rebaseline.
+  Verification: run \`node --check scripts/rebaseline-leaf.mjs\`.`;
+  fs.writeFileSync(blocked, `${JSON.stringify({
+    block_reason: 'terminal_runtime_failure',
+    controller_fingerprint: 'old-controller',
+    queue_fingerprint: createHash('sha256').update(leaf).digest('hex'),
+    selected_todo_sha256: createHash('sha256').update(leaf).digest('hex'),
+    selected_todo_first_line: leaf.split('\n')[0],
+    retry_cap: 0,
+    run_stamp: 'old-run'
+  })}\n`);
+
+  assert.equal(selectFirstSchedulableTodo(leaf, {
+    blockedPath: blocked,
+    controllerFingerprint: 'new-controller'
+  }), leaf);
+});
+
+test('terminal retry budget overrides a legacy stable block for a generated leaf', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const leaf = `- [ ] E-terminal-legacy-leaf: Patch only \`scripts/terminal-legacy-leaf.mjs\`:
+  Route: implementation.
+  Source TODO: TODO-decompose-terminal-legacy.
+  Depends on: <none>.
+  Completion condition: the generated leaf gets its allowed terminal retry.
+  Verification: run \`node --check scripts/terminal-legacy-leaf.mjs\`.`;
+  const queueFingerprint = createHash('sha256').update(leaf).digest('hex');
+  const leafHash = createHash('sha256').update(leaf).digest('hex');
+  fs.writeFileSync(blocked, `${JSON.stringify({
+    controller_fingerprint: 'current-controller',
+    queue_fingerprint: queueFingerprint,
+    selected_todo_sha256: leafHash,
+    selected_todo_first_line: leaf.split('\n')[0],
+    block_reason: 'legacy_stable_block'
+  })}\n${JSON.stringify({
+    controller_fingerprint: 'current-controller',
+    queue_fingerprint: queueFingerprint,
+    selected_todo_sha256: leafHash,
+    selected_todo_first_line: leaf.split('\n')[0],
+    block_reason: 'terminal_runtime_failure',
+    retry_cap: 1
+  })}\n`);
+
+  assert.equal(selectFirstSchedulableTodo(leaf, {
+    blockedPath: blocked,
+    controllerFingerprint: 'current-controller'
+  }), leaf);
+});
+
 test('skips stalled replan blocked IDs across queue fingerprints regardless of TODO shape', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');
