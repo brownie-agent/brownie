@@ -142,6 +142,7 @@ assert_contains "$PHASE_LOOP" 'local guard_script="\$ROOT_DIR/scripts/phase-loop
 assert_contains "$PHASE_LOOP" 'node "\$guard_script" --repo "\$ROOT_DIR" --baseline-ref "\$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE"'
 assert_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_WORKSPACE_ROOT"'
 assert_contains "$PHASE_LOOP" "phase-loop-run-state\.mjs"
+assert_contains "$PHASE_LOOP" "\.brownie/headless-\*"
 assert_contains "$PHASE_LOOP" "refusing to leave status running"
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$ROOT_DIR"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_STATE_DIR"'
@@ -465,6 +466,13 @@ fake_brownie_terminal_no_eligible="$(mktemp)"
 cat > "$fake_brownie_terminal_no_eligible" <<'SH'
 #!/usr/bin/env bash
 set -eu
+if [ "${PHASE_LOOP_TEST_HEADLESS_ONLY:-0}" = "1" ]; then
+  mkdir -p "$PHASE_LOOP_WORKSPACE_ROOT/.brownie/headless-continuations"
+  printf '%s\n' '{"headless":"controller-output-only"}' > "$PHASE_LOOP_WORKSPACE_ROOT/.brownie/headless-continuations/fresh-run.json"
+fi
+if [ "${PHASE_LOOP_TEST_REMOVE_CLAIM:-0}" = "1" ]; then
+  rm -f "$PHASE_LOOP_STATE_DIR/todo-claims/current.json"
+fi
 cat <<'JSON'
 {
   "command": "run",
@@ -484,7 +492,12 @@ cat <<'JSON'
       "run_id": "run-terminal",
       "journey_id": "journey-terminal",
       "next_action": "inspect_progress_overview",
-      "next_invocation": null
+      "next_invocation": null,
+      "llm_provider_failure": {
+        "failure_fingerprint": "sha256:provider-terminal-no-content",
+        "failure_class": "missing_provider_content",
+        "retryable": true
+      }
     },
     "status": "no_eligible_task",
     "session_id": "session-terminal",
@@ -501,7 +514,12 @@ cat <<'JSON'
     "controller_action": "stop",
     "stop_class": "terminal_failure",
     "stop_reason": "terminal_task_failed",
-    "next_invocation": null
+    "next_invocation": null,
+    "llm_provider_failure": {
+      "failure_fingerprint": "sha256:provider-terminal-no-content",
+      "failure_class": "missing_provider_content",
+      "retryable": true
+    }
   }
 }
 JSON
@@ -782,6 +800,7 @@ PHASE_LOOP_TODO="$todo_terminal_no_eligible" \
 PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_no_eligible" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 terminal_no_eligible_exit="$?"
 set -e
@@ -795,15 +814,85 @@ status = json.load(open(sys.argv[1], encoding="utf-8"))
 progress = json.load(open(sys.argv[2], encoding="utf-8"))
 claim = json.load(open(sys.argv[3], encoding="utf-8"))
 feedback = json.load(open(sys.argv[4], encoding="utf-8"))
-assert status["status"] == "no_progress", status
-assert "recovery=" in status["detail"], status
-assert progress["classification"] == "no_progress", progress
+assert status["status"] == "blocked", status
+assert "terminal_task_failed" in status["detail"], status
+assert progress["classification"] == "terminal_failure", progress
 assert progress["meaningful_progress"] is False, progress
 assert progress["progress_projection"]["blocked_by_terminal_task_failure"] is True, progress
+assert progress["progress_projection"]["provider_failure_fingerprint"] == "sha256:provider-terminal-no-content", progress
 assert progress["workspace_changed"] is False, progress
-assert claim["status"] == "in_progress", claim
+assert claim["status"] == "failed", claim
 assert feedback["claim_id"] == claim["claim_id"], feedback
 assert feedback["reason"] == "runtime_terminal_failure", feedback
+PY
+
+# Terminal recovery remains durable when the runtime removes the active claim
+# before the controller emits its final trajectory. The next run must not
+# recreate the same queue-generation/target attempt.
+state_terminal_claim_absent="$(mktemp -d)"
+prompt_terminal_claim_absent="$(mktemp)"
+todo_terminal_claim_absent="$(mktemp)"
+terminal_claim_absent_workspace="$(mktemp -d)"
+git -C "$terminal_claim_absent_workspace" init -b main >/dev/null
+git -C "$terminal_claim_absent_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$prompt_terminal_claim_absent"
+printf -- '- [ ] E-15b-provider-terminal: Patch only `scripts/provider-target.mjs`:\n  Route: implementation.\n  Completion condition: provider terminal failure is durably blocked.\n  Verification: run `node --check scripts/provider-target.mjs`.\n' > "$todo_terminal_claim_absent"
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_claim_absent" \
+PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
+PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+terminal_claim_absent_exit="$?"
+set -e
+test "$terminal_claim_absent_exit" = "76"
+test ! -f "$state_terminal_claim_absent/todo-claims/current.json"
+python3 - "$state_terminal_claim_absent/status.json" "$state_terminal_claim_absent/todo-claims/blocked.jsonl" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines() if line.strip()]
+ledger = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'blocked', status
+assert blocked and blocked[-1]['block_reason'] == 'terminal_runtime_failure', blocked
+assert blocked[-1]['terminal_failure'] is True, blocked
+assert blocked[-1]['provider_failure_fingerprint'] == 'sha256:provider-terminal-no-content', blocked
+assert 'terminal_failure_transaction' in ledger, ledger
+assert 'E-15b-provider-terminal' in ledger, ledger
+assert 'provider-terminal-no-content' in ledger, ledger
+assert '"claim_absent":true' in ledger, ledger
+assert 'scripts/provider-target.mjs' in ledger, ledger
+assert 'node --check scripts/provider-target.mjs' in ledger, ledger
+PY
+PHASE_LOOP_STATE_DIR="$state_terminal_claim_absent" \
+PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
+PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
+python3 "$state_terminal_claim_absent/todo-claims/current.json" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+current = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+assert not current['selected_todo'].startswith('- [ ] E-15b-provider-terminal:'), current
+transactions = []
+for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get('kind') == 'terminal_failure_transaction':
+        transactions.append(record)
+same_todo = [
+    record for record in transactions
+    if any('E-15b-provider-terminal:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
+]
+assert len(same_todo) == 1, same_todo
 PY
 
 state_objective_apply_stalled="$(mktemp -d)"
