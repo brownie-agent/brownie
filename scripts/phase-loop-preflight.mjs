@@ -60,12 +60,15 @@ function parseArgs(argv) {
   return args;
 }
 
-function requiredPathInRepository(repoRoot, requestedPath, errors) {
+function requiredPathInRepository(repoRoot, requestedPath, errors, options = {}) {
   const lexicalRepoRoot = path.resolve(repoRoot);
   const realRepoRoot = fs.realpathSync(repoRoot);
   const resolvedPath = path.resolve(lexicalRepoRoot, requestedPath);
   const relativePath = path.relative(lexicalRepoRoot, resolvedPath);
   if (relativePath === '..' || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    if (options.allowOutsideRepository === true) {
+      return resolvedPath;
+    }
     errors.push({
       code: 'required_file_outside_repository',
       path: requestedPath,
@@ -90,8 +93,8 @@ function requiredPathInRepository(repoRoot, requestedPath, errors) {
   return resolvedPath;
 }
 
-function readText(repoRoot, requestedPath, errors) {
-  const resolvedPath = requiredPathInRepository(repoRoot, requestedPath, errors);
+function readText(repoRoot, requestedPath, errors, options = {}) {
+  const resolvedPath = requiredPathInRepository(repoRoot, requestedPath, errors, options);
   if (!resolvedPath) {
     return '';
   }
@@ -491,10 +494,12 @@ export function validatePhaseLoopPreflight(options = {}) {
     });
   }
   const todoPath = options.todo ?? '.brownie/todo.md';
-  const todoText = readText(repoRoot, todoPath, errors);
+  const fixtureProfile = profile === 'claim-smoke-fixture';
+  const fixturePathOptions = fixtureProfile ? { allowOutsideRepository: true } : {};
+  const todoText = readText(repoRoot, todoPath, errors, fixturePathOptions);
   const breakdownPath = options.breakdown ?? '.brownie/todo-breakdown.md';
   const breakdownText = options.snapshotSource
-    ? readText(repoRoot, breakdownPath, errors)
+    ? readText(repoRoot, breakdownPath, errors, fixturePathOptions)
     : null;
   const snapshotAudit = errors.some((error) => error.code === 'required_file_outside_repository')
     ? null

@@ -220,6 +220,28 @@ test('rejects the claim-smoke fixture profile without its explicit test-only mar
   }
 });
 
+test('allows an external temporary queue only under the explicit claim-smoke fixture profile', () => {
+  const repo = makeRepo();
+  const outsideTodo = path.join(os.tmpdir(), `brownie-claim-smoke-todo-${Date.now()}.md`);
+  fs.writeFileSync(outsideTodo, '- [ ] B-01: durable claim task\n');
+  const previous = process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = '1';
+  try {
+    const result = validatePhaseLoopPreflight({
+      repo,
+      controlPlaneRoot: repositoryRoot,
+      profile: 'claim-smoke-fixture',
+      todo: outsideTodo
+    });
+    assert.equal(result.valid, true, JSON.stringify(result, null, 2));
+    assert.equal(result.command_results.length, 1);
+  } finally {
+    if (previous === undefined) delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+    else process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = previous;
+    fs.rmSync(outsideTodo, { force: true });
+  }
+});
+
 test('keeps production preflight strict when a controller root is supplied', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-phase-loop-minimal-workspace-'));
   fs.mkdirSync(path.join(repo, '.brownie'), { recursive: true });
