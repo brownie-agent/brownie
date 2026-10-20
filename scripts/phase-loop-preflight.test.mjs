@@ -101,6 +101,65 @@ test('rejects an in-repository TODO symlink that resolves outside the repository
   fs.rmSync(outsideTodo);
 });
 
+test('accepts a workspace TODO snapshot and records source, fingerprint, and queue CAS evidence', () => {
+  const repo = makeRepo();
+  const sourceTodo = path.join(os.tmpdir(), `brownie-snapshot-source-${Date.now()}.md`);
+  const snapshotTodo = path.join(repo, '.brownie', 'todo-snapshot.md');
+  const breakdown = path.join(repo, '.brownie', 'todo-breakdown.md');
+  const todoText = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+  fs.writeFileSync(sourceTodo, todoText);
+  fs.writeFileSync(snapshotTodo, todoText);
+  fs.writeFileSync(breakdown, '# snapshot breakdown\n');
+  const result = validatePhaseLoopPreflight({
+    repo,
+    todo: snapshotTodo,
+    breakdown,
+    snapshotSource: sourceTodo,
+    skipCommands: true
+  });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.equal(result.snapshot_audit.source_path, sourceTodo);
+  assert.equal(result.snapshot_audit.snapshot_path, snapshotTodo);
+  assert.equal(result.snapshot_audit.source_sha256, result.snapshot_audit.snapshot_sha256);
+  assert.match(result.snapshot_audit.queue_cas, /^sha256:[0-9a-f]{64}$/u);
+  fs.rmSync(sourceTodo);
+});
+
+test('rejects a workspace TODO snapshot whose source fingerprint changed', () => {
+  const repo = makeRepo();
+  const sourceTodo = path.join(os.tmpdir(), `brownie-snapshot-mismatch-${Date.now()}.md`);
+  const snapshotTodo = path.join(repo, '.brownie', 'todo-snapshot.md');
+  const breakdown = path.join(repo, '.brownie', 'todo-breakdown.md');
+  fs.writeFileSync(sourceTodo, '- [ ] E-source: Patch only `README.md`\n');
+  fs.copyFileSync(path.join(repo, '.brownie/todo.md'), snapshotTodo);
+  fs.writeFileSync(breakdown, '# snapshot breakdown\n');
+  const result = validatePhaseLoopPreflight({
+    repo,
+    todo: snapshotTodo,
+    breakdown,
+    snapshotSource: sourceTodo,
+    skipCommands: true
+  });
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'todo_snapshot_fingerprint_mismatch'), JSON.stringify(result.errors));
+  fs.rmSync(sourceTodo);
+});
+
+test('places the strict preflight boundary before claim rebaseline and forbids ledger/runtime continuation', () => {
+  const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
+  const runOnce = controller.indexOf('_run_brownie_once()');
+  const boundary = controller.indexOf('run_phase_loop_preflight "$run_stamp" "pre-claim-boundary"', runOnce);
+  const rebaseline = controller.indexOf('phase_loop_rebaseline_stale_claim "$run_stamp"', runOnce);
+  const restoreTransition = controller.indexOf('restore_terminal_failure_source_transition_obligation', boundary);
+  assert.ok(boundary >= 0);
+  assert.ok(boundary < rebaseline);
+  assert.ok(boundary < restoreTransition);
+  assert.match(controller, /phase_loop_preflight_boundary_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden/u);
+  assert.ok(controller.includes('if [ "$stage" = "pre-claim-boundary" ]; then'));
+  assert.ok(controller.indexOf('return 78', boundary) < rebaseline);
+  assert.doesNotMatch(controller.slice(boundary, restoreTransition), /write_bdk_trajectory_event/u);
+});
+
 test('bounded implementation leaves are not instructed to re-split their TODO on missing patch context', () => {
   const prompt = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.md'), 'utf8');
   assert.match(prompt, /This is allowed only when the\s+selected TODO is not already a bounded leaf with explicit patch targets\./);

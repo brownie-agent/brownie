@@ -21,6 +21,8 @@ function parseArgs(argv) {
     stage: 'general',
     claim: '.brownie/private/phase-loop/todo-claims/current.json',
     todo: '.brownie/todo.md',
+    breakdown: '.brownie/todo-breakdown.md',
+    snapshotSource: null,
     skipCommands: false
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -33,6 +35,10 @@ function parseArgs(argv) {
       args.claim = argv[++index];
     } else if (arg === '--todo') {
       args.todo = argv[++index];
+    } else if (arg === '--breakdown') {
+      args.breakdown = argv[++index];
+    } else if (arg === '--snapshot-source') {
+      args.snapshotSource = argv[++index];
     } else if (arg === '--skip-commands') {
       args.skipCommands = true;
     } else {
@@ -108,6 +114,46 @@ function readJson(repoRoot, relativePath, errors) {
 
 function sha256Text(text) {
   return `sha256:${crypto.createHash('sha256').update(text).digest('hex')}`;
+}
+
+function todoSnapshotAudit({ repoRoot, todoPath, todoText, breakdownPath, breakdownText, snapshotSource, errors }) {
+  if (!snapshotSource) {
+    return null;
+  }
+  const sourcePath = path.resolve(snapshotSource);
+  let sourceText;
+  try {
+    sourceText = fs.readFileSync(sourcePath, 'utf8');
+  } catch (error) {
+    errors.push({
+      code: 'todo_snapshot_source_unreadable',
+      path: snapshotSource,
+      message: `TODO snapshot source must be readable: ${error.message}`
+    });
+    return null;
+  }
+  const sourceSha256 = sha256Text(sourceText);
+  const snapshotSha256 = sha256Text(todoText);
+  if (sourceSha256 !== snapshotSha256) {
+    errors.push({
+      code: 'todo_snapshot_fingerprint_mismatch',
+      path: todoPath,
+      source_path: sourcePath,
+      source_sha256: sourceSha256,
+      snapshot_sha256: snapshotSha256,
+      message: 'Workspace TODO snapshot does not match its declared source; refusing a stale or mutable input.'
+    });
+  }
+  const breakdownSha256 = breakdownText === null ? null : sha256Text(breakdownText);
+  return {
+    source_path: sourcePath,
+    snapshot_path: path.resolve(repoRoot, todoPath),
+    source_sha256: sourceSha256,
+    snapshot_sha256: snapshotSha256,
+    breakdown_path: path.resolve(repoRoot, breakdownPath),
+    breakdown_sha256: breakdownSha256,
+    queue_cas: sha256Text(`${snapshotSha256}\n${breakdownSha256 ?? 'missing'}`)
+  };
 }
 
 function nextNonWhitespace(text, index) {
@@ -376,6 +422,21 @@ export function validatePhaseLoopPreflight(options = {}) {
   const warnings = [];
   const todoPath = options.todo ?? '.brownie/todo.md';
   const todoText = readText(repoRoot, todoPath, errors);
+  const breakdownPath = options.breakdown ?? '.brownie/todo-breakdown.md';
+  const breakdownText = options.snapshotSource
+    ? readText(repoRoot, breakdownPath, errors)
+    : null;
+  const snapshotAudit = errors.some((error) => error.code === 'required_file_outside_repository')
+    ? null
+    : todoSnapshotAudit({
+      repoRoot,
+      todoPath,
+      todoText,
+      breakdownPath,
+      breakdownText,
+      snapshotSource: options.snapshotSource,
+      errors
+    });
   validateReleaseEvidence(repoRoot, errors);
   validateDirtyDelivery(repoRoot, todoText, errors);
   const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, errors);
@@ -386,6 +447,7 @@ export function validatePhaseLoopPreflight(options = {}) {
     stage: options.stage ?? 'general',
     errors,
     warnings,
+    ...(snapshotAudit ? { snapshot_audit: snapshotAudit } : {}),
     command_results: commandResults
   };
 }

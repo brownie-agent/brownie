@@ -60,6 +60,8 @@ PHASE_LOOP_DEFAULT_BROWNIE_BIN="$ROOT_DIR/target/debug/brownie"
 PHASE_LOOP_PROMPT="${PHASE_LOOP_PROMPT:-"$ROOT_DIR/phase-loop.md"}"
 PHASE_LOOP_TODO="${PHASE_LOOP_TODO:-"$ROOT_DIR/.brownie/todo.md"}"
 PHASE_LOOP_TODO_BREAKDOWN="${PHASE_LOOP_TODO_BREAKDOWN:-"$(dirname "$PHASE_LOOP_TODO")/todo-breakdown.md"}"
+PHASE_LOOP_TODO_SNAPSHOT_SOURCE="${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}"
+PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-"$STATE_DIR/todo-snapshot-audits"}"
 PHASE_LOOP_WORKSPACE_ROOT="${PHASE_LOOP_WORKSPACE_ROOT:-"$ROOT_DIR"}"
 PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"/Users/satoshitanaka/.codex/automations/brownie-cli-phase-loop"}"
 PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-"$ROOT_DIR/.brownie/private/runtime-store"}"
@@ -13205,12 +13207,57 @@ run_with_portable_timeout() {
   wait "$child_pid"
 }
 
+write_phase_loop_snapshot_audit() {
+  local run_stamp="$1"
+  local preflight_output="$2"
+  if [ -z "${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}" ]; then
+    return 0
+  fi
+  mkdir -p "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR"
+  printf '%s' "$preflight_output" | python3 -c '
+import json
+import os
+import pathlib
+import sys
+import tempfile
+
+audit_path = pathlib.Path(sys.argv[1])
+run_stamp = sys.argv[2]
+try:
+    payload = json.load(sys.stdin)
+    audit = payload.get("snapshot_audit")
+except Exception:
+    audit = None
+if not isinstance(audit, dict):
+    raise SystemExit(0)
+audit = {"run_stamp": run_stamp, **audit}
+audit_path.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=audit_path.name + ".", dir=str(audit_path.parent))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(audit, handle, ensure_ascii=False, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, audit_path)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+' "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/$run_stamp.json" "$run_stamp"
+}
+
 run_phase_loop_preflight() {
   local run_stamp="$1"
   local stage="${2:-general}"
   local output status
+  local -a snapshot_args=()
   if [ ! -f "$PHASE_LOOP_WORKSPACE_ROOT/scripts/phase-loop-preflight.mjs" ]; then
     return 0
+  fi
+  if [ -n "${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}" ]; then
+    snapshot_args=(--snapshot-source "$PHASE_LOOP_TODO_SNAPSHOT_SOURCE")
   fi
   set +e
   output="$(
@@ -13218,11 +13265,22 @@ run_phase_loop_preflight() {
     node scripts/phase-loop-preflight.mjs \
       --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
       --todo "$PHASE_LOOP_TODO" \
+      --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" \
       --claim "$TODO_CLAIM_FILE" \
-      --stage "$stage"
+      --stage "$stage" \
+      "${snapshot_args[@]}"
   2>&1)"
   status=$?
   set -e
+  if [ "$status" -eq 0 ] && ! printf '%s' "$output" | python3 -c 'import json,sys
+try:
+    payload=json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if payload.get("valid", True) else 1)
+'; then
+    status=1
+  fi
   if [ "$status" -ne 0 ]; then
     if [ "$stage" = "pre-claim" ] && [ "${PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0}" != "1" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/scripts/phase-loop-preclaim-recovery.mjs" ]; then
       local recovery_output recovery_status
@@ -13249,12 +13307,21 @@ run_phase_loop_preflight() {
     fi
     printf '%s run=%s phase_loop_preflight_failed=true stage=%s result=%s\n' "$(now_utc)" "$run_stamp" "$stage" "$output" >> "$SUPERVISOR_LOG"
     detail="Phase-loop preflight failed before continuing; stage=$stage result=$output"
+    if [ "$stage" = "pre-claim-boundary" ]; then
+      printf '%s run=%s phase_loop_preflight_boundary_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
     write_status "blocked" "$detail" "$run_stamp" "75" "${CONSECUTIVE_FAILURES:-0}"
     write_bdk_trajectory_event "$run_stamp" "verification.run" "$output"
     return 75
   fi
   printf '%s run=%s phase_loop_preflight_passed=true stage=%s result=%s\n' "$(now_utc)" "$run_stamp" "$stage" "$output" >> "$SUPERVISOR_LOG"
-  write_bdk_trajectory_event "$run_stamp" "verification.run" "$output"
+  if [ "$stage" = "pre-claim-boundary" ]; then
+    write_phase_loop_snapshot_audit "$run_stamp" "$output"
+  else
+    write_bdk_trajectory_event "$run_stamp" "verification.run" "$output"
+  fi
   return 0
 }
 
@@ -13530,6 +13597,12 @@ _run_brownie_once() {
       printf '%s\n' "$PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC" >> "$PHASE_LOOP_ACTIVE_STDOUT_LOG"
     fi
     write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+
+  if ! run_phase_loop_preflight "$run_stamp" "pre-claim-boundary"; then
+    detail="Phase-loop preflight boundary rejected the controller inputs; refusing claim rebaseline, claim selection, task-ledger transition, and Runtime start."
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
     return 78
   fi
 
