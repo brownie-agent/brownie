@@ -100,6 +100,9 @@ phase_loop_prepare_pr_fixture_workspace() {
     "$workspace/docs/architecture/phase-loop-actor-separation-policy.json"
   git -C "$workspace" remote set-url origin https://github.com/globalpocket/brownie.git
   git -C "$workspace" remote add fixture-origin "$remote"
+  git -C "$workspace" add docs/architecture/phase-loop-actor-separation-policy.json
+  git -C "$workspace" -c user.name=Brownie -c user.email=brownie@example.invalid \
+    commit -m 'fixture actor policy baseline' >/dev/null
 }
 
 case "$PHASE_LOOP_CLAIM_SMOKE_SECTION" in
