@@ -156,8 +156,6 @@ export function rebaselineStaleClaim({
     progress.classification === 'terminal_failure'
     || projection.stop_class === 'terminal_failure'
     || projection.stop_reason === 'terminal_task_failed'
-    || projection.cli_status === 'no_eligible_task'
-    || projection.closure === 'no_eligible_task'
   );
   const queueMismatch = (
     claim.queue_generation != null && queue.generation != null && String(claim.queue_generation) !== String(queue.generation)
