@@ -105,6 +105,7 @@ export function isExplicitBlockerTodo(block) {
   const forbidsImplementation =
     lower.includes('forbidden changes: do not patch') ||
     lower.includes('no workspace file is patched') ||
+    lower.includes('verification: blocker:') ||
     lower.includes('do not implement') ||
     lower.includes('owner-controlled') ||
     (
