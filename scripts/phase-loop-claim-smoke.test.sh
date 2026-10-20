@@ -2772,7 +2772,11 @@ if claim_smoke_section_enabled queue; then
 # core shard having initialized any of its variables or workspace files.
 queue_workspace="$(mktemp -d)"
 git -C "$queue_workspace" init -b main >/dev/null
-git -C "$queue_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+# The trusted TODO guard evaluates package-script metadata from the workspace
+# even though its guard implementation is loaded from the control root.
+printf '%s\n' '{"name":"brownie-claim-smoke-queue-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$queue_workspace/package.json"
+git -C "$queue_workspace" add package.json
+git -C "$queue_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
 queue_original_workspace="$test_workspace"
 test_workspace="$queue_workspace"
 
@@ -3413,7 +3417,12 @@ head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], te
 remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
-assert "create PR from tracked Brownie progress" in message, message
+assert message.startswith("Brownie phase-loop: B-01:"), message
+assert "README.md" in message, message
+assert "Route: implementation." in message, message
+assert "Completion condition:" in message, message
+assert "Verification: run" in message, message
+assert "phase-loop-pr-actor-guard.mjs" in message, message
 PY
 
 # A normal Runtime completion must publish tracked workspace progress before
@@ -3461,7 +3470,12 @@ head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], te
 remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr-completed"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
-assert "create PR from completed tracked Brownie progress" in message, message
+assert message.startswith("Brownie phase-loop: B-01:"), message
+assert "README.md" in message, message
+assert "Route: implementation." in message, message
+assert "Completion condition:" in message, message
+assert "Verification: run" in message, message
+assert "phase-loop-pr-actor-guard.mjs" in message, message
 PY
 
 state_pr_supervise="$(mktemp -d)"
