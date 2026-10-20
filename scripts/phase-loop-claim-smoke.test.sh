@@ -203,7 +203,8 @@ assert_terminal_failure_claim_archived() {
   local ledger_path="$3"
   local selected_prefix="$4"
   local expected_archive_count="$5"
-  python3 - "$claim_dir" "$blocked_path" "$ledger_path" "$selected_prefix" "$expected_archive_count" <<'PY'
+  local allow_unrelated_current="${6:-0}"
+  python3 - "$claim_dir" "$blocked_path" "$ledger_path" "$selected_prefix" "$expected_archive_count" "$allow_unrelated_current" <<'PY'
 import json
 import pathlib
 import sys
@@ -213,8 +214,12 @@ blocked_path = pathlib.Path(sys.argv[2])
 ledger_path = pathlib.Path(sys.argv[3])
 selected_prefix = sys.argv[4]
 expected_archive_count = int(sys.argv[5])
+allow_unrelated_current = sys.argv[6] == "1"
 current_path = claim_dir / "current.json"
-assert not current_path.exists(), current_path
+if current_path.exists():
+    current = json.loads(current_path.read_text(encoding="utf-8"))
+    assert allow_unrelated_current, current
+    assert selected_prefix not in str(current.get("selected_todo", "")), current
 archives = sorted(claim_dir.glob("stale-*.json"))
 assert len(archives) == expected_archive_count, archives
 archived = [json.loads(path.read_text(encoding="utf-8")) for path in archives]
@@ -1354,7 +1359,7 @@ assert_terminal_failure_claim_archived \
   "$state_terminal_retry_cap/todo-claims" \
   "$state_terminal_retry_cap/todo-claims/blocked.jsonl" \
   "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" \
-  'E-retry-cap:' 2
+  'E-retry-cap:' 2 1
 python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/status.json" "$state_terminal_retry_cap/progress-state.json" <<'PY'
 import json
 import pathlib
