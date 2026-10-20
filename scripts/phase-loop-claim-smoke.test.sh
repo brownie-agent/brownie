@@ -4759,6 +4759,22 @@ assert "leaf_required_next_tool_policy: the next tool must be `workspace.write` 
 assert "leaf_initial_read_policy" not in prompt, prompt
 PY
 
+# A failed or incomplete repair must retain its live feedback.  This is the
+# negative half of the feedback state transition; a missing file is not a
+# successful repair receipt.
+python3 - "$repair_feedback_state/todo-claims/repair-feedback.json" <<'PY'
+import json
+import pathlib
+import sys
+
+feedback_path = pathlib.Path(sys.argv[1])
+assert feedback_path.is_file(), feedback_path
+feedback = json.loads(feedback_path.read_text(encoding="utf-8"))
+assert feedback["claim_id"] == "todo-g1-repair", feedback
+assert feedback.get("completed") is not True, feedback
+assert feedback["reason"] == "semantic_completion_not_satisfied", feedback
+PY
+
 contract_replan_feedback_state="$(mktemp -d)"
 contract_replan_feedback_prompt="$(mktemp)"
 contract_replan_feedback_todo="$(mktemp)"
@@ -4818,14 +4834,67 @@ BROWNIE_BIN="$fake_brownie_repair_feedback" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
 contract_replan_feedback_prompt_file="$(find "$contract_replan_feedback_state/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
-python3 - "$contract_replan_feedback_state/todo-claims/repair-feedback.json" "$contract_replan_feedback_prompt_file" <<'PY'
+python3 - "$contract_replan_feedback_state/todo-claims/repair-feedback.json" "$contract_replan_feedback_state/todo-claims/repair-feedback-archive" "$contract_replan_feedback_prompt_file" "$contract_replan_feedback_state/status.json" "$repair_feedback_workspace" <<'PY'
 import json
 import pathlib
 import sys
 
-feedback = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-prompt = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-assert feedback["completed"] is False, feedback
+feedback_path = pathlib.Path(sys.argv[1])
+archive_dir = pathlib.Path(sys.argv[2])
+prompt = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+status_path = pathlib.Path(sys.argv[4])
+workspace = pathlib.Path(sys.argv[5])
+expected_claim_id = "todo-g1-source"
+expected_kind = "phase_loop_todo_contract_replan_feedback"
+expected_reason = "supervisor_repeated_leaf_failure_requires_todo_contract_replan"
+if feedback_path.exists():
+    feedback = json.loads(feedback_path.read_text(encoding="utf-8"))
+    # The replan has not been verified in this invocation, so the live
+    # failure feedback must remain available and incomplete.
+    assert feedback["completed"] is False, feedback
+    assert feedback["claim_id"] == expected_claim_id, feedback
+    assert feedback["kind"] == expected_kind, feedback
+    assert feedback["reason"] == expected_reason, feedback
+else:
+    # A repair-success path may consume the live record.  Missing is valid
+    # only when the matching immutable audit archive proves that exact
+    # feedback record was consumed; absence alone is never success.
+    archives = []
+    for candidate in sorted(archive_dir.glob("*.json")):
+        try:
+            archived = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if (
+            archived.get("claim_id") == expected_claim_id
+            and archived.get("kind") == expected_kind
+            and archived.get("reason") == expected_reason
+        ):
+            archives.append((candidate, archived))
+    if archives:
+        archive_path, archived = archives[-1]
+        assert archived.get("completed") is False, archived
+        assert archive_path.is_file(), archive_path
+    else:
+        # If an implementation consumes the live file without an archive,
+        # require a matching successful claim/ledger transition and a clean
+        # status. ENOENT by itself is never a success receipt.
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        assert status.get("status") == "last_run_succeeded", status
+        ledger_path = workspace / ".brownie/private/phase-loop/task-ledger.jsonl"
+        assert ledger_path.is_file(), ledger_path
+        matching_terminal = []
+        for line in ledger_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            events = record.get("events", []) if record.get("kind") in {"replan_transaction", "terminal_failure_transaction"} else [record]
+            for event in events:
+                task_id = str(event.get("task_id", ""))
+                if event.get("claim_id") == expected_claim_id or task_id.endswith(f"@{expected_claim_id}"):
+                    if event.get("to_state") in {"completed", "replanned"}:
+                        matching_terminal.append(event)
+        assert matching_terminal, f"feedback missing without matching completion audit: {ledger_path}"
 assert "## Previous Repair Feedback" in prompt, prompt
 assert "supervisor_repeated_leaf_failure_requires_todo_contract_replan" in prompt, prompt
 assert "E-source" in prompt, prompt

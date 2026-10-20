@@ -359,6 +359,17 @@ test('retains TODO-contract replan feedback until the replan has explicit comple
   assert.equal(fs.existsSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback-archive')), false);
 });
 
+test('does not treat missing repair feedback as a resolved repair receipt', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.resolved_repair_feedback_archive.attempted, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.resolved_repair_feedback_archive.reason, 'no_active_repair_feedback');
+  assert.equal(fs.existsSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback-archive')), false);
+});
+
 test('archives a semantic feedback record only when its recorded failure is the current TODO guard', () => {
   const repo = makeRepo();
   writeTodo(repo);
