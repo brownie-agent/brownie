@@ -2408,6 +2408,7 @@ terminal_claim_absent_exit="$?"
 set -e
 test "$terminal_claim_absent_exit" = "76"
 test ! -f "$state_terminal_claim_absent/todo-claims/current.json"
+test ! -e "$state_terminal_claim_absent/todo-claims/terminal-failure-source-transition.pending.json"
 python3 - "$state_terminal_claim_absent/status.json" "$state_terminal_claim_absent/todo-claims/blocked.jsonl" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_claim_absent/bdk-trajectory.jsonl" <<'PY'
 import json
 import pathlib
@@ -2459,7 +2460,7 @@ PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
-python3 "$state_terminal_claim_absent/todo-claims/current.json" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+python3 - "$state_terminal_claim_absent/todo-claims/current.json" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
 import sys

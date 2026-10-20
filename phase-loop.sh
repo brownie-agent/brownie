@@ -10256,6 +10256,13 @@ PY
 
 clear_terminal_failure_source_transition_pending() {
   local run_stamp="$1"
+  if [ ! -f "$TODO_CLAIM_FILE" ]; then
+    if [ -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" ] && ! rm -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE"; then
+      return 1
+    fi
+    sync_parent_dir "$TODO_CLAIM_DIR"
+    return 0
+  fi
   python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
 import json
 import os
