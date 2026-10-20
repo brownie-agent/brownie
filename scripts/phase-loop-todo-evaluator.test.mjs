@@ -425,6 +425,43 @@ test('honors terminal failure retry caps before stable suppression', () => {
   }), changedTodo);
 });
 
+test('terminal retry budget wins over generic suppression even when terminal hash metadata is legacy-missing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const todo = `- [ ] E-legacy-terminal-cap-leaf: Patch only \`scripts/legacy-terminal-cap.mjs\`:
+  Route: implementation.
+  Source TODO: TODO-decompose-legacy-terminal-cap.
+  Depends on: <none>.
+  Completion condition: the terminal retry budget is honored.
+  Verification: run \`node --check scripts/legacy-terminal-cap.mjs\`.`;
+  const firstLine = todo.split('\n')[0];
+  const stable = {
+    block_reason: 'legacy_stable_block',
+    controller_fingerprint: 'controller-legacy-cap',
+    selected_todo_first_line: firstLine
+  };
+  const terminal = {
+    block_reason: 'terminal_runtime_failure',
+    controller_fingerprint: 'controller-legacy-cap',
+    selected_todo_first_line: firstLine,
+    retry_cap: 1,
+    provider_failure_fingerprint: 'provider-a'
+  };
+  fs.writeFileSync(blocked, `${JSON.stringify(stable)}\n${JSON.stringify(terminal)}\n`);
+
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-legacy-cap'
+  }), todo);
+
+  terminal.retry_cap = 0;
+  fs.writeFileSync(blocked, `${JSON.stringify(stable)}\n${JSON.stringify(terminal)}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-legacy-cap'
+  }), '');
+});
+
 test('does not treat a stable blocked record as dependency completion evidence', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');

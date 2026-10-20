@@ -236,16 +236,20 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
       const record = JSON.parse(line);
       const recordHasController = typeof record.controller_fingerprint === 'string' && record.controller_fingerprint;
       const recordMatchesController = !controllerFingerprint || !recordHasController || record.controller_fingerprint === controllerFingerprint;
+      const terminalRuntimeFailure = record.block_reason === 'terminal_runtime_failure';
       // Hash/first-line suppression predates controller-bound blocked records.
       // Once a controller identity is present, stale generic suppression must
       // not survive a controller rebaseline, especially for generated leaves.
-      if (recordMatchesController && record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_sha256 === 'string') {
+      // Terminal failures are governed only by their retry budget below; do
+      // not let a missing/legacy hash field turn a retryable terminal record
+      // into generic stable suppression.
+      if (!terminalRuntimeFailure && recordMatchesController && record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_sha256 === 'string') {
         hashes.add(record.selected_todo_sha256);
         if (controllerFingerprint && record.controller_fingerprint === controllerFingerprint) {
           currentControllerHashes.add(record.selected_todo_sha256);
         }
       }
-      if (recordMatchesController && record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_first_line === 'string' && record.selected_todo_first_line) {
+      if (!terminalRuntimeFailure && recordMatchesController && record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_first_line === 'string' && record.selected_todo_first_line) {
         firstLines.add(record.selected_todo_first_line);
         if (controllerFingerprint && record.controller_fingerprint === controllerFingerprint) {
           currentControllerFirstLines.add(record.selected_todo_first_line);
@@ -255,7 +259,6 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
         const blockedId = todoId(record.selected_todo_first_line);
         const explicitOwnerBlocker = record.selected_todo_first_line.includes('Blocker:');
         const stalledLeafContractReplan = record.block_reason === 'stalled_leaf_contract_replan';
-        const terminalRuntimeFailure = record.block_reason === 'terminal_runtime_failure';
         // A stable block suppresses retries only for the controller that
         // observed it. A controller update is the explicit rebaseline point
         // for legacy state, including records created before fingerprints.
@@ -276,21 +279,26 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
             ? record.selected_todo_sha256
             : sha256Text(record.selected_todo_first_line);
           const recordController = String(record.controller_fingerprint || controllerFingerprint || '');
-          const key = `${todoHash}\u0000${recordController}`;
           const retryCapValue = Number(record.retry_cap);
           const retryCap = Number.isFinite(retryCapValue) && retryCapValue >= 0
             ? Math.floor(retryCapValue)
             : 0;
+          const providerFailureFingerprint = String(record.provider_failure_fingerprint || '');
+          const key = `${todoHash}\u0000${recordController}\u0000${providerFailureFingerprint}`;
           const previous = terminalFailureAttempts.get(key) ?? {
             count: 0,
             retry_cap: retryCap,
             todo_hash: todoHash,
+            todo_first_line: record.selected_todo_first_line,
+            provider_failure_fingerprint: providerFailureFingerprint,
             controller_fingerprint: recordController,
             blocked_id: blockedId
           };
           previous.count += 1;
           previous.retry_cap = retryCap;
           previous.blocked_id = blockedId;
+          previous.todo_first_line = record.selected_todo_first_line;
+          previous.provider_failure_fingerprint = providerFailureFingerprint;
           terminalFailureAttempts.set(key, previous);
           continue;
         }
@@ -384,13 +392,16 @@ export function selectFirstSchedulableTodo(text, options = {}) {
     }
     const firstLine = block.split('\n')[0]?.trim() ?? '';
     const blockHash = sha256Text(block);
-    const terminalFailureAttempt = [...blocked.terminalFailureAttempts.values()].find((entry) => (
-      entry.todo_hash === blockHash
+    const terminalFailureAttempts = [...blocked.terminalFailureAttempts.values()].filter((entry) => (
+      (entry.todo_hash === blockHash || entry.todo_first_line === firstLine)
       && (!options.controllerFingerprint || entry.controller_fingerprint === options.controllerFingerprint)
     ));
-    const terminalFailureRetryAvailable = Boolean(
-      terminalFailureAttempt && terminalFailureAttempt.count <= terminalFailureAttempt.retry_cap
-    );
+    const terminalFailureRetryAvailable = terminalFailureAttempts.some((entry) => entry.count <= entry.retry_cap);
+    const terminalFailureRetryExhausted = terminalFailureAttempts.length > 0 && !terminalFailureRetryAvailable;
+    if (terminalFailureRetryExhausted) {
+      dependencyBlockedIds.add(id);
+      continue;
+    }
     if (blocked.stableIds.has(id)) {
       // A blocked record is not completion evidence. Dependents remain blocked
       // until the shared TODO state marks this id completed or resolves a
@@ -414,10 +425,10 @@ export function selectFirstSchedulableTodo(text, options = {}) {
     }
     const blockedInCurrentQueue = blocked.hashes.has(blockHash)
       || blocked.firstLines.has(firstLine)
-      || Boolean(terminalFailureAttempt);
+      || terminalFailureAttempts.length > 0;
     const blockedByCurrentController = blocked.currentControllerHashes.has(blockHash)
       || blocked.currentControllerFirstLines.has(firstLine)
-      || Boolean(terminalFailureAttempt);
+      || terminalFailureAttempts.length > 0;
     const sourceId = sourceTodoId(block);
     const sourceIsGeneratedParent = Boolean(productPrefix(sourceId));
     const canRetryAfterControllerRepair = blockedInCurrentQueue && !blockedByCurrentController && !isExplicitBlockerTodo(block) && !sourceIsGeneratedParent;

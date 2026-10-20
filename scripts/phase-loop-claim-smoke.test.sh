@@ -1336,25 +1336,18 @@ status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
 claim_dir = pathlib.Path(sys.argv[2])
 ledger_path = pathlib.Path(sys.argv[3])
 archives = sorted(claim_dir.glob('stale-*.json'))
-assert len(archives) == 1, archives
-archive = json.loads(archives[0].read_text(encoding='utf-8'))
-assert archive['archive_reason'] == 'terminal_failure_ledger_failed', archive
-assert archive['retry_eligible'] is False, archive
-assert archive['status'] == 'failed', archive
-assert not (claim_dir / 'current.json').exists()
+assert not archives, archives
+claim = json.loads((claim_dir / 'current.json').read_text(encoding='utf-8'))
+assert claim['status'] == 'in_progress', claim
+assert claim['terminal_failure_recovery_pending'] is True, claim
 blocked_path = claim_dir / 'blocked.jsonl'
 assert not blocked_path.exists() or (blocked_path.is_file() and not blocked_path.read_text(encoding='utf-8').strip()), blocked_path
 ledger = ledger_path.read_text(encoding='utf-8')
 assert 'terminal_failure_transaction' not in ledger, ledger
 ledger_records = [json.loads(line) for line in ledger.splitlines() if line.strip()]
-claim_id = archive['claim_id']
-assert any(
-    event.get('claim_id') == claim_id
-    and event.get('to_state') == 'failed'
-    and event.get('from_state') in ('claimed', 'running')
-    and str(event.get('task_id', '')).endswith('@' + claim_id)
-    for event in ledger_records
-), ledger_records
+claim_id = claim['claim_id']
+source_task = 'E-ledger-terminal-failure@' + claim_id
+assert not any(event.get('task_id') == source_task and event.get('to_state') == 'failed' for event in ledger_records), ledger_records
 assert status['status'] == 'blocked', status
 assert status['exit_code'] == '78', status
 assert 'could not be fully recorded' in status['detail'], status
@@ -1367,14 +1360,27 @@ PHASE_LOOP_TODO="$ledger_terminal_failure_todo" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible_counted" \
 PHASE_LOOP_WORKSPACE_ROOT="$ledger_terminal_failure_workspace" \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 65,75 "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 ledger_terminal_failure_retry_exit="$?"
 set -e
-case "$ledger_terminal_failure_retry_exit" in
-  65|75) ;;
-  *) echo "unexpected ledger-failure retry exit=$ledger_terminal_failure_retry_exit" >&2; exit 1 ;;
-esac
+test "$ledger_terminal_failure_retry_exit" = "76"
 test "$(cat "$ledger_terminal_failure_state/terminal-no-eligible-count" 2>/dev/null || printf '0')" = "0"
+python3 - "$ledger_terminal_failure_state/status.json" "$ledger_terminal_failure_state/todo-claims/current.json" "$ledger_terminal_failure_state/todo-claims/blocked.jsonl" "$ledger_terminal_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() if line.strip()]
+ledger = [json.loads(line) for line in pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert status['exit_code'] == '76', status
+assert claim['status'] == 'failed', claim
+assert claim['terminal_failure_recovery_pending'] is False, claim
+assert blocked and blocked[-1]['terminal_failure'] is True, blocked
+source_task = 'E-ledger-terminal-failure@' + claim['claim_id']
+assert any(event.get('task_id') == source_task and event.get('to_state') == 'failed' and event.get('from_state') in ('claimed', 'running') for event in ledger), ledger
+PY
 
 # A successful terminal ledger transaction is not complete until blocked.jsonl
 # also accepts the evidence. A directory at that path must fail closed and

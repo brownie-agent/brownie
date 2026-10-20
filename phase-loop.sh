@@ -1730,30 +1730,23 @@ try: print(json.load(sys.stdin).get("recovery_id", ""))
 except Exception: print("")' 2>/dev/null || true)"
   local terminal_claim_snapshot="$RUN_DIR/$run_stamp.claim.before-runtime.json"
   if [ "$recovery_status" -ne 0 ] || [ -z "$recovery_id" ]; then
-    # Do not archive a failed claim as non-retryable while its source attempt
-    # is still projected as running. The recovery transaction may fail before
-    # it can append blocked evidence, but the source attempt must still reach
-    # todo.failed first; otherwise the next audit sees a permanently running
-    # task with no durable recovery path.
-    local recovery_failure_transition_status=0
-    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure_recovery_recording_failed","terminal_failure":true}' "todo.failed" || recovery_failure_transition_status=$?
-    if [ "$recovery_failure_transition_status" -ne 0 ]; then
-      PHASE_LOOP_TASK_LEDGER_FAILURE=1
-      PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure recovery recording failed and source attempt could not be terminalized: recovery_status=$recovery_status transition_status=$recovery_failure_transition_status; keeping claim recoverable."
-      return 78
+    # Recovery is not durable until record-terminal-failure returns a recovery
+    # identity. Do not append retry-eligible blocked evidence or terminalize
+    # the source attempt before that point. Persist a recoverable recovery
+    # obligation and let the next run retry the ledger transaction first.
+    if [ ! -f "$TODO_CLAIM_FILE" ] && [ -f "$terminal_claim_snapshot" ]; then
+      cp "$terminal_claim_snapshot" "$TODO_CLAIM_FILE"
+      chmod 600 "$TODO_CLAIM_FILE"
+      sync_parent_dir "$TODO_CLAIM_DIR"
     fi
-    local recording_failure_archive_status=1
+    local recovery_pending_status=0
     if [ -f "$TODO_CLAIM_FILE" ]; then
-      if archive_terminal_failure_claim_snapshot "$TODO_CLAIM_FILE" "$run_stamp" terminal_failure_ledger_failed false "$recovery_id"; then
-        recording_failure_archive_status=0
-      fi
-    elif [ -f "$terminal_claim_snapshot" ]; then
-      if archive_terminal_failure_claim_snapshot "$terminal_claim_snapshot" "$run_stamp" terminal_failure_ledger_failed false "$recovery_id"; then
-        recording_failure_archive_status=0
-      fi
+      mark_terminal_failure_recovery_pending "$run_stamp" || recovery_pending_status=$?
+    else
+      recovery_pending_status=1
     fi
     PHASE_LOOP_TASK_LEDGER_FAILURE=1
-    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure ledger recording failed: ${recovery_output:-<no output>} archive_status=$recording_failure_archive_status; retry is suppressed."
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure ledger recording failed before durable recovery; blocked evidence and source terminalization are withheld. recovery_status=$recovery_status pending_marker_status=$recovery_pending_status result=${recovery_output:-<no output>}; keeping claim recoverable."
     return 78
   fi
   if [ "$claim_absent" = "true" ]; then
@@ -9899,6 +9892,143 @@ PY
   sync_parent_dir "$TODO_CLAIM_DIR"
 }
 
+terminal_failure_recovery_pending() {
+  case "$(claim_status 2>/dev/null || true)" in
+    claimed|in_progress|running)
+      [ "$(claim_field terminal_failure_recovery_pending 2>/dev/null || true)" = "true" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+mark_terminal_failure_recovery_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") not in ("claimed", "in_progress", "running"):
+    raise SystemExit(1)
+claim["terminal_failure_recovery_pending"] = True
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": claim.get("status"),
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "terminal_failure_recovery_pending",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.terminal-failure-recovery-pending.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+clear_terminal_failure_recovery_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict):
+    raise SystemExit(1)
+claim["terminal_failure_recovery_pending"] = False
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": claim.get("status"),
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "terminal_failure_recovery_completed",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.terminal-failure-recovery-complete.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+retry_terminal_failure_recovery() {
+  local run_stamp="$1"
+  if ! terminal_failure_recovery_pending; then
+    return 1
+  fi
+  local recovery_output recovery_status recovery_id transition_output transition_status
+  if recovery_output="$(record_terminal_failure_todo_claim "$run_stamp" "$PROGRESS_STATE_FILE" 2>&1)"; then
+    recovery_status=0
+  else
+    recovery_status=$?
+  fi
+  if [ "$recovery_status" -ne 0 ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery is still not durable: status=$recovery_status result=${recovery_output:-<no output>}"
+    return 78
+  fi
+  recovery_id="$(printf '%s' "$recovery_output" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("recovery_id", ""))
+except Exception: print("")' 2>/dev/null || true)"
+  if [ -z "$recovery_id" ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery returned no recovery identity; result=${recovery_output:-<no output>}"
+    return 78
+  fi
+  if ! clear_terminal_failure_recovery_pending "$run_stamp"; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery succeeded but its pending marker could not be cleared: recovery_id=$recovery_id"
+    return 78
+  fi
+  if transition_output="$(write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed" 2>&1)"; then
+    transition_status=0
+  else
+    transition_status=$?
+  fi
+  if [ "$transition_status" -ne 0 ] || [ "${PHASE_LOOP_TASK_LEDGER_FAILURE:-0}" -eq 1 ]; then
+    mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || true
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery succeeded but source todo.failed transition failed: status=$transition_status result=${transition_output:-<no output>} recovery_id=$recovery_id"
+    return 78
+  fi
+  if ! write_todo_claim "$(claim_field claim_id)" "failed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"; then
+    mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || true
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery and source transition succeeded but failed claim state could not be persisted: recovery_id=$recovery_id"
+    return 78
+  fi
+  printf '%s\n' "$recovery_output"
+  return 0
+}
+
 terminal_failure_source_transition_pending() {
   case "$(claim_status 2>/dev/null || true)" in
     claimed|in_progress|running)
@@ -13058,6 +13188,24 @@ PY
     cd "$PHASE_LOOP_WORKSPACE_ROOT" && git rev-parse HEAD 2>/dev/null || true
   )"
   clear_inconsistent_repair_feedback_for_active_claim
+  if terminal_failure_recovery_pending; then
+    local deferred_terminal_recovery_output deferred_terminal_recovery_status
+    if deferred_terminal_recovery_output="$(retry_terminal_failure_recovery "$run_stamp" 2>&1)"; then
+      deferred_terminal_recovery_status=0
+    else
+      deferred_terminal_recovery_status=$?
+    fi
+    if [ "$deferred_terminal_recovery_status" -ne 0 ]; then
+      detail="A terminal runtime failure recovery transaction is still pending; keeping the claim recoverable without rerunning Runtime. recovery=$deferred_terminal_recovery_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+      printf '%s run=%s terminal_runtime_failure_recovery_retry_failed=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$deferred_terminal_recovery_output" >> "$SUPERVISOR_LOG"
+      return 78
+    fi
+    detail="A terminal runtime failure recovery transaction and source todo.failed transition were closed without rerunning Runtime. recovery=$deferred_terminal_recovery_output"
+    write_status "blocked" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
+    printf '%s run=%s terminal_runtime_failure_recovery_retry_succeeded=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$deferred_terminal_recovery_output" >> "$SUPERVISOR_LOG"
+    return 76
+  fi
   if terminal_failure_source_transition_pending; then
     local deferred_terminal_transition_output deferred_terminal_transition_status
     if deferred_terminal_transition_output="$(retry_terminal_failure_source_transition "$run_stamp" 2>&1)"; then
