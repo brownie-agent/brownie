@@ -32,6 +32,9 @@ const releaseTargets = [
   }
 ];
 
+const downloadedArtifactRoot = process.env.BROWNIE_RELEASE_ROUNDTRIP_DOWNLOAD_ROOT ?? '';
+const downloadedTargetId = process.env.BROWNIE_RELEASE_ROUNDTRIP_TARGET ?? '';
+
 function sha256File(filePath) {
   return `sha256:${crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')}`;
 }
@@ -158,6 +161,19 @@ function copyTree(sourceRoot, destinationRoot) {
   fs.cpSync(sourceRoot, destinationRoot, { recursive: true });
 }
 
+function findFile(root, fileName) {
+  const entries = fs.readdirSync(root, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(root, entry.name);
+    if (entry.isFile() && entry.name === fileName) return fullPath;
+    if (entry.isDirectory()) {
+      const found = findFile(fullPath, fileName);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 function parseChecksums(filePath) {
   return Object.fromEntries(
     fs.readFileSync(filePath, 'utf8')
@@ -204,14 +220,67 @@ function assertDownloadedPackageRoundTrips(target, uploadRoot, expectedArchiveSh
   assert.match(launch.stdout, new RegExp(`^cli-ready:${target.id}:runtime-ready:${target.id}$`, 'mu'));
 }
 
+function assertCiDownloadedPackageRoundTrips(target) {
+  assert.equal(downloadedTargetId, target.id);
+  const archivePath = findFile(downloadedArtifactRoot, target.archiveName);
+  assert.ok(archivePath, `${target.id} archive was not downloaded by actions/download-artifact`);
+  assert.match(sha256File(archivePath), /^sha256:[a-f0-9]{64}$/u);
+  const extractionRoot = fs.mkdtempSync(path.join(os.tmpdir(), `brownie-ci-release-extract-${target.id}-`));
+  extractArchive(target, archivePath, extractionRoot);
+
+  const evidence = JSON.parse(fs.readFileSync(path.join(extractionRoot, 'artifact-evidence.json'), 'utf8'));
+  const checksums = parseChecksums(path.join(extractionRoot, 'SHA256SUMS'));
+  for (const [field, name] of [['artifact', target.binaryName], ['runtime_companion', target.runtimeName]]) {
+    const filePath = path.join(extractionRoot, name);
+    assert.ok(fs.existsSync(filePath), `${target.id} extracted package is missing ${name}`);
+    assert.equal(evidence[field].path, name);
+    assert.equal(evidence[field].sha256, sha256File(filePath));
+    assert.equal(checksums[name], sha256File(filePath));
+  }
+  assert.equal(evidence.target, target.id);
+  const expectedPlatform = process.platform === 'win32' ? 'win32' : process.platform;
+  const expectedArch = process.arch === 'x64' ? 'x64' : process.arch;
+  assert.equal(target.id, `${expectedPlatform}-${expectedArch}`, 'CI matrix target does not match runner platform');
+
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), `brownie-ci-release-workspace-${target.id}-`));
+  const packagedCli = path.join(extractionRoot, target.binaryName);
+  if (process.platform !== 'win32') {
+    fs.accessSync(packagedCli, fs.constants.X_OK);
+  }
+  const environment = { ...process.env, BROWNIE_WORKSPACE_ROOT: workspaceRoot };
+  delete environment.BROWNIE_RUNTIME_PATH;
+  const launch = spawnSync(packagedCli, ['--json', 'status'], {
+    cwd: workspaceRoot,
+    encoding: 'utf8',
+    timeout: 60_000,
+    env: environment,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  assert.equal(launch.status, 0, `${target.id} downloaded packaged CLI failed to start its Runtime companion\n${launch.stderr || launch.stdout}`);
+  assert.doesNotThrow(() => JSON.parse(launch.stdout), `${target.id} packaged CLI did not return JSON status`);
+}
+
 test('release workflow uploads every target artifact directory required for roundtrip verification', () => {
   const workflow = fs.readFileSync(path.join(repoRoot, '.github/workflows/release.yml'), 'utf8');
   assert.match(workflow, /uses: actions\/upload-artifact@v4/u);
+  assert.match(workflow, /uses: actions\/download-artifact@v4/u);
+  assert.match(workflow, /needs: build-and-evidence/u);
+  assert.match(workflow, /BROWNIE_RELEASE_ROUNDTRIP_DOWNLOAD_ROOT/u);
   assert.match(workflow, /\.brownie\/release-evidence\/artifacts\/\$\{\{ matrix\.target \}\}\//u);
   for (const target of releaseTargets) {
     assert.match(workflow, new RegExp(`target: ${target.id}\\n\\s+archive_name: ${target.archiveName}`, 'u'));
   }
 });
+
+if (process.env.CI === 'true') {
+  test('CI roundtrip consumes the artifact downloaded by the release workflow', () => {
+    assert.ok(downloadedArtifactRoot, 'CI download root is required for the release roundtrip job');
+    assert.ok(downloadedTargetId, 'CI target is required for the release roundtrip job');
+    const target = releaseTargets.find((candidate) => candidate.id === downloadedTargetId);
+    assert.ok(target, `unsupported CI target: ${downloadedTargetId}`);
+    assertCiDownloadedPackageRoundTrips(target);
+  });
+}
 
 test('downloaded release packages preserve SHA bindings and start with their Runtime companion', () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-release-upload-fixtures-'));
