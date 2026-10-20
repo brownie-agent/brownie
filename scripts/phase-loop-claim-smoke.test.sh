@@ -1432,6 +1432,7 @@ BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
+PHASE_LOOP_TEST_TRACE_ERRORS=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 retry_success_first_exit="$?"
@@ -1466,6 +1467,7 @@ BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
+PHASE_LOOP_TEST_TRACE_ERRORS=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 retry_success_second_exit="$?"

@@ -107,6 +107,10 @@ PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK="${PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK
 
 mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
 
+if [ "${PHASE_LOOP_TEST_TRACE_ERRORS:-0}" = "1" ]; then
+  trap 'printf "%s phase_loop_test_err_trap line=%s command=%s\n" "$(now_utc)" "${BASH_LINENO[0]:-unknown}" "$BASH_COMMAND" >&2' ERR
+fi
+
 json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])'
 }
