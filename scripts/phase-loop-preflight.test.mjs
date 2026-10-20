@@ -69,6 +69,37 @@ test('accepts Brownie-managed state changes when only an owner blocker remains',
   assert(!result.errors.some((error) => error.code === 'dirty_delivery_required'), JSON.stringify(result.errors));
 });
 
+test('allows claim-smoke recovery to deliver dirty workspace progress for a pending completed claim', () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), '- [ ] E-owner: Owner must provide release credentials:\n  Route: owner.\n  Verification: external owner handoff.\n');
+  fs.writeFileSync(path.join(repo, 'README.md'), 'dirty\n');
+  const claim = path.join(os.tmpdir(), `brownie-pending-completion-claim-${Date.now()}.json`);
+  fs.writeFileSync(claim, JSON.stringify({
+    status: 'completed',
+    completion_cleanup_pending: true,
+    completion_pr_pending: false
+  }));
+  const previous = process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = '1';
+  try {
+    const fixtureResult = validatePhaseLoopPreflight({
+      repo,
+      controlPlaneRoot: repositoryRoot,
+      profile: 'claim-smoke-fixture',
+      claim,
+      skipCommands: true
+    });
+    assert(!fixtureResult.errors.some((error) => error.code === 'dirty_delivery_required'), JSON.stringify(fixtureResult.errors));
+
+    const productionResult = validatePhaseLoopPreflight({ repo, claim, skipCommands: true });
+    assert(productionResult.errors.some((error) => error.code === 'dirty_delivery_required'), JSON.stringify(productionResult.errors));
+  } finally {
+    if (previous === undefined) delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+    else process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = previous;
+    fs.rmSync(claim, { force: true });
+  }
+});
+
 test('accepts an absolute TODO path inside the repository', () => {
   const repo = makeRepo();
   const result = validatePhaseLoopPreflight({

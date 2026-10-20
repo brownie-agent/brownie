@@ -425,12 +425,28 @@ function validateReleaseEvidence(repoRoot, errors) {
   }
 }
 
-function validateDirtyDelivery(repoRoot, todoText, errors) {
+function hasPendingCompletionClaim(claimPath) {
+  if (!claimPath) {
+    return false;
+  }
+  try {
+    const claim = JSON.parse(fs.readFileSync(path.resolve(claimPath), 'utf8'));
+    return claim?.status === 'completed'
+      && (claim.completion_cleanup_pending === true || claim.completion_pr_pending === true);
+  } catch {
+    return false;
+  }
+}
+
+function validateDirtyDelivery(repoRoot, todoText, errors, options = {}) {
   const dirtyFiles = gitDirtyFiles(repoRoot);
   if (dirtyFiles.length === 0) {
     return;
   }
   if (!hasImplementableTodo(todoText)) {
+    if (options.allowPendingCompletionRecovery === true && hasPendingCompletionClaim(options.claimPath)) {
+      return;
+    }
     errors.push({
       code: 'dirty_delivery_required',
       dirty_files: dirtyFiles,
@@ -515,7 +531,10 @@ export function validatePhaseLoopPreflight(options = {}) {
       errors
     });
   validateReleaseEvidence(profile === 'claim-smoke-fixture' ? controlPlaneRoot : repoRoot, errors);
-  validateDirtyDelivery(repoRoot, todoText, errors);
+  validateDirtyDelivery(repoRoot, todoText, errors, {
+    allowPendingCompletionRecovery: fixtureProfile,
+    claimPath: options.claim
+  });
   const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors);
 
   return {
