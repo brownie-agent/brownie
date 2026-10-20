@@ -960,7 +960,7 @@ export function normalizeStaleRunningStatus({
   now = new Date().toISOString(),
   processExists = (pid) => processIsAlive(pid),
   getProcessCommand = processCommand,
-  listSupervisors = () => liveSupervisorPids(rootDir)
+  listSupervisors = () => liveSupervisorPids(rootDir, stateDir)
 }) {
   const statusPath = path.join(stateDir, 'status.json');
   const auditPath = path.join(stateDir, 'run-state-recovery.jsonl');
@@ -1087,7 +1087,7 @@ export function watchdogContinuationLiveness({
   runStamp = null,
   processExists = (pid) => processIsAlive(pid),
   getProcessCommand = processCommand,
-  listSupervisors = () => liveSupervisorPids(rootDir)
+  listSupervisors = () => liveSupervisorPids(rootDir, stateDir)
 }) {
   const statusPath = path.join(stateDir, 'status.json');
   const auditPath = path.join(stateDir, 'run-state-recovery.jsonl');

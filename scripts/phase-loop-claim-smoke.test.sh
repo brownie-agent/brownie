@@ -2410,6 +2410,44 @@ PY
 fi
 
 if claim_smoke_section_enabled queue; then
+# Queue fixtures are intentionally self-contained.  In particular, this
+# section must also run when selected directly by CI, without relying on the
+# core shard having initialized any of its variables or workspace files.
+queue_workspace="$(mktemp -d)"
+git -C "$queue_workspace" init -b main >/dev/null
+git -C "$queue_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+queue_original_workspace="$test_workspace"
+test_workspace="$queue_workspace"
+
+queue_state_with_claim="$(mktemp -d)"
+queue_prompt_with_claim="$(mktemp)"
+queue_todo_with_claim="$(mktemp)"
+printf 'base prompt\n' > "$queue_prompt_with_claim"
+printf -- '- [ ] B-01: durable claim task\n  with detail\n  Files: \`scripts/release-runtime-operational-evidence.mjs\`, \`docs/architecture/local-release-targets.example.json\`.\n- [ ] B-02: next task\n' > "$queue_todo_with_claim"
+
+PHASE_LOOP_STATE_DIR="$queue_state_with_claim" \
+PHASE_LOOP_PROMPT="$queue_prompt_with_claim" \
+PHASE_LOOP_TODO="$queue_todo_with_claim" \
+BROWNIE_BIN="$fake_brownie_json" \
+PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+queue_claim_file="$queue_state_with_claim/todo-claims/current.json"
+queue_prompt_file="$(find "$queue_state_with_claim/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
+
+queue_state_with_blocked="$(mktemp -d)"
+queue_prompt_with_blocked="$(mktemp)"
+queue_todo_with_blocked="$(mktemp)"
+printf 'base prompt\n' > "$queue_prompt_with_blocked"
+printf -- '- [ ] R-09: blocked boundary task\n' > "$queue_todo_with_blocked"
+
+PHASE_LOOP_STATE_DIR="$queue_state_with_blocked" \
+PHASE_LOOP_PROMPT="$queue_prompt_with_blocked" \
+PHASE_LOOP_TODO="$queue_todo_with_blocked" \
+BROWNIE_BIN="$fake_brownie_blocked_json" \
+PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
 state_objective_apply_stalled="$(mktemp -d)"
 prompt_objective_apply_stalled="$(mktemp)"
 todo_objective_apply_stalled="$(mktemp)"
@@ -2644,16 +2682,16 @@ assert selected in todo, todo
 assert f"Source TODO: {historical_id}." in todo, todo
 PY
 
-printf -- '- [ ] R-09: blocked boundary task\n  Extra context that changes the queue fingerprint.\n- [ ] R-10: next unblocked task\n' > "$todo_with_blocked"
+printf -- '- [ ] R-09: blocked boundary task\n  Extra context that changes the queue fingerprint.\n- [ ] R-10: next unblocked task\n' > "$queue_todo_with_blocked"
 
-PHASE_LOOP_STATE_DIR="$state_with_blocked" \
-PHASE_LOOP_PROMPT="$prompt_with_blocked" \
-PHASE_LOOP_TODO="$todo_with_blocked" \
+PHASE_LOOP_STATE_DIR="$queue_state_with_blocked" \
+PHASE_LOOP_PROMPT="$queue_prompt_with_blocked" \
+PHASE_LOOP_TODO="$queue_todo_with_blocked" \
 BROWNIE_BIN="$fake_brownie_json" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$state_with_blocked/todo-claims/current.json" <<'PY'
+python3 - "$queue_state_with_blocked/todo-claims/current.json" <<'PY'
 import json
 import sys
 
@@ -2688,9 +2726,9 @@ assert claim["status"] == "in_progress", claim
 assert claim["selected_todo"].startswith("- [ ] E-15-parent:"), claim
 PY
 
-assert_contains "$prompt_file" '## Active TODO Claim'
-assert_contains "$prompt_file" 'queue_generation'
-assert_contains "$prompt_file" 'B-01: durable claim task'
+assert_contains "$queue_prompt_file" '## Active TODO Claim'
+assert_contains "$queue_prompt_file" 'queue_generation'
+assert_contains "$queue_prompt_file" 'B-01: durable claim task'
 
 state_explicit_blocker="$(mktemp -d)"
 prompt_explicit_blocker="$(mktemp)"
@@ -2752,16 +2790,16 @@ assert claim["status"] == "in_progress", claim
 assert claim["selected_todo"].startswith("- [ ] E-15f-next:"), claim
 PY
 
-printf '' > "$todo_with_claim"
+printf '' > "$queue_todo_with_claim"
 
-PHASE_LOOP_STATE_DIR="$state_with_claim" \
-PHASE_LOOP_PROMPT="$prompt_with_claim" \
-PHASE_LOOP_TODO="$todo_with_claim" \
+PHASE_LOOP_STATE_DIR="$queue_state_with_claim" \
+PHASE_LOOP_PROMPT="$queue_prompt_with_claim" \
+PHASE_LOOP_TODO="$queue_todo_with_claim" \
 BROWNIE_BIN="$fake_brownie_json" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$claim_file" <<'PY'
+python3 - "$queue_claim_file" <<'PY'
 import json
 import sys
 
@@ -2896,6 +2934,7 @@ assert progress["classification"] == "progress", progress
 assert progress["meaningful_progress"] is True, progress
 assert progress["workspace_changed"] is True, progress
 PY
+test_workspace="$queue_original_workspace"
 fi
 
 if claim_smoke_section_enabled pr; then
