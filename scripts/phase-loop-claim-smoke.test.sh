@@ -783,17 +783,6 @@ if [ "\$attempt" -eq 1 ] && [ "\${PHASE_LOOP_TEST_REMOVE_CLAIM:-0}" = "1" ]; the
   rm -f "\$PHASE_LOOP_STATE_DIR/todo-claims/current.json"
 fi
 if [ "\$attempt" -ge 2 ]; then
-  python3 - "\$PHASE_LOOP_TODO" <<'PY'
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text(encoding='utf-8')
-updated, count = re.subn(r'(?m)^- \[ \] (E-retry-success|E-retry-leaf):', r'- [x] \1:', text, count=1)
-assert count == 1, text
-path.write_text(updated, encoding='utf-8')
-PY
   target_path="\$(python3 - "\$PHASE_LOOP_TODO" <<'PY'
 import pathlib
 import re
