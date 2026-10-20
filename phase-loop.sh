@@ -1885,6 +1885,11 @@ PY
         terminal_transition_status=78
       fi
     fi
+    if [ "$terminal_transition_status" -eq 0 ]; then
+      if ! clear_terminal_failure_source_transition_pending "$run_stamp"; then
+        terminal_transition_status=78
+      fi
+    fi
     if [ "$terminal_transition_status" -ne 0 ]; then
       mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || true
     fi
