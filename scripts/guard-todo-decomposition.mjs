@@ -916,21 +916,25 @@ function readJsonOrNull(repoRoot, relativePath) {
   }
 }
 
-export function validateTodoDecomposition(repoRoot = defaultRepoRoot, todoPath = defaultTodoPath) {
+export function validateTodoDecomposition(repoRoot = defaultRepoRoot, todoPath = defaultTodoPath, breakdownPath = defaultBreakdownPath) {
   const state = releaseState(repoRoot);
-  const todoText = readText(repoRoot, todoPath);
+  const resolvedTodoPath = path.resolve(repoRoot, todoPath);
+  const resolvedBreakdownPath = path.resolve(repoRoot, breakdownPath);
+  const todoDisplayPath = path.relative(repoRoot, resolvedTodoPath) || resolvedTodoPath;
+  const breakdownDisplayPath = path.relative(repoRoot, resolvedBreakdownPath) || resolvedBreakdownPath;
+  const todoText = fs.readFileSync(resolvedTodoPath, 'utf8');
   const todoState = loadTodoState(repoRoot, todoText, {
-    breakdownPath: path.resolve(repoRoot, defaultBreakdownPath)
+    breakdownPath: resolvedBreakdownPath
   });
   const unresolvedSupersededIds = new Set(
     [...todoState.supersededIds].filter((id) => !todoState.resolvedIds.has(id))
   );
   return validateTodoDecompositionText(todoText, {
-    path: todoPath,
+    path: todoDisplayPath,
     repoRoot,
     packageScripts: packageScripts(repoRoot),
-    breakdownPath: defaultBreakdownPath,
-    breakdownText: maybeReadText(repoRoot, defaultBreakdownPath),
+    breakdownPath: breakdownDisplayPath,
+    breakdownText: fs.existsSync(resolvedBreakdownPath) ? fs.readFileSync(resolvedBreakdownPath, 'utf8') : null,
     completedTodoIds: todoState.resolvedIds,
     invalidCheckedTodoIds: unresolvedSupersededIds,
     productReady: state.productReady,
@@ -939,14 +943,29 @@ export function validateTodoDecomposition(repoRoot = defaultRepoRoot, todoPath =
 }
 
 if (process.argv[1] === __filename) {
-  const todoPath = process.argv[2] ?? defaultTodoPath;
-  const scoreMode = process.argv.includes('--score');
-  const actualTodoPath = todoPath === '--score' ? defaultTodoPath : todoPath;
+  const argv = process.argv.slice(2);
+  let positionalTodo = null;
+  let explicitTodo = null;
+  let breakdownPath = defaultBreakdownPath;
+  let scoreMode = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--todo') {
+      explicitTodo = argv[++index] ?? defaultTodoPath;
+    } else if (arg === '--breakdown') {
+      breakdownPath = argv[++index] ?? defaultBreakdownPath;
+    } else if (arg === '--score') {
+      scoreMode = true;
+    } else if (!arg.startsWith('--') && positionalTodo === null) {
+      positionalTodo = arg;
+    }
+  }
+  const actualTodoPath = explicitTodo ?? positionalTodo ?? defaultTodoPath;
   if (scoreMode) {
-    console.log(JSON.stringify(scoreTodoDecompositionText(readText(defaultRepoRoot, actualTodoPath)), null, 2));
+    console.log(JSON.stringify(scoreTodoDecompositionText(fs.readFileSync(path.resolve(defaultRepoRoot, actualTodoPath), 'utf8')), null, 2));
     process.exit(0);
   }
-  const errors = validateTodoDecomposition(defaultRepoRoot, actualTodoPath);
+  const errors = validateTodoDecomposition(defaultRepoRoot, actualTodoPath, breakdownPath);
   if (errors.length > 0) {
     console.error('TODO decomposition guard failed:');
     for (const error of errors) {

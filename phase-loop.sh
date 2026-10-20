@@ -62,6 +62,7 @@ PHASE_LOOP_TODO="${PHASE_LOOP_TODO:-"$ROOT_DIR/.brownie/todo.md"}"
 PHASE_LOOP_TODO_BREAKDOWN="${PHASE_LOOP_TODO_BREAKDOWN:-"$(dirname "$PHASE_LOOP_TODO")/todo-breakdown.md"}"
 PHASE_LOOP_TODO_SNAPSHOT_SOURCE="${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}"
 PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-"$STATE_DIR/todo-snapshot-audits"}"
+PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-"$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/current.json"}"
 PHASE_LOOP_WORKSPACE_ROOT="${PHASE_LOOP_WORKSPACE_ROOT:-"$ROOT_DIR"}"
 PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"/Users/satoshitanaka/.codex/automations/brownie-cli-phase-loop"}"
 PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-"$ROOT_DIR/.brownie/private/runtime-store"}"
@@ -2410,21 +2411,17 @@ PY
   if [ -n "$todo_guard_path" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/scripts/guard-todo-decomposition.mjs" ]; then
     if ! todo_guard_output="$(
       cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-      node scripts/guard-todo-decomposition.mjs "$todo_guard_path" 2>&1
+      node scripts/guard-todo-decomposition.mjs "$todo_guard_path" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" 2>&1
     )"; then
       local todo_repair_output todo_repair_guard_output
       if todo_repair_output="$(try_deterministic_todo_decomposition_repair "$run_stamp" 2>&1)"; then
         if todo_repair_guard_output="$(
           cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-          node scripts/guard-todo-decomposition.mjs "$todo_guard_path" 2>&1
+          node scripts/guard-todo-decomposition.mjs "$todo_guard_path" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" 2>&1
         )"; then
           printf '%s run=%s completed_todo_removal_guard_repaired=true repair=%s guard=%s\n' "$(now_utc)" "$run_stamp" "$todo_repair_output" "$todo_repair_guard_output" >> "$SUPERVISOR_LOG"
-          python3 - "$todo_backup" <<'PY'
-import pathlib
-import sys
-pathlib.Path(sys.argv[1]).unlink(missing_ok=True)
-PY
-          return 0
+          finalize_phase_loop_todo_snapshot_removal "$run_stamp" "$todo_backup"
+          return $?
         fi
         printf '%s run=%s completed_todo_removal_repair_guard_failed=true repair=%s guard=%s\n' "$(now_utc)" "$run_stamp" "$todo_repair_output" "$todo_repair_guard_output" >> "$SUPERVISOR_LOG"
       else
@@ -2437,15 +2434,11 @@ PY
       )"; then
         if release_ops_blocker_guard_output="$(
           cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-          node scripts/guard-todo-decomposition.mjs "$todo_guard_path" 2>&1
+          node scripts/guard-todo-decomposition.mjs "$todo_guard_path" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" 2>&1
         )"; then
           printf '%s run=%s completed_release_ops_replaced_with_blocker=true result=%s guard=%s\n' "$(now_utc)" "$run_stamp" "$release_ops_blocker_output" "$release_ops_blocker_guard_output" >> "$SUPERVISOR_LOG"
-          python3 - "$todo_backup" <<'PY'
-import pathlib
-import sys
-pathlib.Path(sys.argv[1]).unlink(missing_ok=True)
-PY
-          return 0
+          finalize_phase_loop_todo_snapshot_removal "$run_stamp" "$todo_backup"
+          return $?
         else
           printf '%s run=%s completed_release_ops_blocker_guard_failed=true result=%s guard=%s\n' "$(now_utc)" "$run_stamp" "$release_ops_blocker_output" "$release_ops_blocker_guard_output" >> "$SUPERVISOR_LOG"
         fi
@@ -2460,15 +2453,11 @@ PY
       printf '%s run=%s completed_todo_removal_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_status" "${integrated_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
       if integrated_supervisor_guard_output="$(
         cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-        node scripts/guard-todo-decomposition.mjs "$todo_guard_path" 2>&1
+        node scripts/guard-todo-decomposition.mjs "$todo_guard_path" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" 2>&1
       )"; then
         printf '%s run=%s completed_todo_removal_guard_repaired_by_integrated_supervisor=true guard=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_guard_output" >> "$SUPERVISOR_LOG"
-        python3 - "$todo_backup" <<'PY'
-import pathlib
-import sys
-pathlib.Path(sys.argv[1]).unlink(missing_ok=True)
-PY
-        return 0
+        finalize_phase_loop_todo_snapshot_removal "$run_stamp" "$todo_backup"
+        return $?
       fi
       printf '%s run=%s completed_todo_removal_integrated_supervisor_guard_failed=true guard=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_guard_output" >> "$SUPERVISOR_LOG"
       cp "$todo_backup" "$PHASE_LOOP_TODO"
@@ -2476,20 +2465,12 @@ PY
       PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED=1
       PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL="$todo_guard_output"
       printf '%s run=%s completed_todo_removal_reverted=true guard=%s\n' "$(now_utc)" "$run_stamp" "$todo_guard_output" >> "$SUPERVISOR_LOG"
-      python3 - "$todo_backup" <<'PY'
-import pathlib
-import sys
-pathlib.Path(sys.argv[1]).unlink(missing_ok=True)
-PY
       return 76
     fi
     printf '%s run=%s completed_todo_removal_guard_passed=true guard=%s\n' "$(now_utc)" "$run_stamp" "$todo_guard_output" >> "$SUPERVISOR_LOG"
   fi
-  python3 - "$todo_backup" <<'PY'
-import pathlib
-import sys
-pathlib.Path(sys.argv[1]).unlink(missing_ok=True)
-PY
+  finalize_phase_loop_todo_snapshot_removal "$run_stamp" "$todo_backup"
+  return $?
 }
 
 classify_no_progress_recovery() {
@@ -13213,7 +13194,9 @@ write_phase_loop_snapshot_audit() {
   if [ -z "${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}" ]; then
     return 0
   fi
-  mkdir -p "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR"
+  if ! mkdir -p "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR"; then
+    return 78
+  fi
   printf '%s' "$preflight_output" | python3 -c '
 import json
 import os
@@ -13222,30 +13205,131 @@ import sys
 import tempfile
 
 audit_path = pathlib.Path(sys.argv[1])
-run_stamp = sys.argv[2]
+current_path = pathlib.Path(sys.argv[2])
+run_stamp = sys.argv[3]
 try:
     payload = json.load(sys.stdin)
     audit = payload.get("snapshot_audit")
 except Exception:
     audit = None
 if not isinstance(audit, dict):
-    raise SystemExit(0)
+    raise SystemExit(78)
 audit = {"run_stamp": run_stamp, **audit}
 audit_path.parent.mkdir(parents=True, exist_ok=True)
-fd, temporary = tempfile.mkstemp(prefix=audit_path.name + ".", dir=str(audit_path.parent))
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(audit, handle, ensure_ascii=False, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, audit_path)
-except Exception:
+for target in (audit_path, current_path):
+    fd, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=str(target.parent))
     try:
-        os.unlink(temporary)
-    except OSError:
-        pass
-' "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/$run_stamp.json" "$run_stamp"
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(audit, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+' "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/$run_stamp.json" "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE" "$run_stamp"
+}
+
+write_phase_loop_snapshot_mutation_audit() {
+  local run_stamp="$1"
+  local previous_snapshot_path="$2"
+  local removed_todo_first_line="$3"
+  if [ -z "${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}" ]; then
+    return 0
+  fi
+  if [ ! -f "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE" ]; then
+    return 78
+  fi
+  python3 - "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE" "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/$run_stamp.json" "$previous_snapshot_path" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_SNAPSHOT_SOURCE" "$PHASE_LOOP_TODO_BREAKDOWN" "$run_stamp" "$removed_todo_first_line" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+import tempfile
+
+current_audit_path = pathlib.Path(sys.argv[1])
+archive_audit_path = pathlib.Path(sys.argv[2])
+previous_snapshot_path = pathlib.Path(sys.argv[3])
+snapshot_path = pathlib.Path(sys.argv[4])
+source_path = pathlib.Path(sys.argv[5])
+breakdown_path = pathlib.Path(sys.argv[6])
+run_stamp = sys.argv[7]
+removed_todo_first_line = sys.argv[8]
+
+def sha256_file(path):
+    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+try:
+    audit = json.loads(current_audit_path.read_text(encoding="utf-8"))
+    source_sha256 = sha256_file(source_path)
+    previous_snapshot_sha256 = sha256_file(previous_snapshot_path)
+    snapshot_sha256 = sha256_file(snapshot_path)
+    breakdown_sha256 = sha256_file(breakdown_path) if breakdown_path.exists() else None
+    queue_cas = f"sha256:{hashlib.sha256((snapshot_sha256 + chr(10) + (breakdown_sha256 or 'missing')).encode()).hexdigest()}"
+    if audit.get("source_sha256") != source_sha256 or audit.get("source_base_sha256") != source_sha256:
+        raise RuntimeError("snapshot source changed since the last audit")
+    if audit.get("snapshot_sha256") != previous_snapshot_sha256:
+        raise RuntimeError("snapshot changed outside the audited completion transition")
+    generation = audit.get("generation")
+    if not isinstance(generation, int) or generation < 0:
+        raise RuntimeError("snapshot audit generation is invalid")
+    next_audit = {
+        **audit,
+        "run_stamp": run_stamp,
+        "source_sha256": source_sha256,
+        "snapshot_sha256": snapshot_sha256,
+        "breakdown_sha256": breakdown_sha256,
+        "queue_cas": queue_cas,
+        "generation": generation + 1,
+        "mutation": {
+            "kind": "completed_todo_removal",
+            "previous_snapshot_sha256": previous_snapshot_sha256,
+            "removed_todo_first_line": removed_todo_first_line,
+        },
+    }
+    current_audit_path.parent.mkdir(parents=True, exist_ok=True)
+    for target in (archive_audit_path, current_audit_path):
+        fd, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=str(target.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(next_audit, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+except Exception as error:
+    print(f"snapshot mutation audit failed: {error}", file=sys.stderr)
+    raise SystemExit(78)
+PY
+}
+
+finalize_phase_loop_todo_snapshot_removal() {
+  local run_stamp="$1"
+  local todo_backup="$2"
+  local removed_todo_first_line="${3:-}"
+  if [ -z "$removed_todo_first_line" ]; then
+    removed_todo_first_line="$(claim_field selected_todo | sed -n '1p')"
+  fi
+  if ! write_phase_loop_snapshot_mutation_audit "$run_stamp" "$todo_backup" "$removed_todo_first_line"; then
+    cp "$todo_backup" "$PHASE_LOOP_TODO" 2>/dev/null || true
+    mark_completed_todo_cleanup_pending "$run_stamp" || true
+    printf '%s run=%s completed_todo_snapshot_audit_failed=true restored_snapshot=true\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+    rm -f "$todo_backup"
+    return 76
+  fi
+  rm -f "$todo_backup"
+  return 0
 }
 
 run_phase_loop_preflight() {
@@ -13257,7 +13341,7 @@ run_phase_loop_preflight() {
     return 0
   fi
   if [ -n "${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}" ]; then
-    snapshot_args=(--snapshot-source "$PHASE_LOOP_TODO_SNAPSHOT_SOURCE")
+    snapshot_args=(--snapshot-source "$PHASE_LOOP_TODO_SNAPSHOT_SOURCE" --snapshot-audit "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE")
   fi
   set +e
   output="$(
@@ -13318,7 +13402,13 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
   fi
   printf '%s run=%s phase_loop_preflight_passed=true stage=%s result=%s\n' "$(now_utc)" "$run_stamp" "$stage" "$output" >> "$SUPERVISOR_LOG"
   if [ "$stage" = "pre-claim-boundary" ]; then
-    write_phase_loop_snapshot_audit "$run_stamp" "$output"
+    if ! write_phase_loop_snapshot_audit "$run_stamp" "$output"; then
+      detail="Phase-loop TODO snapshot audit could not be durably written; refusing claim rebaseline, claim selection, task-ledger transition, and Runtime start."
+      printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+      printf '%s run=%s phase_loop_snapshot_audit_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
   else
     write_bdk_trajectory_event "$run_stamp" "verification.run" "$output"
   fi
