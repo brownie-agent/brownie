@@ -376,7 +376,7 @@ assert_contains "$PHASE_LOOP" 'never generate a read-only `Read`, `Inspect`, or 
 assert_contains "$PHASE_LOOP" "phase-loop-pr-actor-guard.mjs"
 assert_contains "${BASH_SOURCE[0]}" "phase_loop_smoke_cpu_count"
 assert_contains "${BASH_SOURCE[0]}" "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"
-assert_contains "${BASH_SOURCE[0]}" 'claim_smoke_batch_size="$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"'
+assert_contains "${BASH_SOURCE[0]}" 'claim_smoke_batch_size="\$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"'
 
 claim_smoke_private_state_sha256() {
   local state_root="$REPO_ROOT/.brownie/private/phase-loop"
