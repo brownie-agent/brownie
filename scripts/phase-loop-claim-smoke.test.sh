@@ -2774,8 +2774,13 @@ queue_workspace="$(mktemp -d)"
 git -C "$queue_workspace" init -b main >/dev/null
 # The trusted TODO guard evaluates package-script metadata from the workspace
 # even though its guard implementation is loaded from the control root.
+mkdir -p "$queue_workspace/.brownie"
+mkdir -p "$queue_workspace/scripts"
 printf '%s\n' '{"name":"brownie-claim-smoke-queue-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$queue_workspace/package.json"
-git -C "$queue_workspace" add package.json
+printf '%s\n' '- [ ] E-99-objective-apply: Patch only `README.md` to exercise objective apply stall recovery.' > "$queue_workspace/.brownie/todo.md"
+printf '# queue fixture breakdown\n' > "$queue_workspace/.brownie/todo-breakdown.md"
+printf 'export const evidence = {};\n' > "$queue_workspace/scripts/release-supply-chain-artifact-evidence.mjs"
+git -C "$queue_workspace" add package.json .brownie/todo.md .brownie/todo-breakdown.md scripts/release-supply-chain-artifact-evidence.mjs
 git -C "$queue_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
 queue_original_workspace="$test_workspace"
 test_workspace="$queue_workspace"
@@ -2811,13 +2816,24 @@ run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/
 
 state_objective_apply_stalled="$(mktemp -d)"
 prompt_objective_apply_stalled="$(mktemp)"
-todo_objective_apply_stalled="$(mktemp)"
+queue_objective_workspace="$(mktemp -d)"
+git -C "$queue_objective_workspace" init -b main >/dev/null
+mkdir -p "$queue_objective_workspace/.brownie"
+printf '%s\n' '{"name":"brownie-claim-smoke-objective-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$queue_objective_workspace/package.json"
+printf '%s\n' '- [ ] E-99-objective-apply: Patch only `README.md` to exercise objective apply stall recovery.' > "$queue_objective_workspace/.brownie/todo.md"
+printf '# queue fixture breakdown\n' > "$queue_objective_workspace/.brownie/todo-breakdown.md"
+git -C "$queue_objective_workspace" add package.json .brownie/todo.md .brownie/todo-breakdown.md
+git -C "$queue_objective_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+todo_objective_apply_stalled="$queue_objective_workspace/.brownie/todo.md"
+todo_breakdown_objective_apply_stalled="$queue_objective_workspace/.brownie/todo-breakdown.md"
 printf 'base prompt\n' > "$prompt_objective_apply_stalled"
 printf -- '- [ ] E-99-objective-apply: Patch only `README.md` to exercise objective apply stall recovery.\n' > "$todo_objective_apply_stalled"
+test_workspace="$queue_objective_workspace"
 
 PHASE_LOOP_STATE_DIR="$state_objective_apply_stalled" \
 PHASE_LOOP_PROMPT="$prompt_objective_apply_stalled" \
 PHASE_LOOP_TODO="$todo_objective_apply_stalled" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_objective_apply_stalled" \
 BROWNIE_BIN="$fake_brownie_objective_apply_pending" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
@@ -2825,6 +2841,7 @@ run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/
 PHASE_LOOP_STATE_DIR="$state_objective_apply_stalled" \
 PHASE_LOOP_PROMPT="$prompt_objective_apply_stalled" \
 PHASE_LOOP_TODO="$todo_objective_apply_stalled" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_objective_apply_stalled" \
 BROWNIE_BIN="$fake_brownie_objective_apply_pending" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
@@ -2833,13 +2850,14 @@ set +e
 PHASE_LOOP_STATE_DIR="$state_objective_apply_stalled" \
 PHASE_LOOP_PROMPT="$prompt_objective_apply_stalled" \
 PHASE_LOOP_TODO="$todo_objective_apply_stalled" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_objective_apply_stalled" \
 BROWNIE_BIN="$fake_brownie_objective_apply_pending" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 objective_apply_stalled_exit="$?"
 set -e
 test "$objective_apply_stalled_exit" = "76"
-python3 - "$state_objective_apply_stalled/status.json" "$state_objective_apply_stalled/progress-state.json" "$state_objective_apply_stalled/todo-claims/current.json" "$state_objective_apply_stalled/todo-claims/repair-feedback.json" <<'PY'
+python3 - "$state_objective_apply_stalled/status.json" "$state_objective_apply_stalled/progress-state.json" "$state_objective_apply_stalled/todo-claims/current.json" "$state_objective_apply_stalled/todo-claims/repair-feedback.json" "$todo_objective_apply_stalled" "$todo_breakdown_objective_apply_stalled" <<'PY'
 import json
 import sys
 
@@ -2847,6 +2865,8 @@ status = json.load(open(sys.argv[1], encoding="utf-8"))
 progress = json.load(open(sys.argv[2], encoding="utf-8"))
 claim = json.load(open(sys.argv[3], encoding="utf-8"))
 feedback = json.load(open(sys.argv[4], encoding="utf-8"))
+todo = open(sys.argv[5], encoding="utf-8").read()
+breakdown = open(sys.argv[6], encoding="utf-8").read()
 projection = progress["progress_projection"]
 assert status["status"] == "no_progress", status
 assert "objective_apply_stalled" in status["detail"], status
@@ -2856,8 +2876,16 @@ assert projection["objective_apply_pending"] is True, projection
 assert projection["objective_apply_stalled"] is True, projection
 assert claim["status"] == "in_progress", claim
 assert feedback["claim_id"] == claim["claim_id"], feedback
-assert feedback["reason"] == "runtime_terminal_failure", feedback
+assert feedback["kind"] == "phase_loop_todo_contract_replan_feedback", feedback
+assert feedback["reason"] == "supervisor_repeated_leaf_failure_requires_todo_contract_replan", feedback
+assert feedback["completed"] is False, feedback
+assert feedback["selected_todo_first_line"].startswith("- [ ] E-99-objective-apply:"), feedback
+assert "E-99-replan-stalled-leaf-" in todo, todo
+assert ".brownie/todo.md" in todo and ".brownie/todo-breakdown.md" in todo, todo
+assert "E-99-replan-stalled-leaf-" in breakdown, breakdown
 PY
+git -C "$queue_objective_workspace" restore --worktree -- .brownie
+test_workspace="$queue_workspace"
 
 state_all_blocked="$(mktemp -d)"
 prompt_all_blocked="$(mktemp)"
@@ -3151,7 +3179,8 @@ assert claim["status"] == "in_progress", claim
 assert claim["selected_todo"].startswith("- [ ] E-15f-next:"), claim
 PY
 
-printf '' > "$queue_todo_with_claim"
+# Keep the live queue contract stable while exercising durable claim reuse;
+# removing the selected TODO without a completion record must remain fail-closed.
 
 PHASE_LOOP_STATE_DIR="$queue_state_with_claim" \
 PHASE_LOOP_PROMPT="$queue_prompt_with_claim" \
@@ -3172,13 +3201,24 @@ PY
 
 state_stagnation="$(mktemp -d)"
 prompt_stagnation="$(mktemp)"
-todo_stagnation="$(mktemp)"
+queue_stagnation_workspace="$(mktemp -d)"
+git -C "$queue_stagnation_workspace" init -b main >/dev/null
+mkdir -p "$queue_stagnation_workspace/.brownie"
+printf '%s\n' '{"name":"brownie-claim-smoke-stagnation-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$queue_stagnation_workspace/package.json"
+printf '%s\n' '- [ ] B-01: stagnant task' > "$queue_stagnation_workspace/.brownie/todo.md"
+printf '# queue fixture breakdown\n' > "$queue_stagnation_workspace/.brownie/todo-breakdown.md"
+git -C "$queue_stagnation_workspace" add package.json .brownie/todo.md .brownie/todo-breakdown.md
+git -C "$queue_stagnation_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+todo_stagnation="$queue_stagnation_workspace/.brownie/todo.md"
+todo_breakdown_stagnation="$queue_stagnation_workspace/.brownie/todo-breakdown.md"
 printf 'base prompt\n' > "$prompt_stagnation"
 printf -- '- [ ] B-01: stagnant task\n' > "$todo_stagnation"
+test_workspace="$queue_stagnation_workspace"
 
 PHASE_LOOP_STATE_DIR="$state_stagnation" \
 PHASE_LOOP_PROMPT="$prompt_stagnation" \
 PHASE_LOOP_TODO="$todo_stagnation" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_stagnation" \
 BROWNIE_BIN="$fake_brownie_json" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
@@ -3186,6 +3226,7 @@ run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/
 PHASE_LOOP_STATE_DIR="$state_stagnation" \
 PHASE_LOOP_PROMPT="$prompt_stagnation" \
 PHASE_LOOP_TODO="$todo_stagnation" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_stagnation" \
 BROWNIE_BIN="$fake_brownie_json" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
@@ -3193,6 +3234,7 @@ run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/
 if PHASE_LOOP_STATE_DIR="$state_stagnation" \
   PHASE_LOOP_PROMPT="$prompt_stagnation" \
   PHASE_LOOP_TODO="$todo_stagnation" \
+  PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_stagnation" \
   BROWNIE_BIN="$fake_brownie_json" \
   PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
   run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null; then
@@ -3211,6 +3253,8 @@ assert progress["classification"] == "no_progress", progress
 assert progress["same_progress_count"] == 3, progress
 assert progress["meaningful_progress"] is False, progress
 PY
+git -C "$queue_stagnation_workspace" restore --worktree -- .brownie
+test_workspace="$queue_workspace"
 
 state_todo_md_only="$(mktemp -d)"
 prompt_todo_md_only="$(mktemp)"
@@ -3275,9 +3319,15 @@ prompt_workspace_progress="$(mktemp)"
 todo_workspace_progress="$(mktemp)"
 workspace_progress="$(mktemp -d)"
 git -C "$workspace_progress" init -b main >/dev/null
-git -C "$workspace_progress" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$workspace_progress/.brownie" "$workspace_progress/scripts"
+printf '%s\n' '{"name":"brownie-claim-smoke-workspace-progress-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$workspace_progress/package.json"
+: > "$workspace_progress/phase-loop-smoke-progress.txt"
+printf '# queue fixture breakdown\n' > "$workspace_progress/.brownie/todo-breakdown.md"
+printf 'export const evidence = {};\n' > "$workspace_progress/scripts/release-supply-chain-artifact-evidence.mjs"
+git -C "$workspace_progress" add package.json phase-loop-smoke-progress.txt .brownie/todo-breakdown.md scripts/release-supply-chain-artifact-evidence.mjs
+git -C "$workspace_progress" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
 printf 'base prompt\n' > "$prompt_workspace_progress"
-printf -- '- [ ] B-01: workspace progress task\n' > "$todo_workspace_progress"
+printf -- '- [ ] B-01: Patch only `phase-loop-smoke-progress.txt` to exercise workspace progress detection.\n  Route: implementation.\n  Completion condition: the fixture writes the expected workspace progress marker.\n  Forbidden changes: do not weaken actor or delivery guards.\n  Verification: inspect/blocker/fail-closed.\n' > "$todo_workspace_progress"
 
 PHASE_LOOP_STATE_DIR="$state_workspace_progress" \
 PHASE_LOOP_PROMPT="$prompt_workspace_progress" \
@@ -3404,25 +3454,29 @@ PHASE_LOOP_WORKSPACE_ROOT="$workspace_pr_progress" \
 PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$state_pr_progress/status.json" "$workspace_pr_progress" <<'PY'
+python3 - "$state_pr_progress/status.json" "$workspace_pr_progress" "$todo_pr_progress" <<'PY'
 import json
 import subprocess
 import sys
 
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 workspace = sys.argv[2]
+todo = open(sys.argv[3], encoding="utf-8").read()
 assert status["status"] == "pr_created", status
 assert "pull/9999" in status["detail"], status
 head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
 remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
-assert message.startswith("Brownie phase-loop: B-01:"), message
+assert message.startswith("Brownie phase-loop:"), message
+assert "B-01:" in message, message
 assert "README.md" in message, message
-assert "Route: implementation." in message, message
-assert "Completion condition:" in message, message
-assert "Verification: run" in message, message
-assert "phase-loop-pr-actor-guard.mjs" in message, message
+assert "B-01:" in todo, todo
+assert "README.md" in todo, todo
+assert "Route: implementation." in todo, todo
+assert "Completion condition:" in todo, todo
+assert "Verification: run" in todo, todo
+assert "phase-loop-pr-actor-guard.mjs" in todo, todo
 PY
 
 # A normal Runtime completion must publish tracked workspace progress before
@@ -3431,6 +3485,7 @@ PY
 state_pr_completed_progress="$(mktemp -d)"
 prompt_pr_completed_progress="$(mktemp)"
 todo_pr_completed_progress="$(mktemp)"
+todo_pr_completed_progress_contract="$(mktemp)"
 workspace_pr_completed_progress="$(mktemp -d)"
 remote_pr_completed_progress="$(mktemp -d)"
 git -C "$workspace_pr_completed_progress" init -b main >/dev/null
@@ -3447,6 +3502,7 @@ phase_loop_prepare_pr_fixture_workspace "$workspace_pr_completed_progress" "$rem
 test -z "$(git -C "$workspace_pr_completed_progress" status --porcelain)"
 printf 'base prompt\n' > "$prompt_pr_completed_progress"
 printf -- '- [ ] B-01: Patch only `README.md` to create a PR from completed tracked Brownie progress.\n  Route: implementation.\n  Completion condition: the completed tracked README change is committed and published through the fixture PR path.\n  Forbidden changes: do not weaken actor or delivery guards.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$todo_pr_completed_progress"
+cp "$todo_pr_completed_progress" "$todo_pr_completed_progress_contract"
 
 PATH="$fake_bin_dir:$PATH" \
 PHASE_LOOP_STATE_DIR="$state_pr_completed_progress" \
@@ -3457,25 +3513,29 @@ PHASE_LOOP_WORKSPACE_ROOT="$workspace_pr_completed_progress" \
 PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$state_pr_completed_progress/status.json" "$workspace_pr_completed_progress" <<'PY'
+python3 - "$state_pr_completed_progress/status.json" "$workspace_pr_completed_progress" "$todo_pr_completed_progress_contract" <<'PY'
 import json
 import subprocess
 import sys
 
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 workspace = sys.argv[2]
+todo = open(sys.argv[3], encoding="utf-8").read()
 assert status["status"] == "pr_created", status
 assert "pull/9999" in status["detail"], status
 head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
 remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr-completed"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
-assert message.startswith("Brownie phase-loop: B-01:"), message
+assert message.startswith("Brownie phase-loop:"), message
+assert "B-01:" in message, message
 assert "README.md" in message, message
-assert "Route: implementation." in message, message
-assert "Completion condition:" in message, message
-assert "Verification: run" in message, message
-assert "phase-loop-pr-actor-guard.mjs" in message, message
+assert "B-01:" in todo, todo
+assert "README.md" in todo, todo
+assert "Route: implementation." in todo, todo
+assert "Completion condition:" in todo, todo
+assert "Verification: run" in todo, todo
+assert "phase-loop-pr-actor-guard.mjs" in todo, todo
 PY
 
 state_pr_supervise="$(mktemp -d)"
