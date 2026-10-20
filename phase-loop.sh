@@ -2642,10 +2642,12 @@ PY
   rm -f "$guard_stdout" "$guard_stderr"
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    node --input-type=module - <<'NODE'
+    node --input-type=module - "$ROOT_DIR/scripts/guard-runtime-release-readiness.mjs" <<'NODE'
 import fs from 'node:fs';
 import path from 'node:path';
-import { buildSafetyReadinessEvidenceSnapshot } from './scripts/guard-runtime-release-readiness.mjs';
+import { pathToFileURL } from 'node:url';
+
+const { buildSafetyReadinessEvidenceSnapshot } = await import(pathToFileURL(process.argv[1]).href);
 
 const auditPath = path.join(process.cwd(), 'docs/architecture/runtime-release-readiness-audit.json');
 const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
@@ -6322,6 +6324,7 @@ run_integrated_supervisor_control() {
     PHASE_LOOP_SUPERVISOR_CONTROL_ACTIVE=1 \
       node "$ROOT_DIR/scripts/phase-loop-supervisor-control.mjs" \
         --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
+        --control-plane-root "$ROOT_DIR" \
         --repair \
         --no-start \
         --write
@@ -9636,7 +9639,7 @@ phase_loop_create_pr_for_progress() {
   fi
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" --role implementation >/dev/null
+    node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" --role implementation --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" >/dev/null
   ) || {
     printf '%s pr_create_skipped reason=implementation_preflight_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 1

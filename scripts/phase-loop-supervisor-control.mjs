@@ -11,10 +11,16 @@ import { loadTodoState } from './phase-loop-todo-state.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const defaultRepoRoot = path.resolve(__dirname, '..');
+let activeControlPlaneRoot = defaultRepoRoot;
+
+function controlPlaneScript(relativePath) {
+  return path.join(activeControlPlaneRoot, relativePath);
+}
 
 function parseArgs(argv) {
   const args = {
     repo: defaultRepoRoot,
+    controlPlaneRoot: defaultRepoRoot,
     write: true,
     repair: true,
     start: false,
@@ -27,6 +33,8 @@ function parseArgs(argv) {
       continue;
     } else if (arg === '--repo') {
       args.repo = path.resolve(argv[++index]);
+    } else if (arg === '--control-plane-root') {
+      args.controlPlaneRoot = path.resolve(argv[++index]);
     } else if (arg === '--write') {
       args.write = true;
     } else if (arg === '--no-write') {
@@ -81,7 +89,7 @@ function runTextCommand(repoRoot, command, args) {
 
 function runTodoQueueIntegrity(repoRoot) {
   return runJsonCommand(repoRoot, process.execPath, [
-    'scripts/phase-loop-todo-queue-integrity.mjs',
+    controlPlaneScript('scripts/phase-loop-todo-queue-integrity.mjs'),
     '--repo',
     repoRoot,
     '--todo',
@@ -113,7 +121,7 @@ function maybeArchiveResolvedRepairFeedback(repoRoot) {
     return { attempted: false, reason: 'feedback_kind_requires_its_own_verification', kind: feedback.kind ?? null };
   }
   try {
-    runTextCommand(repoRoot, process.execPath, ['scripts/guard-todo-decomposition.mjs']);
+    runTextCommand(repoRoot, process.execPath, [controlPlaneScript('scripts/guard-todo-decomposition.mjs'), '--repo', repoRoot, '--todo', '.brownie/todo.md', '--breakdown', '.brownie/todo-breakdown.md']);
     const integrity = runTodoQueueIntegrity(repoRoot);
     if (integrity.valid !== true) return { attempted: false, reason: 'todo_queue_integrity_still_invalid', integrity };
     const archiveDir = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback-archive');
@@ -205,7 +213,7 @@ function maybeRepairTodoContract(repoRoot, diagnostic) {
   }
   try {
     const result = runJsonCommand(repoRoot, process.execPath, [
-      'scripts/repair-todo-decomposition.mjs',
+      controlPlaneScript('scripts/repair-todo-decomposition.mjs'),
       '--claim',
       path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json'),
       '--todo',
@@ -261,7 +269,7 @@ function maybeRepairTodoQueueIntegrity(repoRoot, diagnostic) {
       JSON.stringify(diagnostic)
     ].filter(Boolean).join('\n');
     const repairResult = runJsonCommand(repoRoot, process.execPath, [
-      'scripts/phase-loop-preclaim-recovery.mjs',
+      controlPlaneScript('scripts/phase-loop-preclaim-recovery.mjs'),
       '--repo',
       repoRoot,
       '--claim',
@@ -1052,12 +1060,8 @@ function todoBlocks(todoText) {
 }
 
 function phaseLoopControllerFingerprint(repoRoot) {
-  const files = ['phase-loop.sh', 'scripts/phase-loop-todo-evaluator.mjs'];
-  // Diagnostic tests use an isolated state fixture rather than a controller
-  // checkout. In that case, fingerprint the executing controller itself.
-  const controllerRoot = files.every((file) => fs.existsSync(path.join(repoRoot, file)))
-    ? repoRoot
-    : defaultRepoRoot;
+  const files = ['phase-loop.sh', 'scripts/phase-loop-controller-source-manifest.json', 'scripts/phase-loop-todo-evaluator.mjs'];
+  const controllerRoot = activeControlPlaneRoot;
   const manifest = files.map((file) => {
     const content = fs.readFileSync(path.join(controllerRoot, file));
     return `${crypto.createHash('sha256').update(content).digest('hex')}  ${file}\n`;
@@ -1283,13 +1287,13 @@ function postRepairValidation(repoRoot, repairs, diagnostic) {
       kind: 'command',
       name: 'guard-todo-decomposition',
       command: process.execPath,
-      args: ['scripts/guard-todo-decomposition.mjs']
+      args: [controlPlaneScript('scripts/guard-todo-decomposition.mjs'), '--repo', repoRoot, '--todo', '.brownie/todo.md', '--breakdown', '.brownie/todo-breakdown.md']
     });
     steps.push({
       kind: 'command',
       name: 'phase-loop-todo-queue-integrity',
       command: process.execPath,
-      args: ['scripts/phase-loop-todo-queue-integrity.mjs']
+      args: [controlPlaneScript('scripts/phase-loop-todo-queue-integrity.mjs'), '--repo', repoRoot, '--todo', '.brownie/todo.md', '--breakdown', '.brownie/todo-breakdown.md']
     });
   }
   if (changedPaths.has('.brownie/private/phase-loop/todo-claims/repair-feedback.json')) {
@@ -2792,7 +2796,7 @@ function maybeStartPhaseLoop(repoRoot, enabled, diagnostic, options = {}) {
     };
   }
   try {
-    const stdout = runTextCommand(repoRoot, './phase-loop.sh', ['start']);
+    const stdout = runTextCommand(repoRoot, controlPlaneScript('phase-loop.sh'), ['start']);
     return { attempted: true, ok: true, stdout };
   } catch (error) {
     return {
@@ -2807,6 +2811,7 @@ function maybeStartPhaseLoop(repoRoot, enabled, diagnostic, options = {}) {
 
 export function controlPhaseLoop(options = {}) {
   const repoRoot = path.resolve(options.repoRoot ?? defaultRepoRoot);
+  activeControlPlaneRoot = path.resolve(options.controlPlaneRoot ?? defaultRepoRoot);
   const delegationProvenanceVerifier = options.delegationProvenanceVerifier
     ?? ((_, pullRequestUrl, implementationCommit) => verifyDelegationPullRequestProvenance(
       repoRoot,
@@ -3110,6 +3115,7 @@ export function controlPhaseLoop(options = {}) {
     control_kind: 'brownie_phase_loop_supervisor_control',
     generated_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
     repo_root: repoRoot,
+    control_plane_root: activeControlPlaneRoot,
     initial_summary: initial.summary,
     repair: {
       failure_ledger: failureLedger,
@@ -3151,6 +3157,7 @@ if (process.argv[1] === __filename) {
   const args = parseArgs(process.argv);
   const result = controlPhaseLoop({
     repoRoot: args.repo,
+    controlPlaneRoot: args.controlPlaneRoot,
     write: args.write,
     repair: args.repair,
     start: args.start,

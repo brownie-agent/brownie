@@ -37,6 +37,8 @@ test('accepts every manifest-listed control-plane script at the approved baselin
   const result = inspectControlPlaneSource({ repoRoot: repo, baselineRef: 'origin/main' });
   assert.equal(result.ok, true, JSON.stringify(result, null, 2));
   assert.match(result.source_fingerprint, /^sha256:[0-9a-f]{64}$/u);
+  assert(result.fingerprint_paths.includes('phase-loop.sh'));
+  assert(result.fingerprint_paths.includes('scripts/phase-loop-controller-source-manifest.json'));
   assert(result.files.length > 0);
 });
 
@@ -75,6 +77,8 @@ test('controller routes control-plane execution through ROOT_DIR and never works
   assert.doesNotMatch(controller.slice(preflight, rebaseline), /node scripts\/phase-loop-preflight\.mjs/u);
   assert.doesNotMatch(controller.slice(preflight, rebaseline), /PHASE_LOOP_WORKSPACE_ROOT\/scripts\/phase-loop-preflight\.mjs/u);
   assert.doesNotMatch(controller, /node\s+[^\n]*PHASE_LOOP_WORKSPACE_ROOT\/scripts\/(?:phase-loop|guard-|repair-)/u);
+  assert.match(controller, /node --input-type=module - "\$ROOT_DIR\/scripts\/guard-runtime-release-readiness\.mjs"/u);
+  assert.doesNotMatch(controller, /from ['"]\.\/scripts\/guard-runtime-release-readiness\.mjs['"]/u);
   assert.match(controller, /node "\$control_plane_guard" --repo "\$ROOT_DIR" --baseline-ref/u);
   assert.ok(boundary > preflight);
 });

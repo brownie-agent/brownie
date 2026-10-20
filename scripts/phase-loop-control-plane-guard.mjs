@@ -70,7 +70,8 @@ export function inspectControlPlaneSource({
   } catch (error) {
     errors.push(`approved controller baseline ${baselineRef} could not be resolved: ${error.message}`);
   }
-  const files = paths.map((relativePath) => {
+  const fingerprintPaths = [manifestPath, 'phase-loop.sh', ...paths].sort();
+  const files = fingerprintPaths.map((relativePath) => {
     const currentPath = path.join(root, relativePath);
     let current = null;
     let baseline = null;
@@ -94,6 +95,7 @@ export function inspectControlPlaneSource({
     baseline_ref: baselineRef,
     baseline_commit: baselineCommit,
     control_plane_paths: paths,
+    fingerprint_paths: fingerprintPaths,
     source_fingerprint: sourceFingerprint,
     files,
     errors

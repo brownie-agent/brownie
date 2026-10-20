@@ -16,6 +16,15 @@ import { readTrackedBreakdownReplanRecords } from './phase-loop-todo-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+test('nested supervisor repair uses the explicit controller source root', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'phase-loop-supervisor-control.mjs'), 'utf8');
+  assert.match(source, /--control-plane-root/u);
+  assert.match(source, /controlPlaneScript\('scripts\/phase-loop-todo-queue-integrity\.mjs'\)/u);
+  assert.match(source, /controlPlaneScript\('scripts\/repair-todo-decomposition\.mjs'\)/u);
+  assert.match(source, /controlPlaneScript\('scripts\/phase-loop-preclaim-recovery\.mjs'\)/u);
+  assert.doesNotMatch(source, /runJsonCommand\(repoRoot, process\.execPath, \[\s*'scripts\/(?:phase-loop-todo-queue-integrity|repair-todo-decomposition|phase-loop-preclaim-recovery)\.mjs'/u);
+});
+
 const runtimeEvidenceTodo = `- [ ] E-21c-runtime-operational-evidence-impl-2-target-02: Patch only \`scripts/guard-runtime-operational-evidence.test.mjs\` to require runtime operational evidence to model release operation as executable fail-closed evidence:
   Route: implementation.
   Source TODO: E-21c-runtime-operational-evidence.
