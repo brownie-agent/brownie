@@ -13388,6 +13388,10 @@ run_phase_loop_preflight() {
     return 78
   fi
   if [ -n "${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}" ]; then
+    if [ -z "${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-}" ]; then
+      printf '%s run=%s phase_loop_preflight_snapshot_audit_missing=true source=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_TODO_SNAPSHOT_SOURCE" >> "$SUPERVISOR_LOG"
+      return 78
+    fi
     snapshot_args=(--snapshot-source "$PHASE_LOOP_TODO_SNAPSHOT_SOURCE" --snapshot-audit "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE")
   fi
   set +e
@@ -13402,7 +13406,7 @@ run_phase_loop_preflight() {
       --controller-fingerprint "$PHASE_LOOP_CONTROL_PLANE_FINGERPRINT" \
       --claim "$TODO_CLAIM_FILE" \
       --stage "$stage" \
-      "${snapshot_args[@]}"
+      ${snapshot_args[@]+"${snapshot_args[@]}"}
   2>&1)"
   status=$?
   set -e

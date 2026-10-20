@@ -404,6 +404,15 @@ test('places the strict preflight boundary before claim rebaseline and forbids l
   assert.doesNotMatch(auditFailureBoundary, /phase_loop_rebaseline_stale_claim|write_bdk_trajectory_event|run_brownie_runtime/u);
 });
 
+test('expands optional snapshot arguments safely and rejects incomplete snapshot configuration', () => {
+  const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
+  const preflightFunction = controller.indexOf('run_phase_loop_preflight()');
+  const preflightBody = controller.slice(preflightFunction, controller.indexOf('\n}\n\n', preflightFunction) + 3);
+  assert.match(preflightBody, /phase_loop_preflight_snapshot_audit_missing=true/u);
+  assert.match(preflightBody, /\$\{snapshot_args\[@\]\+"\$\{snapshot_args\[@\]\}"\}/u);
+  assert.doesNotMatch(preflightBody, /"\$\{snapshot_args\[@\]\}"\s*\n\s*2>&1/u);
+});
+
 test('bounded implementation leaves are not instructed to re-split their TODO on missing patch context', () => {
   const prompt = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.md'), 'utf8');
   assert.match(prompt, /This is allowed only when the\s+selected TODO is not already a bounded leaf with explicit patch targets\./);
