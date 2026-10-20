@@ -107,11 +107,6 @@ PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK="${PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK
 
 mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
 
-if [ "${PHASE_LOOP_TEST_TRACE_ERRORS:-0}" = "1" ]; then
-  set -E
-  trap 'printf "%s phase_loop_test_err_trap line=%s command=%s\n" "$(now_utc)" "${BASH_LINENO[0]:-unknown}" "$BASH_COMMAND" >&2' ERR
-fi
-
 json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])'
 }
@@ -14726,10 +14721,7 @@ PY
     fi
   ) > "$stdout_log" 2> "$stderr_log"
   exit_code=$?
-  if ! bind_runtime_stdout_to_active_claim "$stdout_log"; then
-    printf '%s run=%s runtime_stdout_claim_binding_skipped=true reason=active_claim_unavailable_or_stdout_binding_failed stdout=%s\n' \
-      "$(now_utc)" "$run_stamp" "$stdout_log" >> "$SUPERVISOR_LOG"
-  fi
+  bind_runtime_stdout_to_active_claim "$stdout_log"
   if [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ] && {
     [ "${active_target_path##*.}" = "json" ] || [ "${active_target_path##*.}" = "jsonc" ];
   }; then
@@ -14889,7 +14881,7 @@ PY
     if [ -f "$ROOT_DIR/scripts/guard-js-duplicate-exports.mjs" ]; then
       active_target_duplicate_exports_output="$(
         cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-        node "$ROOT_DIR/scripts/guard-js-duplicate-exports.mjs" "$active_target_path" 2>&1
+        node "$ROOT_DIR/scripts/guard-js-duplicate-exports.mjs" "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" 2>&1
       )"
       active_target_duplicate_exports_status=$?
       if [ "$active_target_duplicate_exports_status" -ne 0 ]; then

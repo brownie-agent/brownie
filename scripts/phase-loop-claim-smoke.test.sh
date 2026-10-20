@@ -323,12 +323,6 @@ run_with_timeout() {
         echo "--- $PHASE_LOOP_STATE_DIR/logs/supervisor.log (tail) ---" >&2
         tail -n 80 "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" >&2
       fi
-      for diagnostic_file in "$PHASE_LOOP_STATE_DIR"/terminal-retry-then-success.runtime-trace; do
-        if [ -f "$diagnostic_file" ]; then
-          echo "--- $diagnostic_file ---" >&2
-          cat "$diagnostic_file" >&2
-        fi
-      done
     fi
       ;;
     esac
@@ -773,8 +767,6 @@ fake_brownie_terminal_retry_then_success="$(mktemp)"
 cat > "$fake_brownie_terminal_retry_then_success" <<SH
 #!/usr/bin/env bash
 set -eu
-trace_file="\$PHASE_LOOP_STATE_DIR/terminal-retry-then-success.runtime-trace"
-trap 'printf "runtime_exit=%s attempt=%s\\n" "\$?" "\${attempt:-unset}" >> "\$trace_file"' EXIT
 attempt_file="\$PHASE_LOOP_STATE_DIR/terminal-retry-then-success.attempt"
 attempt="\$(python3 - "\$attempt_file" <<'PY'
 import pathlib
@@ -1440,7 +1432,6 @@ BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
-PHASE_LOOP_TEST_TRACE_ERRORS=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 retry_success_first_exit="$?"
@@ -1475,7 +1466,6 @@ BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
-PHASE_LOOP_TEST_TRACE_ERRORS=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 retry_success_second_exit="$?"
