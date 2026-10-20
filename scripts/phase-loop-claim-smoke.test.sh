@@ -1438,6 +1438,25 @@ retry_success_first_exit="$?"
 set -e
 test "$retry_success_first_exit" = "76"
 test ! -f "$state_terminal_retry_success/todo-claims/current.json"
+if [ ! -f "$state_terminal_retry_success/terminal-retry-then-success.attempt" ]; then
+  echo "retry-success fixture did not reach its first Runtime invocation" >&2
+  if [ -f "$state_terminal_retry_success/status.json" ]; then
+    cat "$state_terminal_retry_success/status.json" >&2
+  fi
+  if [ -f "$state_terminal_retry_success/logs/supervisor.log" ]; then
+    tail -n 120 "$state_terminal_retry_success/logs/supervisor.log" >&2
+  fi
+  latest_retry_success_stdout="$(find "$state_terminal_retry_success/runs" -name '*.stdout.log' -type f -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+  latest_retry_success_stderr="$(find "$state_terminal_retry_success/runs" -name '*.stderr.log' -type f -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+  for retry_success_diagnostic in "$latest_retry_success_stdout" "$latest_retry_success_stderr"; do
+    if [ -n "$retry_success_diagnostic" ] && [ -f "$retry_success_diagnostic" ]; then
+      echo "--- $retry_success_diagnostic ---" >&2
+      tail -n 80 "$retry_success_diagnostic" >&2
+    fi
+  done
+  exit 1
+fi
+test "$(cat "$state_terminal_retry_success/terminal-retry-then-success.attempt")" = "1"
 set +e
 PHASE_LOOP_STATE_DIR="$state_terminal_retry_success" \
 PHASE_LOOP_PROMPT="$prompt_terminal_retry_success" \
