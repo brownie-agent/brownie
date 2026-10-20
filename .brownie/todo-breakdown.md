@@ -21,7 +21,7 @@ Dependency graph:
 
 Verification ledger:
 - E-23a-release-artifact-portable-archive: `pnpm --workspace-root release:local-artifact:test`; `pnpm --workspace-root guard:supply-chain-artifact-evidence:test`; Release Workflow matrix
-- E-23b-release-artifact-download-roundtrip: `node --test scripts/release-artifact-roundtrip-e2e.test.mjs`; Release Workflow matrix
+- E-23b-release-artifact-download-roundtrip: Patch only `scripts/release-artifact-roundtrip-e2e.test.mjs` and `.github/workflows/release.yml`; `node --test scripts/release-artifact-roundtrip-e2e.test.mjs`; Release Workflow matrix
 - E-23c-release-artifact-runtime-journey: `node --test scripts/release-artifact-runtime-journey.test.mjs`; `pnpm --workspace-root guard:runtime-operational-evidence:test`; Release Workflow matrix
 - E-23d-release-artifact-stateful-soak: `node --test scripts/release-artifact-stateful-soak.test.mjs`; `pnpm --workspace-root guard:runtime-operational-evidence:test`; Release Workflow matrix
 - E-23e-release-evidence-roundtrip-collector: `pnpm --workspace-root guard:supply-chain-artifact-evidence`; `pnpm --workspace-root guard:runtime-operational-evidence`
