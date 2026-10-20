@@ -26,6 +26,7 @@ function parseArgs(argv) {
     controllerFingerprint: null,
     snapshotSource: null,
     snapshotAudit: null,
+    profile: 'production',
     skipCommands: false
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -48,6 +49,8 @@ function parseArgs(argv) {
       args.snapshotSource = argv[++index];
     } else if (arg === '--snapshot-audit') {
       args.snapshotAudit = argv[++index];
+    } else if (arg === '--profile') {
+      args.profile = argv[++index];
     } else if (arg === '--skip-commands') {
       args.skipCommands = true;
     } else {
@@ -433,17 +436,25 @@ function validateDirtyDelivery(repoRoot, todoText, errors) {
   }
 }
 
-function validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, errors) {
+function validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors) {
   const controlScripts = path.join(controlPlaneRoot, 'scripts');
-  const commands = [
-    ['node', [path.join(controlScripts, 'guard-todo-decomposition.mjs'), '--repo', repoRoot, '--todo', todoPath, '--breakdown', breakdownPath]],
-    ['node', [path.join(controlScripts, 'phase-loop-todo-queue-integrity.mjs'), '--repo', repoRoot, '--todo', todoPath, '--breakdown', breakdownPath]],
-    ['node', [path.join(controlScripts, 'guard-release-contract.mjs'), '--repo', repoRoot]],
-    ['node', [path.join(controlScripts, 'guard-runtime-release-readiness.mjs'), '--repo', repoRoot]]
-  ];
+  const absoluteTodoPath = path.resolve(repoRoot, todoPath);
+  const absoluteBreakdownPath = path.resolve(repoRoot, breakdownPath);
+  const fixtureProfile = profile === 'claim-smoke-fixture';
+  const policyRoot = fixtureProfile ? controlPlaneRoot : repoRoot;
+  const queueIntegrityCommand = ['node', [path.join(controlScripts, 'phase-loop-todo-queue-integrity.mjs'), '--repo', repoRoot, '--todo', absoluteTodoPath, '--breakdown', absoluteBreakdownPath]];
+  const commands = fixtureProfile
+    ? [queueIntegrityCommand]
+    : [
+      ['node', [path.join(controlScripts, 'guard-todo-decomposition.mjs'), '--repo', policyRoot, '--todo', absoluteTodoPath, '--breakdown', absoluteBreakdownPath]],
+      queueIntegrityCommand,
+      ['node', [path.join(controlScripts, 'guard-release-contract.mjs'), '--repo', policyRoot]],
+      ['node', [path.join(controlScripts, 'guard-runtime-release-readiness.mjs'), '--repo', policyRoot]]
+    ];
   const results = [];
   for (const [command, args] of commands) {
-    const result = runCommand(repoRoot, command, args);
+    const commandRoot = args.includes(path.join(controlScripts, 'phase-loop-todo-queue-integrity.mjs')) ? repoRoot : policyRoot;
+    const result = runCommand(commandRoot, command, args);
     results.push(result);
     if (result.exit_code !== 0) {
       errors.push({
@@ -462,8 +473,23 @@ function validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlan
 export function validatePhaseLoopPreflight(options = {}) {
   const repoRoot = path.resolve(options.repo ?? defaultRepoRoot);
   const controlPlaneRoot = path.resolve(options.controlPlaneRoot ?? repoRoot);
+  const profile = options.profile ?? 'production';
   const errors = [];
   const warnings = [];
+  if (!['production', 'claim-smoke-fixture'].includes(profile)) {
+    errors.push({
+      code: 'phase_loop_preflight_profile_unknown',
+      profile,
+      message: `Unknown phase-loop preflight profile: ${profile}`
+    });
+  }
+  if (profile === 'claim-smoke-fixture' && process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY !== '1') {
+    errors.push({
+      code: 'phase_loop_preflight_fixture_profile_forbidden',
+      profile,
+      message: 'The claim-smoke fixture profile requires the explicit test-only PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 marker.'
+    });
+  }
   const todoPath = options.todo ?? '.brownie/todo.md';
   const todoText = readText(repoRoot, todoPath, errors);
   const breakdownPath = options.breakdown ?? '.brownie/todo-breakdown.md';
@@ -483,14 +509,15 @@ export function validatePhaseLoopPreflight(options = {}) {
       controllerFingerprint: options.controllerFingerprint,
       errors
     });
-  validateReleaseEvidence(repoRoot, errors);
+  validateReleaseEvidence(profile === 'claim-smoke-fixture' ? controlPlaneRoot : repoRoot, errors);
   validateDirtyDelivery(repoRoot, todoText, errors);
-  const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, errors);
+  const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors);
 
   return {
     schema_version: 1,
     valid: errors.length === 0,
     stage: options.stage ?? 'general',
+    profile,
     errors,
     warnings,
     ...(snapshotAudit ? { snapshot_audit: snapshotAudit } : {}),

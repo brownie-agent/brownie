@@ -8,6 +8,11 @@ PHASE_LOOP="$REPO_ROOT/phase-loop.sh"
 # controller so the smoke suite exercises controller behavior without
 # pretending that a PR branch already matches origin/main.
 export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="HEAD"
+# The claim-smoke suite intentionally uses minimal temporary worker repos.
+# This explicit test-only profile lets preflight use the trusted controller
+# policy/evidence while keeping TODO and git queue state workspace-scoped.
+export PHASE_LOOP_PREFLIGHT_PROFILE="claim-smoke-fixture"
+export PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY="1"
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
 PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
 

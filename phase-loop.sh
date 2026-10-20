@@ -36,6 +36,7 @@ PHASE_LOOP_ACTIVE_RUN_ID=""
 PHASE_LOOP_ACTIVE_STDOUT_LOG=""
 PHASE_LOOP_ACTIVE_STDERR_LOG=""
 PHASE_LOOP_CONTROL_PLANE_FINGERPRINT=""
+PHASE_LOOP_PREFLIGHT_PROFILE="${PHASE_LOOP_PREFLIGHT_PROFILE:-production}"
 PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC=""
 PHASE_LOOP_ENV_SOURCES="process environment"
 PHASE_LOOP_RUNTIME_PATH_SOURCE="cli-delegated"
@@ -13366,6 +13367,14 @@ run_phase_loop_preflight() {
   local stage="${2:-general}"
   local output status
   local -a snapshot_args=()
+  if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" != "production" ] && [ "$PHASE_LOOP_PREFLIGHT_PROFILE" != "claim-smoke-fixture" ]; then
+    printf '%s run=%s phase_loop_preflight_profile_rejected=true profile=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_PREFLIGHT_PROFILE" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" = "claim-smoke-fixture" ] && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" != "1" ]; then
+    printf '%s run=%s phase_loop_preflight_fixture_profile_rejected=true profile=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_PREFLIGHT_PROFILE" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
   if [ ! -f "$ROOT_DIR/scripts/phase-loop-preflight.mjs" ]; then
     printf '%s run=%s phase_loop_preflight_missing=true path=%s\n' "$(now_utc)" "$run_stamp" "$ROOT_DIR/scripts/phase-loop-preflight.mjs" >> "$SUPERVISOR_LOG"
     return 78
@@ -13381,6 +13390,7 @@ run_phase_loop_preflight() {
       --todo "$PHASE_LOOP_TODO" \
       --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" \
       --control-plane-root "$ROOT_DIR" \
+      --profile "$PHASE_LOOP_PREFLIGHT_PROFILE" \
       --controller-fingerprint "$PHASE_LOOP_CONTROL_PLANE_FINGERPRINT" \
       --claim "$TODO_CLAIM_FILE" \
       --stage "$stage" \

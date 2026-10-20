@@ -143,8 +143,8 @@ test('runs the TODO guard against the configured snapshot path and rejects malfo
     /TODO decomposition guard failed/u
   );
   const preflight = fs.readFileSync(path.join(repositoryRoot, 'scripts/phase-loop-preflight.mjs'), 'utf8');
-  assert.match(preflight, /guard-todo-decomposition\.mjs'\), '--repo', repoRoot, '--todo', todoPath, '--breakdown', breakdownPath/u);
-  assert.match(preflight, /phase-loop-todo-queue-integrity\.mjs'\), '--repo', repoRoot, '--todo', todoPath, '--breakdown', breakdownPath/u);
+  assert.match(preflight, /guard-todo-decomposition\.mjs'\), '--repo', policyRoot, '--todo', absoluteTodoPath, '--breakdown', absoluteBreakdownPath/u);
+  assert.match(preflight, /phase-loop-todo-queue-integrity\.mjs'\), '--repo', repoRoot, '--todo', absoluteTodoPath, '--breakdown', absoluteBreakdownPath/u);
 });
 
 test('snapshot audit rejection preserves claim, ledger, status, and runtime state', () => {
@@ -204,6 +204,34 @@ test('runs required preflight commands from the controller root when the workspa
   const result = validatePhaseLoopPreflight({ repo, controlPlaneRoot });
   assert.equal(result.valid, true, JSON.stringify(result, null, 2));
   assert.deepEqual(result.command_results.map((entry) => entry.exit_code), [0, 0, 0, 0]);
+});
+
+test('rejects the claim-smoke fixture profile without its explicit test-only marker', () => {
+  const repo = makeRepo();
+  const previous = process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  try {
+    const result = validatePhaseLoopPreflight({ repo, profile: 'claim-smoke-fixture', skipCommands: true });
+    assert.equal(result.valid, false, JSON.stringify(result, null, 2));
+    assert(result.errors.some((error) => error.code === 'phase_loop_preflight_fixture_profile_forbidden'), JSON.stringify(result.errors));
+  } finally {
+    if (previous === undefined) delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+    else process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = previous;
+  }
+});
+
+test('keeps production preflight strict when a controller root is supplied', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-phase-loop-minimal-workspace-'));
+  fs.mkdirSync(path.join(repo, '.brownie'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), '- [ ] E-1: Patch only `README.md`:\n  Route: documentation.\n  Verification: inspect README.md.\n');
+  execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.name', 'test'], { cwd: repo });
+  execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: repo });
+  execFileSync('git', ['add', '.'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
+  const result = validatePhaseLoopPreflight({ repo, controlPlaneRoot: repositoryRoot, skipCommands: true });
+  assert.equal(result.valid, false, JSON.stringify(result, null, 2));
+  assert(result.errors.some((error) => error.code === 'required_file_unreadable' || error.code === 'readiness_audit_hash_mismatch'), JSON.stringify(result.errors));
 });
 
 test('accepts sequential controller-owned completion mutations for multiple TODOs', () => {
@@ -310,6 +338,10 @@ test('places the strict preflight boundary before claim rebaseline and forbids l
   assert.ok(controller.indexOf('return 78', boundary) < rebaseline);
   assert.doesNotMatch(controller.slice(boundary, restoreTransition), /write_bdk_trajectory_event/u);
   const preflightFunction = controller.indexOf('run_phase_loop_preflight()');
+  const preflightCommand = controller.indexOf('node "$ROOT_DIR/scripts/phase-loop-preflight.mjs"', preflightFunction);
+  const fixtureProfileRejection = controller.indexOf('phase_loop_preflight_fixture_profile_rejected=true', preflightFunction);
+  assert.ok(fixtureProfileRejection >= 0);
+  assert.ok(fixtureProfileRejection < preflightCommand);
   const auditFailure = controller.indexOf('if ! write_phase_loop_snapshot_audit "$run_stamp" "$output"; then', preflightFunction);
   assert.ok(auditFailure >= 0);
   assert.ok(auditFailure < rebaseline);
