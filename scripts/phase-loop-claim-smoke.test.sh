@@ -1223,7 +1223,10 @@ prompt_stale_r3="$(mktemp)"
 todo_stale_r3="$(mktemp)"
 stale_r3_workspace="$(mktemp -d)"
 git -C "$stale_r3_workspace" init -b main >/dev/null
-git -C "$stale_r3_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$stale_r3_workspace/.brownie/headless-continuations"
+printf '%s\n' '{"headless":"controller-output-only"}' > "$stale_r3_workspace/.brownie/headless-continuations/fresh-run.json"
+git -C "$stale_r3_workspace" add .brownie/headless-continuations/fresh-run.json
+git -C "$stale_r3_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
 printf 'base prompt\n' > "$prompt_stale_r3"
 printf -- '- [ ] E-stale-r3: Patch only `scripts/stale-r3.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/stale-r3.mjs`.\n' > "$todo_stale_r3"
 mkdir -p "$state_stale_r3/todo-claims" "$state_stale_r3/runs"
