@@ -21,6 +21,9 @@ function parseArgs(argv) {
     stage: 'general',
     claim: '.brownie/private/phase-loop/todo-claims/current.json',
     todo: '.brownie/todo.md',
+    breakdown: '.brownie/todo-breakdown.md',
+    snapshotSource: null,
+    snapshotAudit: null,
     skipCommands: false
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -33,6 +36,12 @@ function parseArgs(argv) {
       args.claim = argv[++index];
     } else if (arg === '--todo') {
       args.todo = argv[++index];
+    } else if (arg === '--breakdown') {
+      args.breakdown = argv[++index];
+    } else if (arg === '--snapshot-source') {
+      args.snapshotSource = argv[++index];
+    } else if (arg === '--snapshot-audit') {
+      args.snapshotAudit = argv[++index];
     } else if (arg === '--skip-commands') {
       args.skipCommands = true;
     } else {
@@ -108,6 +117,77 @@ function readJson(repoRoot, relativePath, errors) {
 
 function sha256Text(text) {
   return `sha256:${crypto.createHash('sha256').update(text).digest('hex')}`;
+}
+
+function todoSnapshotAudit({ repoRoot, todoPath, todoText, breakdownPath, breakdownText, snapshotSource, snapshotAuditPath, errors }) {
+  if (!snapshotSource) {
+    return null;
+  }
+  const sourcePath = path.resolve(snapshotSource);
+  let sourceText;
+  try {
+    sourceText = fs.readFileSync(sourcePath, 'utf8');
+  } catch (error) {
+    errors.push({
+      code: 'todo_snapshot_source_unreadable',
+      path: snapshotSource,
+      message: `TODO snapshot source must be readable: ${error.message}`
+    });
+    return null;
+  }
+  const sourceSha256 = sha256Text(sourceText);
+  const snapshotSha256 = sha256Text(todoText);
+  const breakdownSha256 = breakdownText === null ? null : sha256Text(breakdownText);
+  const queueCas = sha256Text(`${snapshotSha256}\n${breakdownSha256 ?? 'missing'}`);
+  let generation = 0;
+  let mutation = null;
+  if (sourceSha256 !== snapshotSha256) {
+    let audit = null;
+    try {
+      audit = snapshotAuditPath ? JSON.parse(fs.readFileSync(path.resolve(snapshotAuditPath), 'utf8')) : null;
+    } catch {
+      audit = null;
+    }
+    const validMutationAudit = audit
+      && audit.schema_version === 1
+      && audit.source_path === sourcePath
+      && audit.source_sha256 === sourceSha256
+      && audit.source_base_sha256 === sourceSha256
+      && audit.snapshot_path === path.resolve(repoRoot, todoPath)
+      && audit.snapshot_sha256 === snapshotSha256
+      && audit.queue_cas === queueCas
+      && Number.isInteger(audit.generation)
+      && audit.generation > 0
+      && audit.mutation?.kind === 'completed_todo_removal'
+      && typeof audit.mutation.previous_snapshot_sha256 === 'string';
+    if (!validMutationAudit) {
+      errors.push({
+        code: 'todo_snapshot_mutation_audit_missing',
+        path: todoPath,
+        source_path: sourcePath,
+        snapshot_audit_path: snapshotAuditPath ?? null,
+        source_sha256: sourceSha256,
+        snapshot_sha256: snapshotSha256,
+        message: 'A workspace TODO snapshot differs from its source without a matching controller-owned completion mutation audit.'
+      });
+    } else {
+      generation = audit.generation;
+      mutation = audit.mutation;
+    }
+  }
+  return {
+    schema_version: 1,
+    source_path: sourcePath,
+    snapshot_path: path.resolve(repoRoot, todoPath),
+    source_base_sha256: sourceSha256,
+    source_sha256: sourceSha256,
+    snapshot_sha256: snapshotSha256,
+    breakdown_path: path.resolve(repoRoot, breakdownPath),
+    breakdown_sha256: breakdownSha256,
+    queue_cas: queueCas,
+    generation,
+    ...(mutation ? { mutation } : {})
+  };
 }
 
 function nextNonWhitespace(text, index) {
@@ -345,10 +425,10 @@ function validateDirtyDelivery(repoRoot, todoText, errors) {
   }
 }
 
-function validateRequiredCommands(repoRoot, errors) {
+function validateRequiredCommands(repoRoot, todoPath, breakdownPath, errors) {
   const commands = [
-    ['node', ['scripts/guard-todo-decomposition.mjs']],
-    ['node', ['scripts/phase-loop-todo-queue-integrity.mjs']],
+    ['node', ['scripts/guard-todo-decomposition.mjs', '--todo', todoPath, '--breakdown', breakdownPath]],
+    ['node', ['scripts/phase-loop-todo-queue-integrity.mjs', '--repo', repoRoot, '--todo', todoPath, '--breakdown', breakdownPath]],
     ['node', ['scripts/guard-release-contract.mjs']],
     ['node', ['scripts/guard-runtime-release-readiness.mjs']]
   ];
@@ -376,9 +456,25 @@ export function validatePhaseLoopPreflight(options = {}) {
   const warnings = [];
   const todoPath = options.todo ?? '.brownie/todo.md';
   const todoText = readText(repoRoot, todoPath, errors);
+  const breakdownPath = options.breakdown ?? '.brownie/todo-breakdown.md';
+  const breakdownText = options.snapshotSource
+    ? readText(repoRoot, breakdownPath, errors)
+    : null;
+  const snapshotAudit = errors.some((error) => error.code === 'required_file_outside_repository')
+    ? null
+    : todoSnapshotAudit({
+      repoRoot,
+      todoPath,
+      todoText,
+      breakdownPath,
+      breakdownText,
+      snapshotSource: options.snapshotSource,
+      snapshotAuditPath: options.snapshotAudit,
+      errors
+    });
   validateReleaseEvidence(repoRoot, errors);
   validateDirtyDelivery(repoRoot, todoText, errors);
-  const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, errors);
+  const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, errors);
 
   return {
     schema_version: 1,
@@ -386,6 +482,7 @@ export function validatePhaseLoopPreflight(options = {}) {
     stage: options.stage ?? 'general',
     errors,
     warnings,
+    ...(snapshotAudit ? { snapshot_audit: snapshotAudit } : {}),
     command_results: commandResults
   };
 }

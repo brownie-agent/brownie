@@ -21,7 +21,8 @@ const defaultTodoPath = '.brownie/todo.md';
 function parseArgs(argv) {
   const args = {
     repo: process.cwd(),
-    todo: defaultTodoPath
+    todo: defaultTodoPath,
+    breakdown: '.brownie/todo-breakdown.md'
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -29,6 +30,8 @@ function parseArgs(argv) {
       args.repo = argv[++index];
     } else if (arg === '--todo') {
       args.todo = argv[++index];
+    } else if (arg === '--breakdown') {
+      args.breakdown = argv[++index];
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -407,10 +410,11 @@ export function loadCliInput(args) {
   const repoRoot = path.resolve(args.repo);
   const todoPath = path.resolve(repoRoot, args.todo);
   const todoRelative = path.relative(repoRoot, todoPath).split(path.sep).join('/');
-  const breakdownPath = path.resolve(repoRoot, '.brownie/todo-breakdown.md');
+  const breakdownPath = path.resolve(repoRoot, args.breakdown ?? '.brownie/todo-breakdown.md');
+  const breakdownRelative = path.relative(repoRoot, breakdownPath).split(path.sep).join('/');
   const todoBefore = gitHeadText(repoRoot, todoRelative);
   const todoAfter = maybeReadText(todoPath);
-  const breakdownBefore = gitHeadText(repoRoot, '.brownie/todo-breakdown.md');
+  const breakdownBefore = gitHeadText(repoRoot, breakdownRelative);
   const breakdownAfter = maybeReadText(breakdownPath);
   const replanRecords = readAllTodoReplanRecords(repoRoot);
   const todoState = resolveTodoState({
@@ -421,6 +425,7 @@ export function loadCliInput(args) {
   return {
     repoRoot,
     todoRelative,
+    breakdownRelative,
     todoBefore,
     todoAfter,
     beforeBreakdownText: breakdownBefore,
