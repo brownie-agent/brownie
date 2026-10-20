@@ -1307,7 +1307,10 @@ prompt_terminal_retry_cap="$(mktemp)"
 todo_terminal_retry_cap="$(mktemp)"
 terminal_retry_cap_workspace="$(mktemp -d)"
 git -C "$terminal_retry_cap_workspace" init -b main >/dev/null
-git -C "$terminal_retry_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$terminal_retry_cap_workspace/.brownie/headless-continuations"
+printf '%s\n' '{"headless":"controller-output-only"}' > "$terminal_retry_cap_workspace/.brownie/headless-continuations/fresh-run.json"
+git -C "$terminal_retry_cap_workspace" add .brownie/headless-continuations/fresh-run.json
+git -C "$terminal_retry_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
 printf 'base prompt\n' > "$prompt_terminal_retry_cap"
 printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n' > "$todo_terminal_retry_cap"
 for retry_run in 1 2; do
