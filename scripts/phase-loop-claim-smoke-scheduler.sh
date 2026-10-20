@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+
+# Process lifecycle and audit helpers for phase-loop claim-smoke fixtures.
+# This file is sourced by the smoke suite and by its isolated scheduler tests.
+
+phase_loop_claim_smoke_now_utc() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+phase_loop_claim_smoke_process_group() {
+  local pid="$1"
+  ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+phase_loop_claim_smoke_process_is_live() {
+  local pid="$1"
+  local state
+  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+  [ -n "$state" ] && [[ "$state" != Z* ]]
+}
+
+phase_loop_claim_smoke_group_has_live_members() {
+  local pgid="$1"
+  case "$pgid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  ps -eo pgid=,stat= 2>/dev/null | awk -v target="$pgid" '$1 == target && $2 !~ /^Z/ { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+phase_loop_claim_smoke_start_process_group() {
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" &
+    PHASE_LOOP_CLAIM_SMOKE_LAST_ISOLATED=1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+    PHASE_LOOP_CLAIM_SMOKE_LAST_ISOLATED=1
+  else
+    "$@" &
+    PHASE_LOOP_CLAIM_SMOKE_LAST_ISOLATED=0
+  fi
+  PHASE_LOOP_CLAIM_SMOKE_LAST_PID="$!"
+  if [ "$PHASE_LOOP_CLAIM_SMOKE_LAST_ISOLATED" -eq 1 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_LAST_PGID="$PHASE_LOOP_CLAIM_SMOKE_LAST_PID"
+  else
+    PHASE_LOOP_CLAIM_SMOKE_LAST_PGID="$(phase_loop_claim_smoke_process_group "$PHASE_LOOP_CLAIM_SMOKE_LAST_PID")"
+  fi
+}
+
+phase_loop_claim_smoke_terminate_process_group() {
+  local pid="$1"
+  local grace_seconds="${2:-3}"
+  local requested_pgid="${3:-}"
+  local pgid
+  local current_pgid
+  local elapsed=0
+  pgid="${requested_pgid:-$(phase_loop_claim_smoke_process_group "$pid")}" 
+  current_pgid="$(phase_loop_claim_smoke_process_group "$$")"
+
+  if [ -n "$pgid" ] && [ "$pgid" != "$current_pgid" ]; then
+    kill -TERM -"$pgid" 2>/dev/null || true
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+
+  while [ "$elapsed" -lt "$grace_seconds" ] && {
+    phase_loop_claim_smoke_process_is_live "$pid" || {
+      [ -n "$pgid" ] && phase_loop_claim_smoke_group_has_live_members "$pgid"
+    }
+  }; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  if [ -n "$pgid" ] && [ "$pgid" != "$current_pgid" ] && phase_loop_claim_smoke_group_has_live_members "$pgid"; then
+    kill -KILL -"$pgid" 2>/dev/null || true
+  fi
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+phase_loop_claim_smoke_append_audit_event() {
+  local audit_file="$1"
+  local event="$2"
+  local shard="$3"
+  local pid="$4"
+  local pgid="$5"
+  local status="$6"
+  local exit_code="$7"
+  local stdout_path="$8"
+  local stderr_path="$9"
+  local control_root="${10}"
+  local state_root="${11}"
+  local workspace_root="${12}"
+  local detail="${13}"
+  mkdir -p "$(dirname "$audit_file")"
+  python3 - "$audit_file" "$event" "$shard" "$pid" "$pgid" "$status" "$exit_code" "$stdout_path" "$stderr_path" "$control_root" "$state_root" "$workspace_root" "$detail" <<'PY'
+import json
+import pathlib
+import sys
+from datetime import datetime, timezone
+
+(
+    audit_file,
+    event,
+    shard,
+    pid,
+    pgid,
+    status,
+    exit_code,
+    stdout_path,
+    stderr_path,
+    control_root,
+    state_root,
+    workspace_root,
+    detail,
+) = sys.argv[1:]
+
+def optional(value):
+    return value if value else None
+
+record = {
+    "event": event,
+    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "shard": optional(shard),
+    "pid": int(pid) if pid.isdigit() else None,
+    "pgid": int(pgid) if pgid.isdigit() else None,
+    "status": optional(status),
+    "exit_code": int(exit_code) if exit_code.lstrip("-").isdigit() else None,
+    "stdout_path": optional(stdout_path),
+    "stderr_path": optional(stderr_path),
+    "temp_root": str(pathlib.Path(audit_file).parent),
+    "control_root": optional(control_root),
+    "state_root": optional(state_root),
+    "workspace_root": optional(workspace_root),
+    "detail": optional(detail),
+}
+with pathlib.Path(audit_file).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record, sort_keys=True) + "\n")
+PY
+}
+
+phase_loop_claim_smoke_write_audit_manifest() {
+  local shard_dir="$1"
+  local output_file="$2"
+  local scheduler_timed_out="$3"
+  python3 - "$shard_dir" "$output_file" "$scheduler_timed_out" <<'PY'
+import json
+import pathlib
+import sys
+
+shard_dir = pathlib.Path(sys.argv[1])
+output_file = pathlib.Path(sys.argv[2])
+scheduler_timed_out = sys.argv[3] == "1"
+
+def tail(path):
+    if not path:
+        return []
+    candidate = pathlib.Path(path)
+    if not candidate.is_file():
+        return []
+    lines = candidate.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+    return [line if len(line) <= 2000 else line[-2000:] for line in lines]
+
+records = []
+for audit_file in sorted(shard_dir.glob("*.audit.jsonl")):
+    for line in audit_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            records.append({"event": "invalid_audit_record", "audit_file": str(audit_file), "raw": line})
+            continue
+        record["stdout_tail"] = tail(record.get("stdout_path"))
+        record["stderr_tail"] = tail(record.get("stderr_path"))
+        records.append(record)
+
+manifest = {
+    "schema_version": 1,
+    "scheduler_timed_out": scheduler_timed_out,
+    "shard_dir": str(shard_dir),
+    "records": records,
+}
+output_file.parent.mkdir(parents=True, exist_ok=True)
+output_file.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+phase_loop_claim_smoke_run_with_timeout() {
+  local seconds="$1"
+  shift
+  local expected_exit_codes=0
+  if [ "${1:-}" = "--expected-exit" ]; then
+    expected_exit_codes="$2"
+    shift 2
+  fi
+  local audit_file="${PHASE_LOOP_CLAIM_SMOKE_AUDIT_FILE:-}"
+  local shard_name="${PHASE_LOOP_CLAIM_SMOKE_SHARD_NAME:-command}"
+  local command_description="$*"
+  local child_pid
+  local child_pgid
+  local elapsed=0
+  local timed_out=0
+  local child_status=0
+
+  phase_loop_claim_smoke_start_process_group "$@"
+  child_pid="$PHASE_LOOP_CLAIM_SMOKE_LAST_PID"
+  child_pgid="$PHASE_LOOP_CLAIM_SMOKE_LAST_PGID"
+  while phase_loop_claim_smoke_process_is_live "$child_pid"; do
+    if [ "$elapsed" -ge "$seconds" ]; then
+      echo "command timed out after ${seconds}s: ${command_description} pid=${child_pid} pgid=${child_pgid}" >&2
+      phase_loop_claim_smoke_terminate_process_group "$child_pid"
+      timed_out=1
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "$timed_out" -eq 1 ]; then
+    child_status=124
+    if [ -n "$audit_file" ]; then
+      phase_loop_claim_smoke_append_audit_event \
+        "$audit_file" command_timeout "$shard_name" "$child_pid" "$child_pgid" \
+        timed_out 124 "" "" "${PHASE_LOOP_CONTROL_ROOT:-}" \
+        "${PHASE_LOOP_STATE_DIR:-}" "${PHASE_LOOP_WORKSPACE_ROOT:-$PWD}" "$command_description"
+    fi
+  elif wait "$child_pid"; then
+    child_status=0
+  else
+    child_status="$?"
+  fi
+  if [ -n "$child_pgid" ] && phase_loop_claim_smoke_group_has_live_members "$child_pgid"; then
+    phase_loop_claim_smoke_terminate_process_group "$child_pid" 3 "$child_pgid"
+  fi
+  if [ "$child_status" -ne 0 ]; then
+    case ",${expected_exit_codes}," in
+      *,"$child_status",*) ;;
+      *)
+        echo "phase-loop claim smoke command failed exit=${child_status}: ${command_description}" >&2
+        if [ -n "${PHASE_LOOP_STATE_DIR:-}" ]; then
+          for diagnostic_file in status.json progress-state.json; do
+            if [ -f "$PHASE_LOOP_STATE_DIR/$diagnostic_file" ]; then
+              echo "--- $PHASE_LOOP_STATE_DIR/$diagnostic_file ---" >&2
+              cat "$PHASE_LOOP_STATE_DIR/$diagnostic_file" >&2
+            fi
+          done
+          latest_stdout="$(find "$PHASE_LOOP_STATE_DIR/runs" -name '*.stdout.log' -type f -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+          latest_stderr="$(find "$PHASE_LOOP_STATE_DIR/runs" -name '*.stderr.log' -type f -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+          for diagnostic_file in "$latest_stdout" "$latest_stderr"; do
+            if [ -n "$diagnostic_file" ] && [ -f "$diagnostic_file" ]; then
+              echo "--- $diagnostic_file (tail) ---" >&2
+              tail -n 80 "$diagnostic_file" >&2
+            fi
+          done
+          if [ -f "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" ]; then
+            echo "--- $PHASE_LOOP_STATE_DIR/logs/supervisor.log (tail) ---" >&2
+            tail -n 80 "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" >&2
+          fi
+        fi
+        ;;
+    esac
+  fi
+  return "$child_status"
+}
+
+phase_loop_claim_smoke_wait_for_pid_exit() {
+  local pid="$1"
+  local seconds="$2"
+  local elapsed=0
+  while phase_loop_claim_smoke_process_is_live "$pid"; do
+    if [ "$elapsed" -ge "$seconds" ]; then
+      echo "expected pid=$pid to exit within ${seconds}s" >&2
+      phase_loop_claim_smoke_terminate_process_group "$pid"
+      return 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "$pid" 2>/dev/null || true
+}
+
+phase_loop_claim_smoke_run_scheduler() {
+  local shard_dir="$1"
+  local script_path="$2"
+  local batch_size="$3"
+  local watchdog_seconds="$4"
+  shift 4
+  local -a shards=("$@")
+  local audit_file="$shard_dir/scheduler.audit.jsonl"
+  local manifest_file="${PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT:-$shard_dir/claim-smoke-audit.json}"
+  local watchdog_pid
+  local scheduler_parent_pid="$$"
+  local scheduler_timed_out=0
+  local cleanup_running=0
+  local claim_smoke_failed=0
+  local batch_start=0
+  local claim_smoke_batch_end
+  local shard
+  local control_root
+  local stdout_log
+  local stderr_log
+  local pid
+  local pgid
+  local status
+  local index
+  local i
+  local -a active_pids=()
+  local -a active_pgids=()
+  local -a active_shards=()
+
+  mkdir -p "$shard_dir"
+
+  phase_loop_claim_smoke_cleanup() {
+    local cleanup_status="$?"
+    if [ "$cleanup_running" -eq 1 ]; then
+      return
+    fi
+    cleanup_running=1
+    kill "$watchdog_pid" 2>/dev/null || true
+    for i in "${!active_pids[@]}"; do
+      pid="${active_pids[$i]}"
+      pgid="${active_pgids[$i]}"
+      if phase_loop_claim_smoke_process_is_live "$pid" || phase_loop_claim_smoke_group_has_live_members "$pgid"; then
+        phase_loop_claim_smoke_terminate_process_group "$pid" 3 "$pgid"
+        shard="${active_shards[$i]}"
+        control_root="$shard_dir/$shard-control-root"
+        stdout_log="$shard_dir/$shard.stdout.log"
+        stderr_log="$shard_dir/$shard.stderr.log"
+        phase_loop_claim_smoke_append_audit_event "$audit_file" shard_timeout "$shard" "$pid" "$pgid" timed_out 124 "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "scheduler watchdog expired"
+      fi
+    done
+    phase_loop_claim_smoke_write_audit_manifest "$shard_dir" "$manifest_file" "$scheduler_timed_out"
+    if [ "$cleanup_status" -ne 0 ] || [ "$scheduler_timed_out" -eq 1 ]; then
+      echo "phase-loop claim smoke audit: $manifest_file" >&2
+      cat "$manifest_file" >&2
+    fi
+    if [ "$manifest_file" != "$shard_dir/claim-smoke-audit.json" ]; then
+      :
+    fi
+    rm -rf -- "$shard_dir"
+  }
+
+  phase_loop_claim_smoke_scheduler_signal() {
+    scheduler_timed_out=1
+    exit 143
+  }
+
+  trap phase_loop_claim_smoke_cleanup EXIT
+  trap phase_loop_claim_smoke_scheduler_signal TERM INT
+  (
+    sleep "$watchdog_seconds"
+    phase_loop_claim_smoke_append_audit_event "$audit_file" scheduler_timeout "" "" "" timed_out 124 "" "" "" "" "$PWD" "watchdog expired after ${watchdog_seconds}s"
+    kill -TERM "$scheduler_parent_pid" 2>/dev/null || true
+  ) &
+  watchdog_pid="$!"
+
+  while [ "$batch_start" -lt "${#shards[@]}" ]; do
+    active_pids=()
+    active_pgids=()
+    active_shards=()
+    claim_smoke_batch_end=$((batch_start + batch_size))
+    if [ "$claim_smoke_batch_end" -gt "${#shards[@]}" ]; then
+      claim_smoke_batch_end="${#shards[@]}"
+    fi
+    index="$batch_start"
+    while [ "$index" -lt "$claim_smoke_batch_end" ]; do
+      shard="${shards[$index]}"
+      control_root="$shard_dir/$shard-control-root"
+      stdout_log="$shard_dir/$shard.stdout.log"
+      stderr_log="$shard_dir/$shard.stderr.log"
+      mkdir -p "$control_root"
+      PHASE_LOOP_CLAIM_SMOKE_SECTION="$shard" \
+      PHASE_LOOP_CONTROL_ROOT="$control_root" \
+      PHASE_LOOP_CLAIM_SMOKE_AUDIT_FILE="$shard_dir/$shard.audit.jsonl" \
+      PHASE_LOOP_CLAIM_SMOKE_SHARD_NAME="$shard" \
+      phase_loop_claim_smoke_start_process_group "$BASH" "$script_path" >"$stdout_log" 2>"$stderr_log"
+      pid="$PHASE_LOOP_CLAIM_SMOKE_LAST_PID"
+      pgid="$PHASE_LOOP_CLAIM_SMOKE_LAST_PGID"
+      active_pids+=("$pid")
+      active_pgids+=("$pgid")
+      active_shards+=("$shard")
+      phase_loop_claim_smoke_append_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start"
+      index=$((index + 1))
+    done
+    for ((i = 0; i < ${#active_pids[@]}; i += 1)); do
+      pid="${active_pids[$i]}"
+      shard="${active_shards[$i]}"
+      if wait "$pid"; then
+        status=0
+      else
+        status="$?"
+      fi
+      pgid="${active_pgids[$i]}"
+      if phase_loop_claim_smoke_group_has_live_members "$pgid"; then
+        phase_loop_claim_smoke_terminate_process_group "$pid" 3 "$pgid"
+      fi
+      phase_loop_claim_smoke_append_audit_event "$audit_file" shard_finished "$shard" "$pid" "$pgid" "$([ "$status" -eq 0 ] && echo passed || echo failed)" "$status" "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" ""
+      if [ "$status" -ne 0 ]; then
+        claim_smoke_failed=1
+        echo "phase-loop claim smoke shard failed: $shard exit=$status" >&2
+        cat "$shard_dir/$shard.stdout.log" >&2 || true
+        cat "$shard_dir/$shard.stderr.log" >&2 || true
+      fi
+    done
+    if [ "$claim_smoke_failed" -ne 0 ]; then
+      phase_loop_claim_smoke_cleanup
+      trap - EXIT TERM INT
+      return 1
+    fi
+    batch_start="$claim_smoke_batch_end"
+  done
+  phase_loop_claim_smoke_cleanup
+  trap - EXIT TERM INT
+  return 0
+}

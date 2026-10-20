@@ -3,6 +3,8 @@ set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHASE_LOOP="$REPO_ROOT/phase-loop.sh"
+CLAIM_SMOKE_SCHEDULER="$REPO_ROOT/scripts/phase-loop-claim-smoke-scheduler.sh"
+source "$CLAIM_SMOKE_SCHEDULER"
 # Claim smoke runs against temporary worker workspaces while the controller
 # source remains this checkout.  Pin the fixture baseline to the checked-out
 # controller so the smoke suite exercises controller behavior without
@@ -115,22 +117,6 @@ case "$PHASE_LOOP_CLAIM_SMOKE_SECTION" in
     ;;
 esac
 
-(
-  sleep "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS"
-  echo "phase-loop claim smoke timed out after ${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS}s" >&2
-  kill -TERM "$$" 2>/dev/null || true
-) &
-claim_smoke_watchdog_pid="$!"
-claim_smoke_shard_dir=""
-cleanup_claim_smoke() {
-  kill "$claim_smoke_watchdog_pid" 2>/dev/null || true
-  wait "$claim_smoke_watchdog_pid" 2>/dev/null || true
-  if [ -n "$claim_smoke_shard_dir" ] && [ -d "$claim_smoke_shard_dir" ]; then
-    rm -rf -- "$claim_smoke_shard_dir"
-  fi
-}
-trap cleanup_claim_smoke EXIT
-
 # The suite contains independent temporary-workspace fixtures. Run those
 # sections in parallel so adding another bounded fixture does not turn the
 # single serial smoke process into a CI watchdog timeout. Each child gets its
@@ -138,45 +124,11 @@ trap cleanup_claim_smoke EXIT
 # aggregate command with its diagnostics.
 if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   claim_smoke_shard_dir="$(mktemp -d)"
-  # The lifecycle shard owns process-group signal fixtures; keep it out of
-  # the other CPU-heavy batches so its bounded child cleanup remains stable.
   claim_smoke_shards=(core terminal completion terminal-absent queue pr guards feedback lifecycle)
-  claim_smoke_failed=0
-  claim_smoke_batch_size="$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"
-  claim_smoke_batch_start=0
-  while [ "$claim_smoke_batch_start" -lt "${#claim_smoke_shards[@]}" ]; do
-    claim_smoke_pids=()
-    claim_smoke_batch_end=$((claim_smoke_batch_start + claim_smoke_batch_size))
-    if [ "$claim_smoke_batch_end" -gt "${#claim_smoke_shards[@]}" ]; then
-      claim_smoke_batch_end="${#claim_smoke_shards[@]}"
-    fi
-    for ((claim_smoke_index = claim_smoke_batch_start; claim_smoke_index < claim_smoke_batch_end; claim_smoke_index += 1)); do
-      claim_smoke_shard="${claim_smoke_shards[$claim_smoke_index]}"
-      claim_smoke_control_root="$claim_smoke_shard_dir/$claim_smoke_shard-control-root"
-      mkdir -p "$claim_smoke_control_root"
-      PHASE_LOOP_CLAIM_SMOKE_SECTION="$claim_smoke_shard" \
-      PHASE_LOOP_CONTROL_ROOT="$claim_smoke_control_root" \
-      "$BASH" "$0" >"$claim_smoke_shard_dir/$claim_smoke_shard.stdout.log" 2>"$claim_smoke_shard_dir/$claim_smoke_shard.stderr.log" &
-      claim_smoke_pids+=("$!")
-    done
-    for ((claim_smoke_index = claim_smoke_batch_start; claim_smoke_index < claim_smoke_batch_end; claim_smoke_index += 1)); do
-      claim_smoke_shard="${claim_smoke_shards[$claim_smoke_index]}"
-      if ! wait "${claim_smoke_pids[$claim_smoke_index - claim_smoke_batch_start]}"; then
-        claim_smoke_failed=1
-        echo "phase-loop claim smoke shard failed: $claim_smoke_shard" >&2
-        cat "$claim_smoke_shard_dir/$claim_smoke_shard.stdout.log" >&2
-        cat "$claim_smoke_shard_dir/$claim_smoke_shard.stderr.log" >&2
-      fi
-    done
-    if [ "$claim_smoke_failed" -ne 0 ]; then
-      break
-    fi
-    claim_smoke_batch_start="$claim_smoke_batch_end"
-  done
-  if [ "$claim_smoke_failed" -ne 0 ]; then
-    exit 1
-  fi
-  exit 0
+  phase_loop_claim_smoke_run_scheduler \
+    "$claim_smoke_shard_dir" "$0" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
+    "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" "${claim_smoke_shards[@]}"
+  exit "$?"
 fi
 
 if ! command -v rg >/dev/null 2>&1; then
@@ -288,86 +240,11 @@ PY
 }
 
 run_with_timeout() {
-  local seconds="$1"
-  shift
-  local expected_exit_codes=0
-  if [ "${1:-}" = "--expected-exit" ]; then
-    expected_exit_codes="$2"
-    shift 2
-  fi
-  "$@" &
-  local child_pid="$!"
-  local elapsed=0
-  local timed_out=0
-  while kill -0 "$child_pid" 2>/dev/null; do
-    if [ "$elapsed" -ge "$seconds" ]; then
-      echo "command timed out after ${seconds}s: $*" >&2
-      kill "$child_pid" 2>/dev/null || true
-      sleep 1
-      kill -KILL "$child_pid" 2>/dev/null || true
-      wait "$child_pid" 2>/dev/null || true
-      timed_out=1
-      break
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  local child_status=0
-  if [ "$timed_out" -eq 1 ]; then
-    child_status=124
-  elif wait "$child_pid"; then
-    child_status=0
-  else
-    child_status="$?"
-  fi
-  if [ "$child_status" -ne 0 ]; then
-    case ",$expected_exit_codes," in
-      *,"$child_status",*) ;;
-      *)
-    echo "phase-loop claim smoke command failed exit=$child_status: $*" >&2
-    if [ -n "${PHASE_LOOP_STATE_DIR:-}" ]; then
-      for diagnostic_file in status.json progress-state.json; do
-        if [ -f "$PHASE_LOOP_STATE_DIR/$diagnostic_file" ]; then
-          echo "--- $PHASE_LOOP_STATE_DIR/$diagnostic_file ---" >&2
-          cat "$PHASE_LOOP_STATE_DIR/$diagnostic_file" >&2
-        fi
-      done
-      latest_stdout="$(find "$PHASE_LOOP_STATE_DIR/runs" -name '*.stdout.log' -type f -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
-      latest_stderr="$(find "$PHASE_LOOP_STATE_DIR/runs" -name '*.stderr.log' -type f -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
-      for diagnostic_file in "$latest_stdout" "$latest_stderr"; do
-        if [ -n "$diagnostic_file" ] && [ -f "$diagnostic_file" ]; then
-          echo "--- $diagnostic_file (tail) ---" >&2
-          tail -n 80 "$diagnostic_file" >&2
-        fi
-      done
-      if [ -f "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" ]; then
-        echo "--- $PHASE_LOOP_STATE_DIR/logs/supervisor.log (tail) ---" >&2
-        tail -n 80 "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" >&2
-      fi
-    fi
-      ;;
-    esac
-  fi
-  return "$child_status"
+  phase_loop_claim_smoke_run_with_timeout "$@"
 }
 
 wait_for_pid_exit() {
-  local pid="$1"
-  local seconds="$2"
-  local elapsed=0
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ "$elapsed" -ge "$seconds" ]; then
-      echo "expected pid=$pid to exit within ${seconds}s" >&2
-      kill "$pid" 2>/dev/null || true
-      sleep 1
-      kill -KILL "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      return 1
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  wait "$pid" 2>/dev/null || true
+  phase_loop_claim_smoke_wait_for_pid_exit "$@"
 }
 
 assert_contains "$PHASE_LOOP" "phase-loop-todo-queue-integrity\\.mjs"
@@ -405,7 +282,10 @@ assert_contains "$PHASE_LOOP" "phase_loop_claim_id"
 assert_contains "$PHASE_LOOP" "phase_loop_selected_todo_first_line"
 assert_contains "$PHASE_LOOP" "feedback_identity_missing"
 assert_contains "$PHASE_LOOP" "progress_projection_claim_id_mismatch"
-assert_contains "${BASH_SOURCE[0]}" "timed_out=1"
+assert_contains "$CLAIM_SMOKE_SCHEDULER" "timed_out=1"
+assert_contains "$CLAIM_SMOKE_SCHEDULER" "setsid"
+assert_contains "$CLAIM_SMOKE_SCHEDULER" "shard_timeout"
+assert_contains "$CLAIM_SMOKE_SCHEDULER" "claim-smoke-audit.json"
 assert_contains "$PHASE_LOOP" "Every generated leaf ID must be unique within new_text"
 assert_contains "$PHASE_LOOP" "A leaf must never depend on itself"
 assert_contains "$PHASE_LOOP" "distinct prerequisite TODO ID already present in the live queue"
@@ -413,7 +293,7 @@ assert_contains "$PHASE_LOOP" 'never generate a read-only `Read`, `Inspect`, or 
 assert_contains "$PHASE_LOOP" "phase-loop-pr-actor-guard.mjs"
 assert_contains "${BASH_SOURCE[0]}" "phase_loop_smoke_cpu_count"
 assert_contains "${BASH_SOURCE[0]}" "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"
-assert_contains "${BASH_SOURCE[0]}" 'claim_smoke_batch_size="\$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"'
+assert_contains "$CLAIM_SMOKE_SCHEDULER" 'local batch_size="\$3"'
 
 claim_smoke_private_state_sha256() {
   local state_root="$REPO_ROOT/.brownie/private/phase-loop"
