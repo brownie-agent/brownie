@@ -5438,7 +5438,10 @@ if "Route: todo-decomposition" in selected:
     skip("todo_decomposition_route")
 verification_feedback = feedback.get("verification") if isinstance(feedback.get("verification"), dict) else {}
 progress_projection = progress.get("progress_projection") if isinstance(progress.get("progress_projection"), dict) else {}
-if progress_projection.get("claim_id") != claim.get("claim_id"):
+if (
+    progress_projection.get("claim_id") != claim.get("claim_id")
+    and not prior_terminal_evidence
+):
     skip("progress_projection_claim_id_mismatch")
 projection_selected = str(progress_projection.get("selected_todo") or "")
 if not projection_selected or projection_selected.splitlines()[0] != selected_first:
