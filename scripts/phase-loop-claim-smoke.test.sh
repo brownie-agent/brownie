@@ -13,6 +13,7 @@ export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="HEAD"
 # policy/evidence while keeping TODO and git queue state workspace-scoped.
 export PHASE_LOOP_PREFLIGHT_PROFILE="claim-smoke-fixture"
 export PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY="1"
+export PHASE_LOOP_PR_REMOTE="fixture-origin"
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
 PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
 
@@ -3289,7 +3290,6 @@ test_workspace="$queue_original_workspace"
 fi
 
 if claim_smoke_section_enabled pr; then
-export PHASE_LOOP_PR_REMOTE=fixture-origin
 state_pr_progress="$(mktemp -d)"
 prompt_pr_progress="$(mktemp)"
 todo_pr_progress="$(mktemp)"
