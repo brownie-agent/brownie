@@ -4207,7 +4207,7 @@ fake_brownie_broad_decomposition="$(mktemp)"
 cat > "$fake_brownie_broad_decomposition" <<'SH'
 #!/usr/bin/env bash
 if [ "$1" = "--json" ] && [ "$2" = "run" ]; then
-  printf '%s\n' '{"ok":true,"command":"run","exit_code":0,"run":{"status":"no_eligible_task","completed":false,"blocked":true,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed","automation":{"status":"terminal_failure","blocked":true,"completed":false,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed"}}}'
+  printf '%s\n' '{"ok":true,"command":"run","exit_code":0,"run":{"status":"no_eligible_task","completed":false,"blocked":true,"retryable":false,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed","automation":{"status":"terminal_failure","blocked":true,"completed":false,"retryable":false,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed"}}}'
   exit 0
 fi
 printf '%s\n' '{"ok":true}'
