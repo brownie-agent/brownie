@@ -1208,7 +1208,7 @@ assert progress["progress_projection"]["provider_failure_fingerprint"] == "sha25
 assert progress["workspace_changed"] is False, progress
 assert claim["status"] == "in_progress", claim
 assert claim["status_history"][-1]["status"] == "in_progress", claim
-assert feedback["kind"] == "phase_loop_terminal_failure_redelegation_required", feedback
+assert feedback.get("kind") == "phase_loop_terminal_failure_redelegation_required", feedback
 assert feedback["claim_id"] == claim["claim_id"], feedback
 assert feedback["recovery_state"] == "redelegatable", feedback
 assert not blocked, blocked
@@ -1293,7 +1293,7 @@ assert claim["status"] == "in_progress", claim
 # controller-level cap is intentionally not copied into the claim record.
 assert claim.get("retry_cap") != 0, claim
 feedback = json.loads((claim_dir / "repair-feedback.json").read_text(encoding="utf-8"))
-assert feedback["kind"] == "phase_loop_terminal_failure_redelegation_required", feedback
+assert feedback.get("kind") == "phase_loop_terminal_failure_redelegation_required", feedback
 assert feedback["recovery_state"] == "redelegatable", feedback
 PY
 
