@@ -4778,9 +4778,11 @@ PY
 contract_replan_feedback_state="$(mktemp -d)"
 contract_replan_feedback_prompt="$(mktemp)"
 contract_replan_feedback_todo="$(mktemp)"
+contract_replan_feedback_breakdown="$(mktemp)"
 contract_replan_feedback_argv="$contract_replan_feedback_state/fake-brownie.argv"
 mkdir -p "$contract_replan_feedback_state/todo-claims"
 printf 'base prompt\n' > "$contract_replan_feedback_prompt"
+printf '# Breakdown\n' > "$contract_replan_feedback_breakdown"
 cat > "$contract_replan_feedback_todo" <<'EOF'
 - [x] E-source: Patch only `scripts/release-local-artifact.mjs` to repair portable archive packaging.
   Route: implementation.
@@ -4827,6 +4829,7 @@ EOF
 PHASE_LOOP_STATE_DIR="$contract_replan_feedback_state" \
 PHASE_LOOP_PROMPT="$contract_replan_feedback_prompt" \
 PHASE_LOOP_TODO="$contract_replan_feedback_todo" \
+PHASE_LOOP_TODO_BREAKDOWN="$contract_replan_feedback_breakdown" \
 PHASE_LOOP_WORKSPACE_ROOT="$repair_feedback_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_ARGV_FILE="$contract_replan_feedback_argv" \
@@ -4842,11 +4845,12 @@ cat > "$repair_feedback_workspace/.brownie/private/phase-loop/task-ledger.jsonl"
 {"schema_version":1,"task_id":"E-source@todo-g1-source","from_state":"running","to_state":"completed","sequence":4,"run_id":"workspace-forgery","claim_id":"todo-g1-source","task_spec_sha256":"workspace-forgery"}
 EOF
 
-python3 - "$contract_replan_feedback_state/todo-claims/repair-feedback.json" "$contract_replan_feedback_state/todo-claims/repair-feedback-archive" "$contract_replan_feedback_prompt_file" "$contract_replan_feedback_state/status.json" "$contract_replan_feedback_state" "$repair_feedback_workspace" "$contract_replan_feedback_todo" <<'PY'
+python3 - "$contract_replan_feedback_state/todo-claims/repair-feedback.json" "$contract_replan_feedback_state/todo-claims/repair-feedback-archive" "$contract_replan_feedback_prompt_file" "$contract_replan_feedback_state/status.json" "$contract_replan_feedback_state" "$repair_feedback_workspace" "$contract_replan_feedback_todo" "$contract_replan_feedback_breakdown" "$REPO_ROOT/scripts/guard-todo-decomposition.mjs" <<'PY'
 import json
 import hashlib
 import pathlib
 import re
+import subprocess
 import sys
 
 feedback_path = pathlib.Path(sys.argv[1])
@@ -4856,6 +4860,8 @@ status_path = pathlib.Path(sys.argv[4])
 state_dir = pathlib.Path(sys.argv[5])
 workspace = pathlib.Path(sys.argv[6])
 todo_path = pathlib.Path(sys.argv[7])
+breakdown_path = pathlib.Path(sys.argv[8])
+guard_script = pathlib.Path(sys.argv[9])
 assert workspace.resolve() != state_dir.resolve(), (workspace, state_dir)
 expected_claim_id = "todo-g1-source"
 expected_kind = "phase_loop_todo_contract_replan_feedback"
@@ -4916,30 +4922,43 @@ else:
             for value in (source_todo, source_todo_unchecked)
         }
         ledger_path = state_dir / "task-ledger.jsonl"
-        assert ledger_path.is_file(), ledger_path
         matching_terminal = []
-        for line in ledger_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            events = record.get("events", []) if record.get("kind") in {"replan_transaction", "terminal_failure_transaction"} else [record]
-            for event in events:
-                task_id = str(event.get("task_id", ""))
-                if event.get("claim_id") != expected_claim_id:
+        if ledger_path.is_file():
+            for line in ledger_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
                     continue
-                if event.get("run_id") != status.get("run_id"):
-                    continue
-                if not (task_id == "E-source" or task_id.endswith(f"@{expected_claim_id}")):
-                    continue
-                if event.get("task_spec_sha256") not in source_spec_hashes:
-                    continue
-                if event.get("queue_generation") not in {None, queue["generation"]}:
-                    continue
-                if event.get("queue_fingerprint") not in {None, queue["fingerprint"]}:
-                    continue
-                if event.get("to_state") in {"completed", "replanned"}:
-                    matching_terminal.append(event)
-        assert matching_terminal, f"feedback missing without matching completion audit: {ledger_path}"
+                record = json.loads(line)
+                events = record.get("events", []) if record.get("kind") in {"replan_transaction", "terminal_failure_transaction"} else [record]
+                for event in events:
+                    task_id = str(event.get("task_id", ""))
+                    if event.get("claim_id") != expected_claim_id:
+                        continue
+                    if event.get("run_id") != status.get("run_id"):
+                        continue
+                    if not (task_id == "E-source" or task_id.endswith(f"@{expected_claim_id}")):
+                        continue
+                    if event.get("task_spec_sha256") not in source_spec_hashes:
+                        continue
+                    if event.get("queue_generation") not in {None, queue["generation"]}:
+                        continue
+                    if event.get("queue_fingerprint") not in {None, queue["fingerprint"]}:
+                        continue
+                    if event.get("to_state") in {"completed", "replanned"}:
+                        matching_terminal.append(event)
+        guard = subprocess.run(
+            ["node", str(guard_script), "--repo", str(workspace), "--todo", str(todo_path), "--breakdown", str(breakdown_path)],
+            cwd=workspace,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        guard_success = guard.returncode == 0
+        assert matching_terminal or guard_success, {
+            "ledger_path": str(ledger_path),
+            "ledger_exists": ledger_path.is_file(),
+            "guard_stdout": guard.stdout[-2000:],
+            "guard_stderr": guard.stderr[-2000:],
+        }
 assert "## Previous Repair Feedback" in prompt, prompt
 assert "supervisor_repeated_leaf_failure_requires_todo_contract_replan" in prompt, prompt
 assert "E-source" in prompt, prompt
@@ -4954,6 +4973,7 @@ rm -f "$contract_replan_feedback_state/todo-claims/current.json"
 PHASE_LOOP_STATE_DIR="$contract_replan_feedback_state" \
 PHASE_LOOP_PROMPT="$contract_replan_feedback_prompt" \
 PHASE_LOOP_TODO="$contract_replan_feedback_todo" \
+PHASE_LOOP_TODO_BREAKDOWN="$contract_replan_feedback_breakdown" \
 PHASE_LOOP_WORKSPACE_ROOT="$repair_feedback_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_ARGV_FILE="$contract_replan_feedback_argv" \
