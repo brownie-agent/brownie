@@ -4834,16 +4834,29 @@ BROWNIE_BIN="$fake_brownie_repair_feedback" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
 contract_replan_feedback_prompt_file="$(find "$contract_replan_feedback_state/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
-python3 - "$contract_replan_feedback_state/todo-claims/repair-feedback.json" "$contract_replan_feedback_state/todo-claims/repair-feedback-archive" "$contract_replan_feedback_prompt_file" "$contract_replan_feedback_state/status.json" "$repair_feedback_workspace" <<'PY'
+# A workspace-side ledger must not be accepted as a completion receipt for an
+# externally configured controller state root.  Its claim id is tempting, but
+# its run and task-spec bindings are intentionally forged.
+mkdir -p "$repair_feedback_workspace/.brownie/private/phase-loop"
+cat > "$repair_feedback_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'EOF'
+{"schema_version":1,"task_id":"E-source@todo-g1-source","from_state":"running","to_state":"completed","sequence":4,"run_id":"workspace-forgery","claim_id":"todo-g1-source","task_spec_sha256":"workspace-forgery"}
+EOF
+
+python3 - "$contract_replan_feedback_state/todo-claims/repair-feedback.json" "$contract_replan_feedback_state/todo-claims/repair-feedback-archive" "$contract_replan_feedback_prompt_file" "$contract_replan_feedback_state/status.json" "$contract_replan_feedback_state" "$repair_feedback_workspace" "$contract_replan_feedback_todo" <<'PY'
 import json
+import hashlib
 import pathlib
+import re
 import sys
 
 feedback_path = pathlib.Path(sys.argv[1])
 archive_dir = pathlib.Path(sys.argv[2])
 prompt = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 status_path = pathlib.Path(sys.argv[4])
-workspace = pathlib.Path(sys.argv[5])
+state_dir = pathlib.Path(sys.argv[5])
+workspace = pathlib.Path(sys.argv[6])
+todo_path = pathlib.Path(sys.argv[7])
+assert workspace.resolve() != state_dir.resolve(), (workspace, state_dir)
 expected_claim_id = "todo-g1-source"
 expected_kind = "phase_loop_todo_contract_replan_feedback"
 expected_reason = "supervisor_repeated_leaf_failure_requires_todo_contract_replan"
@@ -4878,10 +4891,31 @@ else:
     else:
         # If an implementation consumes the live file without an archive,
         # require a matching successful claim/ledger transition and a clean
-        # status. ENOENT by itself is never a success receipt.
+        # status. ENOENT by itself is never a success receipt.  Resolve every
+        # audit input from the state directory that was passed to phase-loop;
+        # the workspace ledger is deliberately not an alternative source.
         status = json.loads(status_path.read_text(encoding="utf-8"))
         assert status.get("status") == "last_run_succeeded", status
-        ledger_path = workspace / ".brownie/private/phase-loop/task-ledger.jsonl"
+        expected_claim_path = (state_dir / "todo-claims/current.json").resolve()
+        assert pathlib.Path(status["todo_claim"]).resolve() == expected_claim_path, status
+        expected_queue_path = (state_dir / "todo-claims/todo-queue-state.json").resolve()
+        assert pathlib.Path(status["todo_queue_state"]).resolve() == expected_queue_path, status
+        queue = json.loads(expected_queue_path.read_text(encoding="utf-8"))
+        assert pathlib.Path(queue["todo_path"]).resolve() == todo_path.resolve(), queue
+        todo_text = todo_path.read_text(encoding="utf-8")
+        assert hashlib.sha256(todo_text.encode("utf-8")).hexdigest() == queue["fingerprint"], queue
+        source_match = re.search(
+            r"(?ms)^- \[x\] E-source:.*?(?=^- \[[ xX]\] E-replan:|\Z)",
+            todo_text,
+        )
+        assert source_match, todo_text
+        source_todo = source_match.group(0).rstrip()
+        source_todo_unchecked = re.sub(r"^(- )\[x\]", r"\1[ ]", source_todo, count=1)
+        source_spec_hashes = {
+            hashlib.sha256(value.encode("utf-8")).hexdigest()
+            for value in (source_todo, source_todo_unchecked)
+        }
+        ledger_path = state_dir / "task-ledger.jsonl"
         assert ledger_path.is_file(), ledger_path
         matching_terminal = []
         for line in ledger_path.read_text(encoding="utf-8").splitlines():
@@ -4891,9 +4925,20 @@ else:
             events = record.get("events", []) if record.get("kind") in {"replan_transaction", "terminal_failure_transaction"} else [record]
             for event in events:
                 task_id = str(event.get("task_id", ""))
-                if event.get("claim_id") == expected_claim_id or task_id.endswith(f"@{expected_claim_id}"):
-                    if event.get("to_state") in {"completed", "replanned"}:
-                        matching_terminal.append(event)
+                if event.get("claim_id") != expected_claim_id:
+                    continue
+                if event.get("run_id") != status.get("run_id"):
+                    continue
+                if not (task_id == "E-source" or task_id.endswith(f"@{expected_claim_id}")):
+                    continue
+                if event.get("task_spec_sha256") not in source_spec_hashes:
+                    continue
+                if event.get("queue_generation") not in {None, queue["generation"]}:
+                    continue
+                if event.get("queue_fingerprint") not in {None, queue["fingerprint"]}:
+                    continue
+                if event.get("to_state") in {"completed", "replanned"}:
+                    matching_terminal.append(event)
         assert matching_terminal, f"feedback missing without matching completion audit: {ledger_path}"
 assert "## Previous Repair Feedback" in prompt, prompt
 assert "supervisor_repeated_leaf_failure_requires_todo_contract_replan" in prompt, prompt
