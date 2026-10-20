@@ -1179,6 +1179,7 @@ PHASE_LOOP_TODO="$todo_terminal_no_eligible" \
 PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_no_eligible" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
 PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 terminal_no_eligible_exit="$?"
