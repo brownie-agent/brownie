@@ -587,7 +587,10 @@ todo_first_pending_item() {
       --controller-fingerprint "$(phase_loop_controller_fingerprint)"
     )
     local suppressed_hash
-    for suppressed_hash in "${suppressed_todo_hashes[@]}"; do
+    for suppressed_hash in "${suppressed_todo_hashes[@]-}"; do
+      if [ -z "$suppressed_hash" ]; then
+        continue
+      fi
       evaluator_args+=(--exclude-todo-sha256 "$suppressed_hash")
     done
     selected_todo="$(node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" "${evaluator_args[@]}")"
