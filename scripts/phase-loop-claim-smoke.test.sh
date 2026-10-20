@@ -849,6 +849,12 @@ fake_brownie_completed="$(mktemp)"
 cat > "$fake_brownie_completed" <<'SH'
 #!/usr/bin/env bash
 set -eu
+if [ "${PHASE_LOOP_TEST_MUTATE_TARGET:-0}" = "1" ]; then
+  target_path="$(sed -n 's/.*Patch only `\([^`]*\)`.*/\1/p' "$PHASE_LOOP_TODO" | head -n 1)"
+  test -n "$target_path"
+  mkdir -p "$(dirname "$PHASE_LOOP_WORKSPACE_ROOT/$target_path")"
+  printf '\nexport const phaseLoopCompletionFixtureCompleted = true;\n' >> "$PHASE_LOOP_WORKSPACE_ROOT/$target_path"
+fi
 cat <<'JSON'
 {
   "command": "run",
@@ -1810,6 +1816,7 @@ PHASE_LOOP_PROMPT="$completion_removal_failure_prompt" \
 PHASE_LOOP_TODO="$completion_removal_failure_todo" \
 BROWNIE_BIN="$fake_brownie_completed" \
 PHASE_LOOP_WORKSPACE_ROOT="$completion_removal_failure_workspace" \
+PHASE_LOOP_TEST_MUTATE_TARGET=1 \
 PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
 completion_removal_failure_exit="$?"
