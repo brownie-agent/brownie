@@ -14,6 +14,7 @@ STATUS_FILE="$STATE_DIR/status.json"
 SUPERVISOR_LOG="$LOG_DIR/supervisor.log"
 TODO_CLAIM_DIR="$STATE_DIR/todo-claims"
 TODO_CLAIM_FILE="$TODO_CLAIM_DIR/current.json"
+TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE="$TODO_CLAIM_DIR/terminal-failure-source-transition.pending.json"
 TODO_QUEUE_STATE_FILE="$TODO_CLAIM_DIR/todo-queue-state.json"
 TODO_BLOCKED_FILE="$TODO_CLAIM_DIR/blocked.jsonl"
 TODO_REPAIR_FEEDBACK_FILE="$TODO_CLAIM_DIR/repair-feedback.json"
@@ -575,62 +576,34 @@ todo_first_pending_item() {
     return 0
   fi
   local evaluator_todo_path="$PHASE_LOOP_TODO"
-  local suppressed_todo_path=""
-  local selected_todo next_todo_path selected_first_line
+  local selected_todo selected_hash
+  local -a suppressed_todo_hashes=()
   while true; do
-    selected_todo="$(node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" select --todo "$evaluator_todo_path" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" --blocked "$TODO_BLOCKED_FILE" --controller-fingerprint "$(phase_loop_controller_fingerprint)")"
+    local -a evaluator_args=(
+      select
+      --todo "$evaluator_todo_path"
+      --breakdown "$PHASE_LOOP_TODO_BREAKDOWN"
+      --blocked "$TODO_BLOCKED_FILE"
+      --controller-fingerprint "$(phase_loop_controller_fingerprint)"
+    )
+    local suppressed_hash
+    for suppressed_hash in "${suppressed_todo_hashes[@]}"; do
+      evaluator_args+=(--exclude-todo-sha256 "$suppressed_hash")
+    done
+    selected_todo="$(node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" "${evaluator_args[@]}")"
     if [ -z "$selected_todo" ]; then
-      if [ -n "$suppressed_todo_path" ]; then
-        rm -f "$suppressed_todo_path"
-      fi
       return 0
     fi
     if ! terminal_failure_retry_suppressed_for_todo "$selected_todo"; then
-      if [ -n "$suppressed_todo_path" ]; then
-        rm -f "$suppressed_todo_path"
-      fi
       printf '%s\n' "$selected_todo"
       return 0
     fi
-    # A non-retryable terminal claim is an archived attempt, not a reason to
-    # stop queue selection.  Mark only that in-memory evaluator view as
-    # resolved, then ask the evaluator for the next healthy TODO.  Never write
-    # this projection back to the live queue.
-    selected_first_line="$(printf '%s\n' "$selected_todo" | sed -n '1p')"
-    next_todo_path="$(mktemp "${TMPDIR:-/tmp}/brownie-todo-selection.XXXXXX")"
-    if ! python3 - "$evaluator_todo_path" "$next_todo_path" "$selected_first_line" <<'PY'
-import pathlib
-import re
-import sys
-
-source = pathlib.Path(sys.argv[1])
-target = pathlib.Path(sys.argv[2])
-selected_first_line = sys.argv[3]
-text = source.read_text(encoding="utf-8")
-lines = text.splitlines(keepends=True)
-for index, line in enumerate(lines):
-    if line.rstrip("\r\n") != selected_first_line:
-        continue
-    replacement = re.sub(r"(\[[ \t]*)\](?=\s+)", r"\1x", line, count=1)
-    if replacement == line:
-        raise SystemExit(1)
-    lines[index] = replacement
-    target.write_text("".join(lines), encoding="utf-8")
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
-    then
-      rm -f "$next_todo_path"
-      if [ -n "$suppressed_todo_path" ]; then
-        rm -f "$suppressed_todo_path"
-      fi
-      return 0
-    fi
-    if [ -n "$suppressed_todo_path" ]; then
-      rm -f "$suppressed_todo_path"
-    fi
-    suppressed_todo_path="$next_todo_path"
-    evaluator_todo_path="$suppressed_todo_path"
+    # A non-retryable terminal claim is an archived attempt, not completion
+    # evidence. Exclude only its exact block hash from this in-memory
+    # evaluator request so dependency resolution still sees the failed TODO as
+    # unresolved and can select only an independent sibling.
+    selected_hash="$(printf '%s' "$selected_todo" | shasum -a 256 | awk '{ print $1 }')"
+    suppressed_todo_hashes+=("$selected_hash")
   done
 }
 
@@ -1804,6 +1777,25 @@ except Exception: print("")' 2>/dev/null || true)"
     fi
     PHASE_LOOP_TASK_LEDGER_FAILURE=1
     PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure ledger recording failed before durable recovery; blocked evidence and source terminalization are withheld. recovery_status=$recovery_status pending_marker_status=$recovery_pending_status result=${recovery_output:-<no output>}; keeping claim recoverable."
+    return 78
+  fi
+  # The recovery identity is now durable. Persist the source todo.failed
+  # obligation before appending blocked evidence or returning success, so a
+  # supervisor kill in the gap cannot leave a running source@claim with no
+  # restart-visible transition work. For claim-absent runtime paths, retain
+  # the pre-runtime claim in the marker and restore it on the next run.
+  local source_obligation_status=0
+  if [ -f "$TODO_CLAIM_FILE" ]; then
+    mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || source_obligation_status=$?
+    if [ "$source_obligation_status" -eq 0 ]; then
+      persist_terminal_failure_source_transition_obligation "$TODO_CLAIM_FILE" "$run_stamp" "$recovery_id" || source_obligation_status=$?
+    fi
+  else
+    persist_terminal_failure_source_transition_obligation "$terminal_claim_snapshot" "$run_stamp" "$recovery_id" || source_obligation_status=$?
+  fi
+  if [ "$source_obligation_status" -ne 0 ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure recovery is durable, but the source todo.failed obligation could not be persisted; refusing retry. recovery_id=$recovery_id"
     return 78
   fi
   local blocked_record_status
@@ -10109,6 +10101,11 @@ except Exception: print("")' 2>/dev/null || true)"
     PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery and source transition succeeded but failed claim state could not be persisted: recovery_id=$recovery_id"
     return 78
   fi
+  if ! clear_terminal_failure_source_transition_pending "$run_stamp"; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery and source transition succeeded but its durable obligation marker could not be cleared: recovery_id=$recovery_id"
+    return 78
+  fi
   printf '%s\n' "$recovery_output"
   return 0
 }
@@ -10164,6 +10161,91 @@ PY
   sync_parent_dir "$TODO_CLAIM_DIR"
 }
 
+persist_terminal_failure_source_transition_obligation() {
+  local snapshot_path="${1:-$TODO_CLAIM_FILE}"
+  local run_stamp="$2"
+  local recovery_id="${3:-}"
+  if [ ! -f "$snapshot_path" ]; then
+    return 1
+  fi
+  python3 - "$snapshot_path" "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" "$run_stamp" "$(now_utc)" "$recovery_id" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+claim_path = pathlib.Path(sys.argv[1])
+marker_path = pathlib.Path(sys.argv[2])
+try:
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or not str(claim.get("claim_id") or ""):
+    raise SystemExit(1)
+claim["terminal_failure_source_transition_pending"] = True
+claim["terminal_failure_source_transition_recovery_id"] = sys.argv[5]
+marker = {
+    "schema_version": 1,
+    "run_stamp": sys.argv[3],
+    "updated_at": sys.argv[4],
+    "recovery_id": sys.argv[5],
+    "claim": claim,
+}
+marker_path.parent.mkdir(parents=True, exist_ok=True)
+tmp = marker_path.with_suffix(".tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(marker, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, marker_path)
+os.chmod(marker_path, 0o600)
+directory_fd = os.open(str(marker_path.parent), os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+restore_terminal_failure_source_transition_obligation() {
+  if [ ! -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" ]; then
+    return 0
+  fi
+  python3 - "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" "$TODO_CLAIM_FILE" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+marker_path = pathlib.Path(sys.argv[1])
+claim_path = pathlib.Path(sys.argv[2])
+try:
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    claim = marker["claim"]
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or not str(claim.get("claim_id") or ""):
+    raise SystemExit(1)
+claim["terminal_failure_source_transition_pending"] = True
+claim["terminal_failure_source_transition_recovery_id"] = str(marker.get("recovery_id") or claim.get("terminal_failure_source_transition_recovery_id") or "")
+if not claim_path.exists():
+    tmp = claim_path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, claim_path)
+    os.chmod(claim_path, 0o600)
+PY
+  chmod 600 "$TODO_CLAIM_FILE"
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
 clear_terminal_failure_source_transition_pending() {
   local run_stamp="$1"
   python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
@@ -10199,6 +10281,10 @@ os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 os.chmod(path, 0o600)
 PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+  if [ -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" ] && ! rm -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE"; then
+    return 1
+  fi
   sync_parent_dir "$TODO_CLAIM_DIR"
 }
 
@@ -13129,6 +13215,13 @@ _run_brownie_once() {
     return 78
   fi
 
+  if ! restore_terminal_failure_source_transition_obligation; then
+    detail="A durable terminal source-transition obligation could not be restored; refusing Runtime restart. marker=$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+    return 78
+  fi
+
   write_status "running" "Brownie run started at $started_at" "$run_stamp" "" "${CONSECUTIVE_FAILURES:-0}"
   git_workspace_status_snapshot > "$workspace_status_before"
   chmod 600 "$workspace_status_before" 2>/dev/null || true
@@ -15061,6 +15154,9 @@ PY
           write_status "blocked" "Terminal runtime failure could not be fully recorded; refusing to retry the selected TODO. ledger=${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL:-ledger transaction failed} recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
           return 78
         fi
+        if [ "${PHASE_LOOP_TEST_KILL_AFTER_TERMINAL_RECOVERY:-0}" = "1" ]; then
+          kill -TERM "$$"
+        fi
         local terminal_failure_recovery_id
         terminal_failure_recovery_id="$(printf '%s' "$terminal_failure_recovery_output" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("recovery_id", ""))
@@ -15086,8 +15182,14 @@ except Exception: print("")' 2>/dev/null || true)"
             write_status "blocked" "Terminal runtime failure source transition succeeded, but failed claim state could not be persisted; keeping the source claim recoverable. recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
             return 78
           fi
+          if ! clear_terminal_failure_source_transition_pending "$run_stamp"; then
+            write_status "blocked" "Terminal runtime failure source transition succeeded, but its durable obligation marker could not be cleared; keeping the source claim recoverable. recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+            return 78
+          fi
         else
-          write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed" || true
+          if write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed"; then
+            clear_terminal_failure_source_transition_pending "$run_stamp" || true
+          fi
         fi
         detail="Brownie reported terminal_task_failed with no_eligible_task; retired the selected claim and recorded durable blocked evidence without treating the product queue as complete. recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"

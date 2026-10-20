@@ -2310,6 +2310,78 @@ assert any(event.get('task_id') == source_task and event.get('to_state') == 'fai
 assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[4]).read_text()
 PY
 test ! -e "$terminal_source_transition_pending_state/stop"
+
+# If the supervisor is killed after terminal recovery and blocked evidence are
+# durable but before the main loop writes todo.failed, the restart-visible
+# source-transition obligation must prevent a second Runtime invocation.
+terminal_source_kill_window_state="$(mktemp -d)"
+terminal_source_kill_window_prompt="$(mktemp)"
+terminal_source_kill_window_todo="$(mktemp)"
+terminal_source_kill_window_workspace="$(mktemp -d)"
+terminal_source_kill_window_runtime_count="$terminal_source_kill_window_state/runtime-count"
+git -C "$terminal_source_kill_window_workspace" init -b main >/dev/null
+git -C "$terminal_source_kill_window_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$terminal_source_kill_window_prompt"
+printf -- '- [ ] E-terminal-source-kill-window: Patch only `scripts/provider-target.mjs`:\n  Route: implementation.\n  Completion condition: source transition remains durable across supervisor interruption.\n  Verification: run `node --check scripts/provider-target.mjs`.\n' > "$terminal_source_kill_window_todo"
+terminal_source_kill_window_brownie="$(mktemp)"
+cat > "$terminal_source_kill_window_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$terminal_source_kill_window_runtime_count"
+exec "$fake_brownie_terminal_no_eligible" "\$@"
+SH
+chmod +x "$terminal_source_kill_window_brownie"
+set +e
+PHASE_LOOP_STATE_DIR="$terminal_source_kill_window_state" \
+PHASE_LOOP_PROMPT="$terminal_source_kill_window_prompt" \
+PHASE_LOOP_TODO="$terminal_source_kill_window_todo" \
+BROWNIE_BIN="$terminal_source_kill_window_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_kill_window_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TEST_KILL_AFTER_TERMINAL_RECOVERY=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 143 "$PHASE_LOOP" run-once >/dev/null
+terminal_source_kill_window_first_exit="$?"
+set -e
+test "$terminal_source_kill_window_first_exit" = "143"
+python3 - "$terminal_source_kill_window_state/todo-claims/terminal-failure-source-transition.pending.json" "$terminal_source_kill_window_state/todo-claims/blocked.jsonl" "$terminal_source_kill_window_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+marker = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert marker['claim']['terminal_failure_source_transition_pending'] is True, marker
+assert marker['recovery_id'], marker
+assert blocked and blocked[-1]['terminal_failure'] is True, blocked
+assert pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[3]).read_text()
+PY
+set +e
+PHASE_LOOP_STATE_DIR="$terminal_source_kill_window_state" \
+PHASE_LOOP_PROMPT="$terminal_source_kill_window_prompt" \
+PHASE_LOOP_TODO="$terminal_source_kill_window_todo" \
+BROWNIE_BIN="$terminal_source_kill_window_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_kill_window_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+terminal_source_kill_window_second_exit="$?"
+set -e
+test "$terminal_source_kill_window_second_exit" = "76"
+python3 - "$terminal_source_kill_window_state/status.json" "$terminal_source_kill_window_state/todo-claims/current.json" "$terminal_source_kill_window_state/todo-claims/blocked.jsonl" "$terminal_source_kill_window_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert status['exit_code'] == '76', status
+assert claim['status'] == 'failed', claim
+assert claim['terminal_failure_source_transition_pending'] is False, claim
+assert any(item.get('note') == 'terminal_failure_source_transition_completed' for item in claim['status_history']), claim
+assert len(blocked) == 1, blocked
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[4]).read_text()
+assert not pathlib.Path(sys.argv[2]).parent.joinpath('terminal-failure-source-transition.pending.json').exists()
+PY
 fi
 
 if claim_smoke_section_enabled terminal-absent; then

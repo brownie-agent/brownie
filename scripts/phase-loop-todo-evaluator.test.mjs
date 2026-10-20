@@ -460,6 +460,28 @@ test('counts terminal retry attempts independently for each provider failure fin
   }), '');
 });
 
+test('keeps a suppressed terminal TODO unresolved while selecting an independent sibling', () => {
+  const parent = `- [ ] E-suppressed-parent: Patch only \`scripts/suppressed-parent.mjs\`:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: the parent remains unresolved after a nonretryable terminal attempt.
+  Verification: run \`node --check scripts/suppressed-parent.mjs\`.`;
+  const dependent = `- [ ] E-suppressed-dependent: Patch only \`scripts/suppressed-dependent.mjs\`:
+  Route: implementation.
+  Depends on: E-suppressed-parent.
+  Completion condition: dependent work waits for the unresolved parent.
+  Verification: run \`node --check scripts/suppressed-dependent.mjs\`.`;
+  const sibling = `- [ ] E-independent-sibling: Patch only \`scripts/independent-sibling.mjs\`:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: independent work remains schedulable.
+  Verification: run \`node --check scripts/independent-sibling.mjs\`.`;
+  const queue = `${parent}\n${dependent}\n${sibling}`;
+  assert.equal(selectFirstSchedulableTodo(queue, {
+    excludedTodoHashes: [createHash('sha256').update(parent).digest('hex')]
+  }), sibling);
+});
+
 test('terminal retry budget wins over generic suppression even when terminal hash metadata is legacy-missing', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');

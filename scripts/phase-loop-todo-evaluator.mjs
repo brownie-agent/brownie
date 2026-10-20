@@ -354,12 +354,23 @@ export function selectFirstSchedulableTodo(text, options = {}) {
       .filter(Boolean)
   );
   const dependencyBlockedIds = new Set();
+  const excludedTodoHashes = options.excludedTodoHashes instanceof Set
+    ? options.excludedTodoHashes
+    : new Set(Array.isArray(options.excludedTodoHashes) ? options.excludedTodoHashes : []);
   for (const block of blocks) {
     const id = todoId(block);
     if (!id) {
       continue;
     }
     if (todoState.completedIds.has(id) || todoState.supersededIds.has(id)) {
+      continue;
+    }
+    const blockHash = sha256Text(block);
+    if (excludedTodoHashes.has(blockHash)) {
+      // Excluded terminal attempts are not completion evidence. Keep their
+      // TODO unresolved so dependents remain blocked while independent
+      // siblings can still be selected.
+      dependencyBlockedIds.add(id);
       continue;
     }
     if (blockedQueueDecompositionQueued && !id.startsWith('TODO-decompose-blocked-queue-')) {
@@ -392,7 +403,6 @@ export function selectFirstSchedulableTodo(text, options = {}) {
       continue;
     }
     const firstLine = block.split('\n')[0]?.trim() ?? '';
-    const blockHash = sha256Text(block);
     const terminalFailureAttempts = [...blocked.terminalFailureAttempts.values()].filter((entry) => (
       (entry.todo_hash === blockHash || entry.todo_first_line === firstLine)
       && (!options.controllerFingerprint || entry.controller_fingerprint === options.controllerFingerprint)
@@ -468,7 +478,7 @@ export function evaluateTodoQueue(text, options = {}) {
 }
 
 function parseArgs(argv) {
-  const args = { mode: argv[2] ?? 'select' };
+  const args = { mode: argv[2] ?? 'select', excludedTodoHashes: [] };
   for (let index = 3; index < argv.length; index += 1) {
     const key = argv[index];
     const value = argv[index + 1];
@@ -483,6 +493,9 @@ function parseArgs(argv) {
       index += 1;
     } else if (key === '--controller-fingerprint') {
       args.controllerFingerprint = value;
+      index += 1;
+    } else if (key === '--exclude-todo-sha256') {
+      args.excludedTodoHashes.push(value);
       index += 1;
     } else if (key === '--json') {
       args.json = true;
@@ -508,7 +521,8 @@ if (isMainModule()) {
     repoRoot: defaultRepoRoot,
     breakdownPath,
     blockedPath: args.blocked,
-    controllerFingerprint: args.controllerFingerprint
+    controllerFingerprint: args.controllerFingerprint,
+    excludedTodoHashes: args.excludedTodoHashes
   });
   if (args.mode === 'score' || args.mode === 'needs-decomposition' || args.json) {
     console.log(JSON.stringify(result, null, 2));
