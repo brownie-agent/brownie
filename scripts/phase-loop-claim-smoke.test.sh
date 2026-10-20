@@ -31,8 +31,8 @@ phase_loop_smoke_cpu_count() {
   printf '%s\n' "$detected"
 }
 
-# The sections are CPU-heavy.  Default to online CPUs minus two, with a floor
-# of two and a cap of eight, so an 8-shard run uses the available headroom on
+# The sections are CPU-heavy.  Default to online CPUs minus four, with a floor
+# of two and a cap of six, so an 8-shard run keeps two CPU slots of headroom on
 # a normal worker while a 2-core worker never launches all eight at once.  The
 # batch size remains configurable for CI hosts with known capacity.
 if [ -n "${PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE:-}" ]; then
@@ -45,13 +45,13 @@ if [ -n "${PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE:-}" ]; then
   fi
 else
   phase_loop_smoke_cpu_count_value="$(phase_loop_smoke_cpu_count)"
-  PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=$((phase_loop_smoke_cpu_count_value - 2))
+  PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=$((phase_loop_smoke_cpu_count_value - 4))
   if [ "$phase_loop_smoke_cpu_count_value" -eq 1 ]; then
     PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=1
   elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -lt 2 ]; then
     PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=2
-  elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -gt 8 ]; then
-    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=8
+  elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -gt 6 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=6
   fi
 fi
 
