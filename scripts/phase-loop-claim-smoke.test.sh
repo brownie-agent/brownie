@@ -31,9 +31,9 @@ phase_loop_smoke_cpu_count() {
   printf '%s\n' "$detected"
 }
 
-# The sections are CPU-heavy.  Default to at most half the online CPUs, with
-# a floor of two on ordinary CI workers and a cap of four, so an 8-shard run
-# does not make every child compete for the same limited worker pool.  The
+# The sections are CPU-heavy.  Default to online CPUs minus two, with a floor
+# of two and a cap of eight, so an 8-shard run uses the available headroom on
+# a normal worker while a 2-core worker never launches all eight at once.  The
 # batch size remains configurable for CI hosts with known capacity.
 if [ -n "${PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE:-}" ]; then
   case "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" in
@@ -45,13 +45,13 @@ if [ -n "${PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE:-}" ]; then
   fi
 else
   phase_loop_smoke_cpu_count_value="$(phase_loop_smoke_cpu_count)"
-  PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=$((phase_loop_smoke_cpu_count_value / 2))
+  PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=$((phase_loop_smoke_cpu_count_value - 2))
   if [ "$phase_loop_smoke_cpu_count_value" -eq 1 ]; then
     PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=1
   elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -lt 2 ]; then
     PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=2
-  elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -gt 4 ]; then
-    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=4
+  elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -gt 8 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=8
   fi
 fi
 
@@ -63,13 +63,19 @@ fi
 if [ -z "${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-}" ]; then
   case "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" in
     1) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
-    2) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=75 ;;
-    *) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=60 ;;
+    2) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
+    3|4) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=60 ;;
+    *) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=45 ;;
   esac
 else
   PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS"
 fi
 export PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE PHASE_LOOP_COMMAND_TIMEOUT_SECONDS
+if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
+  printf 'phase-loop claim smoke scheduler: cpus=%s batch_size=%s command_timeout=%ss watchdog=%ss\n' \
+    "$(phase_loop_smoke_cpu_count)" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
+    "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" >&2
+fi
 
 claim_smoke_section_enabled() {
   [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ] || [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "$1" ]
