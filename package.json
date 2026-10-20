@@ -107,6 +107,7 @@
     "phase-loop:delivery-reconcile:test": "node --test scripts/phase-loop-delivery-reconcile.test.mjs",
     "phase-loop:claim-smoke": "bash scripts/phase-loop-claim-smoke.test.sh",
     "phase-loop:binary-freshness": "./phase-loop.sh check-binary-freshness",
+    "phase-loop:bootstrap:test": "node --test scripts/phase-loop-bootstrap.test.mjs",
     "phase-loop:decomposition-adversarial-real-llm": "node scripts/phase-loop-decomposition-adversarial-real-llm.mjs",
     "phase-loop:implementation-preflight": "node scripts/phase-loop-actor-preflight.mjs --role implementation",
     "phase-loop:review-preflight": "node scripts/phase-loop-actor-preflight.mjs --role review",
