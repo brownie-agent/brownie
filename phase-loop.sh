@@ -3486,7 +3486,12 @@ elif selected_id == "e-19a-prevent-empty-queue-completion":
     vsix_check = str(vsix_package_json.get("scripts", {}).get("check", ""))
     semantic_checks = {
         "todo_removal_backup_present": "todo_backup=\"$(mktemp" in phase_loop_text and "cp \"$PHASE_LOOP_TODO\" \"$todo_backup\"" in phase_loop_text,
-        "todo_decomposition_guard_runs_after_completion_removal": "node scripts/guard-todo-decomposition.mjs \"$todo_guard_path\"" in phase_loop_text,
+        "todo_decomposition_guard_runs_after_completion_removal": all(token in phase_loop_text for token in (
+            "node \"$ROOT_DIR/scripts/guard-todo-decomposition.mjs\"",
+            "--repo \"$PHASE_LOOP_WORKSPACE_ROOT\"",
+            "--todo \"$todo_guard_path\"",
+            "--breakdown \"$PHASE_LOOP_TODO_BREAKDOWN\"",
+        )),
         "todo_removal_reverts_live_queue": "completed_todo_removal_reverted=true" in phase_loop_text and "cp \"$todo_backup\" \"$PHASE_LOOP_TODO\"" in phase_loop_text,
         "claim_restored_to_in_progress": "write_todo_claim \"$(claim_field claim_id)\" \"in_progress\"" in phase_loop_text,
         "success_status_forced_to_no_progress": "PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED" in phase_loop_text and "status=\"no_progress\"" in phase_loop_text and "force_status_exit_code=\"76\"" in phase_loop_text,

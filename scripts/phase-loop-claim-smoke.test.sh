@@ -3936,7 +3936,7 @@ if PHASE_LOOP_STATE_DIR="$state_empty_dirty" \
   BROWNIE_BIN="$fake_brownie_json" \
   PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
   run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null; then
-  echo "expected empty queue without durable claim to stop even with dirty/non-main workspace" >&2
+  echo "expected empty queue with dirty/non-main workspace to fail closed before Runtime start" >&2
   exit 1
 fi
 
@@ -3945,9 +3945,12 @@ import json
 import sys
 
 status = json.load(open(sys.argv[1], encoding="utf-8"))
-assert status["status"] == "stopped", status
-assert "durable in-progress claim" in status["detail"], status
+assert status["status"] == "blocked", status
+assert status["exit_code"] == "78", status
+assert "preflight failed before continuing" in status["detail"], status
 PY
+rm -f "$test_workspace/unrelated.txt"
+git -C "$test_workspace" checkout main >/dev/null
 
 state_invalid_json="$(mktemp -d)"
 prompt_invalid_json="$(mktemp)"
@@ -4054,7 +4057,7 @@ PHASE_LOOP_STOP_FORCE_SECONDS=3 \
 "$PHASE_LOOP" stop >/dev/null
 wait_for_pid_exit "$child_supervisor_pid" 8
 sleep 1
-if kill -0 "$child_pid" 2>/dev/null; then
+if kill -0 "$child_pid" 2>/dev/null && ! ps -o stat= -p "$child_pid" 2>/dev/null | grep -Eq '^[[:space:]]*Z'; then
   echo "expected stop to terminate supervisor-managed child pid=$child_pid" >&2
   kill -KILL "$child_pid" 2>/dev/null || true
   exit 1
@@ -4257,7 +4260,7 @@ cp "$REPO_ROOT/scripts/phase-loop-todo-state.mjs" "$verified_noop_e19_workspace/
 printf '{"product_ready":false}\n' > "$verified_noop_e19_workspace/docs/architecture/phase-value-manifest.json"
 cat > "$verified_noop_e19_workspace/.brownie/todo.md" <<'EOF'
 - [ ] E-19a-prevent-empty-queue-completion: Patch only `phase-loop.sh` so completed TODO removal is reverted when the resulting `.brownie/todo.md` fails the decomposition guard:
-  Route: implementation.
+  Route: blocker.
   Source TODO: empty-queue-regression-follow-up-2026-09-22.
   Depends on: <none>.
   Completion condition: release blocker queues cannot become empty while Product Ready is false; attempted completion removal is reverted while the durable claim remains completed with cleanup pending when the guard rejects the resulting queue.
@@ -4266,6 +4269,13 @@ cat > "$verified_noop_e19_workspace/.brownie/todo.md" <<'EOF'
 
 - [ ] E-19b-refresh-owner-governance-evidence-after-stable-ci: Blocker: release blocker evidence remains fail-closed until owner governance evidence reflects completed latest-main CI instead of pending checks.
   Verification: inspect latest main CI completion and fail-closed owner governance evidence, then keep the blocker if GitHub checks are still pending or unavailable.
+
+- [ ] E-19c-queue-cleanup-follow-up: Patch only `scripts/phase-loop-todo-state.mjs` to preserve queue cleanup invariants after the completed-item removal path:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: queue state remains executable while release blockers are unresolved.
+  Forbidden changes: do not weaken TODO decomposition or Product Ready guards.
+  Verification: run `node --check scripts/phase-loop-todo-state.mjs`.
 EOF
 git -C "$verified_noop_e19_workspace" add .
 git -C "$verified_noop_e19_workspace" commit -m init >/dev/null
@@ -4303,6 +4313,7 @@ assert "semantic_wiring_already_present_without_verification_commands" in status
 assert claim["status"] == "completed", claim
 assert "E-19a-prevent-empty-queue-completion" not in todo, todo
 assert "E-19b-refresh-owner-governance-evidence-after-stable-ci" in todo, todo
+assert "E-19c-queue-cleanup-follow-up" in todo, todo
 PY
 
 python3 - "$PHASE_LOOP" <<'PY'
@@ -4412,7 +4423,7 @@ broad_decomposition_workspace="$(mktemp -d)"
 git -C "$broad_decomposition_workspace" init -b main >/dev/null
 git -C "$broad_decomposition_workspace" config user.name Brownie
 git -C "$broad_decomposition_workspace" config user.email brownie@example.invalid
-touch "$broad_decomposition_workspace/package.json"
+printf '{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs"}}\n' > "$broad_decomposition_workspace/package.json"
 git -C "$broad_decomposition_workspace" add package.json
 git -C "$broad_decomposition_workspace" commit -m init >/dev/null
 printf 'base prompt\n' > "$broad_decomposition_prompt"
@@ -4445,22 +4456,23 @@ PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 BROWNIE_BIN="$fake_brownie_broad_decomposition" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
 
-broad_decomposition_prompt_file="$(find "$broad_decomposition_state/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
-python3 - "$broad_decomposition_todo" "$broad_decomposition_prompt_file" <<'PY'
+python3 - "$broad_decomposition_state/status.json" "$broad_decomposition_todo" "$broad_decomposition_breakdown" "$broad_decomposition_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
 import pathlib
 import sys
 
-todo = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-prompt = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-assert "TODO-decompose-broad-todo-" in todo, todo
-assert "Decompose broad TODO `E-99-runtime-release-evidence`" in todo, todo
-assert "state: `decompose_todo`" in prompt, prompt
-assert "decomposition_policy: this invocation is TODO decomposition only" in prompt, prompt
-assert "replace the active decomposition request and its broad source TODO" in prompt, prompt
-assert "Every generated leaf MUST include the exact line `Source TODO: TODO-decompose-broad-todo-" in prompt, prompt
-assert "write one or two leaf TODOs in `new_text`" in prompt, prompt
-assert "under 900 characters" in prompt, prompt
-assert "do not silently discard parent requirements" in prompt, prompt
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+breakdown = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+ledger = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
+assert status["status"] == "last_run_succeeded", status
+assert "Applied deterministic TODO decomposition repair" in status["detail"], status
+assert "E-99-runtime-release-evidence-blocker" in todo, todo
+assert "E-99-runtime-release-evidence" in todo, todo
+assert "## TODO-decompose-broad-todo-" in breakdown, breakdown
+assert "E-99-runtime-release-evidence" in breakdown, breakdown
+assert "TODO-decompose-broad-todo-" in ledger, ledger
+assert '"to_state":"completed"' in ledger or '"to_state": "completed"' in ledger, ledger
 PY
 
 no_eligible_split_state="$(mktemp -d)"
@@ -4478,7 +4490,7 @@ cat > "$no_eligible_split_workspace/.brownie/todo.md" <<'EOF'
 - [ ] E-20g-final-judgment-sync: Patch only `docs/a.md`, `scripts/b.mjs` to synchronize final judgment and guard coverage:
   Route: implementation.
   Source TODO: E-20.
-  Depends on: E-20f.
+  Depends on: <none>.
   Completion condition: final judgment and guard coverage are synchronized without claiming Product Ready prematurely.
   Forbidden changes: do not edit unrelated files.
   Verification: run `pnpm --workspace-root check`.
@@ -4614,7 +4626,7 @@ git -C "$repair_feedback_workspace" init -b main >/dev/null
 git -C "$repair_feedback_workspace" config user.name Brownie
 git -C "$repair_feedback_workspace" config user.email brownie@example.invalid
 mkdir -p "$repair_feedback_workspace/scripts"
-touch "$repair_feedback_workspace/package.json"
+printf '{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs"}}\n' > "$repair_feedback_workspace/package.json"
 printf 'export const operationalEvidence = {};\n' > "$repair_feedback_workspace/scripts/release-runtime-operational-evidence.mjs"
 git -C "$repair_feedback_workspace" add package.json
 git -C "$repair_feedback_workspace" add scripts/release-runtime-operational-evidence.mjs
@@ -4762,7 +4774,9 @@ cat > "$contract_replan_feedback_todo" <<'EOF'
 - [ ] E-replan: Patch only `scripts/release-runtime-operational-evidence.mjs` to replan the failed archive leaf.
   Route: todo-decomposition.
   Source TODO: E-source.
+  Depends on: <none>.
   Completion condition: replace the failed leaf with implementable children.
+  Forbidden changes: do not edit unrelated files.
   Verification: run `pnpm --workspace-root guard:todo-decomposition`.
 
 - [x] E-completed-after-replan: Completed source must not extend the selected replan block.

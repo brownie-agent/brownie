@@ -1617,3 +1617,53 @@ test('does not prune completion-backed dependency while repairing another dangli
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('fails closed with an auditable result when workspace package.json is invalid', () => {
+  const root = makeTempRepo();
+  try {
+    fs.writeFileSync(path.join(root, 'package.json'), '{ invalid json\n');
+    fs.writeFileSync(path.join(root, 'scripts/fixture.mjs'), 'export const fixture = true;\n');
+    fs.writeFileSync(path.join(root, 'scripts/second-fixture.mjs'), 'export const secondFixture = true;\n');
+    const source = `- [ ] E-invalid-package-contract: Patch only \`scripts/fixture.mjs\`, \`scripts/second-fixture.mjs\` to restore a broad workspace contract:
+  Route: implementation.
+  Depends on: <none>.
+  Source concern: the workspace contract spans multiple independently verified fixture surfaces.
+  Completion condition: both fixture surfaces remain executable.
+  Forbidden changes: do not edit unrelated files.
+  Verification: run \`node --check scripts/fixture.mjs\`.`;
+    const selected = `- [ ] TODO-decompose-broad-todo-invalid-package: Decompose broad TODO \`E-invalid-package-contract\` into bounded leaves:
+  Route: todo-decomposition.
+  Source TODO: E-invalid-package-contract.
+  Depends on: <none>.
+  Completion condition: replace the broad source TODO with bounded executable leaves.
+  Forbidden changes: do not edit unrelated files.
+  Verification: run \`pnpm --workspace-root guard:todo-decomposition\`.`;
+    fs.writeFileSync(path.join(root, '.brownie/todo.md'), `${source}\n\n${selected}\n`);
+    fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-claims/current.json'), JSON.stringify({
+      schema_version: 1,
+      claim_id: 'claim-invalid-package-contract',
+      selected_todo: selected
+    }, null, 2));
+
+    const result = runRepair(root);
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.applied, false, payload);
+    assert.equal(payload.eligible, true, payload);
+    assert.equal(payload.blocked, true, payload);
+    assert.equal(payload.reason, 'workspace_package_json_invalid', payload);
+    assert.equal(payload.error_code, 'workspace_package_json_invalid', payload);
+    assert.match(payload.error_message, /package\.json is invalid/u);
+    assert.doesNotMatch(result.stdout, /SyntaxError: Unexpected token/u);
+    assert.equal(result.stderr, '');
+    const todoAfter = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8');
+    assert.match(todoAfter, /E-invalid-package-contract/u);
+    assert.match(todoAfter, /TODO-decompose-broad-todo-invalid-package/u);
+    const breakdownAfter = fs.readFileSync(path.join(root, '.brownie/todo-breakdown.md'), 'utf8');
+    assert.match(breakdownAfter, /^# TODO breakdown/u);
+    assert.doesNotMatch(breakdownAfter, /TODO-decompose-broad-todo-invalid-package/u);
+    assert.equal(fs.existsSync(path.join(root, '.brownie/private/phase-loop/todo-replans')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
