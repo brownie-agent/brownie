@@ -86,6 +86,21 @@ claim_smoke_section_enabled() {
   [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ] || [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "$1" ]
 }
 
+# PR fixtures use a local bare repository for push assertions, while the
+# production actor preflight intentionally requires origin to identify the
+# real GitHub repository. Keep those concerns separate: origin carries the
+# canonical repository identity and fixture-origin carries the local test
+# transport selected through PHASE_LOOP_PR_REMOTE.
+phase_loop_prepare_pr_fixture_workspace() {
+  local workspace="$1"
+  local remote="$2"
+  mkdir -p "$workspace/docs/architecture"
+  cp "$REPO_ROOT/docs/architecture/phase-loop-actor-separation-policy.json" \
+    "$workspace/docs/architecture/phase-loop-actor-separation-policy.json"
+  git -C "$workspace" remote set-url origin https://github.com/globalpocket/brownie.git
+  git -C "$workspace" remote add fixture-origin "$remote"
+}
+
 case "$PHASE_LOOP_CLAIM_SMOKE_SECTION" in
   all|core|terminal|completion|terminal-absent|queue|pr|lifecycle|guards|feedback) ;;
   *)
@@ -1883,6 +1898,7 @@ git -C "$completion_pr_cleanup_retry_remote" init --bare >/dev/null
 git -C "$completion_pr_cleanup_retry_workspace" remote add origin "$completion_pr_cleanup_retry_remote"
 git -C "$completion_pr_cleanup_retry_workspace" push -u origin main >/dev/null
 git -C "$completion_pr_cleanup_retry_workspace" switch -c brownie-agent/smoke-completion-cleanup-pr >/dev/null
+phase_loop_prepare_pr_fixture_workspace "$completion_pr_cleanup_retry_workspace" "$completion_pr_cleanup_retry_remote"
 printf 'base prompt\n' > "$completion_pr_cleanup_retry_prompt"
 printf -- '- [ ] E-completion-cleanup-pr: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_cleanup_retry_todo"
 cat > "$completion_pr_cleanup_retry_bin/pnpm" <<'SH'
@@ -1984,7 +2000,7 @@ assert '- [ ] E-completion-cleanup-pr:' not in todo, todo
 assert pr_count.read_text(encoding='utf-8').splitlines() == ['1'], pr_count
 assert not runtime_count.exists(), runtime_count
 head = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'HEAD'], text=True).strip()
-remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'origin/brownie-agent/smoke-completion-cleanup-pr'], text=True).strip()
+remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'fixture-origin/brownie-agent/smoke-completion-cleanup-pr'], text=True).strip()
 assert head == remote, (head, remote)
 supervisor = pathlib.Path(pathlib.Path(sys.argv[1]).parent / 'logs' / 'supervisor.log').read_text(encoding='utf-8')
 assert 'completed_todo_pr_publish_retry_succeeded=true' in supervisor, supervisor
@@ -2011,6 +2027,7 @@ git -C "$completion_pr_publish_failure_remote" init --bare >/dev/null
 git -C "$completion_pr_publish_failure_workspace" remote add origin "$completion_pr_publish_failure_remote"
 git -C "$completion_pr_publish_failure_workspace" push -u origin main >/dev/null
 git -C "$completion_pr_publish_failure_workspace" switch -c brownie-agent/smoke-completion-pr-retry >/dev/null
+phase_loop_prepare_pr_fixture_workspace "$completion_pr_publish_failure_workspace" "$completion_pr_publish_failure_remote"
 printf 'base prompt\n' > "$completion_pr_publish_failure_prompt"
 printf -- '- [ ] E-completion-pr-retry: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_publish_failure_todo"
 cat > "$completion_pr_publish_failure_bin/pnpm" <<'SH'
@@ -2119,7 +2136,7 @@ assert claim['completion_pr_pending'] is False, claim
 assert attempts.read_text(encoding='utf-8').splitlines() == ['attempt', 'attempt'], attempts
 assert not runtime_count.exists(), runtime_count
 head = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'HEAD'], text=True).strip()
-remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'origin/brownie-agent/smoke-completion-pr-retry'], text=True).strip()
+remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'fixture-origin/brownie-agent/smoke-completion-pr-retry'], text=True).strip()
 assert head == remote, (head, remote)
 PY
 
@@ -2144,6 +2161,7 @@ git -C "$completion_pr_marker_preservation_remote" init --bare >/dev/null
 git -C "$completion_pr_marker_preservation_workspace" remote add origin "$completion_pr_marker_preservation_remote"
 git -C "$completion_pr_marker_preservation_workspace" push -u origin main >/dev/null
 git -C "$completion_pr_marker_preservation_workspace" switch -c brownie-agent/smoke-completion-pr-marker-preservation >/dev/null
+phase_loop_prepare_pr_fixture_workspace "$completion_pr_marker_preservation_workspace" "$completion_pr_marker_preservation_remote"
 printf 'base prompt\n' > "$completion_pr_marker_preservation_prompt"
 printf -- '- [ ] E-completion-pr-marker-preservation: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_marker_preservation_todo"
 cat > "$completion_pr_marker_preservation_bin/pnpm" <<'SH'
@@ -2286,6 +2304,7 @@ git -C "$completion_cleanup_interrupt_remote" init --bare >/dev/null
 git -C "$completion_cleanup_interrupt_workspace" remote add origin "$completion_cleanup_interrupt_remote"
 git -C "$completion_cleanup_interrupt_workspace" push -u origin main >/dev/null
 git -C "$completion_cleanup_interrupt_workspace" switch -c brownie-agent/smoke-completion-cleanup-interrupt >/dev/null
+phase_loop_prepare_pr_fixture_workspace "$completion_cleanup_interrupt_workspace" "$completion_cleanup_interrupt_remote"
 printf 'base prompt\n' > "$completion_cleanup_interrupt_prompt"
 printf -- '- [ ] E-completion-cleanup-interrupt: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_cleanup_interrupt_todo"
 cat > "$completion_cleanup_interrupt_bin/pnpm" <<'SH'
@@ -3270,6 +3289,7 @@ test_workspace="$queue_original_workspace"
 fi
 
 if claim_smoke_section_enabled pr; then
+export PHASE_LOOP_PR_REMOTE=fixture-origin
 state_pr_progress="$(mktemp -d)"
 prompt_pr_progress="$(mktemp)"
 todo_pr_progress="$(mktemp)"
@@ -3286,6 +3306,7 @@ git -C "$remote_pr_progress" init --bare >/dev/null
 git -C "$workspace_pr_progress" remote add origin "$remote_pr_progress"
 git -C "$workspace_pr_progress" push -u origin main >/dev/null
 git -C "$workspace_pr_progress" switch -c brownie-agent/smoke-pr >/dev/null
+phase_loop_prepare_pr_fixture_workspace "$workspace_pr_progress" "$remote_pr_progress"
 printf 'base prompt\n' > "$prompt_pr_progress"
 printf -- '- [ ] B-01: create PR from tracked Brownie progress\n' > "$todo_pr_progress"
 cat > "$fake_bin_dir/pnpm" <<'SH'
@@ -3335,7 +3356,7 @@ workspace = sys.argv[2]
 assert status["status"] == "pr_created", status
 assert "pull/9999" in status["detail"], status
 head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
-remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "origin/brownie-agent/smoke-pr"], text=True).strip()
+remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
 assert "create PR from tracked Brownie progress" in message, message
@@ -3359,6 +3380,7 @@ git -C "$remote_pr_completed_progress" init --bare >/dev/null
 git -C "$workspace_pr_completed_progress" remote add origin "$remote_pr_completed_progress"
 git -C "$workspace_pr_completed_progress" push -u origin main >/dev/null
 git -C "$workspace_pr_completed_progress" switch -c brownie-agent/smoke-pr-completed >/dev/null
+phase_loop_prepare_pr_fixture_workspace "$workspace_pr_completed_progress" "$remote_pr_completed_progress"
 printf 'base prompt\n' > "$prompt_pr_completed_progress"
 printf -- '- [ ] B-01: create PR from completed tracked Brownie progress\n' > "$todo_pr_completed_progress"
 
@@ -3381,7 +3403,7 @@ workspace = sys.argv[2]
 assert status["status"] == "pr_created", status
 assert "pull/9999" in status["detail"], status
 head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
-remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "origin/brownie-agent/smoke-pr-completed"], text=True).strip()
+remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr-completed"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
 assert "create PR from completed tracked Brownie progress" in message, message
@@ -3403,6 +3425,7 @@ git -C "$remote_pr_supervise" init --bare >/dev/null
 git -C "$workspace_pr_supervise" remote add origin "$remote_pr_supervise"
 git -C "$workspace_pr_supervise" push -u origin main >/dev/null
 git -C "$workspace_pr_supervise" switch -c brownie-agent/smoke-pr-supervise >/dev/null
+phase_loop_prepare_pr_fixture_workspace "$workspace_pr_supervise" "$remote_pr_supervise"
 printf 'base prompt\n' > "$prompt_pr_supervise"
 printf -- '- [ ] B-01: create PR then stop supervisor\n' > "$todo_pr_supervise"
 cat > "$fake_supervise_bin_dir/pnpm" <<'SH'
@@ -3464,7 +3487,7 @@ assert status["status"] == "pr_created", status
 assert "pull/9998" in status["detail"], status
 assert "pr_created observed; stopping supervisor for review" in supervisor_log, supervisor_log
 head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
-remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "origin/brownie-agent/smoke-pr-supervise"], text=True).strip()
+remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr-supervise"], text=True).strip()
 assert head == remote, (head, remote)
 PY
 
