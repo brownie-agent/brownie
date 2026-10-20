@@ -1295,7 +1295,7 @@ terminal_retry_cap_workspace="$(mktemp -d)"
 git -C "$terminal_retry_cap_workspace" init -b main >/dev/null
 git -C "$terminal_retry_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
 printf 'base prompt\n' > "$prompt_terminal_retry_cap"
-printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n\n- [ ] E-retry-cap-deferred: Blocker: unavailable prerequisite is controlled outside the workspace.\n  Route: documentation.\n  Completion condition: the owner supplies the prerequisite evidence.\n  Verification: blocker: exact missing evidence is named, and no workspace file is patched until it is available.\n' > "$todo_terminal_retry_cap"
+printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n' > "$todo_terminal_retry_cap"
 for retry_run in 1 2; do
   set +e
   PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
