@@ -806,6 +806,52 @@ test('does not start when post-replan stale claim archival fails', () => {
   }
 });
 
+test('fails closed when a post-replan stale claim disappears after its audit snapshot', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress', run_id: 'run-replan-archive-enoent', consecutive_failures: 0
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 3, run_stamp: '20261008T000300Z',
+    progress_projection: {
+      cli_status: 'no_eligible_task', closure: 'no_eligible_task',
+      claim_id: 'claim-replan-archive-enoent', selected_todo: runtimeEvidenceTodo
+    }
+  });
+  const claimPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/current.json');
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-replan-archive-enoent', status: 'claimed', selected_todo: runtimeEvidenceTodo
+  });
+  const originalRmSync = fs.rmSync;
+  fs.rmSync = function guardedRemove(file, ...args) {
+    if (String(file) === claimPath) {
+      originalRmSync.call(this, file, ...args);
+      const error = new Error('simulated stale claim disappearance after audit snapshot');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return originalRmSync.call(this, file, ...args);
+  };
+  try {
+    const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: true });
+    assert.equal(result.repair.post_replan_stale_active_claim.ok, false, JSON.stringify(result, null, 2));
+    assert.equal(result.repair.post_replan_stale_active_claim.reason, 'active_claim_disappeared_during_cleanup');
+    assert.equal(result.start.attempted, false, JSON.stringify(result, null, 2));
+    assert.equal(result.start.reason, 'post_replan_stale_claim_archive_failed');
+    assert.equal(fs.existsSync(claimPath), false);
+    const archives = fs.readdirSync(path.dirname(claimPath))
+      .filter((name) => name.startsWith('stale-current-'));
+    assert.equal(archives.length, 1);
+    const archived = JSON.parse(fs.readFileSync(path.join(path.dirname(claimPath), archives[0]), 'utf8'));
+    assert.equal(archived.claim_id, 'claim-replan-archive-enoent');
+    assert.match(archived.claim_snapshot_sha256, /^[a-f0-9]{64}$/u);
+  } finally {
+    fs.rmSync = originalRmSync;
+  }
+});
+
 test('does not carry a no-progress ledger streak across a changed progress fingerprint', () => {
   const repo = makeRepo();
   writeTodo(repo);

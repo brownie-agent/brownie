@@ -2857,16 +2857,21 @@ run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/
 objective_apply_stalled_exit="$?"
 set -e
 test "$objective_apply_stalled_exit" = "76"
-python3 - "$state_objective_apply_stalled/status.json" "$state_objective_apply_stalled/progress-state.json" "$state_objective_apply_stalled/todo-claims/current.json" "$state_objective_apply_stalled/todo-claims/repair-feedback.json" "$todo_objective_apply_stalled" "$todo_breakdown_objective_apply_stalled" <<'PY'
+python3 - "$state_objective_apply_stalled/status.json" "$state_objective_apply_stalled/progress-state.json" "$state_objective_apply_stalled/todo-claims" "$state_objective_apply_stalled/todo-claims/repair-feedback.json" "$todo_objective_apply_stalled" "$todo_breakdown_objective_apply_stalled" <<'PY'
 import json
+import pathlib
+import re
 import sys
 
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 progress = json.load(open(sys.argv[2], encoding="utf-8"))
-claim = json.load(open(sys.argv[3], encoding="utf-8"))
+claim_dir = pathlib.Path(sys.argv[3])
 feedback = json.load(open(sys.argv[4], encoding="utf-8"))
 todo = open(sys.argv[5], encoding="utf-8").read()
 breakdown = open(sys.argv[6], encoding="utf-8").read()
+archives = sorted(claim_dir.glob("stale-current-*.json"))
+assert len(archives) == 1, archives
+claim = json.load(open(archives[0], encoding="utf-8"))
 projection = progress["progress_projection"]
 assert status["status"] == "no_progress", status
 assert "objective_apply_stalled" in status["detail"], status
@@ -2876,12 +2881,14 @@ assert projection["objective_apply_pending"] is True, projection
 assert projection["objective_apply_stalled"] is True, projection
 assert claim["status"] == "in_progress", claim
 assert feedback["claim_id"] == claim["claim_id"], feedback
+assert re.fullmatch(r"[a-f0-9]{64}", claim["claim_snapshot_sha256"]), claim
+assert claim["evaluator_selected_todo_id"].startswith("E-99-replan-stalled-leaf-"), claim
 assert feedback["kind"] == "phase_loop_todo_contract_replan_feedback", feedback
 assert feedback["reason"] == "supervisor_repeated_leaf_failure_requires_todo_contract_replan", feedback
 assert feedback["completed"] is False, feedback
 assert feedback["selected_todo_first_line"].startswith("- [ ] E-99-objective-apply:"), feedback
-assert "E-99-replan-stalled-leaf-" in todo, todo
-assert ".brownie/todo.md" in todo and ".brownie/todo-breakdown.md" in todo, todo
+assert todo.startswith("- [ ] E-99-objective-apply:"), todo
+assert breakdown.startswith("# queue fixture breakdown\n"), breakdown
 assert "E-99-replan-stalled-leaf-" in breakdown, breakdown
 PY
 git -C "$queue_objective_workspace" restore --worktree -- .brownie
@@ -3623,12 +3630,14 @@ PY
 
 actor_guard_missing_workspace="$(mktemp -d)"
 actor_guard_missing_state="$(mktemp -d)"
+actor_guard_missing_control_root="$(mktemp -d)"
 mkdir -p "$actor_guard_missing_workspace/scripts"
+cp "$PHASE_LOOP" "$actor_guard_missing_control_root/phase-loop.sh"
 set +e
 PATH="$fake_bin_dir:$PATH" \
 PHASE_LOOP_STATE_DIR="$actor_guard_missing_state" \
 PHASE_LOOP_WORKSPACE_ROOT="$actor_guard_missing_workspace" \
-bash -c 'script=$1; set --; source "$script" >/dev/null; phase_loop_require_implementation_pr_actor' _ "$PHASE_LOOP"
+bash -c 'script=$1; set --; source "$script" >/dev/null; phase_loop_require_implementation_pr_actor' _ "$actor_guard_missing_control_root/phase-loop.sh"
 actor_guard_missing_exit="$?"
 set -e
 test "$actor_guard_missing_exit" = "1"

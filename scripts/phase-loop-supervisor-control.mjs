@@ -373,8 +373,18 @@ function readJsonOrNull(filePath) {
   }
 }
 
-function removeActiveClaimForArchive(claimPath) {
+function removeActiveClaimForArchive(claimPath, expectedSnapshot = null) {
   try {
+    if (typeof expectedSnapshot === 'string') {
+      const currentSnapshot = fs.readFileSync(claimPath, 'utf8');
+      if (currentSnapshot !== expectedSnapshot) {
+        return {
+          ok: false,
+          reason: 'active_claim_changed_during_cleanup',
+          error: 'active claim changed after the archive snapshot was captured'
+        };
+      }
+    }
     fs.rmSync(claimPath);
     return { ok: true };
   } catch (error) {
@@ -1661,8 +1671,7 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   if (activeClaim?.claim_id && todoIdFromFirstLine(activeClaim.selected_todo) === selectedId) {
     const stamp = new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
     const archivePath = path.join(
-      repoRoot,
-      '.brownie/private/phase-loop/todo-claims',
+      path.dirname(claimPath),
       `terminal-stalled-replan-${stamp}.json`
     );
     const archivedClaim = {
@@ -1804,18 +1813,30 @@ function maybeArchiveStaleActiveClaim(repoRoot, diagnostic) {
     return { attempted: false, reason: 'active_claim_matches_live_queue_or_not_reported' };
   }
   const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
-  const claim = readJsonOrNull(claimPath);
-  if (!claim) {
+  let claimSnapshot;
+  let claim;
+  try {
+    claimSnapshot = fs.readFileSync(claimPath, 'utf8');
+    claim = JSON.parse(claimSnapshot);
+  } catch (error) {
+    return {
+      attempted: true,
+      ok: false,
+      reason: error?.code === 'ENOENT' ? 'active_claim_missing_before_archive' : 'claim_missing_or_invalid',
+      error: error?.message ?? String(error)
+    };
+  }
+  if (!claim || typeof claim !== 'object' || Array.isArray(claim)) {
     return { attempted: true, ok: false, reason: 'claim_missing_or_invalid' };
   }
   const stamp = new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
   const archivePath = path.join(
-    repoRoot,
-    '.brownie/private/phase-loop/todo-claims',
+    path.dirname(claimPath),
     `stale-current-${stamp}.json`
   );
   const archived = {
     ...claim,
+    claim_snapshot_sha256: crypto.createHash('sha256').update(claimSnapshot).digest('hex'),
     archived_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
     archived_by: 'phase-loop-supervisor-control',
     archive_reason: 'active_claim_not_selected_by_live_queue',
@@ -1823,7 +1844,7 @@ function maybeArchiveStaleActiveClaim(repoRoot, diagnostic) {
   };
   try {
     fs.writeFileSync(archivePath, `${JSON.stringify(archived, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    const removal = removeActiveClaimForArchive(claimPath);
+    const removal = removeActiveClaimForArchive(claimPath, claimSnapshot);
     if (!removal.ok) {
       return { attempted: true, ok: false, ...removal, path: path.relative(repoRoot, archivePath) };
     }
@@ -1972,8 +1993,7 @@ function maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, diagnostic, ledgerS
 
   const stamp = new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
   const archivePath = path.join(
-    repoRoot,
-    '.brownie/private/phase-loop/todo-claims',
+    path.dirname(claimPath),
     `terminal-no-eligible-current-${stamp}.json`
   );
   const archived = {

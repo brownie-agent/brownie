@@ -87,3 +87,66 @@ test('archives a blocked active claim and selects its unblocked replan leaf', ()
   assert.ok(fs.existsSync(path.join(claims, 'stale-test-run.json')));
   assert.ok(fs.existsSync(path.join(claims, 'stale-test-run-1.json')));
 });
+
+test('claims a generated blocked-queue decomposition from the same TODO snapshot and CAS', () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-blocked-queue-generated-claim-'));
+  const state = path.join(workspace, '.brownie/private/phase-loop-state');
+  const todo = path.join(workspace, '.brownie/todo.md');
+  const breakdown = path.join(workspace, '.brownie/todo-breakdown.md');
+  const target = path.join(workspace, 'scripts/release-supply-chain-artifact-evidence.mjs');
+  const source = '- [ ] E-23a-portable-archive: Patch only \`scripts/release-supply-chain-artifact-evidence.mjs\`:\n  Route: implementation.\n  Depends on: <none>.\n  Completion condition: portable archive verification is implemented.\n  Forbidden changes: do not declare Product Ready.\n  Verification: inspect/blocker/fail-closed.';
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(path.join(workspace, 'package.json'), JSON.stringify({
+    private: true,
+    scripts: {
+      'guard:todo-decomposition': 'node scripts/guard-todo-decomposition.mjs',
+      'phase-loop:todo-queue-integrity': 'node scripts/phase-loop-todo-queue-integrity.mjs'
+    }
+  }));
+  fs.writeFileSync(target, 'export const evidence = {};\n');
+  fs.writeFileSync(todo, source + '\n');
+  fs.writeFileSync(breakdown, '# Breakdown\n');
+  execFileSync('git', ['init', '-b', 'main'], { cwd: workspace, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
+  execFileSync('git', ['add', '.'], { cwd: workspace });
+  execFileSync('git', ['commit', '-m', 'init'], { cwd: workspace, stdio: 'ignore' });
+
+  const claims = path.join(state, 'todo-claims');
+  const blocked = path.join(claims, 'blocked.jsonl');
+  fs.mkdirSync(claims, { recursive: true });
+  fs.writeFileSync(blocked, JSON.stringify({
+    block_reason: 'stalled_leaf_contract_replan',
+    selected_todo_first_line: source.split('\n')[0]
+  }) + '\n');
+  const breakdownBefore = fs.readFileSync(breakdown, 'utf8');
+
+  const result = execFileSync('bash', [
+    '-c',
+    'script=$1; set --; source "$script" >/dev/null; generated="$(ensure_blocked_todo_decomposition_request)"; claim_first_pending_todo test-run; printf "GENERATED=%s\n" "$generated"; python3 - "$TODO_CLAIM_FILE" "$TODO_QUEUE_STATE_FILE" <<\'PY\'\nimport json, sys\nclaim = json.load(open(sys.argv[1], encoding="utf-8"))\nqueue = json.load(open(sys.argv[2], encoding="utf-8"))\nprint(json.dumps({"claim": claim, "queue": queue}, sort_keys=True))\nPY',
+    '_',
+    phaseLoop
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PHASE_LOOP_STATE_DIR: state,
+      PHASE_LOOP_TODO: todo,
+      PHASE_LOOP_TODO_BREAKDOWN: breakdown,
+      PHASE_LOOP_WORKSPACE_ROOT: workspace
+    }
+  });
+
+  const generated = result.match(/^GENERATED=(TODO-decompose-blocked-queue-[a-f0-9]{12})$/mu)?.[1];
+  assert.ok(generated, result);
+  const payload = JSON.parse(result.trim().split('\n').at(-1));
+  assert.equal(payload.claim.status, 'in_progress', payload);
+  const generatedHeading = new RegExp('- \\[ \\] ' + generated + ':');
+  assert.match(payload.claim.selected_todo, generatedHeading);
+  assert.equal(payload.claim.queue_fingerprint, payload.queue.fingerprint, payload);
+  assert.equal(fs.readFileSync(breakdown, 'utf8'), breakdownBefore);
+  assert.match(fs.readFileSync(todo, 'utf8'), generatedHeading);
+  assert.match(fs.readFileSync(todo, 'utf8'), /\.brownie\/todo-breakdown\.md/u);
+});
