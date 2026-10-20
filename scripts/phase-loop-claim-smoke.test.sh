@@ -323,6 +323,12 @@ run_with_timeout() {
         echo "--- $PHASE_LOOP_STATE_DIR/logs/supervisor.log (tail) ---" >&2
         tail -n 80 "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" >&2
       fi
+      for diagnostic_file in "$PHASE_LOOP_STATE_DIR"/terminal-retry-then-success.runtime-trace; do
+        if [ -f "$diagnostic_file" ]; then
+          echo "--- $diagnostic_file ---" >&2
+          cat "$diagnostic_file" >&2
+        fi
+      done
     fi
       ;;
     esac
@@ -767,6 +773,8 @@ fake_brownie_terminal_retry_then_success="$(mktemp)"
 cat > "$fake_brownie_terminal_retry_then_success" <<SH
 #!/usr/bin/env bash
 set -eu
+trace_file="\$PHASE_LOOP_STATE_DIR/terminal-retry-then-success.runtime-trace"
+trap 'printf "runtime_exit=%s attempt=%s\\n" "\$?" "\${attempt:-unset}" >> "\$trace_file"' EXIT
 attempt_file="\$PHASE_LOOP_STATE_DIR/terminal-retry-then-success.attempt"
 attempt="\$(python3 - "\$attempt_file" <<'PY'
 import pathlib
