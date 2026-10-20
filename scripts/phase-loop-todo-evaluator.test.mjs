@@ -425,6 +425,41 @@ test('honors terminal failure retry caps before stable suppression', () => {
   }), changedTodo);
 });
 
+test('counts terminal retry attempts independently for each provider failure fingerprint', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const todo = `- [ ] E-provider-retry-cap: Patch only \`scripts/provider-retry-cap.mjs\`:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: provider-specific terminal retry budgets remain independent.
+  Verification: run \`node --check scripts/provider-retry-cap.mjs\`.`;
+  const base = {
+    block_reason: 'terminal_runtime_failure',
+    controller_fingerprint: 'controller-provider-cap',
+    selected_todo_sha256: createHash('sha256').update(todo).digest('hex'),
+    selected_todo_first_line: todo.split('\n')[0],
+    retry_cap: 1
+  };
+  fs.writeFileSync(blocked, `${JSON.stringify({ ...base, provider_failure_fingerprint: 'provider-a', run_stamp: 'a-1' })}\n`);
+  fs.appendFileSync(blocked, `${JSON.stringify({ ...base, provider_failure_fingerprint: 'provider-b', run_stamp: 'b-1' })}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-provider-cap'
+  }), todo);
+
+  fs.appendFileSync(blocked, `${JSON.stringify({ ...base, provider_failure_fingerprint: 'provider-a', run_stamp: 'a-2' })}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-provider-cap'
+  }), todo);
+
+  fs.appendFileSync(blocked, `${JSON.stringify({ ...base, provider_failure_fingerprint: 'provider-b', run_stamp: 'b-2' })}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-provider-cap'
+  }), '');
+});
+
 test('terminal retry budget wins over generic suppression even when terminal hash metadata is legacy-missing', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');
