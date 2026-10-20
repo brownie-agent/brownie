@@ -9,12 +9,67 @@ PHASE_LOOP="$REPO_ROOT/phase-loop.sh"
 # pretending that a PR branch already matches origin/main.
 export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="HEAD"
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
-# A fresh CI worker may spend more than 25 seconds in the first `run-once`
-# preparing the temporary Git workspace and Node helpers.  Keep an explicit
-# per-invocation bound, but leave enough headroom for that cold path; the
-# suite-wide watchdog below remains the final hang safeguard.
-PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-45}"
 PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
+
+phase_loop_smoke_cpu_count() {
+  local detected=""
+  if command -v getconf >/dev/null 2>&1; then
+    detected="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+  case "$detected" in
+    ''|*[!0-9]*) detected="" ;;
+  esac
+  if [ -z "$detected" ] && command -v sysctl >/dev/null 2>&1; then
+    detected="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  fi
+  case "$detected" in
+    ''|*[!0-9]*) detected=2 ;;
+  esac
+  if [ "$detected" -lt 1 ]; then
+    detected=2
+  fi
+  printf '%s\n' "$detected"
+}
+
+# The sections are CPU-heavy.  Default to at most half the online CPUs, with
+# a floor of two on ordinary CI workers and a cap of four, so an 8-shard run
+# does not make every child compete for the same limited worker pool.  The
+# batch size remains configurable for CI hosts with known capacity.
+if [ -n "${PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE:-}" ]; then
+  case "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" in
+    ''|*[!0-9]*) echo "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE must be a positive integer" >&2; exit 2 ;;
+  esac
+  if [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -lt 1 ]; then
+    echo "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE must be a positive integer" >&2
+    exit 2
+  fi
+else
+  phase_loop_smoke_cpu_count_value="$(phase_loop_smoke_cpu_count)"
+  PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=$((phase_loop_smoke_cpu_count_value / 2))
+  if [ "$phase_loop_smoke_cpu_count_value" -eq 1 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=1
+  elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -lt 2 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=2
+  elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -gt 4 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=4
+  fi
+fi
+
+# Preserve the historical 45-second bound when the suite is intentionally
+# configured for the old eight-way fan-out.  Otherwise give each child a
+# bounded amount of headroom proportional to the reduced parallelism; this
+# is still below the suite watchdog and avoids false timeout failures caused
+# by CPU contention rather than a hung controller.
+if [ -z "${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-}" ]; then
+  case "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" in
+    1) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
+    2) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=75 ;;
+    *) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=60 ;;
+  esac
+else
+  PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS"
+fi
+export PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE PHASE_LOOP_COMMAND_TIMEOUT_SECONDS
 
 claim_smoke_section_enabled() {
   [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ] || [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "$1" ]
@@ -55,7 +110,7 @@ if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   # the other CPU-heavy batches so its bounded child cleanup remains stable.
   claim_smoke_shards=(core terminal completion terminal-absent queue pr guards feedback lifecycle)
   claim_smoke_failed=0
-  claim_smoke_batch_size=8
+  claim_smoke_batch_size="$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"
   claim_smoke_batch_start=0
   while [ "$claim_smoke_batch_start" -lt "${#claim_smoke_shards[@]}" ]; do
     claim_smoke_pids=()
@@ -319,6 +374,9 @@ assert_contains "$PHASE_LOOP" "A leaf must never depend on itself"
 assert_contains "$PHASE_LOOP" "distinct prerequisite TODO ID already present in the live queue"
 assert_contains "$PHASE_LOOP" 'never generate a read-only `Read`, `Inspect`, or `Extract` leaf'
 assert_contains "$PHASE_LOOP" "phase-loop-pr-actor-guard.mjs"
+assert_contains "${BASH_SOURCE[0]}" "phase_loop_smoke_cpu_count"
+assert_contains "${BASH_SOURCE[0]}" "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"
+assert_contains "${BASH_SOURCE[0]}" 'claim_smoke_batch_size="$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"'
 
 claim_smoke_private_state_sha256() {
   local state_root="$REPO_ROOT/.brownie/private/phase-loop"
