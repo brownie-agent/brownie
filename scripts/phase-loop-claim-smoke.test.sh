@@ -14,6 +14,19 @@ PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS
 # per-invocation bound, but leave enough headroom for that cold path; the
 # suite-wide watchdog below remains the final hang safeguard.
 PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-45}"
+PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
+
+claim_smoke_section_enabled() {
+  [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ] || [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "$1" ]
+}
+
+case "$PHASE_LOOP_CLAIM_SMOKE_SECTION" in
+  all|core|terminal|completion|terminal-absent|queue|pr|lifecycle|guards|feedback) ;;
+  *)
+    echo "unknown phase-loop claim smoke section: $PHASE_LOOP_CLAIM_SMOKE_SECTION" >&2
+    exit 2
+    ;;
+esac
 
 (
   sleep "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS"
@@ -21,7 +34,60 @@ PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-45}"
   kill -TERM "$$" 2>/dev/null || true
 ) &
 claim_smoke_watchdog_pid="$!"
-trap 'kill "$claim_smoke_watchdog_pid" 2>/dev/null || true' EXIT
+claim_smoke_shard_dir=""
+cleanup_claim_smoke() {
+  kill "$claim_smoke_watchdog_pid" 2>/dev/null || true
+  wait "$claim_smoke_watchdog_pid" 2>/dev/null || true
+  if [ -n "$claim_smoke_shard_dir" ] && [ -d "$claim_smoke_shard_dir" ]; then
+    rm -rf -- "$claim_smoke_shard_dir"
+  fi
+}
+trap cleanup_claim_smoke EXIT
+
+# The suite contains independent temporary-workspace fixtures. Run those
+# sections in parallel so adding another bounded fixture does not turn the
+# single serial smoke process into a CI watchdog timeout. Each child gets its
+# own controller store and suite watchdog; a failed child still fails the
+# aggregate command with its diagnostics.
+if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
+  claim_smoke_shard_dir="$(mktemp -d)"
+  # The lifecycle shard owns process-group signal fixtures; keep it out of
+  # the other CPU-heavy batches so its bounded child cleanup remains stable.
+  claim_smoke_shards=(core terminal completion terminal-absent queue pr guards feedback lifecycle)
+  claim_smoke_failed=0
+  claim_smoke_batch_size=8
+  claim_smoke_batch_start=0
+  while [ "$claim_smoke_batch_start" -lt "${#claim_smoke_shards[@]}" ]; do
+    claim_smoke_pids=()
+    claim_smoke_batch_end=$((claim_smoke_batch_start + claim_smoke_batch_size))
+    if [ "$claim_smoke_batch_end" -gt "${#claim_smoke_shards[@]}" ]; then
+      claim_smoke_batch_end="${#claim_smoke_shards[@]}"
+    fi
+    for ((claim_smoke_index = claim_smoke_batch_start; claim_smoke_index < claim_smoke_batch_end; claim_smoke_index += 1)); do
+      claim_smoke_shard="${claim_smoke_shards[$claim_smoke_index]}"
+      PHASE_LOOP_CLAIM_SMOKE_SECTION="$claim_smoke_shard" \
+      "$BASH" "$0" >"$claim_smoke_shard_dir/$claim_smoke_shard.stdout.log" 2>"$claim_smoke_shard_dir/$claim_smoke_shard.stderr.log" &
+      claim_smoke_pids+=("$!")
+    done
+    for ((claim_smoke_index = claim_smoke_batch_start; claim_smoke_index < claim_smoke_batch_end; claim_smoke_index += 1)); do
+      claim_smoke_shard="${claim_smoke_shards[$claim_smoke_index]}"
+      if ! wait "${claim_smoke_pids[$claim_smoke_index - claim_smoke_batch_start]}"; then
+        claim_smoke_failed=1
+        echo "phase-loop claim smoke shard failed: $claim_smoke_shard" >&2
+        cat "$claim_smoke_shard_dir/$claim_smoke_shard.stdout.log" >&2
+        cat "$claim_smoke_shard_dir/$claim_smoke_shard.stderr.log" >&2
+      fi
+    done
+    if [ "$claim_smoke_failed" -ne 0 ]; then
+      break
+    fi
+    claim_smoke_batch_start="$claim_smoke_batch_end"
+  done
+  if [ "$claim_smoke_failed" -ne 0 ]; then
+    exit 1
+  fi
+  exit 0
+fi
 
 if ! command -v rg >/dev/null 2>&1; then
   fallback_bin_dir="$(mktemp -d)"
@@ -913,6 +979,7 @@ exit 99
 SH
 chmod +x "$fake_brownie_must_not_run"
 
+if claim_smoke_section_enabled core; then
 state_with_claim="$(mktemp -d)"
 prompt_with_claim="$(mktemp)"
 todo_with_claim="$(mktemp)"
@@ -1006,7 +1073,9 @@ assert "blocked external-control boundary" in status["detail"], status
 assert "will continue with the next unblocked TODO" in status["detail"], status
 assert claim["status"] == "blocked", claim
 PY
+fi
 
+if claim_smoke_section_enabled terminal; then
 state_terminal_no_eligible="$(mktemp -d)"
 prompt_terminal_no_eligible="$(mktemp)"
 todo_terminal_no_eligible="$(mktemp)"
@@ -1455,7 +1524,9 @@ case "$blocked_append_failure_retry_exit" in
   *) echo "unexpected blocked-append retry exit=$blocked_append_failure_retry_exit" >&2; exit 1 ;;
 esac
 test "$(cat "$blocked_append_failure_state/terminal-no-eligible-count" 2>/dev/null || printf '0')" = "0"
+fi
 
+if claim_smoke_section_enabled completion; then
 # Completion must record the terminal ledger transition before mutating the
 # live TODO queue. An unwritable ledger keeps both queue and claim retryable.
 completion_ledger_failure_state="$(mktemp -d)"
@@ -2172,7 +2243,9 @@ assert any(event.get('task_id') == source_task and event.get('to_state') == 'fai
 assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[4]).read_text()
 PY
 test ! -e "$terminal_source_transition_pending_state/stop"
+fi
 
+if claim_smoke_section_enabled terminal-absent; then
 # Terminal recovery remains durable when the runtime removes the active claim
 # before the controller emits its final trajectory. The next run must not
 # recreate the same queue-generation/target attempt.
@@ -2331,7 +2404,9 @@ assert 'E-stale-replacement-new:' in failed['selected_todo'], failed
 assert failed['claim_id'] != 'todo-g1-old-stale-replacement', failed
 assert failed['claim_id'].startswith('todo-g'), failed
 PY
+fi
 
+if claim_smoke_section_enabled queue; then
 state_objective_apply_stalled="$(mktemp -d)"
 prompt_objective_apply_stalled="$(mktemp)"
 todo_objective_apply_stalled="$(mktemp)"
@@ -2818,7 +2893,9 @@ assert progress["classification"] == "progress", progress
 assert progress["meaningful_progress"] is True, progress
 assert progress["workspace_changed"] is True, progress
 PY
+fi
 
+if claim_smoke_section_enabled pr; then
 state_pr_progress="$(mktemp -d)"
 prompt_pr_progress="$(mktemp)"
 todo_pr_progress="$(mktemp)"
@@ -3052,7 +3129,9 @@ bash -c 'script=$1; set --; source "$script" >/dev/null; phase_loop_require_impl
 actor_guard_invalid_exit="$?"
 set -e
 test "$actor_guard_invalid_exit" = "1"
+fi
 
+if claim_smoke_section_enabled lifecycle; then
 state_truncated="$(mktemp -d)"
 prompt_truncated="$(mktemp)"
 todo_truncated="$(mktemp)"
@@ -3444,7 +3523,9 @@ if kill -0 "$child_pid" 2>/dev/null; then
   kill -KILL "$child_pid" 2>/dev/null || true
   exit 1
 fi
+fi
 
+if claim_smoke_section_enabled guards; then
 exact_workspace="$(mktemp -d)"
 git -C "$exact_workspace" init -b main >/dev/null
 git -C "$exact_workspace" config user.name Brownie
@@ -3983,7 +4064,9 @@ assert blocked[-1]["block_reason"] == "terminal_runtime_failure", blocked
 assert "terminal_failure_transaction" in ledger, ledger
 PY
 fi
+fi
 
+if claim_smoke_section_enabled feedback; then
 repair_feedback_state="$(mktemp -d)"
 repair_feedback_prompt="$(mktemp)"
 repair_feedback_todo="$(mktemp)"
@@ -4356,6 +4439,7 @@ PY
 # leaving status.json at `running`.
 run_status_write_signal_regression TERM 143
 run_status_write_signal_regression INT 130
+fi
 
 assert_repository_state_unchanged
 echo "phase-loop claim smoke passed"
