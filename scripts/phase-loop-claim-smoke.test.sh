@@ -4207,7 +4207,7 @@ fake_brownie_broad_decomposition="$(mktemp)"
 cat > "$fake_brownie_broad_decomposition" <<'SH'
 #!/usr/bin/env bash
 if [ "$1" = "--json" ] && [ "$2" = "run" ]; then
-  printf '%s\n' '{"ok":true,"command":"run","exit_code":0,"run":{"status":"no_eligible_task","completed":false,"blocked":true,"terminal_failure":true,"automation":{"status":"terminal_failure","blocked":true,"completed":false,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed"}}}'
+  printf '%s\n' '{"ok":true,"command":"run","exit_code":0,"run":{"status":"no_eligible_task","completed":false,"blocked":true,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed","automation":{"status":"terminal_failure","blocked":true,"completed":false,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed"}}}'
   exit 0
 fi
 printf '%s\n' '{"ok":true}'
@@ -4280,6 +4280,7 @@ PHASE_LOOP_TODO="$no_eligible_split_workspace/.brownie/todo.md" \
 PHASE_LOOP_TODO_BREAKDOWN="$no_eligible_split_workspace/.brownie/todo-breakdown.md" \
 PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
 
@@ -4290,6 +4291,7 @@ PHASE_LOOP_TODO_BREAKDOWN="$no_eligible_split_workspace/.brownie/todo-breakdown.
 PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_MUTATE_TODO_AFTER_PROMPT=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75,76 "$PHASE_LOOP" run-once >/dev/null
 no_eligible_split_exit="$?"
