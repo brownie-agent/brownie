@@ -597,7 +597,7 @@ todo_first_pending_item() {
     # resolved, then ask the evaluator for the next healthy TODO.  Never write
     # this projection back to the live queue.
     selected_first_line="$(printf '%s\n' "$selected_todo" | sed -n '1p')"
-    next_todo_path="$(mktemp "\${TMPDIR:-/tmp}/brownie-todo-selection.XXXXXX")"
+    next_todo_path="$(mktemp "${TMPDIR:-/tmp}/brownie-todo-selection.XXXXXX")"
     if ! python3 - "$evaluator_todo_path" "$next_todo_path" "$selected_first_line" <<'PY'
 import pathlib
 import re
