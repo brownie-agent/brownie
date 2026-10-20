@@ -65,7 +65,10 @@ if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
     fi
     for ((claim_smoke_index = claim_smoke_batch_start; claim_smoke_index < claim_smoke_batch_end; claim_smoke_index += 1)); do
       claim_smoke_shard="${claim_smoke_shards[$claim_smoke_index]}"
+      claim_smoke_control_root="$claim_smoke_shard_dir/$claim_smoke_shard-control-root"
+      mkdir -p "$claim_smoke_control_root"
       PHASE_LOOP_CLAIM_SMOKE_SECTION="$claim_smoke_shard" \
+      PHASE_LOOP_CONTROL_ROOT="$claim_smoke_control_root" \
       "$BASH" "$0" >"$claim_smoke_shard_dir/$claim_smoke_shard.stdout.log" 2>"$claim_smoke_shard_dir/$claim_smoke_shard.stderr.log" &
       claim_smoke_pids+=("$!")
     done
