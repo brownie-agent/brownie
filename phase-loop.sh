@@ -2075,6 +2075,53 @@ raise SystemExit(0 if count <= retry_cap else 2)
 PY
 }
 
+terminal_failure_retry_state_for_todo() {
+  local selected_todo="$1"
+  if [ ! -f "$TODO_BLOCKED_FILE" ]; then
+    return 1
+  fi
+  python3 - "$TODO_BLOCKED_FILE" "$selected_todo" "$(phase_loop_controller_fingerprint)" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+blocked_path = pathlib.Path(sys.argv[1])
+selected = sys.argv[2]
+controller = sys.argv[3]
+selected_hash = hashlib.sha256(selected.encode("utf-8")).hexdigest()
+count = 0
+retry_cap = 0
+matched = False
+for line in blocked_path.read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    try:
+        record = json.loads(line)
+    except Exception:
+        continue
+    if record.get("block_reason") != "terminal_runtime_failure":
+        continue
+    if record.get("controller_fingerprint") != controller:
+        continue
+    record_hash = record.get("selected_todo_sha256")
+    if not isinstance(record_hash, str) or not record_hash:
+        record_hash = hashlib.sha256(str(record.get("selected_todo_first_line") or "").encode("utf-8")).hexdigest()
+    if record_hash != selected_hash:
+        continue
+    matched = True
+    count += 1
+    try:
+        candidate = int(record.get("retry_cap"))
+    except Exception:
+        candidate = 0
+    retry_cap = max(candidate, 0)
+if not matched:
+    raise SystemExit(1)
+raise SystemExit(0 if count <= retry_cap else 2)
+PY
+}
+
 selected_todo_was_stably_blocked() {
   if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$TODO_BLOCKED_FILE" ]; then
     return 1
@@ -8838,6 +8885,15 @@ archive_failed_todo_claim_for_retry() {
 
 terminal_failure_retry_suppressed_for_todo() {
   local selected_todo="$1"
+  local retry_state
+  if terminal_failure_retry_state_for_todo "$selected_todo"; then
+    :
+  else
+    retry_state=$?
+    if [ "$retry_state" -eq 2 ]; then
+      return 0
+    fi
+  fi
   python3 - "$TODO_CLAIM_DIR" "$selected_todo" <<'PY'
 import json
 import pathlib

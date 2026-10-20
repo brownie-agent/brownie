@@ -2559,16 +2559,15 @@ PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
-python3 - "$state_terminal_claim_absent/todo-claims/current.json" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+python3 - "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
 import sys
 
-current = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
-assert not current['selected_todo'].startswith('- [ ] E-15b-provider-terminal:'), current
 transactions = []
-for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines():
+for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
     if not line.strip():
         continue
     record = json.loads(line)
@@ -2578,7 +2577,39 @@ same_todo = [
     record for record in transactions
     if any('E-15b-provider-terminal:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
 ]
-assert len(same_todo) == 1, same_todo
+assert len(same_todo) == 2, same_todo
+PY
+
+# The configured retry cap permits exactly one fresh attempt, but durable
+# terminal evidence must still stop the controller from reexecuting forever.
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_claim_absent" \
+PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
+PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+terminal_claim_absent_third_exit="$?"
+set -e
+test "$terminal_claim_absent_third_exit" = "0"
+python3 - "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+transactions = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get('kind') == 'terminal_failure_transaction':
+        transactions.append(record)
+same_todo = [
+    record for record in transactions
+    if any('E-15b-provider-terminal:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
+]
+assert len(same_todo) == 2, same_todo
 PY
 
 # A stale active claim can be replaced before Runtime starts. If Runtime then
