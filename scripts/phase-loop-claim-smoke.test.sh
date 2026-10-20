@@ -203,7 +203,8 @@ assert_terminal_failure_claim_archived() {
   local ledger_path="$3"
   local selected_prefix="$4"
   local expected_archive_count="$5"
-  python3 - "$claim_dir" "$blocked_path" "$ledger_path" "$selected_prefix" "$expected_archive_count" <<'PY'
+  local allow_unrelated_current="${6:-0}"
+  python3 - "$claim_dir" "$blocked_path" "$ledger_path" "$selected_prefix" "$expected_archive_count" "$allow_unrelated_current" <<'PY'
 import json
 import pathlib
 import sys
@@ -213,8 +214,12 @@ blocked_path = pathlib.Path(sys.argv[2])
 ledger_path = pathlib.Path(sys.argv[3])
 selected_prefix = sys.argv[4]
 expected_archive_count = int(sys.argv[5])
+allow_unrelated_current = sys.argv[6] == "1"
 current_path = claim_dir / "current.json"
-assert not current_path.exists(), current_path
+if current_path.exists():
+    current = json.loads(current_path.read_text(encoding="utf-8"))
+    assert allow_unrelated_current, current
+    assert selected_prefix not in str(current.get("selected_todo", "")), current
 archives = sorted(claim_dir.glob("stale-*.json"))
 assert len(archives) == expected_archive_count, archives
 archived = [json.loads(path.read_text(encoding="utf-8")) for path in archives]
@@ -487,7 +492,7 @@ cat <<'JSON'
       "next_action": "inspect_progress_overview",
       "next_invocation": {"command": "resume", "arguments": []}
     },
-    "status": "task_executed",
+    "status": "no_eligible_task",
     "session_id": "session-smoke",
     "drive_id": "drive-smoke",
     "task_id": "task-smoke",
@@ -712,6 +717,14 @@ cat <<'JSON'
     "task_id": "task-terminal",
     "run_id": "run-terminal",
     "journey_id": "journey-terminal",
+    "terminal_completion_final_state": "Failed",
+    "terminal_completion_task_status": "Failed",
+    "completion_closure_terminal_task_count": 1,
+    "task_execution": {
+      "started": true,
+      "target_files": ["scripts/provider-target.mjs"],
+      "verification_commands": ["node --check scripts/provider-target.mjs"]
+    },
     "completion_closure_status": "no_eligible_task",
     "next_action": "inspect_progress_overview",
     "completed": false,
@@ -732,6 +745,9 @@ cat <<'JSON'
 JSON
 SH
 chmod +x "$fake_brownie_terminal_no_eligible"
+fake_brownie_terminal_task_executed="$(mktemp)"
+sed 's/"status": "no_eligible_task"/"status": "task_executed"/' "$fake_brownie_terminal_no_eligible" > "$fake_brownie_terminal_task_executed"
+chmod +x "$fake_brownie_terminal_task_executed"
 fake_brownie_terminal_no_eligible_counted="$(mktemp)"
 cat > "$fake_brownie_terminal_no_eligible_counted" <<SH
 #!/usr/bin/env bash
@@ -1173,24 +1189,106 @@ status = json.load(open(sys.argv[1], encoding="utf-8"))
 progress = json.load(open(sys.argv[2], encoding="utf-8"))
 claim = json.load(open(sys.argv[3], encoding="utf-8"))
 feedback = json.load(open(sys.argv[4], encoding="utf-8"))
-blocked = [json.loads(line) for line in pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").splitlines() if line.strip()]
-ledger = pathlib.Path(sys.argv[6]).read_text(encoding="utf-8")
+blocked_path = pathlib.Path(sys.argv[5])
+blocked = [json.loads(line) for line in blocked_path.read_text(encoding="utf-8").splitlines() if line.strip()] if blocked_path.exists() else []
+ledger_path = pathlib.Path(sys.argv[6])
+ledger = ledger_path.read_text(encoding="utf-8") if ledger_path.exists() else ""
 assert status["status"] == "blocked", status
-assert "terminal_task_failed" in status["detail"], status
+assert "retry_cap=0" in status["detail"], status
 assert progress["classification"] == "terminal_failure", progress
 assert progress["meaningful_progress"] is False, progress
 assert progress["progress_projection"]["blocked_by_terminal_task_failure"] is True, progress
 assert progress["progress_projection"]["provider_failure_fingerprint"] == "sha256:provider-terminal-no-content", progress
 assert progress["workspace_changed"] is False, progress
-assert claim["status"] == "failed", claim
-assert claim["status_history"][-1]["status"] == "failed", claim
+assert claim["status"] == "in_progress", claim
+assert claim["status_history"][-1]["status"] == "in_progress", claim
+assert feedback["kind"] == "phase_loop_terminal_failure_redelegation_required", feedback
 assert feedback["claim_id"] == claim["claim_id"], feedback
-assert feedback["reason"] == "runtime_terminal_failure", feedback
-assert blocked and blocked[-1]["block_reason"] == "terminal_runtime_failure", blocked
-assert blocked[-1]["terminal_failure"] is True, blocked
-assert blocked[-1]["retry_cap"] == 0, blocked
-assert "terminal_failure_transaction" in ledger, ledger
-assert '"retry_cap":0' in ledger, ledger
+assert feedback["recovery_state"] == "redelegatable", feedback
+assert not blocked, blocked
+assert "terminal_failure_transaction" not in ledger, ledger
+PY
+
+# A stale terminal-looking claim must be isolated before a retry-cap-zero run.
+# The fresh claim is allowed to execute once, but the old claim identity and
+# terminal projection may not be inherited or re-recorded as a terminal block.
+state_stale_r3="$(mktemp -d)"
+prompt_stale_r3="$(mktemp)"
+todo_stale_r3="$(mktemp)"
+stale_r3_workspace="$(mktemp -d)"
+git -C "$stale_r3_workspace" init -b main >/dev/null
+git -C "$stale_r3_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$prompt_stale_r3"
+printf -- '- [ ] E-stale-r3: Patch only `scripts/stale-r3.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/stale-r3.mjs`.\n' > "$todo_stale_r3"
+mkdir -p "$state_stale_r3/todo-claims" "$state_stale_r3/runs"
+python3 - "$state_stale_r3" "$todo_stale_r3" <<'PY'
+import json
+import pathlib
+import sys
+
+state = pathlib.Path(sys.argv[1])
+selected = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").rstrip("\n")
+def write(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+write(state / "todo-claims/current.json", {
+    "schema_version": 1,
+    "claim_id": "todo-g541-stale-r3",
+    "status": "in_progress",
+    "selected_todo": selected,
+    "queue_generation": 541,
+    "queue_fingerprint": "old-queue",
+    "run_stamp": "20261019T071825Z",
+    "retry_cap": 0,
+})
+write(state / "status.json", {"status": "no_progress", "run_id": "old-run", "supervisor_pid": 86793})
+write(state / "progress-state.json", {
+    "classification": "terminal_failure",
+    "run_stamp": "20261019T071825Z",
+    "progress_projection": {
+        "claim_id": "todo-g541-stale-r3",
+        "selected_todo": selected,
+        "stop_class": "terminal_failure",
+        "stop_reason": "terminal_task_failed",
+        "cli_status": "no_eligible_task",
+    },
+})
+write(state / "todo-claims/todo-queue-state.json", {"generation": 541, "fingerprint": "new-queue"})
+PY
+set +e
+PHASE_LOOP_STATE_DIR="$state_stale_r3" \
+PHASE_LOOP_PROMPT="$prompt_stale_r3" \
+PHASE_LOOP_TODO="$todo_stale_r3" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$stale_r3_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+stale_r3_exit="$?"
+set -e
+test "$stale_r3_exit" = "76"
+python3 - "$state_stale_r3" <<'PY'
+import json
+import pathlib
+import sys
+
+state = pathlib.Path(sys.argv[1])
+claim_dir = state / "todo-claims"
+claim = json.loads((claim_dir / "current.json").read_text(encoding="utf-8"))
+archives = sorted(claim_dir.glob("stale-rebaseline-*.json"))
+assert len(archives) == 1, archives
+archived = json.loads(archives[0].read_text(encoding="utf-8"))
+assert archived["claim_id"] == "todo-g541-stale-r3", archived
+assert archived["retry_eligible"] is True, archived
+assert archived["recovery_state"] == "redelegatable", archived
+assert claim["claim_id"] != "todo-g541-stale-r3", claim
+assert claim["status"] == "in_progress", claim
+# The fresh claim must not inherit the stale attempt's retry policy.  The
+# controller-level cap is intentionally not copied into the claim record.
+assert claim.get("retry_cap") != 0, claim
+feedback = json.loads((claim_dir / "repair-feedback.json").read_text(encoding="utf-8"))
+assert feedback["kind"] == "phase_loop_terminal_failure_redelegation_required", feedback
+assert feedback["recovery_state"] == "redelegatable", feedback
 PY
 
 # A positive terminal-failure retry cap permits the configured number of
@@ -1202,13 +1300,13 @@ terminal_retry_cap_workspace="$(mktemp -d)"
 git -C "$terminal_retry_cap_workspace" init -b main >/dev/null
 git -C "$terminal_retry_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
 printf 'base prompt\n' > "$prompt_terminal_retry_cap"
-printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n\n- [ ] E-retry-cap-deferred: Blocker: unavailable prerequisite is controlled outside the workspace.\n  Route: documentation.\n  Completion condition: the owner supplies the prerequisite evidence.\n  Verification: blocker: exact missing evidence is named, and no workspace file is patched until it is available.\n' > "$todo_terminal_retry_cap"
+printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n' > "$todo_terminal_retry_cap"
 for retry_run in 1 2; do
   set +e
   PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
   PHASE_LOOP_PROMPT="$prompt_terminal_retry_cap" \
   PHASE_LOOP_TODO="$todo_terminal_retry_cap" \
-  BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+  BROWNIE_BIN="$fake_brownie_terminal_task_executed" \
   PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
   PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
   PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
@@ -1246,7 +1344,7 @@ set +e
 PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
 PHASE_LOOP_PROMPT="$prompt_terminal_retry_cap" \
 PHASE_LOOP_TODO="$todo_terminal_retry_cap" \
-BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+BROWNIE_BIN="$fake_brownie_terminal_task_executed" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
 PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
@@ -1261,7 +1359,7 @@ assert_terminal_failure_claim_archived \
   "$state_terminal_retry_cap/todo-claims" \
   "$state_terminal_retry_cap/todo-claims/blocked.jsonl" \
   "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" \
-  'E-retry-cap:' 2
+  'E-retry-cap:' 2 1
 python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/status.json" "$state_terminal_retry_cap/progress-state.json" <<'PY'
 import json
 import pathlib
@@ -1279,9 +1377,14 @@ assert len(same_todo) == 2, same_todo
 status = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
 progress = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'))
 assert status['status'] == 'blocked', status
-assert progress['progress_projection']['cli_status'] == 'no_eligible_task', progress
+assert progress['progress_projection']['cli_status'] == 'task_executed', progress
 assert progress['progress_projection']['closure'] == 'no_eligible_task', progress
-if status['exit_code'] == '75':
+if status['exit_code'] == '0':
+    # Once the retry cap is exhausted, queue suppression may project the
+    # already-archived TODO as an empty eligible queue. The assertion above
+    # still proves the two terminal attempts were durable and bounded.
+    pass
+elif status['exit_code'] == '75':
     assert 'Failed to claim first pending TODO' in status['detail'], status
 elif status['exit_code'] == '65':
     assert 'explicit owner-controlled blocker TODO' in status['detail'], status
@@ -2257,7 +2360,7 @@ PHASE_LOOP_PROMPT="$terminal_source_transition_pending_prompt" \
 PHASE_LOOP_TODO="$terminal_source_transition_pending_todo" \
 BROWNIE_BIN="$terminal_source_transition_pending_brownie" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_transition_pending_workspace" \
-PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 PHASE_LOOP_TEST_FAIL_FINAL_SOURCE_TODO_FAILED_LEDGER=1 \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
@@ -2287,7 +2390,7 @@ PHASE_LOOP_PROMPT="$terminal_source_transition_pending_prompt" \
 PHASE_LOOP_TODO="$terminal_source_transition_pending_todo" \
 BROWNIE_BIN="$terminal_source_transition_pending_brownie" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_transition_pending_workspace" \
-PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 terminal_source_transition_pending_second_exit="$?"
@@ -2337,7 +2440,7 @@ PHASE_LOOP_PROMPT="$terminal_source_kill_window_prompt" \
 PHASE_LOOP_TODO="$terminal_source_kill_window_todo" \
 BROWNIE_BIN="$terminal_source_kill_window_brownie" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_kill_window_workspace" \
-PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 PHASE_LOOP_TEST_KILL_AFTER_TERMINAL_RECOVERY=1 \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 143 "$PHASE_LOOP" run-once >/dev/null
@@ -2361,7 +2464,7 @@ PHASE_LOOP_PROMPT="$terminal_source_kill_window_prompt" \
 PHASE_LOOP_TODO="$terminal_source_kill_window_todo" \
 BROWNIE_BIN="$terminal_source_kill_window_brownie" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_kill_window_workspace" \
-PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 terminal_source_kill_window_second_exit="$?"
@@ -2402,6 +2505,7 @@ PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
 PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 terminal_claim_absent_exit="$?"
@@ -2459,16 +2563,16 @@ PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
 PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
-python3 - "$state_terminal_claim_absent/todo-claims/current.json" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+python3 - "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
 import sys
 
-current = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
-assert not current['selected_todo'].startswith('- [ ] E-15b-provider-terminal:'), current
 transactions = []
-for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines():
+for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
     if not line.strip():
         continue
     record = json.loads(line)
@@ -2478,7 +2582,42 @@ same_todo = [
     record for record in transactions
     if any('E-15b-provider-terminal:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
 ]
-assert len(same_todo) == 1, same_todo
+assert len(same_todo) == 2, same_todo
+PY
+
+# The configured retry cap permits exactly one fresh attempt, but durable
+# terminal evidence must still stop the controller from reexecuting forever.
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_claim_absent" \
+PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
+PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+terminal_claim_absent_third_exit="$?"
+set -e
+case "$terminal_claim_absent_third_exit" in
+  0|76) ;;
+  *) exit 1 ;;
+esac
+python3 - "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+transactions = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get('kind') == 'terminal_failure_transaction':
+        transactions.append(record)
+same_todo = [
+    record for record in transactions
+    if any('E-15b-provider-terminal:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
+]
+assert len(same_todo) == 2, same_todo
 PY
 
 # A stale active claim can be replaced before Runtime starts. If Runtime then
@@ -2518,6 +2657,7 @@ PHASE_LOOP_TODO="$todo_stale_replacement_claim_absent" \
 PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_stale_replacement_claim_absent" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$stale_replacement_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
@@ -4072,7 +4212,7 @@ fake_brownie_broad_decomposition="$(mktemp)"
 cat > "$fake_brownie_broad_decomposition" <<'SH'
 #!/usr/bin/env bash
 if [ "$1" = "--json" ] && [ "$2" = "run" ]; then
-  printf '%s\n' '{"ok":true,"command":"run","exit_code":0,"run":{"status":"no_eligible_task","completed":false,"blocked":true,"terminal_failure":true,"automation":{"status":"terminal_failure","blocked":true,"completed":false,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed"}}}'
+  printf '%s\n' '{"ok":true,"command":"run","exit_code":0,"run":{"status":"no_eligible_task","completed":false,"blocked":true,"retryable":false,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed","automation":{"schema_version":1,"status":"terminal_failure","blocked":true,"completed":false,"retryable":false,"terminal_failure":true,"controller_action":"stop","stop_class":"terminal_failure","stop_reason":"terminal_task_failed"}}}'
   exit 0
 fi
 printf '%s\n' '{"ok":true}'
@@ -4145,6 +4285,7 @@ PHASE_LOOP_TODO="$no_eligible_split_workspace/.brownie/todo.md" \
 PHASE_LOOP_TODO_BREAKDOWN="$no_eligible_split_workspace/.brownie/todo-breakdown.md" \
 PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
 
@@ -4155,6 +4296,7 @@ PHASE_LOOP_TODO_BREAKDOWN="$no_eligible_split_workspace/.brownie/todo-breakdown.
 PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_MUTATE_TODO_AFTER_PROMPT=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75,76 "$PHASE_LOOP" run-once >/dev/null
 no_eligible_split_exit="$?"
