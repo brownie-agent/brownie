@@ -66,6 +66,71 @@ test('accepts explicit absolute executable paths', () => {
   }
 });
 
+test('infers an adjacent runtime when BROWNIE_RUNTIME_PATH is not specified', () => {
+  const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-adjacent-'));
+  try {
+    const cliDirectory = path.join(fixtureDirectory, 'bin');
+    fs.mkdirSync(cliDirectory);
+    const cli = executableFixture(cliDirectory, 'brownie');
+    executableFixture(cliDirectory, 'brownie-runtime');
+    const result = runBootstrapCheck({
+      BROWNIE_BIN: cli,
+      PHASE_LOOP_STATE_DIR: path.join(fixtureDirectory, 'state'),
+      PATH: process.env.PATH
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      code: 'phase_loop_bootstrap_ready'
+    });
+  } finally {
+    fs.rmSync(fixtureDirectory, { recursive: true, force: true });
+  }
+});
+
+test('fails closed when a standard CLI has no adjacent or delegated runtime', () => {
+  const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-no-adjacent-'));
+  try {
+    const cli = executableFixture(fixtureDirectory, 'brownie');
+    const result = runBootstrapCheck({
+      BROWNIE_BIN: cli,
+      PHASE_LOOP_STATE_DIR: path.join(fixtureDirectory, 'state'),
+      PATH: process.env.PATH
+    });
+    assert.equal(result.status, 78, result.stderr);
+    const diagnostic = JSON.parse(result.stdout);
+    assert.equal(diagnostic.code, 'phase_loop_bootstrap_unavailable');
+    assert.equal(diagnostic.runtime_path_source, 'cli-delegated');
+    assert.equal(diagnostic.missing_binaries.length, 1);
+    assert.equal(diagnostic.missing_binaries[0].name, 'BROWNIE_RUNTIME_PATH');
+    assert.equal(diagnostic.missing_binaries[0].reason, 'missing_cli_runtime');
+    assert.equal(path.basename(diagnostic.missing_binaries[0].configured_path), 'brownie-runtime');
+    assert.equal(path.basename(diagnostic.missing_binaries[0].resolved_path), 'brownie-runtime');
+    assert.ok(path.isAbsolute(diagnostic.missing_binaries[0].resolved_path));
+  } finally {
+    fs.rmSync(fixtureDirectory, { recursive: true, force: true });
+  }
+});
+
+test('defers runtime resolution for a self-contained custom CLI', () => {
+  const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-custom-cli-'));
+  try {
+    const cli = executableFixture(fixtureDirectory, 'brownie-test-fixture');
+    const result = runBootstrapCheck({
+      BROWNIE_BIN: cli,
+      PHASE_LOOP_STATE_DIR: path.join(fixtureDirectory, 'state'),
+      PATH: process.env.PATH
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      code: 'phase_loop_bootstrap_ready'
+    });
+  } finally {
+    fs.rmSync(fixtureDirectory, { recursive: true, force: true });
+  }
+});
+
 test('fails closed with a deterministic diagnostic for a missing runtime', () => {
   const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-missing-'));
   try {
@@ -80,6 +145,7 @@ test('fails closed with a deterministic diagnostic for a missing runtime', () =>
     const diagnostic = JSON.parse(result.stdout);
     assert.equal(diagnostic.ok, false);
     assert.equal(diagnostic.code, 'phase_loop_bootstrap_unavailable');
+    assert.equal(diagnostic.runtime_path_source, 'explicit');
     assert.equal(diagnostic.configuration_sources, 'process environment');
     assert.equal(diagnostic.missing_binaries.length, 1);
     assert.deepEqual(diagnostic.missing_binaries[0], {
@@ -118,6 +184,7 @@ test('rejects a path expanded while phase-loop.env was sourced before ROOT_DIR e
     const diagnostic = JSON.parse(result.stdout);
     assert.equal(diagnostic.code, 'phase_loop_bootstrap_unavailable');
     const runtimeFailure = diagnostic.missing_binaries.find((entry) => entry.name === 'BROWNIE_RUNTIME_PATH');
+    assert.equal(diagnostic.runtime_path_source, 'explicit');
     assert.deepEqual(runtimeFailure, {
       configured_path: '/target/debug/brownie-runtime',
       name: 'BROWNIE_RUNTIME_PATH',

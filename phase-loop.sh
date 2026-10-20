@@ -37,6 +37,7 @@ PHASE_LOOP_ACTIVE_STDOUT_LOG=""
 PHASE_LOOP_ACTIVE_STDERR_LOG=""
 PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC=""
 PHASE_LOOP_ENV_SOURCES="process environment"
+PHASE_LOOP_RUNTIME_PATH_SOURCE="cli-delegated"
 PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 PHASE_LOOP_SUPERVISOR_PID=""
 PHASE_LOOP_SUPERVISOR_GENERATION=""
@@ -12630,6 +12631,11 @@ load_env() {
     PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$STATE_DIR/phase-loop.env"
   fi
   set +a
+  if [ -n "${BROWNIE_RUNTIME_PATH:-}" ]; then
+    PHASE_LOOP_RUNTIME_PATH_SOURCE="explicit"
+  else
+    PHASE_LOOP_RUNTIME_PATH_SOURCE="cli-delegated"
+  fi
 }
 
 resolve_phase_loop_binary_path() {
@@ -12652,34 +12658,69 @@ PY
 validate_phase_loop_bootstrap() {
   local run_stamp="${1:-bootstrap-check}"
   local configured_cli="${BROWNIE_BIN:-$ROOT_DIR/target/debug/brownie}"
-  local configured_runtime="${BROWNIE_RUNTIME_PATH:-$ROOT_DIR/target/debug/brownie-runtime}"
-  local resolved_cli resolved_runtime cli_reason="" runtime_reason=""
+  local configured_runtime="${BROWNIE_RUNTIME_PATH:-}"
+  local resolved_cli resolved_runtime="" cli_reason="" runtime_reason=""
+  local runtime_path_source="${PHASE_LOOP_RUNTIME_PATH_SOURCE:-cli-delegated}"
   resolved_cli="$(resolve_phase_loop_binary_path "$configured_cli")"
-  resolved_runtime="$(resolve_phase_loop_binary_path "$configured_runtime")"
 
   if [ ! -f "$resolved_cli" ]; then
     cli_reason="missing"
   elif [ ! -x "$resolved_cli" ]; then
     cli_reason="not_executable"
   fi
-  if [ ! -f "$resolved_runtime" ]; then
-    runtime_reason="missing"
-  elif [ ! -x "$resolved_runtime" ]; then
-    runtime_reason="not_executable"
+
+  if [ -z "$cli_reason" ] && [ "$runtime_path_source" != "explicit" ]; then
+    local adjacent_runtime delegated_runtime
+    adjacent_runtime="$(resolve_phase_loop_binary_path "$(dirname "$resolved_cli")/brownie-runtime")"
+    if [ -f "$adjacent_runtime" ] && [ -x "$adjacent_runtime" ]; then
+      configured_runtime="$adjacent_runtime"
+      resolved_runtime="$adjacent_runtime"
+      runtime_path_source="cli-adjacent-inferred"
+    else
+      delegated_runtime="$(command -v brownie-runtime 2>/dev/null || true)"
+      if [ -n "$delegated_runtime" ]; then
+        delegated_runtime="$(resolve_phase_loop_binary_path "$delegated_runtime")"
+      fi
+      if [ -n "$delegated_runtime" ] && [ -f "$delegated_runtime" ] && [ -x "$delegated_runtime" ]; then
+        configured_runtime="$delegated_runtime"
+        resolved_runtime="$delegated_runtime"
+        runtime_path_source="cli-delegated"
+      elif [ "${resolved_cli##*/}" = "brownie" ] || [ "${resolved_cli##*/}" = "brownie.exe" ]; then
+        configured_runtime="$(dirname "$resolved_cli")/brownie-runtime"
+        resolved_runtime="$adjacent_runtime"
+        runtime_reason="missing_cli_runtime"
+        runtime_path_source="cli-delegated"
+      fi
+    fi
+  elif [ "$runtime_path_source" = "explicit" ]; then
+    resolved_runtime="$(resolve_phase_loop_binary_path "$configured_runtime")"
+  fi
+
+  if [ -n "$resolved_runtime" ] && [ -z "$runtime_reason" ]; then
+    if [ ! -f "$resolved_runtime" ]; then
+      runtime_reason="missing"
+    elif [ ! -x "$resolved_runtime" ]; then
+      runtime_reason="not_executable"
+    fi
   fi
 
   if [ -z "$cli_reason" ] && [ -z "$runtime_reason" ]; then
     BROWNIE_BIN="$resolved_cli"
-    BROWNIE_RUNTIME_PATH="$resolved_runtime"
+    if [ -n "$resolved_runtime" ]; then
+      BROWNIE_RUNTIME_PATH="$resolved_runtime"
+    elif [ "$runtime_path_source" = "cli-delegated" ]; then
+      unset BROWNIE_RUNTIME_PATH
+    fi
+    PHASE_LOOP_RUNTIME_PATH_SOURCE="$runtime_path_source"
     PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC=""
     return 0
   fi
 
-  PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC="$(python3 - "$run_stamp" "$PHASE_LOOP_ENV_SOURCES" "$configured_cli" "$resolved_cli" "$cli_reason" "$configured_runtime" "$resolved_runtime" "$runtime_reason" <<'PY'
+  PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC="$(python3 - "$run_stamp" "$PHASE_LOOP_ENV_SOURCES" "$configured_cli" "$resolved_cli" "$cli_reason" "$configured_runtime" "$resolved_runtime" "$runtime_reason" "$runtime_path_source" <<'PY'
 import json
 import sys
 
-run_stamp, sources, configured_cli, resolved_cli, cli_reason, configured_runtime, resolved_runtime, runtime_reason = sys.argv[1:]
+run_stamp, sources, configured_cli, resolved_cli, cli_reason, configured_runtime, resolved_runtime, runtime_reason, runtime_path_source = sys.argv[1:]
 missing = []
 if cli_reason:
     missing.append({
@@ -12700,8 +12741,9 @@ print(json.dumps({
     "code": "phase_loop_bootstrap_unavailable",
     "run_stamp": run_stamp,
     "configuration_sources": sources,
+    "runtime_path_source": runtime_path_source,
     "missing_binaries": missing,
-    "repair": "Set BROWNIE_BIN and BROWNIE_RUNTIME_PATH to executable absolute paths, or root-relative paths resolved from the controller checkout. Do not source phase-loop.env before phase-loop.sh establishes ROOT_DIR.",
+    "repair": "Set BROWNIE_BIN to an executable absolute path and set BROWNIE_RUNTIME_PATH only when overriding the CLI's runtime resolution. Otherwise place an executable brownie-runtime beside the CLI or on PATH. Do not source phase-loop.env before phase-loop.sh establishes ROOT_DIR.",
 }, sort_keys=True))
 PY
 )"
