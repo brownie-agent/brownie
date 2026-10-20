@@ -19,6 +19,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 test('nested supervisor repair uses the explicit controller source root', () => {
   const source = fs.readFileSync(path.join(__dirname, 'phase-loop-supervisor-control.mjs'), 'utf8');
   assert.match(source, /--control-plane-root/u);
+  assert.match(source, /--todo/u);
+  assert.match(source, /--breakdown/u);
+  assert.match(source, /--state-dir/u);
+  assert.match(source, /workspaceTodoPath\(repoRoot\)/u);
+  assert.match(source, /workspaceStateRoot\(repoRoot\)/u);
   assert.match(source, /controlPlaneScript\('scripts\/phase-loop-todo-queue-integrity\.mjs'\)/u);
   assert.match(source, /controlPlaneScript\('scripts\/repair-todo-decomposition\.mjs'\)/u);
   assert.match(source, /controlPlaneScript\('scripts\/phase-loop-preclaim-recovery\.mjs'\)/u);

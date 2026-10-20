@@ -6326,6 +6326,9 @@ run_integrated_supervisor_control() {
       node "$ROOT_DIR/scripts/phase-loop-supervisor-control.mjs" \
         --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
         --control-plane-root "$ROOT_DIR" \
+        --todo "$PHASE_LOOP_TODO" \
+        --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" \
+        --state-dir "$STATE_DIR" \
         --repair \
         --no-start \
         --write
