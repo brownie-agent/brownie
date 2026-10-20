@@ -14721,7 +14721,10 @@ PY
     fi
   ) > "$stdout_log" 2> "$stderr_log"
   exit_code=$?
-  bind_runtime_stdout_to_active_claim "$stdout_log"
+  if ! bind_runtime_stdout_to_active_claim "$stdout_log"; then
+    printf '%s run=%s runtime_stdout_claim_binding_skipped=true reason=active_claim_unavailable_or_stdout_binding_failed stdout=%s\n' \
+      "$(now_utc)" "$run_stamp" "$stdout_log" >> "$SUPERVISOR_LOG"
+  fi
   if [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ] && {
     [ "${active_target_path##*.}" = "json" ] || [ "${active_target_path##*.}" = "jsonc" ];
   }; then
