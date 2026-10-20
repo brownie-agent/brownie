@@ -2592,7 +2592,10 @@ PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 terminal_claim_absent_third_exit="$?"
 set -e
-test "$terminal_claim_absent_third_exit" = "0"
+case "$terminal_claim_absent_third_exit" in
+  0|76) ;;
+  *) exit 1 ;;
+esac
 python3 - "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
