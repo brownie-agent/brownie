@@ -809,7 +809,19 @@ PY
 )"
   test -n "\$target_path"
   printf '\nexport const phaseLoopRetryFixtureCompleted = true;\n' >> "\$PHASE_LOOP_WORKSPACE_ROOT/\$target_path"
-  cat <<'JSON'
+  task_execution_json="\$(python3 - "\$target_path" <<'PY'
+import json
+import sys
+
+target = sys.argv[1]
+print(json.dumps({
+    'started': True,
+    'target_files': [target],
+    'verification_commands': [f'node --check {target}'],
+}))
+PY
+)"
+  cat <<JSON
 {
   "command": "run",
   "ok": true,
@@ -834,7 +846,8 @@ PY
     "controller_action": "stop",
     "stop_class": "completed",
     "stop_reason": "task_completed",
-    "next_action": "inspect_progress_overview"
+    "next_action": "inspect_progress_overview",
+    "task_execution": \$task_execution_json
   }
 }
 JSON
