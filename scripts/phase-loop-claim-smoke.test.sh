@@ -794,6 +794,9 @@ updated, count = re.subn(r'(?m)^- \[ \] (E-retry-success|E-retry-leaf):', r'- [x
 assert count == 1, text
 path.write_text(updated, encoding='utf-8')
 PY
+  target_path="\$(sed -n 's/.*Patch only `\([^`]*\)`.*/\1/p' "\$PHASE_LOOP_TODO" | head -n 1)"
+  test -n "\$target_path"
+  printf '\nexport const phaseLoopRetryFixtureCompleted = true;\n' >> "\$PHASE_LOOP_WORKSPACE_ROOT/\$target_path"
   cat <<'JSON'
 {
   "command": "run",
