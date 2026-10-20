@@ -5368,8 +5368,6 @@ def prior_terminal_no_eligible_evidence(expected_claim_id, expected_selected_fir
         run = payload.get("run") if isinstance(payload, dict) else None
         if not isinstance(run, dict) or run.get("status") != "no_eligible_task":
             continue
-        if run.get("phase_loop_claim_id") != expected_claim_id:
-            continue
         if run.get("phase_loop_selected_todo_first_line") != expected_selected_first:
             continue
         automation = run.get("automation") if isinstance(run.get("automation"), dict) else {}
@@ -5423,11 +5421,16 @@ selected_first = selected.splitlines()[0] if selected.splitlines() else ""
 selected_id = todo_id_from_first_line(selected_first)
 if not selected_id:
     skip("selected_todo_id_missing")
+prior_terminal_evidence = prior_terminal_no_eligible_evidence(claim.get("claim_id"), selected_first)
 feedback_claim_id = feedback.get("claim_id")
 feedback_first_line = feedback.get("selected_todo_first_line")
 if feedback and (not feedback_claim_id or not feedback_first_line):
     skip("feedback_identity_missing")
-if feedback_claim_id and feedback_claim_id != claim.get("claim_id"):
+if (
+    feedback_claim_id
+    and feedback_claim_id != claim.get("claim_id")
+    and not (feedback_first_line == selected_first and prior_terminal_evidence)
+):
     skip("feedback_claim_id_mismatch")
 if feedback_first_line and feedback_first_line != selected_first:
     skip("feedback_selected_todo_mismatch")
@@ -5440,7 +5443,6 @@ if progress_projection.get("claim_id") != claim.get("claim_id"):
 projection_selected = str(progress_projection.get("selected_todo") or "")
 if not projection_selected or projection_selected.splitlines()[0] != selected_first:
     skip("progress_projection_selected_todo_mismatch")
-prior_terminal_evidence = prior_terminal_no_eligible_evidence(claim.get("claim_id"), selected_first)
 combined = " ".join(
     str(value)
     for value in [
