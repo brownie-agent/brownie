@@ -100,7 +100,9 @@ phase_loop_prepare_pr_fixture_workspace() {
     "$workspace/docs/architecture/phase-loop-actor-separation-policy.json"
   git -C "$workspace" remote set-url origin https://github.com/globalpocket/brownie.git
   git -C "$workspace" remote add fixture-origin "$remote"
-  git -C "$workspace" add docs/architecture/phase-loop-actor-separation-policy.json
+  git -C "$workspace" add \
+    docs/architecture/phase-loop-actor-separation-policy.json \
+    scripts/phase-loop-pr-actor-guard.mjs
   git -C "$workspace" -c user.name=Brownie -c user.email=brownie@example.invalid \
     commit -m 'fixture actor policy baseline' >/dev/null
 }
@@ -3293,6 +3295,54 @@ test_workspace="$queue_original_workspace"
 fi
 
 if claim_smoke_section_enabled pr; then
+# Keep the pre-claim delivery boundary independently covered: a separated
+# controller-root fixture with only dirty scripts and no implementable TODO
+# must be rejected, while the same fixture becomes admissible once an
+# implementation TODO is present. This exercises the boundary directly
+# without weakening production dirty-delivery policy.
+preclaim_delivery_workspace="$(mktemp -d)"
+preclaim_delivery_todo="$(mktemp)"
+preclaim_delivery_breakdown="$(mktemp)"
+git -C "$preclaim_delivery_workspace" init -b main >/dev/null
+mkdir -p "$preclaim_delivery_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$preclaim_delivery_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$preclaim_delivery_workspace/README.md"
+git -C "$preclaim_delivery_workspace" add .
+git -C "$preclaim_delivery_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+printf '# breakdown\n' > "$preclaim_delivery_breakdown"
+printf -- '- [ ] B-ops: Blocker: owner delivery evidence is required before release completion.\n  Route: release-ops.\n  Completion condition: the owner supplies the delivery evidence.\n  Verification: inspect/blocker/fail-closed.\n' > "$preclaim_delivery_todo"
+printf 'fixture-only dirty script\n' >> "$preclaim_delivery_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+set +e
+preclaim_dirty_output="$(PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 node "$REPO_ROOT/scripts/phase-loop-preflight.mjs" \
+  --repo "$preclaim_delivery_workspace" \
+  --todo "$preclaim_delivery_todo" \
+  --breakdown "$preclaim_delivery_breakdown" \
+  --control-plane-root "$REPO_ROOT" \
+  --profile claim-smoke-fixture \
+  --stage pre-claim-boundary 2>&1)"
+preclaim_dirty_status="$?"
+set -e
+test "$preclaim_dirty_status" -ne 0
+python3 - "$preclaim_dirty_output" <<'PY'
+import json
+import sys
+
+result = json.loads(sys.argv[1])
+assert result["valid"] is False, result
+errors = result["errors"]
+assert any(error["code"] == "dirty_delivery_required" for error in errors), result
+assert any("scripts/" in file for error in errors for file in error.get("dirty_files", [])), result
+PY
+
+printf -- '- [ ] B-impl: Patch only `README.md` to prove the separated control-root pre-claim path.\n  Route: implementation.\n  Completion condition: the README change is delivered through the trusted controller path.\n  Forbidden changes: do not weaken actor or delivery guards.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$preclaim_delivery_todo"
+PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 node "$REPO_ROOT/scripts/phase-loop-preflight.mjs" \
+  --repo "$preclaim_delivery_workspace" \
+  --todo "$preclaim_delivery_todo" \
+  --breakdown "$preclaim_delivery_breakdown" \
+  --control-plane-root "$REPO_ROOT" \
+  --profile claim-smoke-fixture \
+  --stage pre-claim-boundary >/dev/null
+
 state_pr_progress="$(mktemp -d)"
 prompt_pr_progress="$(mktemp)"
 todo_pr_progress="$(mktemp)"
@@ -3310,8 +3360,9 @@ git -C "$workspace_pr_progress" remote add origin "$remote_pr_progress"
 git -C "$workspace_pr_progress" push -u origin main >/dev/null
 git -C "$workspace_pr_progress" switch -c brownie-agent/smoke-pr >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$workspace_pr_progress" "$remote_pr_progress"
+test -z "$(git -C "$workspace_pr_progress" status --porcelain)"
 printf 'base prompt\n' > "$prompt_pr_progress"
-printf -- '- [ ] B-01: create PR from tracked Brownie progress\n' > "$todo_pr_progress"
+printf -- '- [ ] B-01: Patch only `README.md` to create a PR from tracked Brownie progress.\n  Route: implementation.\n  Completion condition: the tracked README change is committed and published through the fixture PR path.\n  Forbidden changes: do not weaken actor or delivery guards.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$todo_pr_progress"
 cat > "$fake_bin_dir/pnpm" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -3384,8 +3435,9 @@ git -C "$workspace_pr_completed_progress" remote add origin "$remote_pr_complete
 git -C "$workspace_pr_completed_progress" push -u origin main >/dev/null
 git -C "$workspace_pr_completed_progress" switch -c brownie-agent/smoke-pr-completed >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$workspace_pr_completed_progress" "$remote_pr_completed_progress"
+test -z "$(git -C "$workspace_pr_completed_progress" status --porcelain)"
 printf 'base prompt\n' > "$prompt_pr_completed_progress"
-printf -- '- [ ] B-01: create PR from completed tracked Brownie progress\n' > "$todo_pr_completed_progress"
+printf -- '- [ ] B-01: Patch only `README.md` to create a PR from completed tracked Brownie progress.\n  Route: implementation.\n  Completion condition: the completed tracked README change is committed and published through the fixture PR path.\n  Forbidden changes: do not weaken actor or delivery guards.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$todo_pr_completed_progress"
 
 PATH="$fake_bin_dir:$PATH" \
 PHASE_LOOP_STATE_DIR="$state_pr_completed_progress" \
@@ -3429,8 +3481,9 @@ git -C "$workspace_pr_supervise" remote add origin "$remote_pr_supervise"
 git -C "$workspace_pr_supervise" push -u origin main >/dev/null
 git -C "$workspace_pr_supervise" switch -c brownie-agent/smoke-pr-supervise >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$workspace_pr_supervise" "$remote_pr_supervise"
+test -z "$(git -C "$workspace_pr_supervise" status --porcelain)"
 printf 'base prompt\n' > "$prompt_pr_supervise"
-printf -- '- [ ] B-01: create PR then stop supervisor\n' > "$todo_pr_supervise"
+printf -- '- [ ] B-01: Patch only `README.md` to create a PR and stop the supervisor for review.\n  Route: implementation.\n  Completion condition: the tracked README change is committed, published, and the supervisor stops for review.\n  Forbidden changes: do not weaken actor or delivery guards.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$todo_pr_supervise"
 cat > "$fake_supervise_bin_dir/pnpm" <<'SH'
 #!/usr/bin/env bash
 exit 0
