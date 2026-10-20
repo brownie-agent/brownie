@@ -93,3 +93,37 @@ jobs:
             .brownie/release-evidence/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
+
+  artifact-roundtrip:
+    name: Download and roundtrip artifact (${{ matrix.os }}, ${{ matrix.target }})
+    needs: build-and-evidence
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            archive_name: brownie-linux-x64.tar.gz
+          - os: macos-latest
+            target: darwin-arm64
+            archive_name: brownie-darwin-arm64.tar.gz
+          - os: windows-latest
+            target: win32-x64
+            archive_name: brownie-win32-x64.zip
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download uploaded release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: roundtrip-download
+
+      - name: Verify downloaded package roundtrip
+        env:
+          BROWNIE_RELEASE_ROUNDTRIP_DOWNLOAD_ROOT: roundtrip-download
+          BROWNIE_RELEASE_ROUNDTRIP_TARGET: ${{ matrix.target }}
+        run: node --test scripts/release-artifact-roundtrip-e2e.test.mjs

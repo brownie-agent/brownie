@@ -238,6 +238,24 @@ test('accepts create-only targets that do not exist', () => {
   }), []);
 });
 
+test('rejects create-only targets already present in the baseline but accepts patch-only targets', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-decomposition-existing-target-'));
+  fs.mkdirSync(path.join(repoRoot, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'scripts/example.mjs'), 'export {};\n');
+  const options = {
+    repoRoot,
+    packageScripts: new Set(['guard:release-contract:test'])
+  };
+  const createLeaf = validLeaf.replace('Patch only `scripts/example.mjs`', 'Create only `scripts/example.mjs`');
+  const createErrors = validateTodoDecompositionText(createLeaf, options);
+  assert(
+    createErrors.some((error) => error.includes('Create only target already exists: scripts/example.mjs')),
+    createErrors.join('\n')
+  );
+  assert.deepEqual(validateTodoDecompositionText(validLeaf, options), []);
+  fs.rmSync(repoRoot, { recursive: true, force: true });
+});
+
 test('requires decomposition ledger when validating repo text with breakdown text option', () => {
   const errors = validateTodoDecompositionText(validLeaf, {
     breakdownText: null

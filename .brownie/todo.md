@@ -70,7 +70,7 @@
   Forbidden changes: do not publish a GitHub Release, do not require credentials, do not omit the Runtime companion, and do not claim Product Ready; do not edit unrelated files or sibling split targets `scripts/release-local-artifact.mjs`, `scripts/release-local-artifact.test.mjs`.
   Verification: run `pnpm --workspace-root release:local-artifact:test`, `pnpm --workspace-root guard:supply-chain-artifact-evidence:test`, and the Release Workflow matrix.
 
-- [ ] E-23b-release-artifact-download-roundtrip: Create only `scripts/release-artifact-roundtrip-e2e.mjs` and `scripts/release-artifact-roundtrip-e2e.test.mjs`, then patch only `package.json` and `.github/workflows/release.yml` to invoke them:
+- [ ] E-23b-release-artifact-download-roundtrip: Patch only `scripts/release-artifact-roundtrip-e2e.test.mjs` and `.github/workflows/release.yml` to execute the downloaded artifact roundtrip:
   Route: implementation.
   Source TODO: 2026-10-06 external review: CI executes the pre-upload file but does not download, extract, checksum, and execute the uploaded artifact.
   Depends on: E-23a-release-artifact-portable-archive-target-03.
