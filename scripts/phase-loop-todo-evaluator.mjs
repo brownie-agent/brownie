@@ -105,6 +105,7 @@ export function isExplicitBlockerTodo(block) {
   const forbidsImplementation =
     lower.includes('forbidden changes: do not patch') ||
     lower.includes('no workspace file is patched') ||
+    lower.includes('verification: blocker:') ||
     lower.includes('do not implement') ||
     lower.includes('owner-controlled') ||
     (
@@ -208,7 +209,7 @@ export function needsTodoDecomposition(block) {
 }
 
 function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint = '') {
-  if (!blockedPath || !fs.existsSync(blockedPath)) {
+  if (!blockedPath || !fs.existsSync(blockedPath) || !fs.statSync(blockedPath).isFile()) {
     return {
       hashes: new Set(),
       firstLines: new Set(),
@@ -216,7 +217,8 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
       currentControllerFirstLines: new Set(),
       stableIds: new Set(),
       stablePrefixes: new Set(),
-      stableScopeContracts: new Set()
+      stableScopeContracts: new Set(),
+      terminalFailureAttempts: new Map()
     };
   }
   const hashes = new Set();
@@ -226,19 +228,29 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
   const stableIds = new Set();
   const stablePrefixes = new Set();
   const stableScopeContracts = new Set();
+  const terminalFailureAttempts = new Map();
   for (const line of fs.readFileSync(blockedPath, 'utf8').split('\n')) {
     if (!line.trim()) {
       continue;
     }
     try {
       const record = JSON.parse(line);
-      if (record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_sha256 === 'string') {
+      const recordHasController = typeof record.controller_fingerprint === 'string' && record.controller_fingerprint;
+      const recordMatchesController = !controllerFingerprint || !recordHasController || record.controller_fingerprint === controllerFingerprint;
+      const terminalRuntimeFailure = record.block_reason === 'terminal_runtime_failure';
+      // Hash/first-line suppression predates controller-bound blocked records.
+      // Once a controller identity is present, stale generic suppression must
+      // not survive a controller rebaseline, especially for generated leaves.
+      // Terminal failures are governed only by their retry budget below; do
+      // not let a missing/legacy hash field turn a retryable terminal record
+      // into generic stable suppression.
+      if (!terminalRuntimeFailure && recordMatchesController && record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_sha256 === 'string') {
         hashes.add(record.selected_todo_sha256);
         if (controllerFingerprint && record.controller_fingerprint === controllerFingerprint) {
           currentControllerHashes.add(record.selected_todo_sha256);
         }
       }
-      if (record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_first_line === 'string' && record.selected_todo_first_line) {
+      if (!terminalRuntimeFailure && recordMatchesController && record.queue_fingerprint === queueFingerprint && typeof record.selected_todo_first_line === 'string' && record.selected_todo_first_line) {
         firstLines.add(record.selected_todo_first_line);
         if (controllerFingerprint && record.controller_fingerprint === controllerFingerprint) {
           currentControllerFirstLines.add(record.selected_todo_first_line);
@@ -257,6 +269,38 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
           if (typeof record.target_scope_key === 'string' && record.target_scope_key && typeof record.verification_command === 'string' && record.verification_command) {
             stableScopeContracts.add(`${record.target_scope_key}\u0000${record.verification_command}`);
           }
+          continue;
+        }
+        if (blockedId && terminalRuntimeFailure && matchesController) {
+          // Terminal retry suppression is keyed by the complete TODO
+          // specification hash and controller. Do not add the ID to
+          // stableIds: a materially changed task with the same ID must get a
+          // fresh retry budget instead of inheriting the old suppression.
+          const todoHash = typeof record.selected_todo_sha256 === 'string' && record.selected_todo_sha256
+            ? record.selected_todo_sha256
+            : sha256Text(record.selected_todo_first_line);
+          const recordController = String(record.controller_fingerprint || controllerFingerprint || '');
+          const retryCapValue = Number(record.retry_cap);
+          const retryCap = Number.isFinite(retryCapValue) && retryCapValue >= 0
+            ? Math.floor(retryCapValue)
+            : 0;
+          const providerFailureFingerprint = String(record.provider_failure_fingerprint || '');
+          const key = `${todoHash}\u0000${recordController}\u0000${providerFailureFingerprint}`;
+          const previous = terminalFailureAttempts.get(key) ?? {
+            count: 0,
+            retry_cap: retryCap,
+            todo_hash: todoHash,
+            todo_first_line: record.selected_todo_first_line,
+            provider_failure_fingerprint: providerFailureFingerprint,
+            controller_fingerprint: recordController,
+            blocked_id: blockedId
+          };
+          previous.count += 1;
+          previous.retry_cap = retryCap;
+          previous.blocked_id = blockedId;
+          previous.todo_first_line = record.selected_todo_first_line;
+          previous.provider_failure_fingerprint = providerFailureFingerprint;
+          terminalFailureAttempts.set(key, previous);
           continue;
         }
         if (
@@ -279,7 +323,7 @@ function readBlockedClaims(blockedPath, queueFingerprint, controllerFingerprint 
       // Ignore corrupt historical blocked entries; the phase-loop guard remains fail-closed elsewhere.
     }
   }
-  return { hashes, firstLines, currentControllerHashes, currentControllerFirstLines, stableIds, stablePrefixes, stableScopeContracts };
+  return { hashes, firstLines, currentControllerHashes, currentControllerFirstLines, stableIds, stablePrefixes, stableScopeContracts, terminalFailureAttempts };
 }
 
 export function selectFirstSchedulableTodo(text, options = {}) {
@@ -310,12 +354,23 @@ export function selectFirstSchedulableTodo(text, options = {}) {
       .filter(Boolean)
   );
   const dependencyBlockedIds = new Set();
+  const excludedTodoHashes = options.excludedTodoHashes instanceof Set
+    ? options.excludedTodoHashes
+    : new Set(Array.isArray(options.excludedTodoHashes) ? options.excludedTodoHashes : []);
   for (const block of blocks) {
     const id = todoId(block);
     if (!id) {
       continue;
     }
     if (todoState.completedIds.has(id) || todoState.supersededIds.has(id)) {
+      continue;
+    }
+    const blockHash = sha256Text(block);
+    if (excludedTodoHashes.has(blockHash)) {
+      // Excluded terminal attempts are not completion evidence. Keep their
+      // TODO unresolved so dependents remain blocked while independent
+      // siblings can still be selected.
+      dependencyBlockedIds.add(id);
       continue;
     }
     if (blockedQueueDecompositionQueued && !id.startsWith('TODO-decompose-blocked-queue-')) {
@@ -348,28 +403,47 @@ export function selectFirstSchedulableTodo(text, options = {}) {
       continue;
     }
     const firstLine = block.split('\n')[0]?.trim() ?? '';
-    const blockHash = sha256Text(block);
+    const terminalFailureAttempts = [...blocked.terminalFailureAttempts.values()].filter((entry) => (
+      (entry.todo_hash === blockHash || entry.todo_first_line === firstLine)
+      && (!options.controllerFingerprint || entry.controller_fingerprint === options.controllerFingerprint)
+    ));
+    const terminalFailureRetryAvailable = terminalFailureAttempts.some((entry) => entry.count <= entry.retry_cap);
+    const terminalFailureRetryExhausted = terminalFailureAttempts.length > 0 && !terminalFailureRetryAvailable;
+    if (terminalFailureRetryExhausted) {
+      dependencyBlockedIds.add(id);
+      continue;
+    }
     if (blocked.stableIds.has(id)) {
       // A blocked record is not completion evidence. Dependents remain blocked
       // until the shared TODO state marks this id completed or resolves a
-      // superseded parent through all of its generated children.
+      // superseded parent through all of its generated children. A terminal
+      // failure with retry budget is the explicit exception: it must be
+      // retried even if an older legacy stable-block record has the same leaf
+      // id.
+      if (terminalFailureRetryAvailable) {
+        return block;
+      }
       dependencyBlockedIds.add(id);
       continue;
     }
     const scopeContract = `${targetScopeKey(block)}\u0000${verificationCommand(block)}`;
-    if (isDerivedLeaf(block) && blocked.stableScopeContracts.has(scopeContract)) {
+    if (isDerivedLeaf(block) && blocked.stableScopeContracts.has(scopeContract) && !terminalFailureRetryAvailable) {
       // A replan may change IDs, but it must change the actual work contract.
       // Otherwise the scheduler would repeatedly retry the same target and
       // verification path while presenting it as new work.
       dependencyBlockedIds.add(id);
       continue;
     }
-    const blockedInCurrentQueue = blocked.hashes.has(blockHash) || blocked.firstLines.has(firstLine);
-    const blockedByCurrentController = blocked.currentControllerHashes.has(blockHash) || blocked.currentControllerFirstLines.has(firstLine);
+    const blockedInCurrentQueue = blocked.hashes.has(blockHash)
+      || blocked.firstLines.has(firstLine)
+      || terminalFailureAttempts.length > 0;
+    const blockedByCurrentController = blocked.currentControllerHashes.has(blockHash)
+      || blocked.currentControllerFirstLines.has(firstLine)
+      || terminalFailureAttempts.length > 0;
     const sourceId = sourceTodoId(block);
     const sourceIsGeneratedParent = Boolean(productPrefix(sourceId));
-    const canRetryAfterControllerRepair = blockedInCurrentQueue && !blockedByCurrentController && !isExplicitBlockerTodo(block) && !sourceIsGeneratedParent && !id.includes('-leaf');
-    if (!blockedInCurrentQueue || canRetryAfterControllerRepair) {
+    const canRetryAfterControllerRepair = blockedInCurrentQueue && !blockedByCurrentController && !isExplicitBlockerTodo(block) && !sourceIsGeneratedParent;
+    if (!blockedInCurrentQueue || canRetryAfterControllerRepair || terminalFailureRetryAvailable) {
       return block;
     }
     dependencyBlockedIds.add(id);
@@ -404,7 +478,7 @@ export function evaluateTodoQueue(text, options = {}) {
 }
 
 function parseArgs(argv) {
-  const args = { mode: argv[2] ?? 'select' };
+  const args = { mode: argv[2] ?? 'select', excludedTodoHashes: [] };
   for (let index = 3; index < argv.length; index += 1) {
     const key = argv[index];
     const value = argv[index + 1];
@@ -419,6 +493,9 @@ function parseArgs(argv) {
       index += 1;
     } else if (key === '--controller-fingerprint') {
       args.controllerFingerprint = value;
+      index += 1;
+    } else if (key === '--exclude-todo-sha256') {
+      args.excludedTodoHashes.push(value);
       index += 1;
     } else if (key === '--json') {
       args.json = true;
@@ -444,7 +521,8 @@ if (isMainModule()) {
     repoRoot: defaultRepoRoot,
     breakdownPath,
     blockedPath: args.blocked,
-    controllerFingerprint: args.controllerFingerprint
+    controllerFingerprint: args.controllerFingerprint,
+    excludedTodoHashes: args.excludedTodoHashes
   });
   if (args.mode === 'score' || args.mode === 'needs-decomposition' || args.json) {
     console.log(JSON.stringify(result, null, 2));

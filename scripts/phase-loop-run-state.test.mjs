@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { allSupervisorProcessRecords, inspectSupervisorOwnership, migrateLegacyPhaseLoopState, normalizeStaleRunningStatus, quiesceLegacySupervisor, rollbackStaleRunningRecovery, terminateLegacySupervisor, watchdogContinuationLiveness } from './phase-loop-run-state.mjs';
+import { allSupervisorProcessRecords, inspectSupervisorOwnership, liveSupervisorPids, migrateLegacyPhaseLoopState, normalizeStaleRunningStatus, quiesceLegacySupervisor, rollbackStaleRunningRecovery, terminateLegacySupervisor, watchdogContinuationLiveness } from './phase-loop-run-state.mjs';
 
 function fixture() {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-run-state-'));
@@ -217,6 +217,17 @@ test('accepts a supervisor launched through a symlinked root path', () => {
   });
   assert.equal(result.command_looks_like_supervisor, true);
   assert.equal(result.ownership_ok, true);
+});
+
+test('filters live supervisor discovery by state directory namespace', () => {
+  const records = [
+    { pid: 1234, command: 'bash /repo/phase-loop.sh supervise', state_dir: '/tmp/phase-loop-shard-a' },
+    { pid: 5678, command: 'bash /repo/phase-loop.sh supervise', state_dir: '/tmp/phase-loop-shard-b' }
+  ];
+  assert.deepEqual(liveSupervisorPids('/repo', '/tmp/phase-loop-shard-a', {
+    listAllSupervisors: () => records,
+    processExists: () => true
+  }), [1234]);
 });
 
 test('keeps an authorized continuation within the watchdog deadline', () => {

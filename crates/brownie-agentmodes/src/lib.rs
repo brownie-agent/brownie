@@ -3105,12 +3105,34 @@ customModes:
     where
         F: FnMut() -> std::process::Command,
     {
+        run_git_with_retries_with_spawn(operation, || command().output())
+    }
+
+    fn run_git_with_retries_with_spawn<F>(operation: &str, mut spawn: F) -> Result<(), String>
+    where
+        F: FnMut() -> std::io::Result<std::process::Output>,
+    {
         const MAX_ATTEMPTS: usize = 2;
+        // macOS reports a temporarily busy executable as ETXTBSY (errno 26)
+        // when another process is publishing or replacing it.
+        const ETXTBSY: i32 = 26;
         let mut diagnostics = Vec::new();
         for attempt in 1..=MAX_ATTEMPTS {
-            let output = command()
-                .output()
-                .map_err(|error| format!("attempt {attempt}: spawn failed: {error}"))?;
+            let output = match spawn() {
+                Ok(output) => output,
+                Err(error) => {
+                    let diagnostic = format!("attempt {attempt}: spawn failed: {error}");
+                    if error.raw_os_error() == Some(ETXTBSY) && attempt < MAX_ATTEMPTS {
+                        diagnostics.push(diagnostic);
+                        std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
+                        continue;
+                    }
+                    return Err(format!(
+                        "{operation}; {}",
+                        [diagnostics, vec![diagnostic]].concat().join(" | ")
+                    ));
+                }
+            };
             if output.status.success() {
                 return Ok(());
             }
@@ -3124,6 +3146,39 @@ customModes:
             }
         }
         Err(format!("{operation}; {}", diagnostics.join(" | ")))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatibility_git_retry_retries_text_file_busy_spawn_failure() {
+        let mut attempts = 0;
+        let error = run_git_with_retries_with_spawn("fixture text file busy operation", || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(std::io::Error::from_raw_os_error(26))
+            } else {
+                std::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        "echo 'Could not resolve host: fixture.invalid' >&2; exit 128",
+                    ])
+                    .output()
+            }
+        })
+        .expect_err("the final external failure should preserve both diagnostics");
+        assert_eq!(attempts, 2);
+        assert!(
+            error.contains("attempt 1: spawn failed: Text file busy"),
+            "{error}"
+        );
+        assert!(
+            error.contains("attempt 2: status=exit status: 128"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Could not resolve host: fixture.invalid"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -3185,13 +3240,35 @@ customModes:
             ),
         );
 
-        run_git_with_retries("fixture git operation", || {
+        let fixture_result = run_git_with_retries("fixture git operation", || {
             let path = git_fixture.as_path();
             assert_executable_stable(path);
             std::process::Command::new(path)
-        })
-        .expect("transient fixture failure should retry");
-        assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "2");
+        });
+        match fixture_result {
+            Ok(()) => {
+                // Normal path: the first executed attempt is the transient
+                // external failure and the second attempt succeeds.
+                assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "2");
+            }
+            Err(error) => {
+                // On macOS, ETXTBSY may consume the first bounded attempt
+                // before the fixture process starts. The next attempt then
+                // exposes the fixture's external failure as the final
+                // diagnostic; it must not be mistaken for a lone spawn error.
+                assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "1");
+                assert!(error.contains("fixture git operation"), "{error}");
+                assert!(error.contains("Text file busy"), "{error}");
+                assert!(
+                    error.contains("attempt 2: status=exit status: 128"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("Could not resolve host: fixture.invalid"),
+                    "{error}"
+                );
+            }
+        }
 
         let always_fail = write_executable_fixture(
             "brownie-git-always-fails-",

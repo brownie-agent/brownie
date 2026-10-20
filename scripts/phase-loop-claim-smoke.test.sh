@@ -9,11 +9,85 @@ PHASE_LOOP="$REPO_ROOT/phase-loop.sh"
 # pretending that a PR branch already matches origin/main.
 export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="HEAD"
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
-# A fresh CI worker may spend more than 25 seconds in the first `run-once`
-# preparing the temporary Git workspace and Node helpers.  Keep an explicit
-# per-invocation bound, but leave enough headroom for that cold path; the
-# suite-wide watchdog below remains the final hang safeguard.
-PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-45}"
+PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
+
+phase_loop_smoke_cpu_count() {
+  local detected=""
+  if command -v getconf >/dev/null 2>&1; then
+    detected="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+  case "$detected" in
+    ''|*[!0-9]*) detected="" ;;
+  esac
+  if [ -z "$detected" ] && command -v sysctl >/dev/null 2>&1; then
+    detected="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  fi
+  case "$detected" in
+    ''|*[!0-9]*) detected=2 ;;
+  esac
+  if [ "$detected" -lt 1 ]; then
+    detected=2
+  fi
+  printf '%s\n' "$detected"
+}
+
+# The sections are CPU-heavy.  Default to online CPUs minus four, with a floor
+# of two and a cap of six, so an 8-shard run keeps two CPU slots of headroom on
+# a normal worker while a 2-core worker never launches all eight at once.  The
+# batch size remains configurable for CI hosts with known capacity.
+if [ -n "${PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE:-}" ]; then
+  case "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" in
+    ''|*[!0-9]*) echo "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE must be a positive integer" >&2; exit 2 ;;
+  esac
+  if [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -lt 1 ]; then
+    echo "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE must be a positive integer" >&2
+    exit 2
+  fi
+else
+  phase_loop_smoke_cpu_count_value="$(phase_loop_smoke_cpu_count)"
+  PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=$((phase_loop_smoke_cpu_count_value - 4))
+  if [ "$phase_loop_smoke_cpu_count_value" -eq 1 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=1
+  elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -lt 2 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=2
+  elif [ "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" -gt 6 ]; then
+    PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE=6
+  fi
+fi
+
+# Preserve the historical 45-second bound when the suite is intentionally
+# configured for the old eight-way fan-out.  Otherwise give each child a
+# bounded amount of headroom proportional to the reduced parallelism; this
+# is still below the suite watchdog and avoids false timeout failures caused
+# by CPU contention rather than a hung controller.
+if [ -z "${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-}" ]; then
+  case "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" in
+    1) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
+    2) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
+    3|4|5|6) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=60 ;;
+    *) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=45 ;;
+  esac
+else
+  PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS"
+fi
+export PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE PHASE_LOOP_COMMAND_TIMEOUT_SECONDS
+if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
+  printf 'phase-loop claim smoke scheduler: cpus=%s batch_size=%s command_timeout=%ss watchdog=%ss\n' \
+    "$(phase_loop_smoke_cpu_count)" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
+    "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" >&2
+fi
+
+claim_smoke_section_enabled() {
+  [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ] || [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "$1" ]
+}
+
+case "$PHASE_LOOP_CLAIM_SMOKE_SECTION" in
+  all|core|terminal|completion|terminal-absent|queue|pr|lifecycle|guards|feedback) ;;
+  *)
+    echo "unknown phase-loop claim smoke section: $PHASE_LOOP_CLAIM_SMOKE_SECTION" >&2
+    exit 2
+    ;;
+esac
 
 (
   sleep "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS"
@@ -21,7 +95,63 @@ PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-45}"
   kill -TERM "$$" 2>/dev/null || true
 ) &
 claim_smoke_watchdog_pid="$!"
-trap 'kill "$claim_smoke_watchdog_pid" 2>/dev/null || true' EXIT
+claim_smoke_shard_dir=""
+cleanup_claim_smoke() {
+  kill "$claim_smoke_watchdog_pid" 2>/dev/null || true
+  wait "$claim_smoke_watchdog_pid" 2>/dev/null || true
+  if [ -n "$claim_smoke_shard_dir" ] && [ -d "$claim_smoke_shard_dir" ]; then
+    rm -rf -- "$claim_smoke_shard_dir"
+  fi
+}
+trap cleanup_claim_smoke EXIT
+
+# The suite contains independent temporary-workspace fixtures. Run those
+# sections in parallel so adding another bounded fixture does not turn the
+# single serial smoke process into a CI watchdog timeout. Each child gets its
+# own controller store and suite watchdog; a failed child still fails the
+# aggregate command with its diagnostics.
+if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
+  claim_smoke_shard_dir="$(mktemp -d)"
+  # The lifecycle shard owns process-group signal fixtures; keep it out of
+  # the other CPU-heavy batches so its bounded child cleanup remains stable.
+  claim_smoke_shards=(core terminal completion terminal-absent queue pr guards feedback lifecycle)
+  claim_smoke_failed=0
+  claim_smoke_batch_size="$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"
+  claim_smoke_batch_start=0
+  while [ "$claim_smoke_batch_start" -lt "${#claim_smoke_shards[@]}" ]; do
+    claim_smoke_pids=()
+    claim_smoke_batch_end=$((claim_smoke_batch_start + claim_smoke_batch_size))
+    if [ "$claim_smoke_batch_end" -gt "${#claim_smoke_shards[@]}" ]; then
+      claim_smoke_batch_end="${#claim_smoke_shards[@]}"
+    fi
+    for ((claim_smoke_index = claim_smoke_batch_start; claim_smoke_index < claim_smoke_batch_end; claim_smoke_index += 1)); do
+      claim_smoke_shard="${claim_smoke_shards[$claim_smoke_index]}"
+      claim_smoke_control_root="$claim_smoke_shard_dir/$claim_smoke_shard-control-root"
+      mkdir -p "$claim_smoke_control_root"
+      PHASE_LOOP_CLAIM_SMOKE_SECTION="$claim_smoke_shard" \
+      PHASE_LOOP_CONTROL_ROOT="$claim_smoke_control_root" \
+      "$BASH" "$0" >"$claim_smoke_shard_dir/$claim_smoke_shard.stdout.log" 2>"$claim_smoke_shard_dir/$claim_smoke_shard.stderr.log" &
+      claim_smoke_pids+=("$!")
+    done
+    for ((claim_smoke_index = claim_smoke_batch_start; claim_smoke_index < claim_smoke_batch_end; claim_smoke_index += 1)); do
+      claim_smoke_shard="${claim_smoke_shards[$claim_smoke_index]}"
+      if ! wait "${claim_smoke_pids[$claim_smoke_index - claim_smoke_batch_start]}"; then
+        claim_smoke_failed=1
+        echo "phase-loop claim smoke shard failed: $claim_smoke_shard" >&2
+        cat "$claim_smoke_shard_dir/$claim_smoke_shard.stdout.log" >&2
+        cat "$claim_smoke_shard_dir/$claim_smoke_shard.stderr.log" >&2
+      fi
+    done
+    if [ "$claim_smoke_failed" -ne 0 ]; then
+      break
+    fi
+    claim_smoke_batch_start="$claim_smoke_batch_end"
+  done
+  if [ "$claim_smoke_failed" -ne 0 ]; then
+    exit 1
+  fi
+  exit 0
+fi
 
 if ! command -v rg >/dev/null 2>&1; then
   fallback_bin_dir="$(mktemp -d)"
@@ -31,6 +161,9 @@ set -eu
 quiet=0
 if [ "${1:-}" = "-q" ]; then
   quiet=1
+  shift
+fi
+if [ "${1:-}" = "--" ]; then
   shift
 fi
 pattern="${1:?missing pattern}"
@@ -49,7 +182,7 @@ fi
 assert_contains() {
   local file="$1"
   local pattern="$2"
-  if ! rg -q "$pattern" "$file"; then
+  if ! rg -q -- "$pattern" "$file"; then
     echo "expected $file to contain pattern: $pattern" >&2
     exit 1
   fi
@@ -58,15 +191,79 @@ assert_contains() {
 assert_not_contains() {
   local file="$1"
   local pattern="$2"
-  if rg -q "$pattern" "$file"; then
+  if rg -q -- "$pattern" "$file"; then
     echo "expected $file not to contain pattern: $pattern" >&2
     exit 1
   fi
 }
 
+assert_terminal_failure_claim_archived() {
+  local claim_dir="$1"
+  local blocked_path="$2"
+  local ledger_path="$3"
+  local selected_prefix="$4"
+  local expected_archive_count="$5"
+  python3 - "$claim_dir" "$blocked_path" "$ledger_path" "$selected_prefix" "$expected_archive_count" <<'PY'
+import json
+import pathlib
+import sys
+
+claim_dir = pathlib.Path(sys.argv[1])
+blocked_path = pathlib.Path(sys.argv[2])
+ledger_path = pathlib.Path(sys.argv[3])
+selected_prefix = sys.argv[4]
+expected_archive_count = int(sys.argv[5])
+current_path = claim_dir / "current.json"
+assert not current_path.exists(), current_path
+archives = sorted(claim_dir.glob("stale-*.json"))
+assert len(archives) == expected_archive_count, archives
+archived = [json.loads(path.read_text(encoding="utf-8")) for path in archives]
+matching = [claim for claim in archived if selected_prefix in str(claim.get("selected_todo", ""))]
+assert len(matching) == expected_archive_count, matching
+assert all(claim.get("status") == "failed" for claim in matching), matching
+assert all(claim.get("archive_reason") == "terminal_failure_retry" for claim in matching), matching
+claim_ids = {str(claim.get("claim_id") or "") for claim in matching}
+assert all(claim_ids), matching
+blocked = [
+    json.loads(line)
+    for line in blocked_path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+assert any(
+    record.get("terminal_failure") is True
+    and record.get("claim_id") in claim_ids
+    and selected_prefix in str(record.get("selected_todo", ""))
+    for record in blocked
+), blocked
+ledger_records = [
+    json.loads(line)
+    for line in ledger_path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+terminal_events = []
+for record in ledger_records:
+    if record.get("kind") == "terminal_failure_transaction":
+        terminal_events.extend(record.get("events", []))
+assert all(
+    any(
+        event.get("claim_id") == claim_id
+        and selected_prefix in str(event.get("selected_todo", ""))
+        and "@" in str(event.get("task_id", ""))
+        for event in terminal_events
+    )
+    for claim_id in claim_ids
+), (claim_ids, terminal_events)
+PY
+}
+
 run_with_timeout() {
   local seconds="$1"
   shift
+  local expected_exit_codes=0
+  if [ "${1:-}" = "--expected-exit" ]; then
+    expected_exit_codes="$2"
+    shift 2
+  fi
   "$@" &
   local child_pid="$!"
   local elapsed=0
@@ -93,6 +290,9 @@ run_with_timeout() {
     child_status="$?"
   fi
   if [ "$child_status" -ne 0 ]; then
+    case ",$expected_exit_codes," in
+      *,"$child_status",*) ;;
+      *)
     echo "phase-loop claim smoke command failed exit=$child_status: $*" >&2
     if [ -n "${PHASE_LOOP_STATE_DIR:-}" ]; then
       for diagnostic_file in status.json progress-state.json; do
@@ -114,6 +314,8 @@ run_with_timeout() {
         tail -n 80 "$PHASE_LOOP_STATE_DIR/logs/supervisor.log" >&2
       fi
     fi
+      ;;
+    esac
   fi
   return "$child_status"
 }
@@ -142,6 +344,9 @@ assert_contains "$PHASE_LOOP" 'local guard_script="\$ROOT_DIR/scripts/phase-loop
 assert_contains "$PHASE_LOOP" 'node "\$guard_script" --repo "\$ROOT_DIR" --baseline-ref "\$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE"'
 assert_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_WORKSPACE_ROOT"'
 assert_contains "$PHASE_LOOP" "phase-loop-run-state\.mjs"
+assert_contains "$PHASE_LOOP" "\.brownie/headless-\*"
+assert_contains "$PHASE_LOOP" 'controller-fingerprint "\$controller_fingerprint"'
+assert_contains "$PHASE_LOOP" "Zero means the first terminal failure is stable/blocked"
 assert_contains "$PHASE_LOOP" "refusing to leave status running"
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$ROOT_DIR"'
 assert_not_contains "$PHASE_LOOP" 'phase-loop-task-ledger\.mjs" record-trajectory --repo "\$PHASE_LOOP_STATE_DIR"'
@@ -175,6 +380,9 @@ assert_contains "$PHASE_LOOP" "A leaf must never depend on itself"
 assert_contains "$PHASE_LOOP" "distinct prerequisite TODO ID already present in the live queue"
 assert_contains "$PHASE_LOOP" 'never generate a read-only `Read`, `Inspect`, or `Extract` leaf'
 assert_contains "$PHASE_LOOP" "phase-loop-pr-actor-guard.mjs"
+assert_contains "${BASH_SOURCE[0]}" "phase_loop_smoke_cpu_count"
+assert_contains "${BASH_SOURCE[0]}" "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"
+assert_contains "${BASH_SOURCE[0]}" 'claim_smoke_batch_size="\$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"'
 
 claim_smoke_private_state_sha256() {
   local state_root="$REPO_ROOT/.brownie/private/phase-loop"
@@ -465,6 +673,13 @@ fake_brownie_terminal_no_eligible="$(mktemp)"
 cat > "$fake_brownie_terminal_no_eligible" <<'SH'
 #!/usr/bin/env bash
 set -eu
+if [ "${PHASE_LOOP_TEST_HEADLESS_ONLY:-0}" = "1" ]; then
+  mkdir -p "$PHASE_LOOP_WORKSPACE_ROOT/.brownie/headless-continuations"
+  printf '%s\n' '{"headless":"controller-output-only"}' > "$PHASE_LOOP_WORKSPACE_ROOT/.brownie/headless-continuations/fresh-run.json"
+fi
+if [ "${PHASE_LOOP_TEST_REMOVE_CLAIM:-0}" = "1" ]; then
+  rm -f "$PHASE_LOOP_STATE_DIR/todo-claims/current.json"
+fi
 cat <<'JSON'
 {
   "command": "run",
@@ -484,7 +699,12 @@ cat <<'JSON'
       "run_id": "run-terminal",
       "journey_id": "journey-terminal",
       "next_action": "inspect_progress_overview",
-      "next_invocation": null
+      "next_invocation": null,
+      "llm_provider_failure": {
+        "failure_fingerprint": "sha256:provider-terminal-no-content",
+        "failure_class": "missing_provider_content",
+        "retryable": true
+      }
     },
     "status": "no_eligible_task",
     "session_id": "session-terminal",
@@ -501,12 +721,165 @@ cat <<'JSON'
     "controller_action": "stop",
     "stop_class": "terminal_failure",
     "stop_reason": "terminal_task_failed",
-    "next_invocation": null
+    "next_invocation": null,
+    "llm_provider_failure": {
+      "failure_fingerprint": "sha256:provider-terminal-no-content",
+      "failure_class": "missing_provider_content",
+      "retryable": true
+    }
   }
 }
 JSON
 SH
 chmod +x "$fake_brownie_terminal_no_eligible"
+fake_brownie_terminal_no_eligible_counted="$(mktemp)"
+cat > "$fake_brownie_terminal_no_eligible_counted" <<SH
+#!/usr/bin/env bash
+set -eu
+count_file="\$PHASE_LOOP_STATE_DIR/terminal-no-eligible-count"
+count="\$(cat "\$count_file" 2>/dev/null || printf '0')"
+printf '%s\n' "\$((count + 1))" > "\$count_file"
+exec "$fake_brownie_terminal_no_eligible" "\$@"
+SH
+chmod +x "$fake_brownie_terminal_no_eligible_counted"
+fake_brownie_terminal_retry_then_success="$(mktemp)"
+cat > "$fake_brownie_terminal_retry_then_success" <<SH
+#!/usr/bin/env bash
+set -eu
+attempt_file="\$PHASE_LOOP_STATE_DIR/terminal-retry-then-success.attempt"
+attempt="\$(python3 - "\$attempt_file" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+attempt = int(path.read_text(encoding='utf-8')) if path.exists() else 0
+attempt += 1
+path.write_text(str(attempt), encoding='utf-8')
+print(attempt)
+PY
+)"
+if [ "\$attempt" -eq 1 ] && [ "\${PHASE_LOOP_TEST_REMOVE_CLAIM:-0}" = "1" ]; then
+  rm -f "\$PHASE_LOOP_STATE_DIR/todo-claims/current.json"
+fi
+if [ "\$attempt" -ge 2 ]; then
+  python3 - "\$PHASE_LOOP_TODO" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding='utf-8')
+updated, count = re.subn(r'(?m)^- \[ \] (E-retry-success|E-retry-leaf):', r'- [x] \1:', text, count=1)
+assert count == 1, text
+path.write_text(updated, encoding='utf-8')
+PY
+  cat <<'JSON'
+{
+  "command": "run",
+  "ok": true,
+  "run": {
+    "automation": {
+      "schema_version": 1,
+      "status": "completed",
+      "controller_action": "stop",
+      "stop_class": "completed",
+      "stop_reason": "task_completed",
+      "completed": true,
+      "blocked": false,
+      "retryable": false,
+      "terminal_failure": false
+    },
+    "status": "completed",
+    "completion_closure_status": "completed",
+    "completed": true,
+    "blocked": false,
+    "retryable": false,
+    "terminal_failure": false,
+    "controller_action": "stop",
+    "stop_class": "completed",
+    "stop_reason": "task_completed",
+    "next_action": "inspect_progress_overview"
+  }
+}
+JSON
+else
+  exec "$fake_brownie_terminal_no_eligible" "\$@"
+fi
+SH
+chmod +x "$fake_brownie_terminal_retry_then_success"
+fake_brownie_completed="$(mktemp)"
+cat > "$fake_brownie_completed" <<'SH'
+#!/usr/bin/env bash
+set -eu
+cat <<'JSON'
+{
+  "command": "run",
+  "ok": true,
+  "run": {
+    "automation": {
+      "schema_version": 1,
+      "status": "completed",
+      "controller_action": "stop",
+      "stop_class": "completed",
+      "stop_reason": "task_completed",
+      "completed": true,
+      "blocked": false,
+      "retryable": false,
+      "terminal_failure": false
+    },
+    "status": "completed",
+    "completion_closure_status": "completed",
+    "completed": true,
+    "blocked": false,
+    "retryable": false,
+    "terminal_failure": false,
+    "controller_action": "stop",
+    "stop_class": "completed",
+    "stop_reason": "task_completed",
+    "next_action": "inspect_progress_overview"
+  }
+}
+JSON
+SH
+chmod +x "$fake_brownie_completed"
+fake_brownie_completed_tracked_workspace_change="$(mktemp)"
+cat > "$fake_brownie_completed_tracked_workspace_change" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [ "${2:-}" = "run" ]; then
+  printf 'completed workspace change from Brownie phase-loop\n' > README.md
+fi
+cat <<'JSON'
+{
+  "command": "run",
+  "ok": true,
+  "run": {
+    "automation": {
+      "schema_version": 1,
+      "status": "completed",
+      "controller_action": "stop",
+      "stop_class": "completed",
+      "stop_reason": "task_completed",
+      "completed": true,
+      "blocked": false,
+      "retryable": false,
+      "terminal_failure": false
+    },
+    "status": "completed",
+    "completion_closure_status": "completed",
+    "completed": true,
+    "blocked": false,
+    "retryable": false,
+    "terminal_failure": false,
+    "controller_action": "stop",
+    "stop_class": "completed",
+    "stop_reason": "task_completed",
+    "next_action": "inspect_progress_overview"
+  }
+}
+JSON
+SH
+chmod +x "$fake_brownie_completed_tracked_workspace_change"
 fake_brownie_objective_apply_pending="$(mktemp)"
 cat > "$fake_brownie_objective_apply_pending" <<'SH'
 #!/usr/bin/env bash
@@ -673,6 +1046,7 @@ exit 99
 SH
 chmod +x "$fake_brownie_must_not_run"
 
+if claim_smoke_section_enabled core; then
 state_with_claim="$(mktemp -d)"
 prompt_with_claim="$(mktemp)"
 todo_with_claim="$(mktemp)"
@@ -766,7 +1140,9 @@ assert "blocked external-control boundary" in status["detail"], status
 assert "will continue with the next unblocked TODO" in status["detail"], status
 assert claim["status"] == "blocked", claim
 PY
+fi
 
+if claim_smoke_section_enabled terminal; then
 state_terminal_no_eligible="$(mktemp -d)"
 prompt_terminal_no_eligible="$(mktemp)"
 todo_terminal_no_eligible="$(mktemp)"
@@ -782,29 +1158,1432 @@ PHASE_LOOP_TODO="$todo_terminal_no_eligible" \
 PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_no_eligible" \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 terminal_no_eligible_exit="$?"
 set -e
 test "$terminal_no_eligible_exit" = "76"
 test "$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')" = "$root_breakdown_before"
-python3 - "$state_terminal_no_eligible/status.json" "$state_terminal_no_eligible/progress-state.json" "$state_terminal_no_eligible/todo-claims/current.json" "$state_terminal_no_eligible/todo-claims/repair-feedback.json" <<'PY'
+python3 - "$state_terminal_no_eligible/status.json" "$state_terminal_no_eligible/progress-state.json" "$state_terminal_no_eligible/todo-claims/current.json" "$state_terminal_no_eligible/todo-claims/repair-feedback.json" "$state_terminal_no_eligible/todo-claims/blocked.jsonl" "$test_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
+import pathlib
 import sys
 
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 progress = json.load(open(sys.argv[2], encoding="utf-8"))
 claim = json.load(open(sys.argv[3], encoding="utf-8"))
 feedback = json.load(open(sys.argv[4], encoding="utf-8"))
-assert status["status"] == "no_progress", status
-assert "recovery=" in status["detail"], status
-assert progress["classification"] == "no_progress", progress
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").splitlines() if line.strip()]
+ledger = pathlib.Path(sys.argv[6]).read_text(encoding="utf-8")
+assert status["status"] == "blocked", status
+assert "terminal_task_failed" in status["detail"], status
+assert progress["classification"] == "terminal_failure", progress
 assert progress["meaningful_progress"] is False, progress
 assert progress["progress_projection"]["blocked_by_terminal_task_failure"] is True, progress
+assert progress["progress_projection"]["provider_failure_fingerprint"] == "sha256:provider-terminal-no-content", progress
 assert progress["workspace_changed"] is False, progress
-assert claim["status"] == "in_progress", claim
+assert claim["status"] == "failed", claim
+assert claim["status_history"][-1]["status"] == "failed", claim
 assert feedback["claim_id"] == claim["claim_id"], feedback
 assert feedback["reason"] == "runtime_terminal_failure", feedback
+assert blocked and blocked[-1]["block_reason"] == "terminal_runtime_failure", blocked
+assert blocked[-1]["terminal_failure"] is True, blocked
+assert blocked[-1]["retry_cap"] == 0, blocked
+assert "terminal_failure_transaction" in ledger, ledger
+assert '"retry_cap":0' in ledger, ledger
 PY
+
+# A positive terminal-failure retry cap permits the configured number of
+# additional executions, then suppresses the same TODO on the next claim.
+state_terminal_retry_cap="$(mktemp -d)"
+prompt_terminal_retry_cap="$(mktemp)"
+todo_terminal_retry_cap="$(mktemp)"
+terminal_retry_cap_workspace="$(mktemp -d)"
+git -C "$terminal_retry_cap_workspace" init -b main >/dev/null
+git -C "$terminal_retry_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$prompt_terminal_retry_cap"
+printf -- '- [ ] E-retry-cap: Patch only `scripts/retry-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-cap.mjs`.\n\n- [ ] E-retry-cap-deferred: Blocker: unavailable prerequisite is controlled outside the workspace.\n  Route: documentation.\n  Completion condition: the owner supplies the prerequisite evidence.\n  Verification: blocker: exact missing evidence is named, and no workspace file is patched until it is available.\n' > "$todo_terminal_retry_cap"
+for retry_run in 1 2; do
+  set +e
+  PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
+  PHASE_LOOP_PROMPT="$prompt_terminal_retry_cap" \
+  PHASE_LOOP_TODO="$todo_terminal_retry_cap" \
+  BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+  PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
+  PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
+  PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+  retry_exit="$?"
+  set -e
+  test "$retry_exit" = "76"
+done
+python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+transactions = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get('kind') == 'terminal_failure_transaction':
+        transactions.append(record)
+same_todo = [
+    record for record in transactions
+    if any('E-retry-cap:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
+]
+assert len(same_todo) == 2, same_todo
+assert all(event.get('retry_cap') == 1 for record in same_todo for event in record.get('events', [])), same_todo
+claim_ids = [
+    next(event['claim_id'] for event in record.get('events', []) if 'E-retry-cap:' in str(event.get('selected_todo', '')))
+    for record in same_todo
+]
+assert len(set(claim_ids)) == 2, claim_ids
+assert claim_ids[0] != claim_ids[1], claim_ids
+PY
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_retry_cap" \
+PHASE_LOOP_PROMPT="$prompt_terminal_retry_cap" \
+PHASE_LOOP_TODO="$todo_terminal_retry_cap" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_cap_workspace" \
+PHASE_LOOP_TEST_HEADLESS_ONLY=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 65,75,76 "$PHASE_LOOP" run-once >/dev/null
+retry_cap_exhausted_exit="$?"
+set -e
+case "$retry_cap_exhausted_exit" in
+  65|75|76) ;;
+  *) echo "unexpected retry-cap exhaustion exit=$retry_cap_exhausted_exit" >&2; exit 1 ;;
+esac
+assert_terminal_failure_claim_archived \
+  "$state_terminal_retry_cap/todo-claims" \
+  "$state_terminal_retry_cap/todo-claims/blocked.jsonl" \
+  "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" \
+  'E-retry-cap:' 2
+python3 - "$terminal_retry_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_cap/status.json" "$state_terminal_retry_cap/progress-state.json" <<'PY'
+import json
+import pathlib
+import sys
+
+transactions = [
+    json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()
+    if line.strip() and json.loads(line).get('kind') == 'terminal_failure_transaction'
+]
+same_todo = [
+    record for record in transactions
+    if any('E-retry-cap:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
+]
+assert len(same_todo) == 2, same_todo
+status = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+progress = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'))
+assert status['status'] == 'blocked', status
+assert progress['progress_projection']['cli_status'] == 'no_eligible_task', progress
+assert progress['progress_projection']['closure'] == 'no_eligible_task', progress
+if status['exit_code'] == '75':
+    assert 'Failed to claim first pending TODO' in status['detail'], status
+elif status['exit_code'] == '65':
+    assert 'explicit owner-controlled blocker TODO' in status['detail'], status
+else:
+    assert status['exit_code'] == '76', status
+    assert 'terminal_task_failed' in status['detail'], status
+    assert progress['classification'] == 'terminal_failure', progress
+PY
+
+# A retry-cap allowance must permit the next execution to complete with a
+# fresh claim/attempt rather than colliding with the failed terminal attempt.
+state_terminal_retry_success="$(mktemp -d)"
+prompt_terminal_retry_success="$(mktemp)"
+todo_terminal_retry_success="$(mktemp)"
+todo_breakdown_terminal_retry_success="$(mktemp)"
+terminal_retry_success_workspace="$(mktemp -d)"
+git -C "$terminal_retry_success_workspace" init -b main >/dev/null
+git -C "$terminal_retry_success_workspace" config user.name Brownie
+git -C "$terminal_retry_success_workspace" config user.email brownie@example.invalid
+mkdir -p "$terminal_retry_success_workspace/scripts"
+printf 'export const retrySuccess = true;\n' > "$terminal_retry_success_workspace/scripts/retry-success.mjs"
+git -C "$terminal_retry_success_workspace" add .
+git -C "$terminal_retry_success_workspace" commit -m init >/dev/null
+printf 'base prompt\n' > "$prompt_terminal_retry_success"
+printf -- '- [ ] E-retry-success: Patch only `scripts/retry-success.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry-success.mjs`.\n' > "$todo_terminal_retry_success"
+printf '# Breakdown\n' > "$todo_breakdown_terminal_retry_success"
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_retry_success" \
+PHASE_LOOP_PROMPT="$prompt_terminal_retry_success" \
+PHASE_LOOP_TODO="$todo_terminal_retry_success" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_retry_success" \
+BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+retry_success_first_exit="$?"
+set -e
+test "$retry_success_first_exit" = "76"
+test ! -f "$state_terminal_retry_success/todo-claims/current.json"
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_retry_success" \
+PHASE_LOOP_PROMPT="$prompt_terminal_retry_success" \
+PHASE_LOOP_TODO="$todo_terminal_retry_success" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_terminal_retry_success" \
+BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+retry_success_second_exit="$?"
+set -e
+test "$retry_success_second_exit" = "0"
+python3 - "$terminal_retry_success_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_success/todo-claims" "$todo_terminal_retry_success" <<'PY'
+import json
+import pathlib
+import sys
+
+ledger = []
+terminal_failure_events = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get('kind') == 'terminal_failure_transaction':
+        terminal_failure_events.extend(record.get('events', []))
+    else:
+        ledger.append(record)
+claim_dir = pathlib.Path(sys.argv[2])
+archives = sorted(claim_dir.glob('stale-*.json'))
+assert len(archives) == 1, archives
+archived_claim = json.loads(archives[0].read_text(encoding='utf-8'))
+assert archived_claim['status'] == 'failed', archived_claim
+assert archived_claim['archive_reason'] == 'terminal_failure_retry', archived_claim
+assert archived_claim['retry_eligible'] is True, archived_claim
+assert archived_claim['terminal_recovery_id'], archived_claim
+assert archived_claim['selected_todo'].startswith('- [ ] E-retry-success:'), archived_claim
+attempts = [event for event in ledger if str(event.get('task_id', '')).startswith('E-retry-success@')]
+completed = [event for event in attempts if event.get('to_state') == 'completed']
+failed_claim_ids = {event.get('claim_id') for event in terminal_failure_events}
+assert terminal_failure_events, terminal_failure_events
+assert completed, attempts
+assert completed[-1]['claim_id'] not in failed_claim_ids, (completed, terminal_failure_events)
+assert len({event.get('claim_id') for event in attempts if event.get('claim_id')}) >= 2, attempts
+assert '- [ ] E-retry-success:' not in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'), pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+PY
+
+# A retryable terminal failure for a generated leaf must bypass the legacy
+# stable-ID/controller short circuit and invoke Runtime while cap remains.
+state_terminal_retry_leaf="$(mktemp -d)"
+prompt_terminal_retry_leaf="$(mktemp)"
+todo_terminal_retry_leaf="$(mktemp)"
+terminal_retry_leaf_workspace="$(mktemp -d)"
+git -C "$terminal_retry_leaf_workspace" init -b main >/dev/null
+git -C "$terminal_retry_leaf_workspace" config user.name Brownie
+git -C "$terminal_retry_leaf_workspace" config user.email brownie@example.invalid
+mkdir -p "$terminal_retry_leaf_workspace/scripts"
+printf 'export const retryLeaf = true;\n' > "$terminal_retry_leaf_workspace/scripts/retry-leaf.mjs"
+git -C "$terminal_retry_leaf_workspace" add .
+git -C "$terminal_retry_leaf_workspace" commit -m init >/dev/null
+printf 'base prompt\n' > "$prompt_terminal_retry_leaf"
+printf -- '- [ ] E-retry-leaf: Patch only `scripts/retry-leaf.mjs`:\n  Route: implementation.\n  Source TODO: E-source-parent.\n  Depends on: <none>.\n  Verification: run `node --check scripts/retry-leaf.mjs`.\n' > "$todo_terminal_retry_leaf"
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_retry_leaf" \
+PHASE_LOOP_PROMPT="$prompt_terminal_retry_leaf" \
+PHASE_LOOP_TODO="$todo_terminal_retry_leaf" \
+BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_leaf_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+retry_leaf_first_exit="$?"
+set -e
+test "$retry_leaf_first_exit" = "76"
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_retry_leaf" \
+PHASE_LOOP_PROMPT="$prompt_terminal_retry_leaf" \
+PHASE_LOOP_TODO="$todo_terminal_retry_leaf" \
+BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_leaf_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+retry_leaf_second_exit="$?"
+set -e
+test "$retry_leaf_second_exit" = "0"
+test "$(cat "$state_terminal_retry_leaf/terminal-retry-then-success.attempt")" = "2"
+assert_not_contains "$todo_terminal_retry_leaf" '- \[ \] E-retry-leaf:'
+
+# Invalid retry caps must fail before claim, ledger, archive, or blocked-state
+# writes, and must never invoke the runtime.
+invalid_cap_state="$(mktemp -d)"
+invalid_cap_workspace="$(mktemp -d)"
+invalid_cap_prompt="$(mktemp)"
+invalid_cap_todo="$(mktemp)"
+git -C "$invalid_cap_workspace" init -b main >/dev/null
+git -C "$invalid_cap_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$invalid_cap_prompt"
+printf -- '- [ ] E-invalid-cap: Patch only `scripts/invalid-cap.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/invalid-cap.mjs`.\n' > "$invalid_cap_todo"
+invalid_cap_diagnostic="$invalid_cap_state/invalid-cap.stderr"
+set +e
+PHASE_LOOP_STATE_DIR="$invalid_cap_state" \
+PHASE_LOOP_PROMPT="$invalid_cap_prompt" \
+PHASE_LOOP_TODO="$invalid_cap_todo" \
+BROWNIE_BIN="$fake_brownie_must_not_run" \
+PHASE_LOOP_WORKSPACE_ROOT="$invalid_cap_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP='not-an-integer' \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null 2>"$invalid_cap_diagnostic"
+invalid_cap_exit="$?"
+set -e
+test "$invalid_cap_exit" = "78"
+assert_contains "$invalid_cap_diagnostic" 'Invalid PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=not-an-integer'
+test ! -f "$invalid_cap_state/status.json"
+test ! -f "$invalid_cap_state/todo-claims/current.json"
+test ! -e "$invalid_cap_state/todo-claims/blocked.jsonl"
+test ! -e "$invalid_cap_workspace/.brownie/private/phase-loop/task-ledger.jsonl"
+
+# A terminal recovery ledger write failure must not append blocked evidence or
+# leave a retry-eligible claim behind.
+ledger_terminal_failure_state="$(mktemp -d)"
+ledger_terminal_failure_workspace="$(mktemp -d)"
+ledger_terminal_failure_prompt="$(mktemp)"
+ledger_terminal_failure_todo="$(mktemp)"
+git -C "$ledger_terminal_failure_workspace" init -b main >/dev/null
+git -C "$ledger_terminal_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$ledger_terminal_failure_prompt"
+printf -- '- [ ] E-ledger-terminal-failure: Patch only `scripts/ledger-terminal-failure.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/ledger-terminal-failure.mjs`.\n\n- [ ] E-ledger-terminal-blocker: Blocker: external recovery evidence is unavailable.\n  Route: documentation.\n  Completion condition: the owner supplies the recovery evidence.\n  Verification: blocker: exact missing evidence is named before any workspace patch.\n' > "$ledger_terminal_failure_todo"
+set +e
+PHASE_LOOP_STATE_DIR="$ledger_terminal_failure_state" \
+PHASE_LOOP_PROMPT="$ledger_terminal_failure_prompt" \
+PHASE_LOOP_TODO="$ledger_terminal_failure_todo" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$ledger_terminal_failure_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+PHASE_LOOP_TEST_FAIL_TERMINAL_LEDGER=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+ledger_terminal_failure_exit="$?"
+set -e
+test "$ledger_terminal_failure_exit" = "78"
+python3 - "$ledger_terminal_failure_state/status.json" "$ledger_terminal_failure_state/todo-claims" "$ledger_terminal_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim_dir = pathlib.Path(sys.argv[2])
+ledger_path = pathlib.Path(sys.argv[3])
+archives = sorted(claim_dir.glob('stale-*.json'))
+assert not archives, archives
+claim = json.loads((claim_dir / 'current.json').read_text(encoding='utf-8'))
+assert claim['status'] == 'in_progress', claim
+assert claim['terminal_failure_recovery_pending'] is True, claim
+blocked_path = claim_dir / 'blocked.jsonl'
+assert not blocked_path.exists() or (blocked_path.is_file() and not blocked_path.read_text(encoding='utf-8').strip()), blocked_path
+ledger = ledger_path.read_text(encoding='utf-8')
+assert 'terminal_failure_transaction' not in ledger, ledger
+ledger_records = [json.loads(line) for line in ledger.splitlines() if line.strip()]
+claim_id = claim['claim_id']
+source_task = 'E-ledger-terminal-failure@' + claim_id
+assert not any(event.get('task_id') == source_task and event.get('to_state') == 'failed' for event in ledger_records), ledger_records
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '78', status
+assert 'could not be fully recorded' in status['detail'], status
+assert 'refusing to retry' in status['detail'], status
+PY
+set +e
+PHASE_LOOP_STATE_DIR="$ledger_terminal_failure_state" \
+PHASE_LOOP_PROMPT="$ledger_terminal_failure_prompt" \
+PHASE_LOOP_TODO="$ledger_terminal_failure_todo" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible_counted" \
+PHASE_LOOP_WORKSPACE_ROOT="$ledger_terminal_failure_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+ledger_terminal_failure_retry_exit="$?"
+set -e
+test "$ledger_terminal_failure_retry_exit" = "76"
+test "$(cat "$ledger_terminal_failure_state/terminal-no-eligible-count" 2>/dev/null || printf '0')" = "0"
+python3 - "$ledger_terminal_failure_state/status.json" "$ledger_terminal_failure_state/todo-claims/current.json" "$ledger_terminal_failure_state/todo-claims/blocked.jsonl" "$ledger_terminal_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() if line.strip()]
+ledger = [json.loads(line) for line in pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert status['exit_code'] == '76', status
+assert claim['status'] == 'failed', claim
+assert claim['terminal_failure_recovery_pending'] is False, claim
+assert blocked and blocked[-1]['terminal_failure'] is True, blocked
+source_task = 'E-ledger-terminal-failure@' + claim['claim_id']
+assert any(event.get('task_id') == source_task and event.get('to_state') == 'failed' and event.get('from_state') in ('claimed', 'running') for event in ledger), ledger
+PY
+
+# A successful terminal ledger transaction is not complete until blocked.jsonl
+# also accepts the evidence. A directory at that path must fail closed and
+# retire the claim as non-retryable.
+blocked_append_failure_state="$(mktemp -d)"
+blocked_append_failure_workspace="$(mktemp -d)"
+blocked_append_failure_prompt="$(mktemp)"
+blocked_append_failure_todo="$(mktemp)"
+git -C "$blocked_append_failure_workspace" init -b main >/dev/null
+git -C "$blocked_append_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$blocked_append_failure_state/todo-claims/blocked.jsonl"
+printf 'base prompt\n' > "$blocked_append_failure_prompt"
+printf -- '- [ ] E-blocked-append-failure: Patch only `scripts/blocked-append-failure.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/blocked-append-failure.mjs`.\n\n- [ ] E-blocked-append-blocker: Blocker: external recovery evidence is unavailable.\n  Route: documentation.\n  Completion condition: the owner supplies the recovery evidence.\n  Verification: blocker: exact missing evidence is named before any workspace patch.\n' > "$blocked_append_failure_todo"
+set +e
+PHASE_LOOP_STATE_DIR="$blocked_append_failure_state" \
+PHASE_LOOP_PROMPT="$blocked_append_failure_prompt" \
+PHASE_LOOP_TODO="$blocked_append_failure_todo" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$blocked_append_failure_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+blocked_append_failure_exit="$?"
+set -e
+test "$blocked_append_failure_exit" = "78"
+python3 - "$blocked_append_failure_state/status.json" "$blocked_append_failure_state/todo-claims" "$blocked_append_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim_dir = pathlib.Path(sys.argv[2])
+ledger = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+archives = sorted(claim_dir.glob('stale-*.json'))
+assert len(archives) == 1, archives
+archive = json.loads(archives[0].read_text(encoding='utf-8'))
+assert archive['archive_reason'] == 'terminal_failure_blocked_evidence_failed', archive
+assert archive['retry_eligible'] is False, archive
+assert not (claim_dir / 'current.json').exists()
+assert (claim_dir / 'blocked.jsonl').is_dir()
+assert 'terminal_failure_transaction' in ledger, ledger
+claim_id = archive['claim_id']
+ledger_records = [
+    json.loads(line)
+    for line in ledger.splitlines()
+    if line.strip()
+]
+assert any(
+    event.get('claim_id') == claim_id
+    and event.get('to_state') == 'failed'
+    and event.get('from_state') in ('claimed', 'running')
+    and str(event.get('task_id', '')).endswith('@' + claim_id)
+    for record in ledger_records
+    for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])
+), ledger_records
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '78', status
+assert 'blocked evidence append failed' in status['detail'], status
+assert 'refusing to retry' in status['detail'], status
+PY
+set +e
+PHASE_LOOP_STATE_DIR="$blocked_append_failure_state" \
+PHASE_LOOP_PROMPT="$blocked_append_failure_prompt" \
+PHASE_LOOP_TODO="$blocked_append_failure_todo" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible_counted" \
+PHASE_LOOP_WORKSPACE_ROOT="$blocked_append_failure_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 65,75 "$PHASE_LOOP" run-once >/dev/null
+blocked_append_failure_retry_exit="$?"
+set -e
+case "$blocked_append_failure_retry_exit" in
+  65|75) ;;
+  *) echo "unexpected blocked-append retry exit=$blocked_append_failure_retry_exit" >&2; exit 1 ;;
+esac
+test "$(cat "$blocked_append_failure_state/terminal-no-eligible-count" 2>/dev/null || printf '0')" = "0"
+fi
+
+if claim_smoke_section_enabled completion; then
+# Completion must record the terminal ledger transition before mutating the
+# live TODO queue. An unwritable ledger keeps both queue and claim retryable.
+completion_ledger_failure_state="$(mktemp -d)"
+completion_ledger_failure_workspace="$(mktemp -d)"
+completion_ledger_failure_prompt="$(mktemp)"
+completion_ledger_failure_todo="$(mktemp)"
+git -C "$completion_ledger_failure_workspace" init -b main >/dev/null
+git -C "$completion_ledger_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$completion_ledger_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl"
+printf 'base prompt\n' > "$completion_ledger_failure_prompt"
+printf -- '- [ ] E-completion-ledger-failure: Patch only `scripts/completion-ledger-failure.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/completion-ledger-failure.mjs`.\n' > "$completion_ledger_failure_todo"
+set +e
+PHASE_LOOP_STATE_DIR="$completion_ledger_failure_state" \
+PHASE_LOOP_PROMPT="$completion_ledger_failure_prompt" \
+PHASE_LOOP_TODO="$completion_ledger_failure_todo" \
+BROWNIE_BIN="$fake_brownie_completed" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_ledger_failure_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_ledger_failure_exit="$?"
+set -e
+test "$completion_ledger_failure_exit" = "78"
+python3 - "$completion_ledger_failure_state/status.json" "$completion_ledger_failure_state/todo-claims/current.json" "$completion_ledger_failure_todo" "$completion_ledger_failure_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+ledger_path = pathlib.Path(sys.argv[4])
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '78', status
+assert 'terminal ledger transition failed' in status['detail'], status
+assert claim['status'] == 'in_progress', claim
+assert '- [ ] E-completion-ledger-failure:' in todo, todo
+assert ledger_path.is_dir(), ledger_path
+PY
+
+# A completion ledger record does not authorize reverting the claim to
+# in_progress when queue cleanup fails. Preserve the completed claim and make
+# cleanup the only retryable operation on the next controller invocation.
+completion_removal_failure_state="$(mktemp -d)"
+completion_removal_failure_workspace="$(mktemp -d)"
+completion_removal_failure_prompt="$(mktemp)"
+completion_removal_failure_todo="$(mktemp)"
+git -C "$completion_removal_failure_workspace" init -b main >/dev/null
+git -C "$completion_removal_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$completion_removal_failure_prompt"
+printf -- '- [ ] E-completion-removal-failure: Patch only `scripts/completion-removal-failure.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/completion-removal-failure.mjs`.\n' > "$completion_removal_failure_todo"
+completion_removal_failure_runtime_count="$completion_removal_failure_state/runtime-count"
+completion_removal_failure_brownie="$(mktemp)"
+cat > "$completion_removal_failure_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_removal_failure_runtime_count"
+exit 99
+SH
+chmod +x "$completion_removal_failure_brownie"
+set +e
+PHASE_LOOP_STATE_DIR="$completion_removal_failure_state" \
+PHASE_LOOP_PROMPT="$completion_removal_failure_prompt" \
+PHASE_LOOP_TODO="$completion_removal_failure_todo" \
+BROWNIE_BIN="$fake_brownie_completed" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_removal_failure_workspace" \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_removal_failure_exit="$?"
+set -e
+test "$completion_removal_failure_exit" = "78"
+python3 - "$completion_removal_failure_state/status.json" "$completion_removal_failure_state/todo-claims/current.json" "$completion_removal_failure_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '78', status
+assert claim['status'] == 'completed', claim
+assert claim['completion_cleanup_pending'] is True, claim
+assert '- [ ] E-completion-removal-failure:' in todo, todo
+PY
+
+set +e
+PHASE_LOOP_STATE_DIR="$completion_removal_failure_state" \
+PHASE_LOOP_PROMPT="$completion_removal_failure_prompt" \
+PHASE_LOOP_TODO="$completion_removal_failure_todo" \
+BROWNIE_BIN="$completion_removal_failure_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_removal_failure_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75 "$PHASE_LOOP" run-once >/dev/null
+completion_removal_cleanup_exit="$?"
+set -e
+test "$completion_removal_cleanup_exit" = "75"
+python3 - "$completion_removal_failure_state/status.json" "$completion_removal_failure_state/todo-claims/current.json" "$completion_removal_failure_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'stopped', status
+assert claim['status'] == 'completed', claim
+assert claim['completion_cleanup_pending'] is False, claim
+assert '- [ ] E-completion-removal-failure:' not in todo, todo
+PY
+
+# If completion cleanup is deferred after Runtime changed tracked workspace
+# files, retain a durable PR-publication obligation. A cleanup-only retry must
+# publish that already-created completion exactly once and must not invoke
+# Runtime again.
+completion_pr_cleanup_retry_state="$(mktemp -d)"
+completion_pr_cleanup_retry_prompt="$(mktemp)"
+completion_pr_cleanup_retry_todo="$(mktemp)"
+completion_pr_cleanup_retry_workspace="$(mktemp -d)"
+completion_pr_cleanup_retry_remote="$(mktemp -d)"
+completion_pr_cleanup_retry_bin="$(mktemp -d)"
+completion_pr_cleanup_retry_count="$completion_pr_cleanup_retry_state/pr-create-count"
+completion_pr_cleanup_retry_runtime_count="$completion_pr_cleanup_retry_state/runtime-count"
+git -C "$completion_pr_cleanup_retry_workspace" init -b main >/dev/null
+mkdir -p "$completion_pr_cleanup_retry_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$completion_pr_cleanup_retry_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$completion_pr_cleanup_retry_workspace/README.md"
+git -C "$completion_pr_cleanup_retry_workspace" add .
+git -C "$completion_pr_cleanup_retry_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$completion_pr_cleanup_retry_remote" init --bare >/dev/null
+git -C "$completion_pr_cleanup_retry_workspace" remote add origin "$completion_pr_cleanup_retry_remote"
+git -C "$completion_pr_cleanup_retry_workspace" push -u origin main >/dev/null
+git -C "$completion_pr_cleanup_retry_workspace" switch -c brownie-agent/smoke-completion-cleanup-pr >/dev/null
+printf 'base prompt\n' > "$completion_pr_cleanup_retry_prompt"
+printf -- '- [ ] E-completion-cleanup-pr: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_cleanup_retry_todo"
+cat > "$completion_pr_cleanup_retry_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$completion_pr_cleanup_retry_bin/pnpm"
+cat > "$completion_pr_cleanup_retry_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "${1:-} ${2:-}" in
+  "api user")
+    printf 'brownie-agent\n'
+    ;;
+  "auth token")
+    printf 'fake-token\n'
+    ;;
+  "pr view")
+    exit 1
+    ;;
+  "pr create")
+    printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
+    printf 'https://github.com/globalpocket/brownie/pull/10001\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+SH
+chmod +x "$completion_pr_cleanup_retry_bin/gh"
+completion_pr_cleanup_retry_brownie="$(mktemp)"
+cat > "$completion_pr_cleanup_retry_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_pr_cleanup_retry_runtime_count"
+exit 99
+SH
+chmod +x "$completion_pr_cleanup_retry_brownie"
+set +e
+PATH="$completion_pr_cleanup_retry_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_cleanup_retry_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_cleanup_retry_state" \
+PHASE_LOOP_PROMPT="$completion_pr_cleanup_retry_prompt" \
+PHASE_LOOP_TODO="$completion_pr_cleanup_retry_todo" \
+BROWNIE_BIN="$fake_brownie_completed_tracked_workspace_change" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_cleanup_retry_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_pr_cleanup_retry_first_exit="$?"
+set -e
+test "$completion_pr_cleanup_retry_first_exit" = "78"
+python3 - "$completion_pr_cleanup_retry_state/todo-claims/current.json" "$completion_pr_cleanup_retry_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
+assert claim['status'] == 'completed', claim
+assert claim['completion_cleanup_pending'] is True, claim
+assert claim['completion_pr_pending'] is True, claim
+assert claim['completion_pr_workspace_before'] != claim['completion_pr_workspace_after'], claim
+assert '- [ ] E-completion-cleanup-pr:' in todo, todo
+PY
+test ! -e "$completion_pr_cleanup_retry_count"
+set +e
+PATH="$completion_pr_cleanup_retry_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_cleanup_retry_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_cleanup_retry_state" \
+PHASE_LOOP_PROMPT="$completion_pr_cleanup_retry_prompt" \
+PHASE_LOOP_TODO="$completion_pr_cleanup_retry_todo" \
+BROWNIE_BIN="$completion_pr_cleanup_retry_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_cleanup_retry_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_pr_cleanup_retry_second_exit="$?"
+set -e
+test "$completion_pr_cleanup_retry_second_exit" = "0"
+python3 - "$completion_pr_cleanup_retry_state/status.json" "$completion_pr_cleanup_retry_state/todo-claims/current.json" "$completion_pr_cleanup_retry_todo" "$completion_pr_cleanup_retry_workspace" "$completion_pr_cleanup_retry_count" "$completion_pr_cleanup_retry_runtime_count" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+workspace = sys.argv[4]
+pr_count = pathlib.Path(sys.argv[5])
+runtime_count = pathlib.Path(sys.argv[6])
+assert status['status'] == 'pr_created', status
+assert 'pull/10001' in status['detail'], status
+assert claim['status'] == 'completed', claim
+assert claim['completion_cleanup_pending'] is False, claim
+assert claim['completion_pr_pending'] is False, claim
+assert any(item.get('note') == 'completion_pr_published' for item in claim['status_history']), claim
+assert '- [ ] E-completion-cleanup-pr:' not in todo, todo
+assert pr_count.read_text(encoding='utf-8').splitlines() == ['1'], pr_count
+assert not runtime_count.exists(), runtime_count
+head = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'HEAD'], text=True).strip()
+remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'origin/brownie-agent/smoke-completion-cleanup-pr'], text=True).strip()
+assert head == remote, (head, remote)
+supervisor = pathlib.Path(pathlib.Path(sys.argv[1]).parent / 'logs' / 'supervisor.log').read_text(encoding='utf-8')
+assert 'completed_todo_pr_publish_retry_succeeded=true' in supervisor, supervisor
+PY
+
+# A normal completion whose PR publication fails after queue completion must
+# retain a durable pending-publish marker. The next invocation publishes the
+# same completion without invoking Runtime or selecting another TODO.
+completion_pr_publish_failure_state="$(mktemp -d)"
+completion_pr_publish_failure_prompt="$(mktemp)"
+completion_pr_publish_failure_todo="$(mktemp)"
+completion_pr_publish_failure_workspace="$(mktemp -d)"
+completion_pr_publish_failure_remote="$(mktemp -d)"
+completion_pr_publish_failure_bin="$(mktemp -d)"
+completion_pr_publish_failure_count="$completion_pr_publish_failure_state/pr-create-attempts"
+completion_pr_publish_failure_runtime_count="$completion_pr_publish_failure_state/runtime-count"
+git -C "$completion_pr_publish_failure_workspace" init -b main >/dev/null
+mkdir -p "$completion_pr_publish_failure_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$completion_pr_publish_failure_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$completion_pr_publish_failure_workspace/README.md"
+git -C "$completion_pr_publish_failure_workspace" add .
+git -C "$completion_pr_publish_failure_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$completion_pr_publish_failure_remote" init --bare >/dev/null
+git -C "$completion_pr_publish_failure_workspace" remote add origin "$completion_pr_publish_failure_remote"
+git -C "$completion_pr_publish_failure_workspace" push -u origin main >/dev/null
+git -C "$completion_pr_publish_failure_workspace" switch -c brownie-agent/smoke-completion-pr-retry >/dev/null
+printf 'base prompt\n' > "$completion_pr_publish_failure_prompt"
+printf -- '- [ ] E-completion-pr-retry: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_publish_failure_todo"
+cat > "$completion_pr_publish_failure_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$completion_pr_publish_failure_bin/pnpm"
+cat > "$completion_pr_publish_failure_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "${1:-} ${2:-}" in
+  "api user")
+    printf 'brownie-agent\n'
+    ;;
+  "auth token")
+    printf 'fake-token\n'
+    ;;
+  "pr view")
+    exit 1
+    ;;
+  "pr create")
+    attempts=0
+    if [ -f "${FAKE_GH_PR_CREATE_ATTEMPTS:?}" ]; then
+      attempts="$(wc -l < "${FAKE_GH_PR_CREATE_ATTEMPTS}")"
+    fi
+    printf 'attempt\n' >> "${FAKE_GH_PR_CREATE_ATTEMPTS}"
+    if [ "$attempts" -eq 0 ]; then
+      exit 1
+    fi
+    printf 'https://github.com/globalpocket/brownie/pull/10002\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+SH
+chmod +x "$completion_pr_publish_failure_bin/gh"
+completion_pr_publish_failure_brownie="$(mktemp)"
+cat > "$completion_pr_publish_failure_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_pr_publish_failure_runtime_count"
+exit 99
+SH
+chmod +x "$completion_pr_publish_failure_brownie"
+set +e
+PATH="$completion_pr_publish_failure_bin:$PATH" \
+FAKE_GH_PR_CREATE_ATTEMPTS="$completion_pr_publish_failure_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_publish_failure_state" \
+PHASE_LOOP_PROMPT="$completion_pr_publish_failure_prompt" \
+PHASE_LOOP_TODO="$completion_pr_publish_failure_todo" \
+BROWNIE_BIN="$fake_brownie_completed_tracked_workspace_change" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_publish_failure_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_pr_publish_failure_first_exit="$?"
+set -e
+test "$completion_pr_publish_failure_first_exit" = "78"
+python3 - "$completion_pr_publish_failure_state/status.json" "$completion_pr_publish_failure_state/todo-claims/current.json" "$completion_pr_publish_failure_todo" "$completion_pr_publish_failure_count" "$completion_pr_publish_failure_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+attempts = pathlib.Path(sys.argv[4])
+runtime_count = pathlib.Path(sys.argv[5])
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '78', status
+assert claim['status'] == 'completed', claim
+assert claim['completion_pr_pending'] is True, claim
+assert any(item.get('note') == 'completion_pr_publish_pending' for item in claim['status_history']), claim
+assert '- [ ] E-completion-pr-retry:' not in todo, todo
+assert attempts.read_text(encoding='utf-8').splitlines() == ['attempt'], attempts
+assert not runtime_count.exists(), runtime_count
+PY
+set +e
+PATH="$completion_pr_publish_failure_bin:$PATH" \
+FAKE_GH_PR_CREATE_ATTEMPTS="$completion_pr_publish_failure_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_publish_failure_state" \
+PHASE_LOOP_PROMPT="$completion_pr_publish_failure_prompt" \
+PHASE_LOOP_TODO="$completion_pr_publish_failure_todo" \
+BROWNIE_BIN="$completion_pr_publish_failure_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_publish_failure_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_pr_publish_failure_second_exit="$?"
+set -e
+test "$completion_pr_publish_failure_second_exit" = "0"
+python3 - "$completion_pr_publish_failure_state/status.json" "$completion_pr_publish_failure_state/todo-claims/current.json" "$completion_pr_publish_failure_count" "$completion_pr_publish_failure_runtime_count" "$completion_pr_publish_failure_workspace" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+attempts = pathlib.Path(sys.argv[3])
+runtime_count = pathlib.Path(sys.argv[4])
+workspace = sys.argv[5]
+assert status['status'] == 'pr_created', status
+assert 'pull/10002' in status['detail'], status
+assert claim['status'] == 'completed', claim
+assert claim['completion_pr_pending'] is False, claim
+assert attempts.read_text(encoding='utf-8').splitlines() == ['attempt', 'attempt'], attempts
+assert not runtime_count.exists(), runtime_count
+head = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'HEAD'], text=True).strip()
+remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'origin/brownie-agent/smoke-completion-pr-retry'], text=True).strip()
+assert head == remote, (head, remote)
+PY
+
+# Repeated cleanup failure must reassert cleanup_pending without clearing an
+# already durable completion_pr_pending marker or any of its workspace/log
+# metadata. The third run must complete cleanup and publish that same PR.
+completion_pr_marker_preservation_state="$(mktemp -d)"
+completion_pr_marker_preservation_prompt="$(mktemp)"
+completion_pr_marker_preservation_todo="$(mktemp)"
+completion_pr_marker_preservation_workspace="$(mktemp -d)"
+completion_pr_marker_preservation_remote="$(mktemp -d)"
+completion_pr_marker_preservation_bin="$(mktemp -d)"
+completion_pr_marker_preservation_count="$completion_pr_marker_preservation_state/pr-create-count"
+completion_pr_marker_preservation_runtime_count="$completion_pr_marker_preservation_state/runtime-count"
+git -C "$completion_pr_marker_preservation_workspace" init -b main >/dev/null
+mkdir -p "$completion_pr_marker_preservation_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$completion_pr_marker_preservation_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$completion_pr_marker_preservation_workspace/README.md"
+git -C "$completion_pr_marker_preservation_workspace" add .
+git -C "$completion_pr_marker_preservation_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$completion_pr_marker_preservation_remote" init --bare >/dev/null
+git -C "$completion_pr_marker_preservation_workspace" remote add origin "$completion_pr_marker_preservation_remote"
+git -C "$completion_pr_marker_preservation_workspace" push -u origin main >/dev/null
+git -C "$completion_pr_marker_preservation_workspace" switch -c brownie-agent/smoke-completion-pr-marker-preservation >/dev/null
+printf 'base prompt\n' > "$completion_pr_marker_preservation_prompt"
+printf -- '- [ ] E-completion-pr-marker-preservation: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_marker_preservation_todo"
+cat > "$completion_pr_marker_preservation_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$completion_pr_marker_preservation_bin/pnpm"
+cat > "$completion_pr_marker_preservation_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "${1:-} ${2:-}" in
+  "api user") printf 'brownie-agent\n' ;;
+  "auth token") printf 'fake-token\n' ;;
+  "pr view") exit 1 ;;
+  "pr create")
+    printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
+    printf 'https://github.com/globalpocket/brownie/pull/10003\n'
+    ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$completion_pr_marker_preservation_bin/gh"
+completion_pr_marker_preservation_brownie="$(mktemp)"
+cat > "$completion_pr_marker_preservation_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_pr_marker_preservation_runtime_count"
+exec "$fake_brownie_completed_tracked_workspace_change" "\$@"
+SH
+chmod +x "$completion_pr_marker_preservation_brownie"
+set +e
+PATH="$completion_pr_marker_preservation_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_marker_preservation_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_marker_preservation_state" \
+PHASE_LOOP_PROMPT="$completion_pr_marker_preservation_prompt" \
+PHASE_LOOP_TODO="$completion_pr_marker_preservation_todo" \
+BROWNIE_BIN="$completion_pr_marker_preservation_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_marker_preservation_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_pr_marker_preservation_first_exit="$?"
+set -e
+test "$completion_pr_marker_preservation_first_exit" = "78"
+python3 - "$completion_pr_marker_preservation_state/todo-claims/current.json" <<'PY'
+import json
+import pathlib
+import sys
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+assert claim['completion_cleanup_pending'] is True, claim
+assert claim['completion_pr_pending'] is True, claim
+assert claim['completion_pr_workspace_before'], claim
+assert claim['completion_pr_workspace_after'], claim
+assert claim['completion_pr_stdout_log'], claim
+assert claim['completion_pr_stderr_log'], claim
+PY
+set +e
+PATH="$completion_pr_marker_preservation_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_marker_preservation_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_marker_preservation_state" \
+PHASE_LOOP_PROMPT="$completion_pr_marker_preservation_prompt" \
+PHASE_LOOP_TODO="$completion_pr_marker_preservation_todo" \
+BROWNIE_BIN="$completion_pr_marker_preservation_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_marker_preservation_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_pr_marker_preservation_second_exit="$?"
+set -e
+test "$completion_pr_marker_preservation_second_exit" = "78"
+python3 - "$completion_pr_marker_preservation_state/todo-claims/current.json" "$completion_pr_marker_preservation_state/status.json" "$completion_pr_marker_preservation_runtime_count" "$completion_pr_marker_preservation_count" <<'PY'
+import json
+import pathlib
+import sys
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+status = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+runtime_count = pathlib.Path(sys.argv[3])
+pr_count = pathlib.Path(sys.argv[4])
+assert status['status'] == 'blocked', status
+assert claim['completion_cleanup_pending'] is True, claim
+assert claim['completion_pr_pending'] is True, claim
+assert claim['completion_pr_workspace_before'], claim
+assert claim['completion_pr_workspace_after'], claim
+assert claim['completion_pr_stdout_log'], claim
+assert claim['completion_pr_stderr_log'], claim
+assert runtime_count.read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], runtime_count
+assert not pr_count.exists(), pr_count
+PY
+test ! -e "$completion_pr_marker_preservation_state/stop"
+set +e
+PATH="$completion_pr_marker_preservation_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_pr_marker_preservation_count" \
+PHASE_LOOP_STATE_DIR="$completion_pr_marker_preservation_state" \
+PHASE_LOOP_PROMPT="$completion_pr_marker_preservation_prompt" \
+PHASE_LOOP_TODO="$completion_pr_marker_preservation_todo" \
+BROWNIE_BIN="$completion_pr_marker_preservation_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_pr_marker_preservation_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_pr_marker_preservation_third_exit="$?"
+set -e
+test "$completion_pr_marker_preservation_third_exit" = "0"
+python3 - "$completion_pr_marker_preservation_state/status.json" "$completion_pr_marker_preservation_state/todo-claims/current.json" "$completion_pr_marker_preservation_todo" "$completion_pr_marker_preservation_count" "$completion_pr_marker_preservation_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'pr_created', status
+assert claim['completion_cleanup_pending'] is False, claim
+assert claim['completion_pr_pending'] is False, claim
+assert '- [ ] E-completion-pr-marker-preservation:' not in todo, todo
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['1'], pathlib.Path(sys.argv[4]).read_text()
+assert pathlib.Path(sys.argv[5]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[5]).read_text()
+PY
+test ! -e "$completion_pr_marker_preservation_state/stop"
+
+# If cleanup removes the final TODO and the process is interrupted before
+# clearing cleanup_pending, the next run must recover the marker before the
+# empty-queue stop gate and publish without Runtime or a stop file.
+completion_cleanup_interrupt_state="$(mktemp -d)"
+completion_cleanup_interrupt_prompt="$(mktemp)"
+completion_cleanup_interrupt_todo="$(mktemp)"
+completion_cleanup_interrupt_workspace="$(mktemp -d)"
+completion_cleanup_interrupt_remote="$(mktemp -d)"
+completion_cleanup_interrupt_bin="$(mktemp -d)"
+completion_cleanup_interrupt_count="$completion_cleanup_interrupt_state/pr-create-count"
+completion_cleanup_interrupt_runtime_count="$completion_cleanup_interrupt_state/runtime-count"
+git -C "$completion_cleanup_interrupt_workspace" init -b main >/dev/null
+mkdir -p "$completion_cleanup_interrupt_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$completion_cleanup_interrupt_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$completion_cleanup_interrupt_workspace/README.md"
+git -C "$completion_cleanup_interrupt_workspace" add .
+git -C "$completion_cleanup_interrupt_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$completion_cleanup_interrupt_remote" init --bare >/dev/null
+git -C "$completion_cleanup_interrupt_workspace" remote add origin "$completion_cleanup_interrupt_remote"
+git -C "$completion_cleanup_interrupt_workspace" push -u origin main >/dev/null
+git -C "$completion_cleanup_interrupt_workspace" switch -c brownie-agent/smoke-completion-cleanup-interrupt >/dev/null
+printf 'base prompt\n' > "$completion_cleanup_interrupt_prompt"
+printf -- '- [ ] E-completion-cleanup-interrupt: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_cleanup_interrupt_todo"
+cat > "$completion_cleanup_interrupt_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$completion_cleanup_interrupt_bin/pnpm"
+cat > "$completion_cleanup_interrupt_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "${1:-} ${2:-}" in
+  "api user") printf 'brownie-agent\n' ;;
+  "auth token") printf 'fake-token\n' ;;
+  "pr view") exit 1 ;;
+  "pr create")
+    printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
+    printf 'https://github.com/globalpocket/brownie/pull/10004\n'
+    ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$completion_cleanup_interrupt_bin/gh"
+completion_cleanup_interrupt_brownie="$(mktemp)"
+cat > "$completion_cleanup_interrupt_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$completion_cleanup_interrupt_runtime_count"
+exec "$fake_brownie_completed_tracked_workspace_change" "\$@"
+SH
+chmod +x "$completion_cleanup_interrupt_brownie"
+set +e
+PATH="$completion_cleanup_interrupt_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_cleanup_interrupt_count" \
+PHASE_LOOP_STATE_DIR="$completion_cleanup_interrupt_state" \
+PHASE_LOOP_PROMPT="$completion_cleanup_interrupt_prompt" \
+PHASE_LOOP_TODO="$completion_cleanup_interrupt_todo" \
+BROWNIE_BIN="$completion_cleanup_interrupt_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_cleanup_interrupt_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_cleanup_interrupt_first_exit="$?"
+set -e
+test "$completion_cleanup_interrupt_first_exit" = "78"
+set +e
+PATH="$completion_cleanup_interrupt_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_cleanup_interrupt_count" \
+PHASE_LOOP_STATE_DIR="$completion_cleanup_interrupt_state" \
+PHASE_LOOP_PROMPT="$completion_cleanup_interrupt_prompt" \
+PHASE_LOOP_TODO="$completion_cleanup_interrupt_todo" \
+BROWNIE_BIN="$completion_cleanup_interrupt_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_cleanup_interrupt_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_TEST_INTERRUPT_AFTER_COMPLETED_TODO_REMOVAL=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+completion_cleanup_interrupt_second_exit="$?"
+set -e
+test "$completion_cleanup_interrupt_second_exit" = "78"
+python3 - "$completion_cleanup_interrupt_state/todo-claims/current.json" "$completion_cleanup_interrupt_todo" "$completion_cleanup_interrupt_runtime_count" "$completion_cleanup_interrupt_count" <<'PY'
+import json
+import pathlib
+import sys
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')
+assert claim['completion_cleanup_pending'] is True, claim
+assert claim['completion_pr_pending'] is True, claim
+assert '- [ ] E-completion-cleanup-interrupt:' not in todo, todo
+assert pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[3]).read_text()
+assert not pathlib.Path(sys.argv[4]).exists(), pathlib.Path(sys.argv[4])
+PY
+test ! -e "$completion_cleanup_interrupt_state/stop"
+set +e
+PATH="$completion_cleanup_interrupt_bin:$PATH" \
+FAKE_GH_PR_CREATE_COUNT="$completion_cleanup_interrupt_count" \
+PHASE_LOOP_STATE_DIR="$completion_cleanup_interrupt_state" \
+PHASE_LOOP_PROMPT="$completion_cleanup_interrupt_prompt" \
+PHASE_LOOP_TODO="$completion_cleanup_interrupt_todo" \
+BROWNIE_BIN="$completion_cleanup_interrupt_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_cleanup_interrupt_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+completion_cleanup_interrupt_third_exit="$?"
+set -e
+test "$completion_cleanup_interrupt_third_exit" = "0"
+python3 - "$completion_cleanup_interrupt_state/status.json" "$completion_cleanup_interrupt_state/todo-claims/current.json" "$completion_cleanup_interrupt_todo" "$completion_cleanup_interrupt_count" "$completion_cleanup_interrupt_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+assert status['status'] == 'pr_created', status
+assert claim['completion_cleanup_pending'] is False, claim
+assert claim['completion_pr_pending'] is False, claim
+assert '- [ ] E-completion-cleanup-interrupt:' not in todo, todo
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['1'], pathlib.Path(sys.argv[4]).read_text()
+assert pathlib.Path(sys.argv[5]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[5]).read_text()
+PY
+test ! -e "$completion_cleanup_interrupt_state/stop"
+
+# If recovery and blocked evidence are durable but the final source todo.failed
+# transition fails, retain the source claim and close that transition on the
+# next run without invoking Runtime a second time.
+terminal_source_transition_pending_state="$(mktemp -d)"
+terminal_source_transition_pending_prompt="$(mktemp)"
+terminal_source_transition_pending_todo="$(mktemp)"
+terminal_source_transition_pending_workspace="$(mktemp -d)"
+terminal_source_transition_pending_runtime_count="$terminal_source_transition_pending_state/runtime-count"
+git -C "$terminal_source_transition_pending_workspace" init -b main >/dev/null
+git -C "$terminal_source_transition_pending_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$terminal_source_transition_pending_prompt"
+printf -- '- [ ] E-final-source-transition-pending: Patch only `scripts/provider-target.mjs`:\n  Route: implementation.\n  Completion condition: provider terminal failure is durably blocked.\n  Verification: run `node --check scripts/provider-target.mjs`.\n' > "$terminal_source_transition_pending_todo"
+terminal_source_transition_pending_brownie="$(mktemp)"
+cat > "$terminal_source_transition_pending_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$terminal_source_transition_pending_runtime_count"
+exec "$fake_brownie_terminal_no_eligible" "\$@"
+SH
+chmod +x "$terminal_source_transition_pending_brownie"
+set +e
+PHASE_LOOP_STATE_DIR="$terminal_source_transition_pending_state" \
+PHASE_LOOP_PROMPT="$terminal_source_transition_pending_prompt" \
+PHASE_LOOP_TODO="$terminal_source_transition_pending_todo" \
+BROWNIE_BIN="$terminal_source_transition_pending_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_transition_pending_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TEST_FAIL_FINAL_SOURCE_TODO_FAILED_LEDGER=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 78 "$PHASE_LOOP" run-once >/dev/null
+terminal_source_transition_pending_first_exit="$?"
+set -e
+test "$terminal_source_transition_pending_first_exit" = "78"
+python3 - "$terminal_source_transition_pending_state/todo-claims/current.json" "$terminal_source_transition_pending_state/todo-claims/blocked.jsonl" "$terminal_source_transition_pending_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$terminal_source_transition_pending_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines() if line.strip()]
+ledger = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert claim['status'] == 'in_progress', claim
+assert claim['terminal_failure_source_transition_pending'] is True, claim
+assert claim['terminal_failure_source_transition_recovery_id'], claim
+assert blocked and blocked[-1]['terminal_failure'] is True, blocked
+assert any(record.get('kind') == 'terminal_failure_transaction' for record in ledger), ledger
+source_task = 'E-final-source-transition-pending@' + claim['claim_id']
+assert not any(event.get('task_id') == source_task and event.get('to_state') == 'failed' for record in ledger for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])), ledger
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[4]).read_text()
+PY
+test ! -e "$terminal_source_transition_pending_state/stop"
+set +e
+PHASE_LOOP_STATE_DIR="$terminal_source_transition_pending_state" \
+PHASE_LOOP_PROMPT="$terminal_source_transition_pending_prompt" \
+PHASE_LOOP_TODO="$terminal_source_transition_pending_todo" \
+BROWNIE_BIN="$terminal_source_transition_pending_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_transition_pending_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+terminal_source_transition_pending_second_exit="$?"
+set -e
+test "$terminal_source_transition_pending_second_exit" = "76"
+python3 - "$terminal_source_transition_pending_state/status.json" "$terminal_source_transition_pending_state/todo-claims/current.json" "$terminal_source_transition_pending_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$terminal_source_transition_pending_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+ledger = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert status['status'] == 'blocked', status
+assert status['exit_code'] == '76', status
+assert claim['status'] == 'failed', claim
+assert claim['terminal_failure_source_transition_pending'] is False, claim
+assert any(item.get('note') == 'terminal_failure_source_transition_completed' for item in claim['status_history']), claim
+source_task = 'E-final-source-transition-pending@' + claim['claim_id']
+assert any(event.get('task_id') == source_task and event.get('to_state') == 'failed' and event.get('from_state') in ('claimed', 'running') for record in ledger for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])), ledger
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[4]).read_text()
+PY
+test ! -e "$terminal_source_transition_pending_state/stop"
+
+# If the supervisor is killed after terminal recovery and blocked evidence are
+# durable but before the main loop writes todo.failed, the restart-visible
+# source-transition obligation must prevent a second Runtime invocation.
+terminal_source_kill_window_state="$(mktemp -d)"
+terminal_source_kill_window_prompt="$(mktemp)"
+terminal_source_kill_window_todo="$(mktemp)"
+terminal_source_kill_window_workspace="$(mktemp -d)"
+terminal_source_kill_window_runtime_count="$terminal_source_kill_window_state/runtime-count"
+git -C "$terminal_source_kill_window_workspace" init -b main >/dev/null
+git -C "$terminal_source_kill_window_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$terminal_source_kill_window_prompt"
+printf -- '- [ ] E-terminal-source-kill-window: Patch only `scripts/provider-target.mjs`:\n  Route: implementation.\n  Completion condition: source transition remains durable across supervisor interruption.\n  Verification: run `node --check scripts/provider-target.mjs`.\n' > "$terminal_source_kill_window_todo"
+terminal_source_kill_window_brownie="$(mktemp)"
+cat > "$terminal_source_kill_window_brownie" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$terminal_source_kill_window_runtime_count"
+exec "$fake_brownie_terminal_no_eligible" "\$@"
+SH
+chmod +x "$terminal_source_kill_window_brownie"
+set +e
+PHASE_LOOP_STATE_DIR="$terminal_source_kill_window_state" \
+PHASE_LOOP_PROMPT="$terminal_source_kill_window_prompt" \
+PHASE_LOOP_TODO="$terminal_source_kill_window_todo" \
+BROWNIE_BIN="$terminal_source_kill_window_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_kill_window_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_TEST_KILL_AFTER_TERMINAL_RECOVERY=1 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 143 "$PHASE_LOOP" run-once >/dev/null
+terminal_source_kill_window_first_exit="$?"
+set -e
+test "$terminal_source_kill_window_first_exit" = "143"
+python3 - "$terminal_source_kill_window_state/todo-claims/terminal-failure-source-transition.pending.json" "$terminal_source_kill_window_state/todo-claims/blocked.jsonl" "$terminal_source_kill_window_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+marker = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert marker['claim']['terminal_failure_source_transition_pending'] is True, marker
+assert marker['recovery_id'], marker
+assert blocked and blocked[-1]['terminal_failure'] is True, blocked
+assert pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[3]).read_text()
+PY
+set +e
+PHASE_LOOP_STATE_DIR="$terminal_source_kill_window_state" \
+PHASE_LOOP_PROMPT="$terminal_source_kill_window_prompt" \
+PHASE_LOOP_TODO="$terminal_source_kill_window_todo" \
+BROWNIE_BIN="$terminal_source_kill_window_brownie" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_source_kill_window_workspace" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+terminal_source_kill_window_second_exit="$?"
+set -e
+test "$terminal_source_kill_window_second_exit" = "76"
+python3 - "$terminal_source_kill_window_state/status.json" "$terminal_source_kill_window_state/todo-claims/current.json" "$terminal_source_kill_window_state/todo-claims/blocked.jsonl" "$terminal_source_kill_window_runtime_count" <<'PY'
+import json
+import pathlib
+import sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines() if line.strip()]
+assert status['exit_code'] == '76', status
+assert claim['status'] == 'failed', claim
+assert claim['terminal_failure_source_transition_pending'] is False, claim
+assert any(item.get('note') == 'terminal_failure_source_transition_completed' for item in claim['status_history']), claim
+assert len(blocked) == 1, blocked
+assert pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines() == ['runtime-invoked'], pathlib.Path(sys.argv[4]).read_text()
+assert not pathlib.Path(sys.argv[2]).parent.joinpath('terminal-failure-source-transition.pending.json').exists()
+PY
+fi
+
+if claim_smoke_section_enabled terminal-absent; then
+# Terminal recovery remains durable when the runtime removes the active claim
+# before the controller emits its final trajectory. The next run must not
+# recreate the same queue-generation/target attempt.
+state_terminal_claim_absent="$(mktemp -d)"
+prompt_terminal_claim_absent="$(mktemp)"
+todo_terminal_claim_absent="$(mktemp)"
+terminal_claim_absent_workspace="$(mktemp -d)"
+git -C "$terminal_claim_absent_workspace" init -b main >/dev/null
+git -C "$terminal_claim_absent_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+printf 'base prompt\n' > "$prompt_terminal_claim_absent"
+printf -- '- [ ] E-15b-provider-terminal: Patch only `scripts/provider-target.mjs`:\n  Route: implementation.\n  Completion condition: provider terminal failure is durably blocked.\n  Verification: run `node --check scripts/provider-target.mjs`.\n' > "$todo_terminal_claim_absent"
+set +e
+PHASE_LOOP_STATE_DIR="$state_terminal_claim_absent" \
+PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
+PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+terminal_claim_absent_exit="$?"
+set -e
+test "$terminal_claim_absent_exit" = "76"
+test ! -f "$state_terminal_claim_absent/todo-claims/current.json"
+test ! -e "$state_terminal_claim_absent/todo-claims/terminal-failure-source-transition.pending.json"
+python3 - "$state_terminal_claim_absent/status.json" "$state_terminal_claim_absent/todo-claims/blocked.jsonl" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_claim_absent/bdk-trajectory.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines() if line.strip()]
+ledger = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+ledger_records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8').splitlines()
+    if line.strip()
+]
+bdk_records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[4]).read_text(encoding='utf-8').splitlines()
+    if line.strip()
+]
+assert status['status'] == 'blocked', status
+assert blocked and blocked[-1]['block_reason'] == 'terminal_runtime_failure', blocked
+assert blocked[-1]['terminal_failure'] is True, blocked
+assert blocked[-1]['provider_failure_fingerprint'] == 'sha256:provider-terminal-no-content', blocked
+assert len(blocked[-1]['controller_fingerprint']) == 64, blocked
+assert 'terminal_failure_transaction' in ledger, ledger
+assert 'E-15b-provider-terminal' in ledger, ledger
+assert 'provider-terminal-no-content' in ledger, ledger
+assert 'controller_fingerprint' in ledger, ledger
+assert '"claim_absent":true' in ledger, ledger
+assert 'scripts/provider-target.mjs' in ledger, ledger
+assert 'node --check scripts/provider-target.mjs' in ledger, ledger
+claim_id = blocked[-1]['claim_id']
+assert any(
+    event.get('claim_id') == claim_id
+    and event.get('to_state') == 'failed'
+    and event.get('from_state') in ('claimed', 'running')
+    and str(event.get('task_id', '')).endswith('@' + claim_id)
+    for record in ledger_records
+    for event in (record.get('events', []) if record.get('kind') == 'terminal_failure_transaction' else [record])
+), ledger_records
+assert any(
+    record.get('claim_id') == claim_id
+    and any(event.get('type') == 'todo.blocked' for event in record.get('events', []))
+    for record in bdk_records
+), bdk_records
+PY
+PHASE_LOOP_STATE_DIR="$state_terminal_claim_absent" \
+PHASE_LOOP_PROMPT="$prompt_terminal_claim_absent" \
+PHASE_LOOP_TODO="$todo_terminal_claim_absent" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_claim_absent_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
+python3 - "$state_terminal_claim_absent/todo-claims/current.json" "$terminal_claim_absent_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+current = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+assert not current['selected_todo'].startswith('- [ ] E-15b-provider-terminal:'), current
+transactions = []
+for line in pathlib.Path(sys.argv[2]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    record = json.loads(line)
+    if record.get('kind') == 'terminal_failure_transaction':
+        transactions.append(record)
+same_todo = [
+    record for record in transactions
+    if any('E-15b-provider-terminal:' in str(event.get('selected_todo', '')) for event in record.get('events', []))
+]
+assert len(same_todo) == 1, same_todo
+PY
+
+# A stale active claim can be replaced before Runtime starts. If Runtime then
+# removes current.json, terminal recovery must use the replacement claim
+# snapshot rather than the displaced claim's target/identity.
+state_stale_replacement_claim_absent="$(mktemp -d)"
+prompt_stale_replacement_claim_absent="$(mktemp)"
+todo_stale_replacement_claim_absent="$(mktemp)"
+todo_breakdown_stale_replacement_claim_absent="$(mktemp)"
+stale_replacement_workspace="$(mktemp -d)"
+git -C "$stale_replacement_workspace" init -b main >/dev/null
+git -C "$stale_replacement_workspace" config user.name Brownie
+git -C "$stale_replacement_workspace" config user.email brownie@example.invalid
+mkdir -p "$stale_replacement_workspace/.brownie" "$stale_replacement_workspace/scripts"
+printf 'old target\n' > "$stale_replacement_workspace/scripts/old.mjs"
+printf 'new target\n' > "$stale_replacement_workspace/scripts/new.mjs"
+git -C "$stale_replacement_workspace" add .
+git -C "$stale_replacement_workspace" commit -m init >/dev/null
+printf 'base prompt\n' > "$prompt_stale_replacement_claim_absent"
+printf -- '- [ ] E-stale-replacement-new: Patch only `scripts/new.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/new.mjs`.\n' > "$todo_stale_replacement_claim_absent"
+printf '# Breakdown\n' > "$todo_breakdown_stale_replacement_claim_absent"
+mkdir -p "$state_stale_replacement_claim_absent/todo-claims"
+cat > "$state_stale_replacement_claim_absent/todo-claims/current.json" <<'JSON'
+{
+  "schema_version": 1,
+  "claim_id": "todo-g1-old-stale-replacement",
+  "selected_todo": "- [ ] E-stale-replacement-old: Patch only `scripts/old.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/old.mjs`.\n",
+  "status": "in_progress",
+  "queue_generation": 1,
+  "queue_fingerprint": "old-queue-fingerprint"
+}
+JSON
+set +e
+PHASE_LOOP_STATE_DIR="$state_stale_replacement_claim_absent" \
+PHASE_LOOP_PROMPT="$prompt_stale_replacement_claim_absent" \
+PHASE_LOOP_TODO="$todo_stale_replacement_claim_absent" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_stale_replacement_claim_absent" \
+BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
+PHASE_LOOP_WORKSPACE_ROOT="$stale_replacement_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+stale_replacement_exit="$?"
+set -e
+test "$stale_replacement_exit" = "76"
+python3 - "$state_stale_replacement_claim_absent/todo-claims" "$stale_replacement_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+claim_dir = pathlib.Path(sys.argv[1])
+ledger_path = pathlib.Path(sys.argv[2])
+records = []
+for line in ledger_path.read_text(encoding='utf-8').splitlines():
+    if line.strip():
+        record = json.loads(line)
+        if record.get('kind') == 'terminal_failure_transaction':
+            records.append(record)
+assert len(records) == 1, records
+events = records[0]['events']
+failed = events[-1]
+assert 'E-stale-replacement-new:' in failed['selected_todo'], failed
+assert failed['claim_id'] != 'todo-g1-old-stale-replacement', failed
+assert failed['claim_id'].startswith('todo-g'), failed
+PY
+fi
+
+if claim_smoke_section_enabled queue; then
+# Queue fixtures are intentionally self-contained.  In particular, this
+# section must also run when selected directly by CI, without relying on the
+# core shard having initialized any of its variables or workspace files.
+queue_workspace="$(mktemp -d)"
+git -C "$queue_workspace" init -b main >/dev/null
+git -C "$queue_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+queue_original_workspace="$test_workspace"
+test_workspace="$queue_workspace"
+
+queue_state_with_claim="$(mktemp -d)"
+queue_prompt_with_claim="$(mktemp)"
+queue_todo_with_claim="$(mktemp)"
+printf 'base prompt\n' > "$queue_prompt_with_claim"
+printf -- '- [ ] B-01: durable claim task\n  with detail\n  Files: \`scripts/release-runtime-operational-evidence.mjs\`, \`docs/architecture/local-release-targets.example.json\`.\n- [ ] B-02: next task\n' > "$queue_todo_with_claim"
+
+PHASE_LOOP_STATE_DIR="$queue_state_with_claim" \
+PHASE_LOOP_PROMPT="$queue_prompt_with_claim" \
+PHASE_LOOP_TODO="$queue_todo_with_claim" \
+BROWNIE_BIN="$fake_brownie_json" \
+PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+queue_claim_file="$queue_state_with_claim/todo-claims/current.json"
+queue_prompt_file="$(find "$queue_state_with_claim/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
+
+queue_state_with_blocked="$(mktemp -d)"
+queue_prompt_with_blocked="$(mktemp)"
+queue_todo_with_blocked="$(mktemp)"
+printf 'base prompt\n' > "$queue_prompt_with_blocked"
+printf -- '- [ ] R-09: blocked boundary task\n' > "$queue_todo_with_blocked"
+
+PHASE_LOOP_STATE_DIR="$queue_state_with_blocked" \
+PHASE_LOOP_PROMPT="$queue_prompt_with_blocked" \
+PHASE_LOOP_TODO="$queue_todo_with_blocked" \
+BROWNIE_BIN="$fake_brownie_blocked_json" \
+PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
 state_objective_apply_stalled="$(mktemp -d)"
 prompt_objective_apply_stalled="$(mktemp)"
@@ -1040,16 +2819,16 @@ assert selected in todo, todo
 assert f"Source TODO: {historical_id}." in todo, todo
 PY
 
-printf -- '- [ ] R-09: blocked boundary task\n  Extra context that changes the queue fingerprint.\n- [ ] R-10: next unblocked task\n' > "$todo_with_blocked"
+printf -- '- [ ] R-09: blocked boundary task\n  Extra context that changes the queue fingerprint.\n- [ ] R-10: next unblocked task\n' > "$queue_todo_with_blocked"
 
-PHASE_LOOP_STATE_DIR="$state_with_blocked" \
-PHASE_LOOP_PROMPT="$prompt_with_blocked" \
-PHASE_LOOP_TODO="$todo_with_blocked" \
+PHASE_LOOP_STATE_DIR="$queue_state_with_blocked" \
+PHASE_LOOP_PROMPT="$queue_prompt_with_blocked" \
+PHASE_LOOP_TODO="$queue_todo_with_blocked" \
 BROWNIE_BIN="$fake_brownie_json" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$state_with_blocked/todo-claims/current.json" <<'PY'
+python3 - "$queue_state_with_blocked/todo-claims/current.json" <<'PY'
 import json
 import sys
 
@@ -1084,9 +2863,9 @@ assert claim["status"] == "in_progress", claim
 assert claim["selected_todo"].startswith("- [ ] E-15-parent:"), claim
 PY
 
-assert_contains "$prompt_file" '## Active TODO Claim'
-assert_contains "$prompt_file" 'queue_generation'
-assert_contains "$prompt_file" 'B-01: durable claim task'
+assert_contains "$queue_prompt_file" '## Active TODO Claim'
+assert_contains "$queue_prompt_file" 'queue_generation'
+assert_contains "$queue_prompt_file" 'B-01: durable claim task'
 
 state_explicit_blocker="$(mktemp -d)"
 prompt_explicit_blocker="$(mktemp)"
@@ -1148,16 +2927,16 @@ assert claim["status"] == "in_progress", claim
 assert claim["selected_todo"].startswith("- [ ] E-15f-next:"), claim
 PY
 
-printf '' > "$todo_with_claim"
+printf '' > "$queue_todo_with_claim"
 
-PHASE_LOOP_STATE_DIR="$state_with_claim" \
-PHASE_LOOP_PROMPT="$prompt_with_claim" \
-PHASE_LOOP_TODO="$todo_with_claim" \
+PHASE_LOOP_STATE_DIR="$queue_state_with_claim" \
+PHASE_LOOP_PROMPT="$queue_prompt_with_claim" \
+PHASE_LOOP_TODO="$queue_todo_with_claim" \
 BROWNIE_BIN="$fake_brownie_json" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$claim_file" <<'PY'
+python3 - "$queue_claim_file" <<'PY'
 import json
 import sys
 
@@ -1292,7 +3071,10 @@ assert progress["classification"] == "progress", progress
 assert progress["meaningful_progress"] is True, progress
 assert progress["workspace_changed"] is True, progress
 PY
+test_workspace="$queue_original_workspace"
+fi
 
+if claim_smoke_section_enabled pr; then
 state_pr_progress="$(mktemp -d)"
 prompt_pr_progress="$(mktemp)"
 todo_pr_progress="$(mktemp)"
@@ -1362,6 +3144,52 @@ remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "origin/b
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
 assert "create PR from tracked Brownie progress" in message, message
+PY
+
+# A normal Runtime completion must publish tracked workspace progress before
+# returning success when PR creation is enabled; completion is not an early
+# return that bypasses the commit/push/PR path.
+state_pr_completed_progress="$(mktemp -d)"
+prompt_pr_completed_progress="$(mktemp)"
+todo_pr_completed_progress="$(mktemp)"
+workspace_pr_completed_progress="$(mktemp -d)"
+remote_pr_completed_progress="$(mktemp -d)"
+git -C "$workspace_pr_completed_progress" init -b main >/dev/null
+mkdir -p "$workspace_pr_completed_progress/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$workspace_pr_completed_progress/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$workspace_pr_completed_progress/README.md"
+git -C "$workspace_pr_completed_progress" add README.md
+git -C "$workspace_pr_completed_progress" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$remote_pr_completed_progress" init --bare >/dev/null
+git -C "$workspace_pr_completed_progress" remote add origin "$remote_pr_completed_progress"
+git -C "$workspace_pr_completed_progress" push -u origin main >/dev/null
+git -C "$workspace_pr_completed_progress" switch -c brownie-agent/smoke-pr-completed >/dev/null
+printf 'base prompt\n' > "$prompt_pr_completed_progress"
+printf -- '- [ ] B-01: create PR from completed tracked Brownie progress\n' > "$todo_pr_completed_progress"
+
+PATH="$fake_bin_dir:$PATH" \
+PHASE_LOOP_STATE_DIR="$state_pr_completed_progress" \
+PHASE_LOOP_PROMPT="$prompt_pr_completed_progress" \
+PHASE_LOOP_TODO="$todo_pr_completed_progress" \
+BROWNIE_BIN="$fake_brownie_completed_tracked_workspace_change" \
+PHASE_LOOP_WORKSPACE_ROOT="$workspace_pr_completed_progress" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+python3 - "$state_pr_completed_progress/status.json" "$workspace_pr_completed_progress" <<'PY'
+import json
+import subprocess
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+workspace = sys.argv[2]
+assert status["status"] == "pr_created", status
+assert "pull/9999" in status["detail"], status
+head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
+remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "origin/brownie-agent/smoke-pr-completed"], text=True).strip()
+assert head == remote, (head, remote)
+message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
+assert "create PR from completed tracked Brownie progress" in message, message
 PY
 
 state_pr_supervise="$(mktemp -d)"
@@ -1480,7 +3308,9 @@ bash -c 'script=$1; set --; source "$script" >/dev/null; phase_loop_require_impl
 actor_guard_invalid_exit="$?"
 set -e
 test "$actor_guard_invalid_exit" = "1"
+fi
 
+if claim_smoke_section_enabled lifecycle; then
 state_truncated="$(mktemp -d)"
 prompt_truncated="$(mktemp)"
 todo_truncated="$(mktemp)"
@@ -1872,7 +3702,9 @@ if kill -0 "$child_pid" 2>/dev/null; then
   kill -KILL "$child_pid" 2>/dev/null || true
   exit 1
 fi
+fi
 
+if claim_smoke_section_enabled guards; then
 exact_workspace="$(mktemp -d)"
 git -C "$exact_workspace" init -b main >/dev/null
 git -C "$exact_workspace" config user.name Brownie
@@ -1964,6 +3796,18 @@ cat > "$todo_empty_queue_guard" <<'EOF'
   any other line.
 EOF
 
+empty_queue_guard_ledger="$empty_queue_guard_workspace/.brownie/private/phase-loop/task-ledger.jsonl"
+empty_queue_guard_runtime_marker="$state_empty_queue_guard/runtime-invoked"
+fake_brownie_empty_queue_cleanup_must_not_run="$(mktemp)"
+cat > "$fake_brownie_empty_queue_cleanup_must_not_run" <<SH
+#!/usr/bin/env bash
+set -eu
+printf 'runtime-invoked\n' >> "$empty_queue_guard_runtime_marker"
+echo "Brownie must not run during completed TODO cleanup-only retry" >&2
+exit 99
+SH
+chmod +x "$fake_brownie_empty_queue_cleanup_must_not_run"
+
 set +e
 PHASE_LOOP_STATE_DIR="$state_empty_queue_guard" \
 PHASE_LOOP_PROMPT="$prompt_empty_queue_guard" \
@@ -1984,11 +3828,62 @@ claim = json.load(open(sys.argv[1], encoding="utf-8"))
 todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 supervisor_log = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 target = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
-assert claim["status"] == "in_progress", claim
+assert claim["status"] == "completed", claim
+assert claim["completion_cleanup_pending"] is True, claim
 assert "E-empty-queue-exact" in todo, todo
 assert "completed_todo_removal_reverted=true" in supervisor_log, supervisor_log
 assert "Empty or non-executable TODO queue" in supervisor_log, supervisor_log
 assert "  fixture_path: fixtureRoot,\n  lifecycle_evidence: lifecycleEvidence,\n  commands," in target, target
+PY
+
+python3 - "$empty_queue_guard_ledger" "$state_empty_queue_guard/todo-claims/current.json" <<'PY'
+import json
+import pathlib
+import sys
+
+ledger = pathlib.Path(sys.argv[1])
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+claim_id = claim["claim_id"]
+records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+events = [
+    event
+    for record in records
+    for event in (record.get("events", []) if record.get("kind") in ("replan_transaction", "terminal_failure_transaction") else [record])
+]
+source_attempt = [event for event in events if event.get("task_id") == f"E-empty-queue-exact@{claim_id}"]
+assert source_attempt, events
+assert source_attempt[-1]["to_state"] == "completed", source_attempt
+assert all(event["to_state"] in ("queued", "claimed", "running", "completed") for event in source_attempt), source_attempt
+PY
+
+# Once the decomposition guard condition is repaired, the next invocation must
+# retry only queue cleanup. It must not restart Runtime for the completed
+# source claim, and it must clear the cleanup marker after successful removal.
+printf '{"product_ready":true}\n' > "$empty_queue_guard_workspace/docs/architecture/phase-value-manifest.json"
+set +e
+PHASE_LOOP_STATE_DIR="$state_empty_queue_guard" \
+PHASE_LOOP_PROMPT="$prompt_empty_queue_guard" \
+PHASE_LOOP_TODO="$todo_empty_queue_guard" \
+BROWNIE_BIN="$fake_brownie_empty_queue_cleanup_must_not_run" \
+PHASE_LOOP_WORKSPACE_ROOT="$empty_queue_guard_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75 "$PHASE_LOOP" run-once >/dev/null
+empty_queue_guard_cleanup_exit="$?"
+set -e
+test "$empty_queue_guard_cleanup_exit" = "75"
+test ! -e "$empty_queue_guard_runtime_marker"
+
+python3 - "$state_empty_queue_guard/todo-claims/current.json" "$todo_empty_queue_guard" "$state_empty_queue_guard/logs/supervisor.log" <<'PY'
+import json
+import pathlib
+import sys
+
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+supervisor_log = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+assert claim["status"] == "completed", claim
+assert claim["completion_cleanup_pending"] is False, claim
+assert "E-empty-queue-exact" not in todo, todo
+assert "completed_todo_cleanup_retry_succeeded=true" in supervisor_log, supervisor_log
 PY
 
 verified_noop_e19_workspace="$(mktemp -d)"
@@ -2008,7 +3903,7 @@ cat > "$verified_noop_e19_workspace/.brownie/todo.md" <<'EOF'
   Route: implementation.
   Source TODO: empty-queue-regression-follow-up-2026-09-22.
   Depends on: <none>.
-  Completion condition: release blocker queues cannot become empty while Product Ready is false; attempted completion removal is reverted and the durable claim remains in_progress when the guard rejects the resulting queue.
+  Completion condition: release blocker queues cannot become empty while Product Ready is false; attempted completion removal is reverted while the durable claim remains completed with cleanup pending when the guard rejects the resulting queue.
   Forbidden changes: do not weaken `scripts/guard-todo-decomposition.mjs`, do not declare Runtime Product Ready or Runtime Release Ready, and do not remove remaining release blocker TODOs.
   Verification: run `pnpm --workspace-root phase-loop:claim-smoke`, `pnpm --workspace-root guard:todo-decomposition:test`, and `pnpm --workspace-root guard:todo-decomposition`.
 
@@ -2243,6 +4138,7 @@ printf '# Breakdown\n' > "$no_eligible_split_workspace/.brownie/todo-breakdown.m
 git -C "$no_eligible_split_workspace" add .
 git -C "$no_eligible_split_workspace" commit -m init >/dev/null
 
+set +e
 PHASE_LOOP_STATE_DIR="$no_eligible_split_state" \
 PHASE_LOOP_PROMPT="$no_eligible_split_prompt" \
 PHASE_LOOP_TODO="$no_eligible_split_workspace/.brownie/todo.md" \
@@ -2260,8 +4156,18 @@ PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_MUTATE_TODO_AFTER_PROMPT=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75,76 "$PHASE_LOOP" run-once >/dev/null
+no_eligible_split_exit="$?"
+set -e
+case "$no_eligible_split_exit" in
+  0|75|76) ;;
+  *)
+    echo "unexpected no-eligible fixture exit=$no_eligible_split_exit" >&2
+    exit 1
+    ;;
+esac
 
+if [ "$no_eligible_split_exit" = "0" ]; then
 python3 - "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/.brownie/todo-breakdown.md" "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/private/phase-loop/todo-replans" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
@@ -2308,7 +4214,38 @@ terminal_events = [event for event in ledger_events if event.get("task_id") == a
 assert terminal_events and terminal_events[-1]["to_state"] == "replanned", (attempt_id, ledger_events)
 assert not any(event.get("kind") == "unclaimed_trajectory" and event.get("trajectory_type") == "todo.replanned" for event in ledger_events), ledger_events
 PY
+else
+assert_terminal_failure_claim_archived \
+  "$no_eligible_split_state/todo-claims" \
+  "$no_eligible_split_state/todo-claims/blocked.jsonl" \
+  "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" \
+  'E-20g-final-judgment-sync:' 1
+python3 - "$no_eligible_split_state/status.json" "$no_eligible_split_state/progress-state.json" "$no_eligible_split_state/todo-claims/blocked.jsonl" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
 
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+progress = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+blocked = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").splitlines() if line.strip()]
+ledger = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
+assert status["status"] == "blocked", status
+assert status["exit_code"] in {"75", "76"}, status
+assert progress["progress_projection"]["cli_status"] == "no_eligible_task", progress
+assert progress["progress_projection"]["closure"] == "no_eligible_task", progress
+if status["exit_code"] == "75":
+    assert "Failed to claim first pending TODO" in status["detail"], status
+else:
+    assert "terminal_task_failed" in status["detail"], status
+    assert progress["classification"] == "terminal_failure", progress
+assert blocked and blocked[-1]["terminal_failure"] is True, blocked
+assert blocked[-1]["block_reason"] == "terminal_runtime_failure", blocked
+assert "terminal_failure_transaction" in ledger, ledger
+PY
+fi
+fi
+
+if claim_smoke_section_enabled feedback; then
 repair_feedback_state="$(mktemp -d)"
 repair_feedback_prompt="$(mktemp)"
 repair_feedback_todo="$(mktemp)"
@@ -2681,6 +4618,7 @@ PY
 # leaving status.json at `running`.
 run_status_write_signal_regression TERM 143
 run_status_write_signal_regression INT 130
+fi
 
 assert_repository_state_unchanged
 echo "phase-loop claim smoke passed"

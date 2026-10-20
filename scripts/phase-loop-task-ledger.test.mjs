@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { appendTaskTransition, readTaskLedger, recordTrajectory, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
+import { appendTaskTransition, readTaskLedger, recordTerminalFailureRecovery, recordTrajectory, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
 
 test('task ledger enforces a terminal state machine', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
@@ -221,6 +221,67 @@ test('ignores an incomplete replan journal instead of exposing a parent-only rep
   assert.deepEqual(readTaskLedger(repo), []);
 });
 
+test('binds terminal failure recovery identity to controller and execution attempt', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const selectedTodo = '- [ ] E-retry: Patch only `scripts/retry.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/retry.mjs`.';
+  const base = {
+    selected_todo: selectedTodo,
+    claim_id: 'claim-retry',
+    run_id: 'run-retry-1',
+    queue_generation: 4,
+    queue_fingerprint: 'queue-retry',
+    provider_failure_fingerprint: 'provider-retry',
+    retry_cap: 1,
+    controller_fingerprint: 'controller-old',
+    at: '2026-10-19T08:00:00Z'
+  };
+
+  const first = recordTerminalFailureRecovery(repo, base);
+  assert.equal(first.ok, true);
+  const duplicate = recordTerminalFailureRecovery(repo, base);
+  assert.equal(duplicate.code, 'duplicate_terminal_failure_recovery');
+
+  const rebased = recordTerminalFailureRecovery(repo, {
+    ...base,
+    controller_fingerprint: 'controller-new',
+    at: '2026-10-19T08:01:00Z'
+  });
+  assert.equal(rebased.ok, true);
+  assert.notEqual(rebased.recovery_id, first.recovery_id);
+
+  const events = readTaskLedger(repo).filter((event) => event.to_state === 'failed');
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map((event) => event.controller_fingerprint), ['controller-old', 'controller-new']);
+  assert.equal(validateTaskLedger(readTaskLedger(repo)).ok, true);
+});
+
+test('re-records an explicitly replayed terminal block after controller rebaseline', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const selectedTodo = '- [ ] E-rebaseline-explicit: Patch only `scripts/rebaseline.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/rebaseline.mjs`.';
+  const first = recordTerminalFailureRecovery(repo, {
+    selected_todo: selectedTodo,
+    claim_id: 'claim-rebaseline',
+    run_id: 'run-old',
+    retry_cap: 1,
+    controller_fingerprint: 'controller-old',
+    recovery_id: 'persisted-recovery-id'
+  });
+  const rebased = recordTerminalFailureRecovery(repo, {
+    selected_todo: selectedTodo,
+    claim_id: 'claim-rebaseline',
+    run_id: 'run-new',
+    retry_cap: 1,
+    controller_fingerprint: 'controller-new',
+    recovery_id: 'persisted-recovery-id'
+  });
+  assert.equal(first.ok, true);
+  assert.equal(rebased.ok, true);
+  assert.notEqual(rebased.recovery_id, first.recovery_id);
+  const failed = readTaskLedger(repo).filter((event) => event.to_state === 'failed');
+  assert.deepEqual(failed.map((event) => event.controller_fingerprint), ['controller-old', 'controller-new']);
+  assert.equal(validateTaskLedger(readTaskLedger(repo)).ok, true);
+});
+
 test('records repeated claims as separate immutable task attempts', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   const todo = path.join(repo, '.brownie', 'todo.md');
@@ -235,6 +296,31 @@ test('records repeated claims as separate immutable task attempts', () => {
   const projection = taskProjection(readTaskLedger(repo));
   assert.equal(projection.get(taskAttemptId('T-8', 'claim-one')).to_state, 'claimed');
   assert.equal(projection.get(taskAttemptId('T-8', 'claim-two')).to_state, 'claimed');
+});
+
+test('records a failed retry and its later completion as unique task attempts', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, '- [ ] T-8-success: retryable bounded task\n');
+  const script = path.join(process.cwd(), 'scripts', 'phase-loop-task-ledger.mjs');
+  const record = (claimId, terminalType, runId) => {
+    const claim = path.join(repo, `${claimId}.json`);
+    fs.writeFileSync(claim, JSON.stringify({ claim_id: claimId, selected_todo: '- [ ] T-8-success: retryable bounded task' }));
+    for (const type of ['todo.claimed', 'workflow.routed', terminalType]) {
+      execFileSync(process.execPath, [script, 'record-trajectory', '--repo', repo, '--claim', claim, '--todo', todo, '--type', type, '--run', runId], { stdio: 'pipe' });
+    }
+  };
+  record('claim-failed', 'todo.failed', 'run-failed');
+  record('claim-completed', 'todo.completed', 'run-completed');
+
+  const events = readTaskLedger(repo);
+  const failed = taskProjection(events).get(taskAttemptId('T-8-success', 'claim-failed'));
+  const completed = taskProjection(events).get(taskAttemptId('T-8-success', 'claim-completed'));
+  assert.equal(failed.to_state, 'failed');
+  assert.equal(completed.to_state, 'completed');
+  assert.notEqual(failed.task_id, completed.task_id);
+  assert.equal(validateTaskLedger(events).ok, true);
 });
 
 test('keeps duplicate routed trajectory events nonfatal while preserving the valid task state', () => {

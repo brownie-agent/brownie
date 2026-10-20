@@ -320,9 +320,23 @@ export function allSupervisorProcessRecords({
   });
 }
 
-function liveSupervisorPids(rootDir) {
-  return allSupervisorProcessRecords()
+export function liveSupervisorPids(rootDir, stateDir = '', {
+  listAllSupervisors = allSupervisorProcessRecords,
+  processExists = processIsAlive
+} = {}) {
+  const canonicalStateDir = canonicalizePath(stateDir);
+  const defaultStateDir = rootDir
+    ? canonicalizePath(path.join(canonicalizePath(rootDir), '.brownie', 'private', 'phase-loop'))
+    : '';
+  return listAllSupervisors()
     .filter((record) => supervisorCommandMatchesRoot(record.command, rootDir))
+    .filter((record) => {
+      if (!canonicalStateDir) return true;
+      const reportedStateDir = reportedSupervisorStateDir(record);
+      if (reportedStateDir) return canonicalizePath(reportedStateDir) === canonicalStateDir;
+      return canonicalStateDir === defaultStateDir;
+    })
+    .filter((record) => processExists(record.pid))
     .map((record) => record.pid);
 }
 
@@ -370,7 +384,7 @@ export function inspectSupervisorOwnership({
   ownerGeneration = null,
   processExists = (pid) => processIsAlive(pid),
   getProcessCommand = processCommand,
-  listSupervisors = () => liveSupervisorPids(rootDir)
+  listSupervisors = () => liveSupervisorPids(rootDir, stateDir)
 }) {
   const status = readJson(path.join(stateDir, 'status.json'));
   const pid = readPid(pidFile);
@@ -946,7 +960,7 @@ export function normalizeStaleRunningStatus({
   now = new Date().toISOString(),
   processExists = (pid) => processIsAlive(pid),
   getProcessCommand = processCommand,
-  listSupervisors = () => liveSupervisorPids(rootDir)
+  listSupervisors = () => liveSupervisorPids(rootDir, stateDir)
 }) {
   const statusPath = path.join(stateDir, 'status.json');
   const auditPath = path.join(stateDir, 'run-state-recovery.jsonl');
@@ -1073,7 +1087,7 @@ export function watchdogContinuationLiveness({
   runStamp = null,
   processExists = (pid) => processIsAlive(pid),
   getProcessCommand = processCommand,
-  listSupervisors = () => liveSupervisorPids(rootDir)
+  listSupervisors = () => liveSupervisorPids(rootDir, stateDir)
 }) {
   const statusPath = path.join(stateDir, 'status.json');
   const auditPath = path.join(stateDir, 'run-state-recovery.jsonl');

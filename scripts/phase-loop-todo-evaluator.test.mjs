@@ -206,6 +206,88 @@ test('skips previously blocked generated leaf ids across queue fingerprints', ()
   assert(selected.startsWith('- [ ] E-15f-next:'), selected);
 });
 
+test('rebaselines a generated leaf blocked by an older controller', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const leaf = `- [ ] E-15e-release-contract-audit-doc-sync-leaf: Patch only \`docs/architecture/runtime-release-contract.json\` to resynchronize one release contract field:
+  Route: documentation.
+  Source TODO: TODO-decompose-broad-todo-fbbca34905ac.
+  Depends on: <none>.
+  Completion condition: one release contract field is synchronized while release readiness remains fail-closed.
+  Verification: run \`pnpm --workspace-root guard:release-contract\`.`;
+  fs.writeFileSync(blocked, `${JSON.stringify({
+    block_reason: 'stalled_leaf_contract_replan',
+    controller_fingerprint: 'old-controller',
+    queue_fingerprint: createHash('sha256').update(leaf).digest('hex'),
+    selected_todo_sha256: createHash('sha256').update(leaf).digest('hex'),
+    selected_todo_first_line: leaf.split('\n')[0],
+    target_scope_key: 'docs/architecture/runtime-release-contract.json',
+    verification_command: 'run \\`pnpm --workspace-root guard:release-contract\\`'
+  })}\n`);
+
+  assert.equal(selectFirstSchedulableTodo(leaf, {
+    blockedPath: blocked,
+    controllerFingerprint: 'new-controller'
+  }), leaf);
+});
+
+test('rebaselines a capped generated leaf without generic hash or first-line suppression', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const leaf = `- [ ] E-rebaseline-leaf: Patch only \`scripts/rebaseline-leaf.mjs\`:
+  Route: implementation.
+  Source TODO: TODO-decompose-broad-rebaseline.
+  Depends on: <none>.
+  Completion condition: the generated leaf is retried after controller rebaseline.
+  Verification: run \`node --check scripts/rebaseline-leaf.mjs\`.`;
+  fs.writeFileSync(blocked, `${JSON.stringify({
+    block_reason: 'terminal_runtime_failure',
+    controller_fingerprint: 'old-controller',
+    queue_fingerprint: createHash('sha256').update(leaf).digest('hex'),
+    selected_todo_sha256: createHash('sha256').update(leaf).digest('hex'),
+    selected_todo_first_line: leaf.split('\n')[0],
+    retry_cap: 0,
+    run_stamp: 'old-run'
+  })}\n`);
+
+  assert.equal(selectFirstSchedulableTodo(leaf, {
+    blockedPath: blocked,
+    controllerFingerprint: 'new-controller'
+  }), leaf);
+});
+
+test('terminal retry budget overrides a legacy stable block for a generated leaf', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const leaf = `- [ ] E-terminal-legacy-leaf: Patch only \`scripts/terminal-legacy-leaf.mjs\`:
+  Route: implementation.
+  Source TODO: TODO-decompose-terminal-legacy.
+  Depends on: <none>.
+  Completion condition: the generated leaf gets its allowed terminal retry.
+  Verification: run \`node --check scripts/terminal-legacy-leaf.mjs\`.`;
+  const queueFingerprint = createHash('sha256').update(leaf).digest('hex');
+  const leafHash = createHash('sha256').update(leaf).digest('hex');
+  fs.writeFileSync(blocked, `${JSON.stringify({
+    controller_fingerprint: 'current-controller',
+    queue_fingerprint: queueFingerprint,
+    selected_todo_sha256: leafHash,
+    selected_todo_first_line: leaf.split('\n')[0],
+    block_reason: 'legacy_stable_block'
+  })}\n${JSON.stringify({
+    controller_fingerprint: 'current-controller',
+    queue_fingerprint: queueFingerprint,
+    selected_todo_sha256: leafHash,
+    selected_todo_first_line: leaf.split('\n')[0],
+    block_reason: 'terminal_runtime_failure',
+    retry_cap: 1
+  })}\n`);
+
+  assert.equal(selectFirstSchedulableTodo(leaf, {
+    blockedPath: blocked,
+    controllerFingerprint: 'current-controller'
+  }), leaf);
+});
+
 test('skips stalled replan blocked IDs across queue fingerprints regardless of TODO shape', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
   const blocked = path.join(dir, 'blocked.jsonl');
@@ -289,6 +371,152 @@ test('retries a stalled TODO after the controller fingerprint changes', () => {
   });
 
   assert.equal(selected, stalled);
+});
+
+test('honors terminal failure retry caps before stable suppression', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const todo = `- [ ] E-retry-cap: Patch only \`scripts/retry-cap.mjs\`:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: the retry cap is enforced.
+  Verification: run \`node --check scripts/retry-cap.mjs\`.`;
+  const record = (run, retryCap) => JSON.stringify({
+    block_reason: 'terminal_runtime_failure',
+    controller_fingerprint: 'controller-retry-cap',
+    selected_todo_sha256: createHash('sha256').update(todo).digest('hex'),
+    selected_todo_first_line: todo.split('\n')[0],
+    provider_failure_fingerprint: 'provider-terminal',
+    retry_cap: retryCap,
+    run_stamp: run
+  });
+
+  fs.writeFileSync(blocked, `${record('run-1', 1)}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-retry-cap'
+  }), todo);
+
+  fs.appendFileSync(blocked, `${record('run-2', 1)}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-retry-cap'
+  }), '');
+
+  const zeroCap = path.join(dir, 'zero-cap.jsonl');
+  fs.writeFileSync(zeroCap, `${record('run-zero', 0)}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: zeroCap,
+    controllerFingerprint: 'controller-retry-cap'
+  }), '');
+
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-rebased'
+  }), todo);
+
+  const changedTodo = todo.replace(
+    'scripts/retry-cap.mjs',
+    'scripts/retry-cap-v2.mjs'
+  );
+  assert.equal(selectFirstSchedulableTodo(changedTodo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-retry-cap'
+  }), changedTodo);
+});
+
+test('counts terminal retry attempts independently for each provider failure fingerprint', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const todo = `- [ ] E-provider-retry-cap: Patch only \`scripts/provider-retry-cap.mjs\`:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: provider-specific terminal retry budgets remain independent.
+  Verification: run \`node --check scripts/provider-retry-cap.mjs\`.`;
+  const base = {
+    block_reason: 'terminal_runtime_failure',
+    controller_fingerprint: 'controller-provider-cap',
+    selected_todo_sha256: createHash('sha256').update(todo).digest('hex'),
+    selected_todo_first_line: todo.split('\n')[0],
+    retry_cap: 1
+  };
+  fs.writeFileSync(blocked, `${JSON.stringify({ ...base, provider_failure_fingerprint: 'provider-a', run_stamp: 'a-1' })}\n`);
+  fs.appendFileSync(blocked, `${JSON.stringify({ ...base, provider_failure_fingerprint: 'provider-b', run_stamp: 'b-1' })}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-provider-cap'
+  }), todo);
+
+  fs.appendFileSync(blocked, `${JSON.stringify({ ...base, provider_failure_fingerprint: 'provider-a', run_stamp: 'a-2' })}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-provider-cap'
+  }), todo);
+
+  fs.appendFileSync(blocked, `${JSON.stringify({ ...base, provider_failure_fingerprint: 'provider-b', run_stamp: 'b-2' })}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-provider-cap'
+  }), '');
+});
+
+test('keeps a suppressed terminal TODO unresolved while selecting an independent sibling', () => {
+  const parent = `- [ ] E-suppressed-parent: Patch only \`scripts/suppressed-parent.mjs\`:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: the parent remains unresolved after a nonretryable terminal attempt.
+  Verification: run \`node --check scripts/suppressed-parent.mjs\`.`;
+  const dependent = `- [ ] E-suppressed-dependent: Patch only \`scripts/suppressed-dependent.mjs\`:
+  Route: implementation.
+  Depends on: E-suppressed-parent.
+  Completion condition: dependent work waits for the unresolved parent.
+  Verification: run \`node --check scripts/suppressed-dependent.mjs\`.`;
+  const sibling = `- [ ] E-independent-sibling: Patch only \`scripts/independent-sibling.mjs\`:
+  Route: implementation.
+  Depends on: <none>.
+  Completion condition: independent work remains schedulable.
+  Verification: run \`node --check scripts/independent-sibling.mjs\`.`;
+  const queue = `${parent}\n${dependent}\n${sibling}`;
+  assert.equal(selectFirstSchedulableTodo(queue, {
+    excludedTodoHashes: [createHash('sha256').update(parent).digest('hex')]
+  }), sibling);
+});
+
+test('terminal retry budget wins over generic suppression even when terminal hash metadata is legacy-missing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-evaluator-'));
+  const blocked = path.join(dir, 'blocked.jsonl');
+  const todo = `- [ ] E-legacy-terminal-cap-leaf: Patch only \`scripts/legacy-terminal-cap.mjs\`:
+  Route: implementation.
+  Source TODO: TODO-decompose-legacy-terminal-cap.
+  Depends on: <none>.
+  Completion condition: the terminal retry budget is honored.
+  Verification: run \`node --check scripts/legacy-terminal-cap.mjs\`.`;
+  const firstLine = todo.split('\n')[0];
+  const stable = {
+    block_reason: 'legacy_stable_block',
+    controller_fingerprint: 'controller-legacy-cap',
+    selected_todo_first_line: firstLine
+  };
+  const terminal = {
+    block_reason: 'terminal_runtime_failure',
+    controller_fingerprint: 'controller-legacy-cap',
+    selected_todo_first_line: firstLine,
+    retry_cap: 1,
+    provider_failure_fingerprint: 'provider-a'
+  };
+  fs.writeFileSync(blocked, `${JSON.stringify(stable)}\n${JSON.stringify(terminal)}\n`);
+
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-legacy-cap'
+  }), todo);
+
+  terminal.retry_cap = 0;
+  fs.writeFileSync(blocked, `${JSON.stringify(stable)}\n${JSON.stringify(terminal)}\n`);
+  assert.equal(selectFirstSchedulableTodo(todo, {
+    blockedPath: blocked,
+    controllerFingerprint: 'controller-legacy-cap'
+  }), '');
 });
 
 test('does not treat a stable blocked record as dependency completion evidence', () => {

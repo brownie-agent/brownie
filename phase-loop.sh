@@ -14,6 +14,7 @@ STATUS_FILE="$STATE_DIR/status.json"
 SUPERVISOR_LOG="$LOG_DIR/supervisor.log"
 TODO_CLAIM_DIR="$STATE_DIR/todo-claims"
 TODO_CLAIM_FILE="$TODO_CLAIM_DIR/current.json"
+TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE="$TODO_CLAIM_DIR/terminal-failure-source-transition.pending.json"
 TODO_QUEUE_STATE_FILE="$TODO_CLAIM_DIR/todo-queue-state.json"
 TODO_BLOCKED_FILE="$TODO_CLAIM_DIR/blocked.jsonl"
 TODO_REPAIR_FEEDBACK_FILE="$TODO_CLAIM_DIR/repair-feedback.json"
@@ -38,6 +39,9 @@ PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 PHASE_LOOP_SUPERVISOR_PID=""
 PHASE_LOOP_SUPERVISOR_GENERATION=""
 PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS="${PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS:-900}"
+# Zero means the first terminal failure is stable/blocked. A positive value is
+# the number of additional executions permitted before the failure is stable.
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-0}"
 PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
 PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
 PHASE_LOOP_FINALIZING=0
@@ -217,6 +221,14 @@ PY
   # The ledger adapter derives its controller-state path from a repository
   # root.  Keep it inside the selected workspace so isolated controller runs
   # cannot write task-ledger records into the phase-loop script checkout.
+  if [ "${PHASE_LOOP_TEST_FAIL_FINAL_SOURCE_TODO_FAILED_LEDGER:-0}" = "1" ] &&
+    [ "$ledger_event_type" = "todo.failed" ] &&
+    [[ "$payload_json" == *'"reason":"runtime_terminal_failure"'* ]]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="event=todo.failed exit=78 result=test_final_source_todo_failed_ledger_append_failed claim=$TODO_CLAIM_FILE"
+    printf '%s task_ledger_transition_failed run=%s %s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
   local task_ledger_output task_ledger_status
   if task_ledger_output="$(node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-trajectory --repo "$PHASE_LOOP_WORKSPACE_ROOT" --claim "$trajectory_claim_path" --todo "$PHASE_LOOP_TODO" --type "$ledger_event_type" --payload "$payload_json" --run "$run_stamp" 2>&1)"; then
     if [ -n "$task_ledger_output" ]; then
@@ -233,6 +245,16 @@ PY
       evaluate_bdk_public_harness_feedback "$run_stamp" "$event_type" || true
       ;;
   esac
+}
+
+record_completion_ledger_transition() {
+  local run_stamp="$1"
+  local payload_json="${2:-{}}"
+  write_bdk_trajectory_event "$run_stamp" "todo.completed" "$payload_json"
+  if [ "${PHASE_LOOP_TASK_LEDGER_FAILURE:-0}" -eq 1 ]; then
+    return 78
+  fi
+  return 0
 }
 
 evaluate_bdk_public_harness_feedback() {
@@ -303,7 +325,7 @@ write_status() {
   local continuation_required="${7:-false}"
   if [ "${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED:-0}" = "1" ] && [ "$status" = "last_run_succeeded" ]; then
     status="no_progress"
-    detail="Completed TODO removal was reverted because the resulting TODO queue failed guard validation; keeping the active claim in_progress. guard=${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL:-unknown} previous_success_detail=$detail"
+    detail="Completed TODO removal was reverted because the resulting TODO queue failed guard validation; keeping the completed claim for cleanup retry. guard=${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL:-unknown} previous_success_detail=$detail"
     exit_code="76"
     force_status_exit_code="76"
     if [ "$consecutive_failures" = "0" ]; then
@@ -553,7 +575,39 @@ todo_first_pending_item() {
     printf '%s\n' "$contract_replan_item"
     return 0
   fi
-  node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" select --todo "$PHASE_LOOP_TODO" --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" --blocked "$TODO_BLOCKED_FILE" --controller-fingerprint "$(phase_loop_controller_fingerprint)"
+  local evaluator_todo_path="$PHASE_LOOP_TODO"
+  local selected_todo selected_hash
+  local -a suppressed_todo_hashes=()
+  while true; do
+    local -a evaluator_args=(
+      select
+      --todo "$evaluator_todo_path"
+      --breakdown "$PHASE_LOOP_TODO_BREAKDOWN"
+      --blocked "$TODO_BLOCKED_FILE"
+      --controller-fingerprint "$(phase_loop_controller_fingerprint)"
+    )
+    local suppressed_hash
+    for suppressed_hash in "${suppressed_todo_hashes[@]-}"; do
+      if [ -z "$suppressed_hash" ]; then
+        continue
+      fi
+      evaluator_args+=(--exclude-todo-sha256 "$suppressed_hash")
+    done
+    selected_todo="$(node "$ROOT_DIR/scripts/phase-loop-todo-evaluator.mjs" "${evaluator_args[@]}")"
+    if [ -z "$selected_todo" ]; then
+      return 0
+    fi
+    if ! terminal_failure_retry_suppressed_for_todo "$selected_todo"; then
+      printf '%s\n' "$selected_todo"
+      return 0
+    fi
+    # A non-retryable terminal claim is an archived attempt, not completion
+    # evidence. Exclude only its exact block hash from this in-memory
+    # evaluator request so dependency resolution still sees the failed TODO as
+    # unresolved and can select only an independent sibling.
+    selected_hash="$(printf '%s' "$selected_todo" | shasum -a 256 | awk '{ print $1 }')"
+    suppressed_todo_hashes+=("$selected_hash")
+  done
 }
 
 phase_loop_delegation_pending() {
@@ -1093,7 +1147,7 @@ blocked_hashes_for_current_queue = set()
 blocked_first_lines = set()
 stalled_leaf_ids = set()
 stalled_leaf_first_lines = set()
-if blocked_path.exists():
+if blocked_path.is_file():
     for line in blocked_path.read_text(encoding="utf-8").splitlines():
         try:
             record = json.loads(line)
@@ -1606,6 +1660,260 @@ PY
   sync_parent_dir "$TODO_CLAIM_DIR"
 }
 
+record_terminal_failure_todo_claim() {
+  local run_stamp="$1"
+  local progress_file="$2"
+  local context selected_todo claim_id queue_generation queue_fingerprint provider_failure_fingerprint claim_absent recovery_output recovery_status recovery_id controller_fingerprint retry_cap
+  if ! validate_terminal_failure_retry_cap; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Invalid terminal failure retry cap before durable recovery recording: ${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP_VALIDATION_DETAIL:-unknown validation failure}"
+    return 78
+  fi
+  retry_cap="$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP"
+  context="$(python3 - "$TODO_CLAIM_FILE" "$progress_file" "$PHASE_LOOP_TODO" "$TODO_QUEUE_STATE_FILE" "$RUN_DIR/$run_stamp.claim.before-runtime.json" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+claim_path = pathlib.Path(sys.argv[1])
+progress_path = pathlib.Path(sys.argv[2])
+todo_path = pathlib.Path(sys.argv[3])
+queue_state_path = pathlib.Path(sys.argv[4])
+pre_runtime_claim_path = pathlib.Path(sys.argv[5])
+try:
+    claim = json.loads(claim_path.read_text(encoding="utf-8")) if claim_path.exists() else {}
+except Exception:
+    claim = {}
+claim_absent = not claim_path.exists()
+if claim_absent and pre_runtime_claim_path.exists():
+    try:
+        claim = json.loads(pre_runtime_claim_path.read_text(encoding="utf-8"))
+    except Exception:
+        claim = {}
+try:
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+except Exception:
+    progress = {}
+try:
+    queue_state = json.loads(queue_state_path.read_text(encoding="utf-8"))
+except Exception:
+    queue_state = {}
+projection = progress.get("progress_projection") if isinstance(progress.get("progress_projection"), dict) else {}
+selected = str(claim.get("selected_todo") or projection.get("selected_todo") or "")
+if not selected.strip() and todo_path.exists():
+    todo_text = todo_path.read_text(encoding="utf-8")
+    starts = list(re.finditer(r"(?m)^[ \t]*(?:[-*]|\d+[.)])[ \t]+\[[ \t]*\][ \t]+", todo_text))
+    if starts:
+        end = len(todo_text)
+        next_heading = re.search(r"(?m)^[ \t]*(?:[-*]|\d+[.)])[ \t]+\[[ xX]\][ \t]+", todo_text[starts[0].end():])
+        if next_heading:
+            end = starts[0].end() + next_heading.start()
+        selected = todo_text[starts[0].start():end].rstrip()
+if not selected.strip():
+    raise SystemExit(1)
+print(json.dumps({
+    "selected_todo": selected,
+    "claim_id": str(claim.get("claim_id") or projection.get("claim_id") or ""),
+    "queue_generation": claim.get("queue_generation") or projection.get("queue_generation") or queue_state.get("generation"),
+    "queue_fingerprint": str(claim.get("queue_fingerprint") or projection.get("queue_fingerprint") or queue_state.get("fingerprint") or ""),
+    "provider_failure_fingerprint": str(projection.get("provider_failure_fingerprint") or ""),
+    "claim_absent": claim_absent,
+}, ensure_ascii=False, sort_keys=True))
+PY
+  )" || {
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure recovery could not recover the selected TODO from claim/progress evidence."
+    return 78
+  }
+  selected_todo="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["selected_todo"])')"
+  claim_id="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["claim_id"])')"
+  queue_generation="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["queue_generation"] or "")')"
+  queue_fingerprint="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["queue_fingerprint"])')"
+  provider_failure_fingerprint="$(printf '%s' "$context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["provider_failure_fingerprint"])')"
+  claim_absent="$(printf '%s' "$context" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)["claim_absent"] else "false")')"
+  if [ -z "$claim_id" ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure recovery could not prove a durable claim identity; refusing retry."
+    return 78
+  fi
+  controller_fingerprint="$(phase_loop_controller_fingerprint)"
+  if [ "${PHASE_LOOP_TEST_FAIL_TERMINAL_LEDGER:-0}" = "1" ]; then
+    recovery_output='{"ok":false,"code":"test_terminal_failure_ledger_append_failed"}'
+    recovery_status=78
+  else
+    recovery_output="$(
+      node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-terminal-failure \
+        --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
+        --selected-todo "$selected_todo" \
+        --claim-id "$claim_id" \
+        --run "$run_stamp" \
+        --queue-generation "$queue_generation" \
+        --queue-fingerprint "$queue_fingerprint" \
+        --provider-failure-fingerprint "$provider_failure_fingerprint" \
+        --retry-cap "$retry_cap" \
+        --controller-fingerprint "$controller_fingerprint" \
+        --claim-absent "$claim_absent" \
+        --blocked-reason terminal_runtime_failure 2>&1
+    )"
+    recovery_status=$?
+  fi
+  recovery_id="$(printf '%s' "$recovery_output" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("recovery_id", ""))
+except Exception: print("")' 2>/dev/null || true)"
+  local terminal_claim_snapshot="$RUN_DIR/$run_stamp.claim.before-runtime.json"
+  if [ "$recovery_status" -ne 0 ] || [ -z "$recovery_id" ]; then
+    # Recovery is not durable until record-terminal-failure returns a recovery
+    # identity. Do not append retry-eligible blocked evidence or terminalize
+    # the source attempt before that point. Persist a recoverable recovery
+    # obligation and let the next run retry the ledger transaction first.
+    if [ ! -f "$TODO_CLAIM_FILE" ] && [ -f "$terminal_claim_snapshot" ]; then
+      cp "$terminal_claim_snapshot" "$TODO_CLAIM_FILE"
+      chmod 600 "$TODO_CLAIM_FILE"
+      sync_parent_dir "$TODO_CLAIM_DIR"
+    fi
+    local recovery_pending_status=0
+    if [ -f "$TODO_CLAIM_FILE" ]; then
+      mark_terminal_failure_recovery_pending "$run_stamp" || recovery_pending_status=$?
+    else
+      recovery_pending_status=1
+    fi
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure ledger recording failed before durable recovery; blocked evidence and source terminalization are withheld. recovery_status=$recovery_status pending_marker_status=$recovery_pending_status result=${recovery_output:-<no output>}; keeping claim recoverable."
+    return 78
+  fi
+  # The recovery identity is now durable. Persist the source todo.failed
+  # obligation before appending blocked evidence or returning success, so a
+  # supervisor kill in the gap cannot leave a running source@claim with no
+  # restart-visible transition work. For claim-absent runtime paths, retain
+  # the pre-runtime claim in the marker and restore it on the next run.
+  local source_obligation_status=0
+  if [ -f "$TODO_CLAIM_FILE" ]; then
+    mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || source_obligation_status=$?
+    if [ "$source_obligation_status" -eq 0 ]; then
+      persist_terminal_failure_source_transition_obligation "$TODO_CLAIM_FILE" "$run_stamp" "$recovery_id" || source_obligation_status=$?
+    fi
+  else
+    persist_terminal_failure_source_transition_obligation "$terminal_claim_snapshot" "$run_stamp" "$recovery_id" || source_obligation_status=$?
+  fi
+  if [ "$source_obligation_status" -ne 0 ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure recovery is durable, but the source todo.failed obligation could not be persisted; refusing retry. recovery_id=$recovery_id"
+    return 78
+  fi
+  local blocked_record_status
+  if python3 - "$TODO_BLOCKED_FILE" "$selected_todo" "$claim_id" "$queue_generation" "$queue_fingerprint" "$provider_failure_fingerprint" "$recovery_id" "$run_stamp" "$retry_cap" "$claim_absent" "$(phase_loop_controller_fingerprint)" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+blocked_path = pathlib.Path(sys.argv[1])
+selected = sys.argv[2]
+recovery_id = sys.argv[7]
+record = {
+    "schema_version": 1,
+    "blocked_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat().replace("+00:00", "Z"),
+    "run_stamp": sys.argv[8],
+    "claim_id": sys.argv[3],
+    "queue_generation": sys.argv[4],
+    "queue_fingerprint": sys.argv[5],
+    "selected_todo": selected,
+    "selected_todo_sha256": hashlib.sha256(selected.encode("utf-8")).hexdigest(),
+    "selected_todo_first_line": selected.splitlines()[0] if selected.splitlines() else "",
+    "provider_failure_fingerprint": sys.argv[6],
+    "recovery_id": recovery_id,
+    "retry_cap": int(sys.argv[9] or 0),
+    "block_reason": "terminal_runtime_failure",
+    "terminal_failure": True,
+    "claim_absent": sys.argv[10] == "true",
+    "controller_fingerprint": sys.argv[11],
+}
+blocked_path.parent.mkdir(parents=True, exist_ok=True)
+existing = []
+if blocked_path.exists():
+    existing = blocked_path.read_text(encoding="utf-8").splitlines()
+records = []
+for line in existing:
+    if not line.strip():
+        continue
+    try:
+        parsed = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(parsed, dict):
+        records.append(parsed)
+if not recovery_id or not any(item.get("recovery_id") == recovery_id for item in records):
+    with blocked_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        import os
+        os.fsync(handle.fileno())
+PY
+  then
+    blocked_record_status=0
+  else
+    blocked_record_status=$?
+  fi
+  if [ "$blocked_record_status" -ne 0 ]; then
+    # The recovery task is already durable, but the retry evidence is not.
+    # Restore a claim removed by the runtime before attempting todo.failed;
+    # otherwise the source attempt could be archived without a recoverable
+    # claim or a durable terminal ledger event.
+    if [ ! -f "$TODO_CLAIM_FILE" ] && [ -f "$terminal_claim_snapshot" ]; then
+      cp "$terminal_claim_snapshot" "$TODO_CLAIM_FILE"
+      chmod 600 "$TODO_CLAIM_FILE"
+      sync_parent_dir "$TODO_CLAIM_DIR"
+    fi
+    local terminal_transition_status=0
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure_blocked_evidence_failed","terminal_failure":true}' "todo.failed" || terminal_transition_status=$?
+    if [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 1 ]; then
+      terminal_transition_status=78
+    fi
+    if [ "$terminal_transition_status" -eq 0 ] && [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 0 ]; then
+      if [ -f "$TODO_CLAIM_FILE" ]; then
+        if ! write_todo_claim "$(claim_field claim_id)" "failed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"; then
+          terminal_transition_status=78
+        fi
+      else
+        terminal_transition_status=78
+      fi
+    fi
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    if [ "$terminal_transition_status" -eq 0 ] && [ -f "$TODO_CLAIM_FILE" ]; then
+      if ! archive_terminal_failure_claim_snapshot "$TODO_CLAIM_FILE" "$run_stamp" terminal_failure_blocked_evidence_failed false "$recovery_id"; then
+        terminal_transition_status=78
+      fi
+    fi
+    if [ "$terminal_transition_status" -eq 0 ]; then
+      if ! clear_terminal_failure_source_transition_pending "$run_stamp"; then
+        terminal_transition_status=78
+      fi
+    fi
+    if [ "$terminal_transition_status" -ne 0 ]; then
+      mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || true
+    fi
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure blocked evidence append failed: status=$blocked_record_status source_transition_status=$terminal_transition_status; source claim remains recoverable until todo.failed and archival are durable."
+    printf '%s\n' "$PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL" >&2
+    return 78
+  fi
+  if [ "$claim_absent" = "true" ]; then
+    if ! archive_terminal_failure_claim_snapshot "$terminal_claim_snapshot" "$run_stamp" terminal_failure_retry true "$recovery_id"; then
+      if [ ! -f "$TODO_CLAIM_FILE" ] && [ -f "$terminal_claim_snapshot" ]; then
+        cp "$terminal_claim_snapshot" "$TODO_CLAIM_FILE"
+        chmod 600 "$TODO_CLAIM_FILE"
+        sync_parent_dir "$TODO_CLAIM_DIR"
+        mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || true
+      fi
+      PHASE_LOOP_TASK_LEDGER_FAILURE=1
+      PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Terminal failure ledger and blocked evidence were recorded, but durable retry identity could not be archived; source claim remains recoverable."
+      return 78
+    fi
+  fi
+  printf '%s\n' "$recovery_output"
+  return 0
+}
+
 selected_todo_is_explicit_blocker() {
   if [ ! -f "$TODO_CLAIM_FILE" ]; then
     return 1
@@ -1692,9 +2000,85 @@ record_invalid_decomposition_leaf_claim() {
   write_status "blocked_todo_recorded" "$detail" "invalid-leaf-$run_stamp" "0" "${CONSECUTIVE_FAILURES:-0}"
 }
 
+terminal_failure_retry_state_for_claim() {
+  if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$TODO_BLOCKED_FILE" ]; then
+    return 1
+  fi
+  python3 - "$TODO_CLAIM_FILE" "$TODO_BLOCKED_FILE" "$PROGRESS_STATE_FILE" "$(phase_loop_controller_fingerprint)" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+claim_path = pathlib.Path(sys.argv[1])
+blocked_path = pathlib.Path(sys.argv[2])
+progress_path = pathlib.Path(sys.argv[3])
+controller = sys.argv[4]
+try:
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+selected = claim.get("selected_todo")
+if not isinstance(selected, str) or not selected.strip():
+    raise SystemExit(1)
+selected_hash = hashlib.sha256(selected.encode("utf-8")).hexdigest()
+provider_failure_fingerprint = ""
+try:
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    projection = progress.get("progress_projection")
+    if isinstance(projection, dict):
+        provider_failure_fingerprint = str(projection.get("provider_failure_fingerprint") or "")
+except Exception:
+    pass
+count = 0
+retry_cap = 0
+matched = False
+for line in blocked_path.read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    try:
+        record = json.loads(line)
+    except Exception:
+        continue
+    if record.get("block_reason") != "terminal_runtime_failure":
+        continue
+    if record.get("controller_fingerprint") != controller:
+        continue
+    if provider_failure_fingerprint and str(record.get("provider_failure_fingerprint") or "") != provider_failure_fingerprint:
+        continue
+    record_hash = record.get("selected_todo_sha256")
+    if not isinstance(record_hash, str) or not record_hash:
+        record_hash = hashlib.sha256(str(record.get("selected_todo_first_line") or "").encode("utf-8")).hexdigest()
+    if record_hash != selected_hash:
+        continue
+    matched = True
+    count += 1
+    try:
+        candidate = int(record.get("retry_cap"))
+    except Exception:
+        candidate = 0
+    retry_cap = max(candidate, 0)
+if not matched:
+    raise SystemExit(1)
+raise SystemExit(0 if count <= retry_cap else 2)
+PY
+}
+
 selected_todo_was_stably_blocked() {
   if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$TODO_BLOCKED_FILE" ]; then
     return 1
+  fi
+  local terminal_retry_state
+  if terminal_failure_retry_state_for_claim; then
+    # A terminal failure for this exact task specification still has retry
+    # budget. Do not let the legacy ID/controller stable-block shortcut skip
+    # the runtime invocation.
+    return 1
+  else
+    terminal_retry_state=$?
+    if [ "$terminal_retry_state" -eq 2 ]; then
+      return 0
+    fi
   fi
   python3 - "$TODO_CLAIM_FILE" "$TODO_BLOCKED_FILE" "$(phase_loop_controller_fingerprint)" <<'PY'
 import json
@@ -1755,6 +2139,12 @@ for line in lines:
         record = json.loads(line)
     except Exception:
         continue
+    if record.get("block_reason") == "terminal_runtime_failure":
+        # Terminal retry suppression is keyed by the complete task
+        # specification in terminal_failure_retry_state_for_claim above.
+        # Never fall back to the legacy ID/controller stable-block rule for
+        # a materially changed task with the same ID.
+        continue
     blocked_first = str(record.get("selected_todo_first_line") or "")
     if todo_id(blocked_first) == selected_id:
         if record.get("controller_fingerprint") != controller_fingerprint:
@@ -1777,6 +2167,10 @@ record_stably_blocked_todo_claim() {
 
 remove_completed_todo_claim_from_queue() {
   local run_stamp="$1"
+  if [ "${PHASE_LOOP_TEST_FAIL_COMPLETED_TODO_REMOVAL:-0}" = "1" ]; then
+    printf '%s run=%s completed_todo_removal_test_failure=true\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
   if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$PHASE_LOOP_TODO" ]; then
     return 0
   fi
@@ -1847,7 +2241,7 @@ codes={str(error.get("code")) for error in payload.get("errors", []) if isinstan
 sys.exit(0 if codes & {"completion_record_missing_selected_targets","completion_record_target_not_changed","selected_target_not_changed"} else 1)
 '; then
         write_repair_feedback "$run_stamp" "$completion_record_output" "" "" || true
-        write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+        mark_completed_todo_cleanup_pending "$run_stamp"
         printf '%s run=%s completed_todo_removal_refused=true repair_feedback_recorded=true guard=%s\n' "$(now_utc)" "$run_stamp" "$completion_record_output" >> "$SUPERVISOR_LOG"
       else
         printf '%s run=%s completed_todo_removal_refused=true repair_feedback_skipped_for_non_actionable_guard=true guard=%s\n' "$(now_utc)" "$run_stamp" "$completion_record_output" >> "$SUPERVISOR_LOG"
@@ -2015,7 +2409,7 @@ PY
       fi
       printf '%s run=%s completed_todo_removal_integrated_supervisor_guard_failed=true guard=%s\n' "$(now_utc)" "$run_stamp" "$integrated_supervisor_guard_output" >> "$SUPERVISOR_LOG"
       cp "$todo_backup" "$PHASE_LOOP_TODO"
-      write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+      mark_completed_todo_cleanup_pending "$run_stamp"
       PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED=1
       PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL="$todo_guard_output"
       printf '%s run=%s completed_todo_removal_reverted=true guard=%s\n' "$(now_utc)" "$run_stamp" "$todo_guard_output" >> "$SUPERVISOR_LOG"
@@ -8297,6 +8691,165 @@ PY
   PHASE_LOOP_LAST_CLAIM_ARCHIVE="$archive_path"
 }
 
+archive_terminal_failure_claim_snapshot() {
+  local snapshot_path="$1"
+  local run_stamp="$2"
+  local archive_reason="$3"
+  local retry_eligible="$4"
+  local recovery_id="${5:-}"
+  local archive_path="$TODO_CLAIM_DIR/stale-$run_stamp.json"
+  local archive_suffix=1
+  if [ ! -f "$snapshot_path" ]; then
+    return 1
+  fi
+  while [ -e "$archive_path" ]; do
+    archive_path="$TODO_CLAIM_DIR/stale-$run_stamp-$archive_suffix.json"
+    archive_suffix=$((archive_suffix + 1))
+  done
+  if ! python3 - "$snapshot_path" "$archive_path" "$run_stamp" "$(now_utc)" "$archive_reason" "$retry_eligible" "$recovery_id" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+snapshot_path = pathlib.Path(sys.argv[1])
+archive_path = pathlib.Path(sys.argv[2])
+run_stamp = sys.argv[3]
+timestamp = sys.argv[4]
+archive_reason = sys.argv[5]
+retry_eligible = sys.argv[6] == "true"
+recovery_id = sys.argv[7]
+try:
+    claim = json.loads(snapshot_path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or not str(claim.get("claim_id") or ""):
+    raise SystemExit(1)
+claim["status"] = "failed"
+claim["archive_reason"] = archive_reason
+claim["retry_eligible"] = retry_eligible
+claim["archived_at"] = timestamp
+claim["archive_run_stamp"] = run_stamp
+if recovery_id:
+    claim["terminal_recovery_id"] = recovery_id
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({"status": "failed", "run_stamp": run_stamp, "updated_at": timestamp})
+tmp = archive_path.with_suffix(".tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, archive_path)
+os.chmod(archive_path, 0o600)
+PY
+  then
+    return 1
+  fi
+  if [ "$snapshot_path" = "$TODO_CLAIM_FILE" ]; then
+    if ! rm -f "$snapshot_path"; then
+      return 1
+    fi
+  fi
+  sync_parent_dir "$TODO_CLAIM_DIR"
+  PHASE_LOOP_LAST_CLAIM_ARCHIVE="$archive_path"
+  return 0
+}
+
+suppress_terminal_failure_retry_archive() {
+  local selected_todo="$1"
+  local recovery_id="${2:-}"
+  local run_stamp="$3"
+  python3 - "$TODO_CLAIM_DIR" "$selected_todo" "$recovery_id" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+claim_dir = pathlib.Path(sys.argv[1])
+selected = sys.argv[2]
+recovery_id = sys.argv[3]
+run_stamp = sys.argv[4]
+timestamp = sys.argv[5]
+updated = 0
+for path in sorted(claim_dir.glob("stale-*.json")):
+    try:
+        claim = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if claim.get("archive_reason") != "terminal_failure_retry":
+        continue
+    if claim.get("selected_todo") != selected:
+        continue
+    if recovery_id and claim.get("terminal_recovery_id") != recovery_id:
+        continue
+    claim["archive_reason"] = "terminal_failure_blocked_evidence_failed"
+    claim["retry_eligible"] = False
+    claim["archived_at"] = timestamp
+    claim["archive_run_stamp"] = run_stamp
+    history = claim.setdefault("status_history", [])
+    if isinstance(history, list):
+        history.append({
+            "status": "failed",
+            "run_stamp": run_stamp,
+            "updated_at": timestamp,
+            "reason": "blocked_evidence_append_failed",
+        })
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    updated += 1
+if updated:
+    dir_fd = os.open(str(claim_dir), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+raise SystemExit(0 if updated else 1)
+PY
+}
+
+archive_failed_todo_claim_for_retry() {
+  local run_stamp="$1"
+  if [ ! -f "$TODO_CLAIM_FILE" ] || [ "$(claim_status 2>/dev/null || true)" != "failed" ]; then
+    return 0
+  fi
+  archive_terminal_failure_claim_snapshot "$TODO_CLAIM_FILE" "$run_stamp" terminal_failure_retry true ""
+}
+
+terminal_failure_retry_suppressed_for_todo() {
+  local selected_todo="$1"
+  python3 - "$TODO_CLAIM_DIR" "$selected_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+claim_dir = pathlib.Path(sys.argv[1])
+selected = sys.argv[2]
+for path in sorted(claim_dir.glob("stale-*.json")):
+    try:
+        claim = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    archive_reason = str(claim.get("archive_reason") or "")
+    if (
+        claim.get("retry_eligible") is False
+        and archive_reason.startswith("terminal_failure_")
+        and claim.get("selected_todo") == selected
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 git_workspace_fingerprint() {
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 1
@@ -8307,6 +8860,7 @@ git_workspace_fingerprint() {
           status_path="$(printf '%s' "$status_line" | cut -c4-)"
           case "$status_path" in
             .brownie/private|.brownie/private/*) continue ;;
+            .brownie/headless-*|.brownie/headless-*/*) continue ;;
           esac
           printf '%s\n' "$status_line"
         done
@@ -8645,6 +9199,9 @@ if not isinstance(payload, dict):
     payload = {}
 
 automation = payload.get("automation") if isinstance(payload.get("automation"), dict) else {}
+provider_failure = payload.get("llm_provider_failure") if isinstance(payload.get("llm_provider_failure"), dict) else {}
+if not provider_failure and isinstance(automation.get("llm_provider_failure"), dict):
+    provider_failure = automation.get("llm_provider_failure")
 claim = {}
 if claim_snapshot.get("ok") and isinstance(claim_snapshot.get("claim"), dict):
     claim = claim_snapshot["claim"]
@@ -8678,6 +9235,9 @@ progress_projection = {
     "terminal_final_state": text(payload.get("terminal_completion_final_state")),
     "terminal_task_status": text(payload.get("terminal_completion_task_status")),
     "next_action": text(payload.get("next_action")),
+    "provider_failure_fingerprint": text(provider_failure.get("failure_fingerprint")),
+    "provider_failure_class": text(provider_failure.get("failure_class")),
+    "provider_retryable": text(provider_failure.get("retryable")),
 }
 
 previous = {}
@@ -8839,7 +9399,9 @@ progress_projection["objective_apply_stalled"] = objective_apply_stalled
 no_progress = exit_code == 0 and not meaningful_progress
 stagnated = no_progress and not continuation_required and same_count >= threshold
 classification = (
-    "continuation_required"
+    "terminal_failure"
+    if terminal_non_progress
+    else "continuation_required"
     if continuation_required
     else "no_progress"
     if (stagnated or terminal_non_progress)
@@ -9002,15 +9564,15 @@ phase_loop_create_pr_for_progress() {
   local stderr_log="$3"
   local workspace_before="$4"
   local workspace_after="$5"
-  local title body pr_url branch push_rc
+  local title body pr_url branch push_rc pending_publish="${6:-0}"
   if [ "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" != "1" ]; then
     return 0
   fi
-  if [ "$workspace_before" = "$workspace_after" ]; then
+  if [ "$pending_publish" != "1" ] && [ "$workspace_before" = "$workspace_after" ]; then
     printf '%s pr_create_skipped reason=no_runtime_workspace_change\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 0
   fi
-  if ! tracked_workspace_diff_exists; then
+  if [ "$pending_publish" != "1" ] && ! tracked_workspace_diff_exists; then
     return 0
   fi
   (
@@ -9037,15 +9599,19 @@ This PR was created by the external phase-loop controller after Brownie produced
 
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    stage_runtime_applied_paths "$stdout_log"
-    if git diff --cached --quiet --exit-code; then
+    if tracked_workspace_diff_exists; then
+      stage_runtime_applied_paths "$stdout_log"
+      if git diff --cached --quiet --exit-code; then
+        exit 1
+      fi
+      GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Brownie}" \
+        GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-brownie-agent@users.noreply.github.com}" \
+        GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-Brownie}" \
+        GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-brownie-agent@users.noreply.github.com}" \
+        git commit -m "$title" >/dev/null
+    elif [ "$pending_publish" != "1" ]; then
       exit 1
     fi
-    GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Brownie}" \
-      GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-brownie-agent@users.noreply.github.com}" \
-      GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-Brownie}" \
-      GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-brownie-agent@users.noreply.github.com}" \
-      git commit -m "$title" >/dev/null
   ) || {
     printf '%s pr_create_skipped reason=commit_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 1
@@ -9090,15 +9656,21 @@ This PR was created by the external phase-loop controller after Brownie produced
       return 1
     fi
     if [ "$PHASE_LOOP_PR_DRAFT" = "1" ]; then
-      pr_url="$(
-        cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-        gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body" --draft
-      )"
+      if ! pr_url="$(
+          cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+          gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body" --draft
+        )"; then
+        printf '%s pr_create_skipped reason=gh_pr_create_failed branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
+        return 1
+      fi
     else
-      pr_url="$(
-        cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-        gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body"
-      )"
+      if ! pr_url="$(
+          cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+          gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body"
+        )"; then
+        printf '%s pr_create_skipped reason=gh_pr_create_failed branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
+        return 1
+      fi
     fi
   fi
   printf '%s pr_created branch=%s url=%s\n' "$(now_utc)" "$branch" "$pr_url" >> "$SUPERVISOR_LOG"
@@ -9230,6 +9802,559 @@ PY
   sync_parent_dir "$TODO_CLAIM_DIR"
 }
 
+completed_todo_cleanup_pending() {
+  [ "$(claim_status 2>/dev/null || true)" = "completed" ] &&
+    [ "$(claim_field completion_cleanup_pending 2>/dev/null || true)" = "true" ]
+}
+
+mark_completed_todo_cleanup_pending() {
+  local run_stamp="$1"
+  local stdout_log="${2:-}" stderr_log="${3:-}" workspace_before="${4:-}" workspace_after="${5:-}"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+claim["completion_cleanup_pending"] = True
+new_pr_metadata = sys.argv[4] == "1" and sys.argv[7] and sys.argv[8] and sys.argv[7] != sys.argv[8]
+if new_pr_metadata:
+    claim["completion_pr_pending"] = True
+    claim["completion_pr_run_stamp"] = sys.argv[2]
+    claim["completion_pr_stdout_log"] = sys.argv[5]
+    claim["completion_pr_stderr_log"] = sys.argv[6]
+    claim["completion_pr_workspace_before"] = sys.argv[7]
+    claim["completion_pr_workspace_after"] = sys.argv[8]
+elif claim.get("completion_pr_pending") is not True:
+    claim["completion_pr_pending"] = False
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": "completed",
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "queue_removal_cleanup_pending",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.cleanup-pending.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+clear_completed_todo_cleanup_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+claim["completion_cleanup_pending"] = False
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": "completed",
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "queue_removal_cleanup_completed",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.cleanup-complete.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+mark_completed_todo_pr_pending() {
+  local run_stamp="$1"
+  local stdout_log="${2:-}" stderr_log="${3:-}" workspace_before="${4:-}" workspace_after="${5:-}"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+claim["completion_pr_pending"] = True
+claim["completion_pr_run_stamp"] = sys.argv[2]
+claim["completion_pr_stdout_log"] = sys.argv[4]
+claim["completion_pr_stderr_log"] = sys.argv[5]
+claim["completion_pr_workspace_before"] = sys.argv[6]
+claim["completion_pr_workspace_after"] = sys.argv[7]
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": "completed",
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "completion_pr_publish_pending",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.completion-pr-pending.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+completed_todo_pr_pending() {
+  [ "$(claim_status 2>/dev/null || true)" = "completed" ] &&
+    [ "$(claim_field completion_pr_pending 2>/dev/null || true)" = "true" ]
+}
+
+clear_completed_todo_pr_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+claim["completion_pr_pending"] = False
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({"status": "completed", "run_stamp": sys.argv[2], "updated_at": sys.argv[3], "note": "completion_pr_published"})
+tmp = path.with_name(f"{path.name}.{os.getpid()}.completion-pr.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+terminal_failure_recovery_pending() {
+  case "$(claim_status 2>/dev/null || true)" in
+    claimed|in_progress|running)
+      [ "$(claim_field terminal_failure_recovery_pending 2>/dev/null || true)" = "true" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+mark_terminal_failure_recovery_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") not in ("claimed", "in_progress", "running"):
+    raise SystemExit(1)
+claim["terminal_failure_recovery_pending"] = True
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": claim.get("status"),
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "terminal_failure_recovery_pending",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.terminal-failure-recovery-pending.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+clear_terminal_failure_recovery_pending() {
+  local run_stamp="$1"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict):
+    raise SystemExit(1)
+claim["terminal_failure_recovery_pending"] = False
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": claim.get("status"),
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "terminal_failure_recovery_completed",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.terminal-failure-recovery-complete.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+retry_terminal_failure_recovery() {
+  local run_stamp="$1"
+  if ! terminal_failure_recovery_pending; then
+    return 1
+  fi
+  local recovery_output recovery_status recovery_id transition_output transition_status
+  if recovery_output="$(record_terminal_failure_todo_claim "$run_stamp" "$PROGRESS_STATE_FILE" 2>&1)"; then
+    recovery_status=0
+  else
+    recovery_status=$?
+  fi
+  if [ "$recovery_status" -ne 0 ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery is still not durable: status=$recovery_status result=${recovery_output:-<no output>}"
+    return 78
+  fi
+  recovery_id="$(printf '%s' "$recovery_output" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("recovery_id", ""))
+except Exception: print("")' 2>/dev/null || true)"
+  if [ -z "$recovery_id" ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery returned no recovery identity; result=${recovery_output:-<no output>}"
+    return 78
+  fi
+  if ! clear_terminal_failure_recovery_pending "$run_stamp"; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery succeeded but its pending marker could not be cleared: recovery_id=$recovery_id"
+    return 78
+  fi
+  if transition_output="$(write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed" 2>&1)"; then
+    transition_status=0
+  else
+    transition_status=$?
+  fi
+  if [ "$transition_status" -ne 0 ] || [ "${PHASE_LOOP_TASK_LEDGER_FAILURE:-0}" -eq 1 ]; then
+    mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || true
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery succeeded but source todo.failed transition failed: status=$transition_status result=${transition_output:-<no output>} recovery_id=$recovery_id"
+    return 78
+  fi
+  if ! write_todo_claim "$(claim_field claim_id)" "failed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"; then
+    mark_terminal_failure_source_transition_pending "$run_stamp" "$recovery_id" || true
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery and source transition succeeded but failed claim state could not be persisted: recovery_id=$recovery_id"
+    return 78
+  fi
+  if ! clear_terminal_failure_source_transition_pending "$run_stamp"; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal failure recovery and source transition succeeded but its durable obligation marker could not be cleared: recovery_id=$recovery_id"
+    return 78
+  fi
+  printf '%s\n' "$recovery_output"
+  return 0
+}
+
+terminal_failure_source_transition_pending() {
+  case "$(claim_status 2>/dev/null || true)" in
+    claimed|in_progress|running)
+      [ "$(claim_field terminal_failure_source_transition_pending 2>/dev/null || true)" = "true" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+mark_terminal_failure_source_transition_pending() {
+  local run_stamp="$1"
+  local recovery_id="${2:-}"
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" "$recovery_id" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") not in ("claimed", "in_progress", "running"):
+    raise SystemExit(1)
+claim["terminal_failure_source_transition_pending"] = True
+claim["terminal_failure_source_transition_recovery_id"] = sys.argv[4]
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": claim.get("status"),
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "terminal_failure_source_transition_pending",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.terminal-failure-transition-pending.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+persist_terminal_failure_source_transition_obligation() {
+  local snapshot_path="${1:-$TODO_CLAIM_FILE}"
+  local run_stamp="$2"
+  local recovery_id="${3:-}"
+  if [ ! -f "$snapshot_path" ]; then
+    return 1
+  fi
+  python3 - "$snapshot_path" "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" "$run_stamp" "$(now_utc)" "$recovery_id" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+claim_path = pathlib.Path(sys.argv[1])
+marker_path = pathlib.Path(sys.argv[2])
+try:
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or not str(claim.get("claim_id") or ""):
+    raise SystemExit(1)
+claim["terminal_failure_source_transition_pending"] = True
+claim["terminal_failure_source_transition_recovery_id"] = sys.argv[5]
+marker = {
+    "schema_version": 1,
+    "run_stamp": sys.argv[3],
+    "updated_at": sys.argv[4],
+    "recovery_id": sys.argv[5],
+    "claim": claim,
+}
+marker_path.parent.mkdir(parents=True, exist_ok=True)
+tmp = marker_path.with_suffix(".tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(marker, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, marker_path)
+os.chmod(marker_path, 0o600)
+directory_fd = os.open(str(marker_path.parent), os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+restore_terminal_failure_source_transition_obligation() {
+  if [ ! -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" ]; then
+    return 0
+  fi
+  python3 - "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" "$TODO_CLAIM_FILE" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+marker_path = pathlib.Path(sys.argv[1])
+claim_path = pathlib.Path(sys.argv[2])
+try:
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    claim = marker["claim"]
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or not str(claim.get("claim_id") or ""):
+    raise SystemExit(1)
+claim["terminal_failure_source_transition_pending"] = True
+claim["terminal_failure_source_transition_recovery_id"] = str(marker.get("recovery_id") or claim.get("terminal_failure_source_transition_recovery_id") or "")
+if not claim_path.exists():
+    tmp = claim_path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, claim_path)
+    os.chmod(claim_path, 0o600)
+PY
+  chmod 600 "$TODO_CLAIM_FILE"
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+clear_terminal_failure_source_transition_pending() {
+  local run_stamp="$1"
+  if [ ! -f "$TODO_CLAIM_FILE" ]; then
+    if [ -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" ] && ! rm -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE"; then
+      return 1
+    fi
+    sync_parent_dir "$TODO_CLAIM_DIR"
+    return 0
+  fi
+  python3 - "$TODO_CLAIM_FILE" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict):
+    raise SystemExit(1)
+claim["terminal_failure_source_transition_pending"] = False
+claim["updated_at"] = sys.argv[3]
+history = claim.setdefault("status_history", [])
+if isinstance(history, list):
+    history.append({
+        "status": claim.get("status"),
+        "run_stamp": sys.argv[2],
+        "updated_at": sys.argv[3],
+        "note": "terminal_failure_source_transition_completed",
+    })
+tmp = path.with_name(f"{path.name}.{os.getpid()}.terminal-failure-transition-complete.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+  if [ -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" ] && ! rm -f "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE"; then
+    return 1
+  fi
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+retry_terminal_failure_source_transition() {
+  local run_stamp="$1"
+  if ! terminal_failure_source_transition_pending; then
+    return 1
+  fi
+  local transition_output transition_status recovery_id
+  recovery_id="$(claim_field terminal_failure_source_transition_recovery_id 2>/dev/null || true)"
+  if transition_output="$(write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed" 2>&1)" &&
+    [ "${PHASE_LOOP_TASK_LEDGER_FAILURE:-0}" -eq 0 ]; then
+    transition_status=0
+  else
+    transition_status=$?
+  fi
+  if [ "$transition_status" -ne 0 ]; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal source transition failed: status=$transition_status recovery_id=$recovery_id result=${transition_output:-<no output>}"
+    return 78
+  fi
+  if ! write_todo_claim "$(claim_field claim_id)" "failed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal source transition succeeded but failed claim state could not be persisted: recovery_id=$recovery_id"
+    return 78
+  fi
+  if ! clear_terminal_failure_source_transition_pending "$run_stamp"; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Deferred terminal source transition succeeded but its pending marker could not be cleared: recovery_id=$recovery_id"
+    return 78
+  fi
+  printf '%s\n' "$transition_output"
+  return 0
+}
+
+publish_pending_completed_todo_pr() {
+  local run_stamp="$1"
+  if ! completed_todo_pr_pending; then
+    return 0
+  fi
+  local stdout_log stderr_log workspace_before workspace_after publish_output
+  stdout_log="$(claim_field completion_pr_stdout_log 2>/dev/null || true)"
+  stderr_log="$(claim_field completion_pr_stderr_log 2>/dev/null || true)"
+  workspace_before="$(claim_field completion_pr_workspace_before 2>/dev/null || true)"
+  workspace_after="$(claim_field completion_pr_workspace_after 2>/dev/null || true)"
+  if publish_output="$(phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" 1 2>&1)" && phase_loop_pr_created; then
+    clear_completed_todo_pr_pending "$run_stamp"
+    printf '%s run=%s completed_todo_pr_publish_retry_succeeded=true result=%s\n' "$(now_utc)" "$run_stamp" "$publish_output" >> "$SUPERVISOR_LOG"
+    return 0
+  fi
+  write_status "blocked" "A completed TODO cleanup succeeded, but its durable tracked completion PR is still pending; refusing Runtime restart. publish=${publish_output:-<no output>}" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+  printf '%s run=%s completed_todo_pr_publish_retry_failed=true result=%s\n' "$(now_utc)" "$run_stamp" "${publish_output:-<no output>}" >> "$SUPERVISOR_LOG"
+  return 78
+}
+
 claim_first_pending_todo() {
   local run_stamp="$1"
   local selected_todo queue_fingerprint queue_generation queue_state selected_hash claim_id claim_retry_suffix reread_fingerprint attempt
@@ -9254,6 +10379,10 @@ claim_first_pending_todo() {
       fi
     fi
   fi
+  # A terminally failed claim is an immutable attempt. Retain it as a stale
+  # archive before selecting the next attempt so claim_first_pending_todo can
+  # derive a unique retry id instead of reusing current.json's id.
+  archive_failed_todo_claim_for_retry "$run_stamp"
 
   for attempt in 1 2 3; do
     queue_state="$(refresh_todo_queue_state)"
@@ -9261,6 +10390,10 @@ claim_first_pending_todo() {
     queue_fingerprint="$(printf '%s' "$queue_state" | awk '{ print $2 }')"
     selected_todo="$(todo_first_pending_item)"
     if [ -z "$selected_todo" ]; then
+      return 1
+    fi
+    if terminal_failure_retry_suppressed_for_todo "$selected_todo"; then
+      printf '%s terminal_failure_retry_suppressed=true selected_todo=%s\n' "$(now_utc)" "$selected_todo" >> "$SUPERVISOR_LOG"
       return 1
     fi
     reread_fingerprint="$(todo_queue_fingerprint)"
@@ -11382,7 +12515,7 @@ stop_if_todo_empty() {
 
   pending_count="$(todo_pending_count)"
   if [ "$pending_count" -eq 0 ]; then
-    if active_todo_claim_exists; then
+    if active_todo_claim_exists || completed_todo_cleanup_pending || completed_todo_pr_pending; then
       return 0
     fi
     detail="Phase loop TODO queue is empty; no pending or durable in-progress claim remains."
@@ -11418,6 +12551,30 @@ load_env() {
     . "$STATE_DIR/phase-loop.env"
   fi
   set +a
+}
+
+validate_terminal_failure_retry_cap() {
+  local raw_cap="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-0}"
+  local normalized_cap
+  if ! normalized_cap="$(python3 - "$raw_cap" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1]
+if not re.fullmatch(r"[0-9]+", raw):
+    raise SystemExit(1)
+value = int(raw)
+if value > 9007199254740991:
+    raise SystemExit(1)
+print(value)
+PY
+)"; then
+    PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP_VALIDATION_DETAIL="Invalid PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=${raw_cap}; expected a finite non-negative integer."
+    printf '%s\n' "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP_VALIDATION_DETAIL" >&2
+    return 78
+  fi
+  PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP="$normalized_cap"
+  return 0
 }
 
 phase_loop_require_approved_controller_baseline() {
@@ -12023,12 +13180,15 @@ PY
 
 _run_brownie_once() {
   load_env
+  if ! validate_terminal_failure_retry_cap; then
+    return 78
+  fi
   local started_at run_stamp stdout_log stderr_log effective_prompt exit_code run_id detail brownie_timeout_seconds
   local workspace_before workspace_after head_commit validation progress_summary progress_classification
   local release_contract_before release_contract_repair_output release_contract_repair_status
   local phase_value_manifest_before phase_value_manifest_repair_output phase_value_manifest_repair_status
   local workspace_status_before
-  local active_target_path active_target_snapshot active_target_syntax_output active_target_syntax_status
+  local active_target_path active_target_snapshot active_target_syntax_output active_target_syntax_status claim_snapshot_before_runtime
   local use_resume=0
   local CLAIM_CREATED_THIS_RUN=0
   local CLAIM_REPLACED_BLOCKED=0
@@ -12070,9 +13230,24 @@ _run_brownie_once() {
     return 78
   fi
 
+  if ! restore_terminal_failure_source_transition_obligation; then
+    detail="A durable terminal source-transition obligation could not be restored; refusing Runtime restart. marker=$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+    return 78
+  fi
+
   write_status "running" "Brownie run started at $started_at" "$run_stamp" "" "${CONSECUTIVE_FAILURES:-0}"
   git_workspace_status_snapshot > "$workspace_status_before"
   chmod 600 "$workspace_status_before" 2>/dev/null || true
+
+  # A completed claim can outlive queue removal while its tracked completion
+  # PR is pending. Publish it before the empty-queue stop gate so this retry
+  # cannot be mistaken for a fresh no-work run or invoke Runtime.
+  if completed_todo_pr_pending && ! completed_todo_cleanup_pending; then
+    publish_pending_completed_todo_pr "$run_stamp"
+    return $?
+  fi
 
   local todo_status
   stop_if_todo_empty "${CONSECUTIVE_FAILURES:-0}"
@@ -12205,6 +13380,82 @@ PY
     cd "$PHASE_LOOP_WORKSPACE_ROOT" && git rev-parse HEAD 2>/dev/null || true
   )"
   clear_inconsistent_repair_feedback_for_active_claim
+  if terminal_failure_recovery_pending; then
+    local deferred_terminal_recovery_output deferred_terminal_recovery_status
+    if deferred_terminal_recovery_output="$(retry_terminal_failure_recovery "$run_stamp" 2>&1)"; then
+      deferred_terminal_recovery_status=0
+    else
+      deferred_terminal_recovery_status=$?
+    fi
+    if [ "$deferred_terminal_recovery_status" -ne 0 ]; then
+      detail="A terminal runtime failure recovery transaction is still pending; keeping the claim recoverable without rerunning Runtime. recovery=$deferred_terminal_recovery_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+      printf '%s run=%s terminal_runtime_failure_recovery_retry_failed=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$deferred_terminal_recovery_output" >> "$SUPERVISOR_LOG"
+      return 78
+    fi
+    detail="A terminal runtime failure recovery transaction and source todo.failed transition were closed without rerunning Runtime. recovery=$deferred_terminal_recovery_output"
+    write_status "blocked" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
+    printf '%s run=%s terminal_runtime_failure_recovery_retry_succeeded=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$deferred_terminal_recovery_output" >> "$SUPERVISOR_LOG"
+    return 76
+  fi
+  if terminal_failure_source_transition_pending; then
+    local deferred_terminal_transition_output deferred_terminal_transition_status
+    if deferred_terminal_transition_output="$(retry_terminal_failure_source_transition "$run_stamp" 2>&1)"; then
+      deferred_terminal_transition_status=0
+    else
+      deferred_terminal_transition_status=$?
+    fi
+    if [ "$deferred_terminal_transition_status" -ne 0 ]; then
+      detail="A recovered terminal failure still needs its source todo.failed ledger transition; keeping the claim recoverable without rerunning Runtime. recovery=$deferred_terminal_transition_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+      printf '%s run=%s terminal_runtime_failure_source_transition_retry_failed=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$deferred_terminal_transition_output" >> "$SUPERVISOR_LOG"
+      return 78
+    fi
+    detail="A recovered terminal failure source todo.failed transition was closed without rerunning Runtime. recovery=$deferred_terminal_transition_output"
+    write_status "blocked" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
+    printf '%s run=%s terminal_runtime_failure_source_transition_retry_succeeded=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$deferred_terminal_transition_output" >> "$SUPERVISOR_LOG"
+    return 76
+  fi
+  if completed_todo_cleanup_pending; then
+    local completed_cleanup_output completed_cleanup_status
+    if completed_cleanup_output="$(remove_completed_todo_claim_from_queue "$run_stamp" 2>&1)"; then
+      completed_cleanup_status=0
+    else
+      completed_cleanup_status=$?
+    fi
+    if [ "$completed_cleanup_status" -ne 0 ]; then
+      if ! mark_completed_todo_cleanup_pending "$run_stamp"; then
+        detail="A previously completed TODO still needs queue-removal cleanup, but cleanup and its durable retry marker both failed; refusing Runtime restart. removal=$completed_cleanup_output"
+        write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s completed_todo_cleanup_retry_marker_failed=true removal=%s\n' "$(now_utc)" "$run_stamp" "$completed_cleanup_output" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      detail="A previously completed TODO still needs queue-removal cleanup, but cleanup failed; keeping the completed claim without rerunning Runtime. removal=$completed_cleanup_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+      printf '%s run=%s completed_todo_cleanup_retry_failed=true removal=%s\n' "$(now_utc)" "$run_stamp" "$completed_cleanup_output" >> "$SUPERVISOR_LOG"
+      return 78
+    fi
+    if [ "${PHASE_LOOP_TEST_INTERRUPT_AFTER_COMPLETED_TODO_REMOVAL:-0}" = "1" ]; then
+      detail="A previously completed TODO was removed from the queue, but cleanup was interrupted before its durable marker was cleared; refusing Runtime restart. removal=$completed_cleanup_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+      printf '%s run=%s completed_todo_cleanup_interrupted_after_removal=true removal=%s\n' "$(now_utc)" "$run_stamp" "$completed_cleanup_output" >> "$SUPERVISOR_LOG"
+      return 78
+    fi
+    clear_completed_todo_cleanup_pending "$run_stamp"
+    printf '%s run=%s completed_todo_cleanup_retry_succeeded=true removal=%s\n' "$(now_utc)" "$run_stamp" "$completed_cleanup_output" >> "$SUPERVISOR_LOG"
+    if completed_todo_pr_pending; then
+      publish_pending_completed_todo_pr "$run_stamp"
+      return $?
+    fi
+    if [ "$(todo_pending_count)" -eq 0 ]; then
+      stop_if_todo_empty "${CONSECUTIVE_FAILURES:-0}"
+      return $?
+    fi
+  fi
+  if completed_todo_pr_pending; then
+    publish_pending_completed_todo_pr "$run_stamp"
+    return $?
+  fi
   if phase_loop_should_resume_active_claim; then
     use_resume=1
   fi
@@ -12307,13 +13558,21 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"stably_blocked"}'
     return 0
   fi
+  # Capture the claim only after every stale-queue check and replacement has
+  # settled. If the runtime removes current.json, terminal recovery must use
+  # this replacement claim rather than the pre-replacement snapshot.
+  claim_snapshot_before_runtime="$RUN_DIR/$run_stamp.claim.before-runtime.json"
+  cp "$TODO_CLAIM_FILE" "$claim_snapshot_before_runtime"
+  chmod 600 "$claim_snapshot_before_runtime" 2>/dev/null || true
   active_target_path="$(active_claim_patch_only_target 2>/dev/null || true)"
-  if [ -z "${active_target_snapshot:-}" ] && [ -n "$active_target_path" ]; then
-    if [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
-      active_target_snapshot="$RUN_DIR/$run_stamp.target.before"
-      cp "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" "$active_target_snapshot"
-      chmod 600 "$active_target_snapshot" 2>/dev/null || true
-    fi
+  # Re-snapshot after claim replacement/refresh so recovery and target repair
+  # are bound to the live claim, TODO contract, and target selected for this
+  # runtime invocation.
+  active_target_snapshot=""
+  if [ -n "$active_target_path" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
+    active_target_snapshot="$RUN_DIR/$run_stamp.target.before"
+    cp "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" "$active_target_snapshot"
+    chmod 600 "$active_target_snapshot" 2>/dev/null || true
   fi
   local deterministic_todo_decomposition_output deterministic_todo_decomposition_status
   if deterministic_todo_decomposition_output="$(try_deterministic_todo_decomposition_repair "$run_stamp" 2>&1)"; then
@@ -12849,12 +14108,12 @@ PY
     printf '%s\n' "$pre_guard_exact_fast_path_output" > "$stdout_log"
     : > "$stderr_log"
     write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"exact_line"}'
+    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"exact_line_fast_path"}'
     remove_completed_todo_claim_from_queue "$run_stamp" >> "$SUPERVISOR_LOG"
     detail="Applied deterministic exact-line TODO fast path before guard checks: $pre_guard_exact_fast_path_output"
     write_status "last_run_succeeded" "$detail" "exact-line-$run_stamp" "0" "0"
     printf '%s run=%s exact_line_fast_path=true phase=pre_guard result=%s\n' "$(now_utc)" "exact-line-$run_stamp" "$pre_guard_exact_fast_path_output" >> "$SUPERVISOR_LOG"
-    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"exact_line"}'
-    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"exact_line_fast_path"}'
     phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
     return 0
   elif [ "$pre_guard_exact_fast_path_status" -eq 1 ]; then
@@ -12912,12 +14171,12 @@ PY
     printf '%s\n' "$exact_fast_path_output" > "$stdout_log"
     : > "$stderr_log"
     write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"exact_line"}'
+    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"exact_line_fast_path"}'
     remove_completed_todo_claim_from_queue "$run_stamp" >> "$SUPERVISOR_LOG"
     detail="Applied deterministic exact-line TODO fast path without LLM generation: $exact_fast_path_output"
     write_status "last_run_succeeded" "$detail" "exact-line-$run_stamp" "0" "0"
     printf '%s run=%s exact_line_fast_path=true result=%s\n' "$(now_utc)" "exact-line-$run_stamp" "$exact_fast_path_output" >> "$SUPERVISOR_LOG"
-    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"exact_line"}'
-    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"exact_line_fast_path"}'
     phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
     return 0
   elif [ "$exact_fast_path_status" -eq 1 ]; then
@@ -13401,19 +14660,58 @@ PY
         write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
         return 78
       fi
-      write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"objective_apply_verified"}'
-      if [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 1 ]; then
+      if ! record_completion_ledger_transition "$run_stamp" '{"completion":"objective_apply_verified"}'; then
         detail="Task ledger failed before objective-apply queue completion; leaving the claim in progress for retry. ${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL}"
         write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
         write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
         return 78
       fi
       write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
-      remove_completed_todo_claim_from_queue "$run_stamp" >> "$SUPERVISOR_LOG"
+      if ! mark_completed_todo_cleanup_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+        detail="Brownie applied the workspace patch and verification passed, but the durable cleanup/PR retry marker could not be saved before queue removal; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "$CONSECUTIVE_FAILURES"
+        printf '%s run=%s objective_apply_cleanup_marker_before_removal_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      local objective_completion_removal_output objective_completion_removal_status
+      if objective_completion_removal_output="$(remove_completed_todo_claim_from_queue "$run_stamp" 2>&1)"; then
+        objective_completion_removal_status=0
+      else
+        objective_completion_removal_status=$?
+      fi
+      if [ "$objective_completion_removal_status" -ne 0 ]; then
+        mark_completed_todo_cleanup_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
+        detail="Brownie applied the workspace patch and verification passed, but selected TODO removal failed; kept the completed claim for cleanup-only retry. removal=$objective_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s objective_apply_removal_failed=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$objective_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
       detail="Brownie applied a workspace patch and selected TODO verification passed; marked TODO completed. verification=$verification_completion stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
-      write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
-      printf '%s run=%s objective_apply_verified=true verification=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$verification_completion" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
-      phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
+      if ! phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+        if ! mark_completed_todo_pr_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+          detail="Brownie applied the workspace patch and verification passed, but PR publication failed and its durable retry marker could not be saved; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+          write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+          return 78
+        fi
+        detail="Brownie applied the workspace patch and verification passed, but publishing the tracked workspace progress as a PR failed; the TODO was already durably completed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s objective_apply_pr_failed=true completion_pr_pending=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      if completed_todo_pr_pending && ! clear_completed_todo_pr_pending "$run_stamp"; then
+        detail="Brownie completion PR was published, but its durable PR-pending marker could not be cleared; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "$CONSECUTIVE_FAILURES"
+        return 78
+      fi
+      if ! clear_completed_todo_cleanup_pending "$run_stamp"; then
+        detail="Brownie objective-apply completion and queue cleanup succeeded, but its durable cleanup marker could not be cleared; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "$CONSECUTIVE_FAILURES"
+        return 78
+      fi
+      if [ "$(status_field status 2>/dev/null || true)" != "pr_created" ]; then
+        write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
+      fi
+      printf '%s run=%s objective_apply_verified=true verification=%s removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$verification_completion" "$objective_completion_removal_output" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
       return 0
     else
       write_bdk_trajectory_event "$run_stamp" "verification.run" "$verification_completion"
@@ -13724,8 +15022,68 @@ except Exception:
 sys.exit(0 if payload.get("completed") is True or completed_by_no_actionable_after_apply else 1)
 PY
     then
+      if ! record_completion_ledger_transition "$run_stamp" '{"completion":"runtime_reported_completed"}'; then
+        detail="Brownie reported completion but the terminal ledger transition failed; keeping the TODO and claim in progress for retry. ${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL} stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+        write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s runtime_completion_ledger_failed=true detail=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$detail" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
       write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
-      remove_completed_todo_claim_from_queue "$run_stamp" >> "$SUPERVISOR_LOG"
+      if ! mark_completed_todo_cleanup_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+        detail="Brownie reported completion, but the durable cleanup/PR retry marker could not be saved before queue removal; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "$CONSECUTIVE_FAILURES"
+        printf '%s run=%s runtime_completion_cleanup_marker_before_removal_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      local runtime_completion_removal_output runtime_completion_removal_status
+      if runtime_completion_removal_output="$(remove_completed_todo_claim_from_queue "$run_stamp" 2>&1)"; then
+        runtime_completion_removal_status=0
+      else
+        runtime_completion_removal_status=$?
+      fi
+      if [ "$runtime_completion_removal_status" -ne 0 ]; then
+        if ! mark_completed_todo_cleanup_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+          detail="Brownie reported completion and queue cleanup failed, but the durable cleanup/PR retry marker could not be saved; refusing Runtime restart. removal=$runtime_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+          write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+          printf '%s run=%s runtime_completion_cleanup_marker_failed=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+          return 78
+        fi
+        detail="Brownie reported completion but selected TODO removal failed; kept the completed claim for cleanup-only retry. removal=$runtime_completion_removal_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s runtime_completion_removal_failed=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      detail="Brownie reported the selected TODO completed and its queue entry was removed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+      if ! phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+        if ! mark_completed_todo_pr_pending "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+          detail="Brownie reported the selected TODO completed, but PR publication failed and its durable retry marker could not be saved; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+          write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+          printf '%s run=%s runtime_completion_pr_marker_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+          return 78
+        fi
+        detail="Brownie reported the selected TODO completed, but publishing the tracked workspace progress as a PR failed; the TODO was already durably completed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s runtime_completion_pr_failed=true completion_pr_pending=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      if completed_todo_pr_pending && ! clear_completed_todo_pr_pending "$run_stamp"; then
+        detail="Brownie completion PR was published, but its durable PR-pending marker could not be cleared; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "$CONSECUTIVE_FAILURES"
+        printf '%s run=%s runtime_completion_pr_marker_clear_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      if ! clear_completed_todo_cleanup_pending "$run_stamp"; then
+        detail="Brownie completion PR/queue cleanup succeeded, but its durable cleanup marker could not be cleared; refusing Runtime restart. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "78" "$CONSECUTIVE_FAILURES"
+        printf '%s run=%s runtime_completion_cleanup_marker_clear_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 78
+      fi
+      if [ "$(status_field status 2>/dev/null || true)" != "pr_created" ]; then
+        write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
+      fi
+      printf '%s run=%s runtime_completion_recorded=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+      return 0
     elif python3 - "$stdout_log" <<'PY'
 import json, sys
 root = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -13797,6 +15155,62 @@ PY
     fi
 
     case "$progress_classification" in
+      terminal_failure)
+        local terminal_failure_recovery_output terminal_failure_recovery_status
+        if terminal_failure_recovery_output="$(record_terminal_failure_todo_claim "$run_stamp" "$PROGRESS_STATE_FILE" 2>&1)"; then
+          terminal_failure_recovery_status=0
+        else
+          terminal_failure_recovery_status=$?
+        fi
+        if active_todo_claim_exists; then
+          write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
+        fi
+        if [ "$terminal_failure_recovery_status" -ne 0 ]; then
+          write_status "blocked" "Terminal runtime failure could not be fully recorded; refusing to retry the selected TODO. ledger=${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL:-ledger transaction failed} recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+          return 78
+        fi
+        if [ "${PHASE_LOOP_TEST_KILL_AFTER_TERMINAL_RECOVERY:-0}" = "1" ]; then
+          kill -TERM "$$"
+        fi
+        local terminal_failure_recovery_id
+        terminal_failure_recovery_id="$(printf '%s' "$terminal_failure_recovery_output" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("recovery_id", ""))
+except Exception: print("")' 2>/dev/null || true)"
+        if active_todo_claim_exists; then
+          local final_source_transition_output final_source_transition_status
+          if final_source_transition_output="$(write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed" 2>&1)"; then
+            final_source_transition_status=0
+          else
+            final_source_transition_status=$?
+          fi
+          if [ "$final_source_transition_status" -ne 0 ] || [ "${PHASE_LOOP_TASK_LEDGER_FAILURE:-0}" -eq 1 ]; then
+            if ! mark_terminal_failure_source_transition_pending "$run_stamp" "$terminal_failure_recovery_id"; then
+              PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Final source todo.failed transition failed and its recoverable marker could not be saved. status=$final_source_transition_status output=${final_source_transition_output:-<no output>} recovery_id=$terminal_failure_recovery_id"
+            else
+              PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="Final source todo.failed transition failed after recovery and blocked evidence succeeded; source claim remains recoverable. status=$final_source_transition_status output=${final_source_transition_output:-<no output>} recovery_id=$terminal_failure_recovery_id"
+            fi
+            write_status "blocked" "Terminal runtime failure recovery is durable, but the final source todo.failed ledger transition failed; keeping the source claim recoverable. ledger=${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL:-ledger transition failed} recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+            printf '%s run=%s terminal_runtime_failure_source_transition_pending=true recovery=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$terminal_failure_recovery_output" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+            return 78
+          fi
+          if ! write_todo_claim "$(claim_field claim_id)" "failed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"; then
+            write_status "blocked" "Terminal runtime failure source transition succeeded, but failed claim state could not be persisted; keeping the source claim recoverable. recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+            return 78
+          fi
+          if ! clear_terminal_failure_source_transition_pending "$run_stamp"; then
+            write_status "blocked" "Terminal runtime failure source transition succeeded, but its durable obligation marker could not be cleared; keeping the source claim recoverable. recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
+            return 78
+          fi
+        else
+          if write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_terminal_failure","terminal_failure":true}' "todo.failed"; then
+            clear_terminal_failure_source_transition_pending "$run_stamp" || true
+          fi
+        fi
+        detail="Brownie reported terminal_task_failed with no_eligible_task; retired the selected claim and recorded durable blocked evidence without treating the product queue as complete. recovery=$terminal_failure_recovery_output stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"
+        printf '%s run=%s terminal_runtime_failure_recorded=true recovery=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$terminal_failure_recovery_output" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        return 76
+        ;;
       no_progress)
         recovery_hint="$(classify_no_progress_recovery "$stdout_log" "$stderr_log" "$PROGRESS_STATE_FILE")"
         if active_todo_claim_exists && python3 - "$PROGRESS_STATE_FILE" "$BDK_HARNESS_FEEDBACK_FILE" "$(claim_field claim_id)" <<'PY'
@@ -13993,6 +15407,13 @@ PY
 }
 
 run_brownie_once() {
+  # Validate the retry budget before clearing deferred signals or allowing
+  # any run/claim/status mutation.  An invalid cap must fail closed without
+  # creating an unbounded or partially durable retry attempt.
+  load_env
+  if ! validate_terminal_failure_retry_cap; then
+    return 78
+  fi
   PHASE_LOOP_TASK_LEDGER_FAILURE=0
   PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL=""
   rm -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE"
