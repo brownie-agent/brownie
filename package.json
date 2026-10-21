@@ -87,6 +87,7 @@
     "phase-loop:todo-state:test": "node --test scripts/phase-loop-todo-state.test.mjs",
     "phase-loop:task-ledger:test": "node --test scripts/phase-loop-task-ledger.test.mjs",
     "phase-loop:run-state:test": "node --test scripts/phase-loop-run-state.test.mjs",
+    "phase-loop:supervisor-ownership:test": "bash scripts/phase-loop-supervisor-ownership.test.sh",
     "phase-loop:watchdog:errexit:test": "bash scripts/phase-loop-watchdog-errexit.test.sh",
     "phase-loop:claim-lifecycle:test": "node --test scripts/phase-loop-claim-lifecycle.test.mjs",
     "phase-loop:delegation-admission:test": "node --test scripts/phase-loop-delegation-admission.test.mjs",
