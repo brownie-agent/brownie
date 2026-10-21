@@ -206,6 +206,25 @@ phase_loop_claim_smoke_exit_allowed() {
   return 1
 }
 
+phase_loop_claim_smoke_effective_batch_size() {
+  local shard="$1"
+  local requested_batch_size="$2"
+  local command_timeout_seconds="$3"
+  local cpu_count="${4:-0}"
+  case "$cpu_count" in
+    ''|*[!0-9]*) cpu_count=0 ;;
+  esac
+  if [ "$cpu_count" -le 4 ] && [ "$command_timeout_seconds" -le 90 ] && [ "$requested_batch_size" -gt 1 ]; then
+    case "$shard" in
+      queue|queue-claim|queue-recovery|queue-integrity)
+        printf '1\n'
+        return 0
+        ;;
+    esac
+  fi
+  printf '%s\n' "$requested_batch_size"
+}
+
 phase_loop_claim_smoke_write_audit_manifest() {
   local shard_dir="$1"
   local output_file="$2"
@@ -357,7 +376,7 @@ phase_loop_claim_smoke_run_scheduler() {
   local -a shards=("$@")
   local audit_file="$shard_dir/scheduler.audit.jsonl"
   local manifest_file="${PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT:-$shard_dir/claim-smoke-audit.json}"
-  local watchdog_pid
+  local watchdog_pid=""
   local scheduler_parent_pid="$$"
   local scheduler_timed_out=0
   local cleanup_running=0
@@ -381,6 +400,17 @@ phase_loop_claim_smoke_run_scheduler() {
   local effective_batch_size
   local batch_rationale
   local shard_cpu_count
+  local configured_watchdog_seconds="$watchdog_seconds"
+  local effective_watchdog_seconds
+  local required_watchdog_seconds
+  local planned_batches=0
+  local planned_shards="${#shards[@]}"
+  local planned_max_batch_size=0
+  local cleanup_margin_seconds
+  local plan_overhead_seconds
+  local plan_batch_sizes=""
+  local plan_index
+  local remaining_shards
   local index
   local i
   local -a active_pids=()
@@ -391,6 +421,36 @@ phase_loop_claim_smoke_run_scheduler() {
   local -a active_done=()
 
   mkdir -p "$shard_dir"
+
+  shard_cpu_count="${PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT:-unknown}"
+  plan_index=0
+  while [ "$plan_index" -lt "${#shards[@]}" ]; do
+    shard="${shards[$plan_index]}"
+    effective_batch_size="$(phase_loop_claim_smoke_effective_batch_size "$shard" "$batch_size" "$command_timeout_seconds" "${PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT:-0}")"
+    remaining_shards=$((${#shards[@]} - plan_index))
+    if [ "$effective_batch_size" -gt "$remaining_shards" ]; then
+      effective_batch_size="$remaining_shards"
+    fi
+    planned_batches=$((planned_batches + 1))
+    if [ "$effective_batch_size" -gt "$planned_max_batch_size" ]; then
+      planned_max_batch_size="$effective_batch_size"
+    fi
+    if [ -z "$plan_batch_sizes" ]; then
+      plan_batch_sizes="$effective_batch_size"
+    else
+      plan_batch_sizes="$plan_batch_sizes,$effective_batch_size"
+    fi
+    plan_index=$((plan_index + effective_batch_size))
+  done
+  cleanup_margin_seconds=$((3 * planned_max_batch_size + 5))
+  plan_overhead_seconds="$planned_batches"
+  required_watchdog_seconds=$((planned_batches * command_timeout_seconds + cleanup_margin_seconds + plan_overhead_seconds))
+  effective_watchdog_seconds="$configured_watchdog_seconds"
+  if [ "$effective_watchdog_seconds" -lt "$required_watchdog_seconds" ]; then
+    effective_watchdog_seconds="$required_watchdog_seconds"
+    echo "phase-loop claim smoke scheduler: configured watchdog=${configured_watchdog_seconds}s below computed minimum=${required_watchdog_seconds}s; using effective watchdog=${effective_watchdog_seconds}s" >&2
+  fi
+  phase_loop_claim_smoke_emit_audit_event "$audit_file" scheduler_plan "" "" "" planned "" "" "" "" "" "$PWD" "configured_watchdog_seconds=$configured_watchdog_seconds effective_watchdog_seconds=$effective_watchdog_seconds required_watchdog_seconds=$required_watchdog_seconds planned_shards=$planned_shards planned_batches=$planned_batches requested_batch_size=$batch_size effective_batch_sizes=$plan_batch_sizes command_timeout_seconds=$command_timeout_seconds cleanup_margin_seconds=$cleanup_margin_seconds plan_overhead_seconds=$plan_overhead_seconds cpu_count=$shard_cpu_count" none ""
 
   phase_loop_claim_smoke_cleanup() {
     local cleanup_status="$?"
@@ -430,8 +490,8 @@ phase_loop_claim_smoke_run_scheduler() {
   trap phase_loop_claim_smoke_cleanup EXIT
   trap phase_loop_claim_smoke_scheduler_signal TERM INT
   (
-    sleep "$watchdog_seconds"
-    phase_loop_claim_smoke_emit_audit_event "$audit_file" scheduler_timeout "" "" "" timed_out 124 "" "" "" "" "$PWD" "watchdog expired after ${watchdog_seconds}s"
+    sleep "$effective_watchdog_seconds"
+    phase_loop_claim_smoke_emit_audit_event "$audit_file" scheduler_timeout "" "" "" timed_out 124 "" "" "" "" "$PWD" "watchdog expired after effective=${effective_watchdog_seconds}s configured=${configured_watchdog_seconds}s required=${required_watchdog_seconds}s"
     kill -TERM "$scheduler_parent_pid" 2>/dev/null || true
   ) &
   watchdog_pid="$!"
@@ -446,20 +506,15 @@ phase_loop_claim_smoke_run_scheduler() {
     effective_batch_size="$batch_size"
     batch_rationale="configured_batch_size"
     shard_cpu_count="${PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT:-unknown}"
-    if [ "${PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT:-0}" -le 4 ] && \
-      [ "$command_timeout_seconds" -le 90 ] && \
-      case "${shards[$batch_start]:-}" in
-        queue|queue-claim|queue-recovery|queue-integrity) ;;
-        *) false ;;
-      esac && \
-      [ "$batch_size" -gt 1 ]; then
-      effective_batch_size=1
+    effective_batch_size="$(phase_loop_claim_smoke_effective_batch_size "${shards[$batch_start]:-}" "$batch_size" "$command_timeout_seconds" "${PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT:-0}")"
+    if [ "$effective_batch_size" -lt "$batch_size" ]; then
       batch_rationale="queue_serialized_for_low_cpu_90s_deadline"
     fi
     claim_smoke_batch_end=$((batch_start + effective_batch_size))
     if [ "$claim_smoke_batch_end" -gt "${#shards[@]}" ]; then
       claim_smoke_batch_end="${#shards[@]}"
     fi
+    effective_batch_size=$((claim_smoke_batch_end - batch_start))
     index="$batch_start"
     while [ "$index" -lt "$claim_smoke_batch_end" ]; do
       shard="${shards[$index]}"

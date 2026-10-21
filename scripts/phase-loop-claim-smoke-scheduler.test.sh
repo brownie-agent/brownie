@@ -64,7 +64,9 @@ import sys
 manifest = json.loads(open(sys.argv[1], encoding="utf-8").read())
 safe_globals = {"__builtins__": {}, "manifest": manifest, "len": len, "all": all, "any": any}
 safe_locals = {"manifest": manifest, "len": len, "all": all, "any": any}
-assert eval(sys.argv[2], safe_globals, safe_locals), sys.argv[2]
+expression = sys.argv[2]
+if not eval(expression, safe_globals, safe_locals):
+    raise AssertionError((expression, manifest))
 PY
 }
 
@@ -91,6 +93,7 @@ PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT=4 \
   2>"$fixture_root/capacity-driver.stderr"
 assert_json "$capacity_output" 'all(any(r.get("event") == "shard_started" and r.get("shard") == shard and "batch_size=1" in r.get("detail", "") and "batch_rationale=queue_serialized_for_low_cpu_90s_deadline" in r.get("detail", "") and "cpu_count=4" in r.get("detail", "") for r in manifest["records"]) for shard in ["queue-claim", "queue-recovery", "queue-integrity"])'
 assert_json "$capacity_output" 'any(r.get("event") == "shard_started" and r.get("shard") == "fast" and "batch_start=5" in r.get("detail", "") for r in manifest["records"])'
+assert_json "$capacity_output" 'any(r.get("event") == "scheduler_plan" and "configured_watchdog_seconds=10" in r.get("detail", "") and "effective_watchdog_seconds=466" in r.get("detail", "") and "required_watchdog_seconds=466" in r.get("detail", "") and "planned_batches=5" in r.get("detail", "") and "effective_batch_sizes=2,1,1,1,1" in r.get("detail", "") and "cleanup_margin_seconds=11" in r.get("detail", "") and "plan_overhead_seconds=5" in r.get("detail", "") and r.get("workspace_root") for r in manifest["records"])'
 
 expected_output="$fixture_root/expected-audit.json"
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$expected_output" \
@@ -121,10 +124,10 @@ PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$timeout_output" \
 timeout_status="$?"
 set -e
 [ "$timeout_status" -ne 0 ]
-grep -Fq '"event": "scheduler_timeout"' "$fixture_root/timeout-driver.stderr"
-assert_json "$timeout_output" 'manifest["scheduler_timed_out"] is True'
-assert_json "$timeout_output" 'any(r.get("event") == "scheduler_timeout" for r in manifest["records"])'
-assert_json "$timeout_output" 'any(r.get("event") == "shard_timeout" and r.get("shard") == "slow" and r.get("pid") and r.get("pgid") and r.get("stdout_tail") is not None and r.get("stderr_tail") is not None for r in manifest["records"])'
+assert_json "$timeout_output" 'manifest["scheduler_timed_out"] is False'
+assert_json "$timeout_output" 'any(r.get("event") == "scheduler_plan" and "configured_watchdog_seconds=2" in r.get("detail", "") and "effective_watchdog_seconds=22" in r.get("detail", "") and "required_watchdog_seconds=22" in r.get("detail", "") and "planned_batches=1" in r.get("detail", "") for r in manifest["records"])'
+assert_json "$timeout_output" 'any(r.get("event") == "command_timeout" and r.get("shard") == "slow" and r.get("exit_code") == 124 for r in manifest["records"])'
+assert_json "$timeout_output" 'any(r.get("event") == "shard_finished" and r.get("shard") == "slow" and r.get("exit_code") == 124 and r.get("status") == "failed" for r in manifest["records"])'
 assert_json "$timeout_output" 'any(r.get("event") == "shard_started" and r.get("shard") == "fast" for r in manifest["records"])'
 
 slow_child_pid="$(cat "$child_pid_file")"
