@@ -3,6 +3,10 @@ set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PHASE_LOOP_WORKSPACE_ROOT="${PHASE_LOOP_WORKSPACE_ROOT:-"$ROOT_DIR"}"
+PHASE_LOOP_STATE_DIR_FROM_PROCESS=0
+if [ -n "${PHASE_LOOP_STATE_DIR+x}" ]; then
+  PHASE_LOOP_STATE_DIR_FROM_PROCESS=1
+fi
 STATE_DIR="${PHASE_LOOP_STATE_DIR:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/phase-loop"}"
 RUN_DIR="$STATE_DIR/runs"
 LOG_DIR="$STATE_DIR/logs"
@@ -64,8 +68,11 @@ PHASE_LOOP_TODO_BREAKDOWN="${PHASE_LOOP_TODO_BREAKDOWN:-"$(dirname "$PHASE_LOOP_
 PHASE_LOOP_TODO_SNAPSHOT_SOURCE="${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}"
 PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-"$STATE_DIR/todo-snapshot-audits"}"
 PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-"$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/current.json"}"
-BROWNIE_BIN="${BROWNIE_BIN:-"$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"}"
-PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+PHASE_LOOP_BROWNIE_BIN_EXPLICIT=0
+if [ -n "${BROWNIE_BIN:-}" ]; then
+  PHASE_LOOP_BROWNIE_BIN_EXPLICIT=1
+fi
+PHASE_LOOP_DEFAULT_BROWNIE_BIN=""
 PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"
 PHASE_LOOP_BASE_COMMIT="${PHASE_LOOP_BASE_COMMIT:-}"
 PHASE_LOOP_EXPECTED_ACTOR="${PHASE_LOOP_EXPECTED_ACTOR:-brownie-agent}"
@@ -459,7 +466,7 @@ check_brownie_binary_freshness() {
   if [ "$PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK" = "1" ]; then
     return 0
   fi
-  if [ "$BROWNIE_BIN" != "$PHASE_LOOP_DEFAULT_BROWNIE_BIN" ]; then
+  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 1 ]; then
     return 0
   fi
   local runtime_bin
@@ -554,7 +561,7 @@ rebuild_brownie_binaries_for_freshness() {
   if [ "$PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK" = "1" ]; then
     return 0
   fi
-  if [ "$BROWNIE_BIN" != "$PHASE_LOOP_DEFAULT_BROWNIE_BIN" ]; then
+  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 1 ]; then
     return 1
   fi
   (
@@ -12602,6 +12609,7 @@ stop_if_todo_empty() {
 }
 
 load_env() {
+  local state_dir_before_env="${PHASE_LOOP_STATE_DIR:-$STATE_DIR}"
   PHASE_LOOP_ENV_SOURCES="process environment"
   set -a
   if [ -f "$ROOT_DIR/.test/brownie-loop.env" ]; then
@@ -12623,12 +12631,47 @@ load_env() {
     . "$ROOT_DIR/phase-loop.env"
     PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$ROOT_DIR/phase-loop.env"
   fi
+  if [ "$PHASE_LOOP_STATE_DIR_FROM_PROCESS" -eq 0 ] && [ "${PHASE_LOOP_STATE_DIR:-}" != "$state_dir_before_env" ]; then
+    PHASE_LOOP_STATE_DIR_FROM_PROCESS=1
+  fi
+  if [ "$PHASE_LOOP_STATE_DIR_FROM_PROCESS" -eq 0 ]; then
+    PHASE_LOOP_STATE_DIR="$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/phase-loop"
+  fi
+  STATE_DIR="${PHASE_LOOP_STATE_DIR:-$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/phase-loop}"
   if [ -f "$STATE_DIR/phase-loop.env" ]; then
     # shellcheck disable=SC1091
     . "$STATE_DIR/phase-loop.env"
     PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$STATE_DIR/phase-loop.env"
   fi
   set +a
+  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ] && [ -n "${BROWNIE_BIN:-}" ] && [ "$BROWNIE_BIN" != "$PHASE_LOOP_DEFAULT_BROWNIE_BIN" ]; then
+    PHASE_LOOP_BROWNIE_BIN_EXPLICIT=1
+  fi
+  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ]; then
+    BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+  fi
+  PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+  RUN_DIR="$STATE_DIR/runs"
+  LOG_DIR="$STATE_DIR/logs"
+  PID_FILE="$STATE_DIR/phase-loop.pid"
+  SUPERVISOR_OWNER_FILE="$STATE_DIR/phase-loop-owner.json"
+  LOCK_DIR="$STATE_DIR/phase-loop.lock"
+  STOP_FILE="$STATE_DIR/stop"
+  STATUS_FILE="$STATE_DIR/status.json"
+  SUPERVISOR_LOG="$LOG_DIR/supervisor.log"
+  TODO_CLAIM_DIR="$STATE_DIR/todo-claims"
+  TODO_CLAIM_FILE="$TODO_CLAIM_DIR/current.json"
+  TODO_QUEUE_STATE_FILE="$TODO_CLAIM_DIR/todo-queue-state.json"
+  TODO_BLOCKED_FILE="$TODO_CLAIM_DIR/blocked.jsonl"
+  TODO_REPAIR_FEEDBACK_FILE="$TODO_CLAIM_DIR/repair-feedback.json"
+  PROGRESS_STATE_FILE="$STATE_DIR/progress-state.json"
+  BDK_TRAJECTORY_DIR="$STATE_DIR/trajectories"
+  KNOWN_GOOD_DIR="$STATE_DIR/known-good-targets"
+  BDK_TRAJECTORY_FILE="${PHASE_LOOP_BDK_TRAJECTORY_FILE:-$STATE_DIR/bdk-trajectory.jsonl}"
+  BDK_HARNESS_FEEDBACK_FILE="$STATE_DIR/bdk-harness-feedback.json"
+  PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
+  LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
+  mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
   if [ -n "${BROWNIE_RUNTIME_PATH:-}" ]; then
     PHASE_LOOP_RUNTIME_PATH_SOURCE="explicit"
   else
