@@ -68,6 +68,31 @@ test('fails freshness when only the dependent release contract hash is stale', (
   );
 });
 
+test('source changes cannot leave a stale readiness audit in the checked-in tree', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-readiness-source-change-'));
+  const auditRelativePath = 'docs/architecture/runtime-release-readiness-audit.json';
+  const contractRelativePath = 'docs/architecture/runtime-release-contract.json';
+  const sourcePath = path.join(repoRoot, 'crates/brownie-runtime/src/lib.rs');
+  const auditPath = path.join(repoRoot, auditRelativePath);
+  const contractPath = path.join(repoRoot, contractRelativePath);
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+  fs.mkdirSync(path.dirname(auditPath), { recursive: true });
+  fs.writeFileSync(sourcePath, 'initial safety source\n');
+  fs.writeFileSync(auditPath, JSON.stringify({ safety_readiness_evidence_invalidation: { status: 'implemented_sufficient' } }, null, 2) + '\n');
+  fs.writeFileSync(contractPath, JSON.stringify({ commit_trace: {} }, null, 2) + '\n');
+  spawnSync('git', ['init', '-q', repoRoot], { encoding: 'utf8' });
+  spawnSync('git', ['-C', repoRoot, 'add', 'crates/brownie-runtime/src/lib.rs'], { encoding: 'utf8' });
+  syncRuntimeReleaseReadinessAudit(repoRoot);
+  fs.writeFileSync(sourcePath, 'changed safety source\n');
+  assert.throws(() => syncRuntimeReleaseReadinessAudit(repoRoot, { check: true }), /runtime-release-readiness-audit\.json/u);
+  const unrelated = path.join(repoRoot, 'docs/unrelated.md');
+  fs.mkdirSync(path.dirname(unrelated), { recursive: true });
+  fs.writeFileSync(unrelated, 'must not be generated\n');
+  syncRuntimeReleaseReadinessAudit(repoRoot);
+  assert.equal(fs.existsSync(unrelated), true);
+  assert.equal(syncRuntimeReleaseReadinessAudit(repoRoot, { check: true }).changed, false);
+});
+
 test('CI checks readiness freshness before Rust setup in every cargo job', () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const workflow = fs.readFileSync(path.join(repoRoot, '.github/workflows/ci.yml'), 'utf8');

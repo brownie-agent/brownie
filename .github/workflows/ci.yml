@@ -21,6 +21,8 @@ jobs:
         env:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.name }}
         run: |
           case "$PR_HEAD_REF" in
             brownie-agent/*|phase-loop/*) ;;
@@ -28,6 +30,10 @@ jobs:
           esac
           if [ "$PR_AUTHOR" != "brownie-agent" ]; then
             echo "Implementation pull-request author guard failed: expected brownie-agent, got $PR_AUTHOR" >&2
+            exit 1
+          fi
+          if [ "$PR_HEAD_OWNER" != "brownie-agent" ] || [ "$PR_HEAD_REPO" != "brownie" ]; then
+            echo "Implementation pull-request admission failed: expected head brownie-agent/brownie, got $PR_HEAD_OWNER/$PR_HEAD_REPO" >&2
             exit 1
           fi
           echo "Implementation pull-request author guard passed for $PR_HEAD_REF."

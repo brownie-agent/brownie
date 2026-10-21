@@ -6,14 +6,21 @@ import test from 'node:test';
 
 import { readPullRequestEvent, validateImplementationPullRequest } from './phase-loop-pr-author-guard.mjs';
 
-test('accepts brownie-agent implementation pull requests', () => {
-  assert.deepEqual(validateImplementationPullRequest({ author: 'brownie-agent', headRef: 'brownie-agent/fix' }), []);
+test('accepts brownie-agent implementation pull requests from the brownie-agent fork', () => {
+  assert.deepEqual(validateImplementationPullRequest({ author: 'brownie-agent', headRef: 'brownie-agent/fix', headRepoOwner: 'brownie-agent', headRepoName: 'brownie' }), []);
 });
 
 test('rejects a globalpocket-authored implementation pull request', () => {
   assert.deepEqual(
-    validateImplementationPullRequest({ author: 'globalpocket', headRef: 'brownie-agent/fix' }),
+    validateImplementationPullRequest({ author: 'globalpocket', headRef: 'brownie-agent/fix', headRepoOwner: 'brownie-agent', headRepoName: 'brownie' }),
     ['implementation pull requests on brownie-agent/fix require author brownie-agent; got globalpocket.']
+  );
+});
+
+test('rejects an implementation branch whose head is in the base repository', () => {
+  assert.deepEqual(
+    validateImplementationPullRequest({ author: 'brownie-agent', headRef: 'brownie-agent/fix', headRepoOwner: 'globalpocket', headRepoName: 'brownie' }),
+    ['implementation pull requests on brownie-agent/fix must originate from the brownie-agent fork; head repository owner was globalpocket.']
   );
 });
 

@@ -7,8 +7,11 @@ export const implementationBranchPrefixes = Object.freeze(['brownie-agent/', 'ph
 export function validateImplementationPullRequest({
   author,
   headRef,
+  headRepoOwner,
+  headRepoName,
   expectedActor = 'brownie-agent',
-  branchPrefixes = implementationBranchPrefixes
+  branchPrefixes = implementationBranchPrefixes,
+  expectedRepoName = 'brownie'
 } = {}) {
   const normalizedHeadRef = typeof headRef === 'string' ? headRef.trim() : '';
   if (!branchPrefixes.some((prefix) => normalizedHeadRef.startsWith(prefix))) return [];
@@ -19,6 +22,14 @@ export function validateImplementationPullRequest({
   }
   if (normalizedAuthor !== expectedActor) {
     return [`implementation pull requests on ${normalizedHeadRef} require author ${expectedActor}; got ${normalizedAuthor}.`];
+  }
+  const normalizedOwner = typeof headRepoOwner === 'string' ? headRepoOwner.trim() : '';
+  if (normalizedOwner !== expectedActor) {
+    return [`implementation pull requests on ${normalizedHeadRef} must originate from the ${expectedActor} fork; head repository owner was ${normalizedOwner || '(unknown)'}.`];
+  }
+  const normalizedRepo = typeof headRepoName === 'string' ? headRepoName.trim().replace(/\.git$/u, '') : '';
+  if (normalizedRepo !== expectedRepoName) {
+    return [`implementation pull requests on ${normalizedHeadRef} must originate from ${expectedActor}/${expectedRepoName}; head repository was ${normalizedOwner || '(unknown)'}/${normalizedRepo || '(unknown)'}.`];
   }
   return [];
 }
@@ -31,7 +42,9 @@ export function readPullRequestEvent(eventPath) {
     }
     return {
       author: event?.pull_request?.user?.login ?? '',
-      headRef: event?.pull_request?.head?.ref ?? ''
+      headRef: event?.pull_request?.head?.ref ?? '',
+      headRepoOwner: event?.pull_request?.head?.repo?.owner?.login ?? '',
+      headRepoName: event?.pull_request?.head?.repo?.name ?? ''
     };
   } catch (error) {
     return { author: '', headRef: '', error: error.message };

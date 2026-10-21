@@ -13,6 +13,8 @@ function baseEnvironment() {
   const environment = { ...process.env };
   delete environment.BROWNIE_BIN;
   delete environment.BROWNIE_RUNTIME_PATH;
+  delete environment.PHASE_LOOP_WORKSPACE_ROOT;
+  delete environment.PHASE_LOOP_STATE_DIR;
   delete environment.PHASE_LOOP_TODO;
   delete environment.PHASE_LOOP_TODO_BREAKDOWN;
   return environment;
@@ -31,6 +33,20 @@ function executableFixture(directory, name) {
   fs.writeFileSync(filePath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   fs.chmodSync(filePath, 0o755);
   return filePath;
+}
+
+function externalControllerFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-external-control-plane-'));
+  const controllerRoot = path.join(root, 'control-plane');
+  const workspaceRoot = path.join(root, 'workspace');
+  const stateRoot = path.join(root, 'isolated-state');
+  fs.mkdirSync(controllerRoot);
+  fs.mkdirSync(workspaceRoot);
+  fs.mkdirSync(stateRoot);
+  const controller = path.join(controllerRoot, 'phase-loop.sh');
+  fs.copyFileSync(controllerPath, controller);
+  fs.chmodSync(controller, 0o755);
+  return { root, controller, controllerRoot, workspaceRoot, stateRoot };
 }
 
 test('loads env files only after ROOT_DIR is established', () => {
@@ -63,6 +79,138 @@ test('accepts explicit absolute executable paths', () => {
     });
   } finally {
     fs.rmSync(fixtureDirectory, { recursive: true, force: true });
+  }
+});
+
+test('resolves default CLI from the selected workspace for an external control plane', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const workspaceBinDirectory = path.join(fixture.workspaceRoot, 'target', 'debug');
+    fs.mkdirSync(workspaceBinDirectory, { recursive: true });
+    executableFixture(workspaceBinDirectory, 'brownie');
+    executableFixture(workspaceBinDirectory, 'brownie-runtime');
+    const result = spawnSync('bash', [fixture.controller, 'check-runtime-bootstrap'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      code: 'phase_loop_bootstrap_ready'
+    });
+    assert.equal(fs.existsSync(path.join(fixture.controllerRoot, '.brownie')), false);
+    assert.equal(fs.existsSync(path.join(fixture.stateRoot, 'logs')), true);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('derives the default CLI from a workspace selected by controller phase-loop.env', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const workspaceBinDirectory = path.join(fixture.workspaceRoot, 'target', 'debug');
+    fs.mkdirSync(workspaceBinDirectory, { recursive: true });
+    executableFixture(workspaceBinDirectory, 'brownie');
+    executableFixture(workspaceBinDirectory, 'brownie-runtime');
+    fs.writeFileSync(path.join(fixture.controllerRoot, 'phase-loop.env'), `PHASE_LOOP_WORKSPACE_ROOT=${fixture.workspaceRoot}\n`);
+    const result = spawnSync('bash', [fixture.controller, 'check-runtime-bootstrap'], {
+      cwd: fixture.controllerRoot,
+      env: baseEnvironment(),
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      code: 'phase_loop_bootstrap_ready'
+    });
+    assert.equal(fs.existsSync(path.join(fixture.workspaceRoot, '.brownie', 'private', 'phase-loop', 'logs')), true);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('derives the default CLI from a workspace selected by state phase-loop.env', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const workspaceBinDirectory = path.join(fixture.workspaceRoot, 'target', 'debug');
+    fs.mkdirSync(workspaceBinDirectory, { recursive: true });
+    executableFixture(workspaceBinDirectory, 'brownie');
+    executableFixture(workspaceBinDirectory, 'brownie-runtime');
+    const initialStateDirectory = path.join(fixture.controllerRoot, '.brownie', 'private', 'phase-loop');
+    fs.mkdirSync(initialStateDirectory, { recursive: true });
+    fs.writeFileSync(path.join(initialStateDirectory, 'phase-loop.env'), `PHASE_LOOP_WORKSPACE_ROOT=${fixture.workspaceRoot}\n`);
+    const result = spawnSync('bash', [fixture.controller, 'check-runtime-bootstrap'], {
+      cwd: fixture.controllerRoot,
+      env: baseEnvironment(),
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      code: 'phase_loop_bootstrap_ready'
+    });
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('fails closed when an external control plane has no workspace default CLI', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const result = spawnSync('bash', [fixture.controller, 'check-runtime-bootstrap'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 78, result.stderr);
+    const diagnostic = JSON.parse(result.stdout);
+    assert.equal(diagnostic.code, 'phase_loop_bootstrap_unavailable');
+    const resolvedWorkspaceRoot = fs.realpathSync(fixture.workspaceRoot);
+    assert.deepEqual(diagnostic.missing_binaries, [{
+      configured_path: path.join(fixture.workspaceRoot, 'target', 'debug', 'brownie'),
+      name: 'BROWNIE_BIN',
+      reason: 'missing',
+      resolved_path: path.join(resolvedWorkspaceRoot, 'target', 'debug', 'brownie')
+    }]);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('keeps explicit binary overrides authoritative with an external control plane', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const overrideDirectory = path.join(fixture.root, 'overrides');
+    fs.mkdirSync(overrideDirectory);
+    const cli = executableFixture(overrideDirectory, 'brownie');
+    const runtime = executableFixture(overrideDirectory, 'brownie-runtime');
+    const result = spawnSync('bash', [fixture.controller, 'check-runtime-bootstrap'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot,
+        BROWNIE_BIN: cli,
+        BROWNIE_RUNTIME_PATH: runtime
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      code: 'phase_loop_bootstrap_ready'
+    });
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
   }
 });
 
@@ -193,5 +341,47 @@ test('rejects a path expanded while phase-loop.env was sourced before ROOT_DIR e
     });
   } finally {
     fs.rmSync(fixtureDirectory, { recursive: true, force: true });
+  }
+});
+
+test('does not skip freshness checks for a default binary under a symlinked workspace', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const realWorkspace = path.join(fixture.root, 'real-workspace');
+    const linkedWorkspace = path.join(fixture.root, 'linked-workspace');
+    const sourceDirectory = path.join(realWorkspace, 'crates', 'brownie-cli', 'src');
+    const binaryDirectory = path.join(realWorkspace, 'target', 'debug');
+    fs.mkdirSync(sourceDirectory, { recursive: true });
+    fs.mkdirSync(binaryDirectory, { recursive: true });
+    fs.writeFileSync(path.join(realWorkspace, 'Cargo.toml'), '[workspace]\nmembers = []\n');
+    fs.writeFileSync(path.join(realWorkspace, 'Cargo.lock'), '# fixture\n');
+    fs.writeFileSync(path.join(realWorkspace, 'crates', 'brownie-cli', 'Cargo.toml'), '[package]\nname = "brownie-cli"\nversion = "0.0.0"\n');
+    fs.writeFileSync(path.join(sourceDirectory, 'lib.rs'), 'pub fn fixture() {}\n');
+    executableFixture(binaryDirectory, 'brownie');
+    executableFixture(binaryDirectory, 'brownie-runtime');
+    fs.symlinkSync(realWorkspace, linkedWorkspace, 'dir');
+    spawnSync('git', ['init'], { cwd: realWorkspace, stdio: 'ignore' });
+    spawnSync('git', ['config', 'user.name', 'test'], { cwd: realWorkspace, stdio: 'ignore' });
+    spawnSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: realWorkspace, stdio: 'ignore' });
+    spawnSync('git', ['add', '.'], { cwd: realWorkspace, stdio: 'ignore' });
+    spawnSync('git', ['commit', '-m', 'fixture'], { cwd: realWorkspace, stdio: 'ignore' });
+    const oldTime = new Date(Date.now() - 10_000);
+    const newTime = new Date(Date.now() + 10_000);
+    fs.utimesSync(path.join(binaryDirectory, 'brownie'), oldTime, oldTime);
+    fs.utimesSync(path.join(binaryDirectory, 'brownie-runtime'), oldTime, oldTime);
+    fs.utimesSync(path.join(sourceDirectory, 'lib.rs'), newTime, newTime);
+    const result = spawnSync('bash', [fixture.controller, 'check-binary-freshness'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: linkedWorkspace,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stdout, /binary freshness check failed/u);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
   }
 });
