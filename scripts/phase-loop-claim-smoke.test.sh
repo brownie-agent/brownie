@@ -252,14 +252,37 @@ run_with_timeout() {
   local original_brownie="${BROWNIE_BIN:-}"
   local attested_brownie=""
   local node_bin="$(command -v node)"
-  if [ -n "$original_brownie" ] && [ -x "$original_brownie" ] && printf '%s\n' "$*" | grep -Fq "$PHASE_LOOP"; then
+  if [ -n "$original_brownie" ] && [ -x "$original_brownie" ] &&
+    [ -z "${PHASE_LOOP_TEST_CHILD_PID_FILE:-}" ] &&
+    printf '%s\n' "$*" | grep -Fq "$PHASE_LOOP"; then
     attested_brownie="$(mktemp)"
     cat > "$attested_brownie" <<SH
 #!/usr/bin/env bash
 set +e
 output_file=\$(mktemp)
-"$original_brownie" "\$@" >"\$output_file"
+child_pid=""
+terminate_child_tree() {
+  local pid="\$1"
+  local child
+  for child in \$(pgrep -P "\$pid" 2>/dev/null || true); do
+    terminate_child_tree "\$child"
+  done
+  kill -TERM "\$pid" 2>/dev/null || true
+}
+cleanup_child() {
+  if [ -n "\$child_pid" ] && kill -0 "\$child_pid" 2>/dev/null; then
+    terminate_child_tree "\$child_pid"
+    sleep 1
+    terminate_child_tree "\$child_pid"
+  fi
+}
+trap cleanup_child TERM INT
+"$original_brownie" "\$@" >"\$output_file" &
+child_pid=\$!
+wait "\$child_pid"
 original_status=\$?
+child_pid=""
+trap - TERM INT
 set -e
 "$node_bin" - "\$output_file" "\${BROWNIE_PHASE_LOOP_CLAIM_ID:-}" <<'NODE'
 const fs = require('node:fs');
