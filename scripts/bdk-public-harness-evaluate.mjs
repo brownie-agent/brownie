@@ -167,13 +167,15 @@ export function evaluateBdkPublicHarnessTrajectory(records, { allowPartial = fal
         repair_hint: 'A single claim/run trajectory must finish with one terminal event.'
       });
     }
-    const actionableTerminalEvents = terminalEvents.filter((type) => actionableTerminalEventTypes.has(type));
+    const actionableTerminalEvents = events.filter((event) => actionableTerminalEventTypes.has(event.type)
+      && event.payload?.continuation_required !== true
+      && event.payload?.owner_blocked !== true);
     if (actionableTerminalEvents.length > 0) {
       failures.push({
         class: 'actionable_terminal_event',
         run_claim: key,
-        actual: actionableTerminalEvents,
-        repair_hint: 'Treat todo.replanned and todo.blocked as repair-required outcomes. Feed their reason back into the next bounded run instead of considering the harness trajectory healthy.'
+        actual: actionableTerminalEvents.map((event) => event.type),
+        repair_hint: 'Repair-required terminal events must declare continuation_required=true or owner_blocked=true; they must never be interpreted as completion.'
       });
     }
     for (const event of events) {

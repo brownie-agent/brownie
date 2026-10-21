@@ -54,6 +54,26 @@ test('rejects actionable terminal events as repair-required outcomes', () => {
   assert(result.failures.some((failure) => failure.class === 'actionable_terminal_event'));
 });
 
+test('accepts a replanned event only when it carries bounded continuation', () => {
+  const result = evaluateBdkPublicHarnessTrajectory([
+    record('todo.claimed'),
+    record('workflow.routed'),
+    record('skill.selected'),
+    record('todo.replanned', { continuation_required: true, recovery_scope: 'selected_claim' })
+  ]);
+  assert.equal(result.ok, true);
+});
+
+test('accepts an owner-blocked event without treating it as completion', () => {
+  const result = evaluateBdkPublicHarnessTrajectory([
+    record('todo.claimed'),
+    record('workflow.routed'),
+    record('skill.selected'),
+    record('todo.blocked', { owner_blocked: true, reason: 'explicit_blocker' })
+  ]);
+  assert.equal(result.ok, true);
+});
+
 test('accepts a repair-feedback-only trajectory in partial mode', () => {
   const result = evaluateBdkPublicHarnessTrajectory([
     record('todo.claimed'),

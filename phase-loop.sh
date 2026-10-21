@@ -215,6 +215,36 @@ except Exception:
 if not isinstance(payload, dict):
     payload = {"value": payload}
 
+# Repair-required terminal events are never implicit completion. Carry the
+# controller's next obligation in every public event so the harness can tell a
+# bounded continuation from an owner-controlled stop.
+if event_type == "todo.replanned":
+    payload.setdefault("continuation_required", True)
+    payload.setdefault("recovery_scope", "selected_claim")
+elif event_type == "todo.blocked":
+    reason = str(payload.get("reason") or "")
+    if reason == "explicit_blocker":
+        payload.setdefault("owner_blocked", True)
+    else:
+        payload.setdefault("continuation_required", True)
+
+# The public trajectory is a bounded observability contract. Keep the exact
+# payload for the private task ledger below, but remove machine/user paths from
+# the copy published to the harness. In particular, verification command
+# results often include the absolute cwd even when the command itself is safe.
+absolute_path = re.compile(r"(?:/Users/[^\s'\"]+|/home/[^\s'\"]+|[A-Za-z]:[/\\]Users[/\\][^\s'\"]+)", re.IGNORECASE)
+def public_value(value, key=""):
+    if isinstance(value, str):
+        if key == "command" or key.endswith("_command") or "command" in key or key in {"stdout", "stderr", "path", "cwd"}:
+            return absolute_path.sub("<workspace-path>", value)
+        return absolute_path.sub("<user-path>", value)
+    if isinstance(value, list):
+        return [public_value(item, key) for item in value]
+    if isinstance(value, dict):
+        return {name: public_value(child, name) for name, child in value.items()}
+    return value
+public_payload = public_value(payload)
+
 record = {
     "schema_version": 1,
     "run_id": run_id,
@@ -225,7 +255,7 @@ record = {
             "at": timestamp,
             "todo_id": todo_id,
             "claim_id": claim_id,
-            "payload": payload,
+            "payload": public_payload,
         }
     ],
 }
@@ -13799,7 +13829,7 @@ _run_brownie_once() {
   local release_contract_before release_contract_repair_output release_contract_repair_status
   local phase_value_manifest_before phase_value_manifest_repair_output phase_value_manifest_repair_status
   local workspace_status_before
-  local active_target_path active_target_snapshot active_target_syntax_output active_target_syntax_status claim_snapshot_before_runtime delegated_scope_backup delegated_scope_output delegated_scope_status
+  local active_target_path active_target_snapshot active_target_syntax_output active_target_syntax_status claim_snapshot_before_runtime runtime_admission_snapshot runtime_admission_validation runtime_admission_status delegated_scope_backup delegated_scope_output delegated_scope_status
   local use_resume=0
   local CLAIM_CREATED_THIS_RUN=0
   local CLAIM_REPLACED_BLOCKED=0
@@ -14205,6 +14235,15 @@ PY
   claim_snapshot_before_runtime="$RUN_DIR/$run_stamp.claim.before-runtime.json"
   cp "$TODO_CLAIM_FILE" "$claim_snapshot_before_runtime"
   chmod 600 "$claim_snapshot_before_runtime" 2>/dev/null || true
+  runtime_admission_snapshot="$RUN_DIR/$run_stamp.runtime-admission.json"
+  if ! node "$ROOT_DIR/scripts/phase-loop-runtime-admission.mjs" create \
+      "$runtime_admission_snapshot" "$claim_snapshot_before_runtime" "$run_stamp" >/dev/null 2>&1; then
+    detail="Unable to bind the selected claim/task snapshot for Runtime admission; refusing dispatch. admission=$runtime_admission_snapshot"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_admission_binding_failed","owner_blocked":true}'
+    return 78
+  fi
   delegated_scope_backup="$RUN_DIR/$run_stamp.delegated-scope"
   if ! node "$ROOT_DIR/scripts/phase-loop-delegated-scope.mjs" \
       --capture 1 \
@@ -14843,6 +14882,8 @@ PY
     export BROWNIE_WORKSPACE_ROOT="${BROWNIE_WORKSPACE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"
     export BROWNIE_STORE_ROOT="${BROWNIE_STORE_ROOT:-"$PHASE_LOOP_BROWNIE_STORE_ROOT"}"
     export PHASE_LOOP_CONTROL_ROOT
+    export BROWNIE_PHASE_LOOP_ADMISSION_FILE="$runtime_admission_snapshot"
+    export BROWNIE_PHASE_LOOP_CLAIM_ID="$(claim_field claim_id)"
     if [ "$use_resume" -ne 1 ]; then
       apply_phase_loop_llm_route "$effective_prompt"
     fi
@@ -14858,6 +14899,20 @@ PY
     fi
   ) > "$stdout_log" 2> "$stderr_log"
   exit_code=$?
+  if runtime_admission_validation="$(node "$ROOT_DIR/scripts/phase-loop-runtime-admission.mjs" validate "$runtime_admission_snapshot" "$stdout_log" 2>&1)"; then
+    runtime_admission_status=0
+  else
+    runtime_admission_status=$?
+  fi
+  if [ "$runtime_admission_status" -ne 0 ]; then
+    write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
+    write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    detail="Runtime did not admit the claimed task before execution; preserved the claim for bounded snapshot-mismatch recovery. admission=$runtime_admission_validation stdout=$stdout_log stderr=$stderr_log"
+    write_status "no_progress" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
+    printf '%s run=%s runtime_admission_recovery_required=true admission=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_stamp" "$runtime_admission_validation" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+    write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"runtime_admission_snapshot_mismatch","continuation_required":true,"recovery_scope":"selected_claim","owner_blocked":false}'
+    return 76
+  fi
   bind_runtime_stdout_to_active_claim "$stdout_log"
   set +e
   delegated_scope_output="$(node "$ROOT_DIR/scripts/phase-loop-delegated-scope.mjs" \
