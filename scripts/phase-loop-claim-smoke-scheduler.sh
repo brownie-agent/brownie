@@ -91,8 +91,10 @@ phase_loop_claim_smoke_append_audit_event() {
   local state_root="${11}"
   local workspace_root="${12}"
   local detail="${13}"
+  local expected_exit_codes="${14:-0}"
+  local accepted="${15:-}"
   mkdir -p "$(dirname "$audit_file")"
-  python3 - "$audit_file" "$event" "$shard" "$pid" "$pgid" "$status" "$exit_code" "$stdout_path" "$stderr_path" "$control_root" "$state_root" "$workspace_root" "$detail" <<'PY'
+  python3 - "$audit_file" "$event" "$shard" "$pid" "$pgid" "$status" "$exit_code" "$stdout_path" "$stderr_path" "$control_root" "$state_root" "$workspace_root" "$detail" "$expected_exit_codes" "$accepted" <<'PY'
 import json
 import pathlib
 import sys
@@ -112,6 +114,8 @@ from datetime import datetime, timezone
     state_root,
     workspace_root,
     detail,
+    expected_exit_codes,
+    accepted,
 ) = sys.argv[1:]
 
 def optional(value):
@@ -132,6 +136,8 @@ record = {
     "state_root": optional(state_root),
     "workspace_root": optional(workspace_root),
     "detail": optional(detail),
+    "expected_exit_codes": [int(code) for code in expected_exit_codes.split(",") if code.strip().lstrip("-").isdigit()],
+    "accepted": True if accepted == "true" else False if accepted == "false" else None,
 }
 with pathlib.Path(audit_file).open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -143,6 +149,47 @@ phase_loop_claim_smoke_emit_audit_event() {
   shift
   phase_loop_claim_smoke_append_audit_event "$audit_file" "$@"
   tail -n 1 "$audit_file" >&2 || true
+}
+
+phase_loop_claim_smoke_expected_exit_codes() {
+  local shard="$1"
+  local contract="${2:-}"
+  local entry
+  local name
+  local codes
+  local -a entries=()
+  if [ -n "$contract" ]; then
+    IFS=';' read -r -a entries <<< "$contract"
+  fi
+  if [ -n "$contract" ]; then
+    for entry in "${entries[@]}"; do
+      name="${entry%%=*}"
+      codes="${entry#*=}"
+      if [ "$name" = "$shard" ] && [ "$entry" != "$name" ]; then
+        printf '%s\n' "$codes"
+        return 0
+      fi
+    done
+  fi
+  printf '%s\n' 0
+}
+
+phase_loop_claim_smoke_exit_allowed() {
+  local actual="$1"
+  local expected="$2"
+  local code
+  local -a expected_codes=()
+  if [ -n "$expected" ]; then
+    IFS=',' read -r -a expected_codes <<< "$expected"
+  fi
+  if [ -n "$expected" ]; then
+    for code in "${expected_codes[@]}"; do
+      if [ "$actual" = "$code" ]; then
+        return 0
+      fi
+    done
+  fi
+  return 1
 }
 
 phase_loop_claim_smoke_write_audit_manifest() {
@@ -290,7 +337,8 @@ phase_loop_claim_smoke_run_scheduler() {
   local script_path="$2"
   local batch_size="$3"
   local watchdog_seconds="$4"
-  shift 4
+  local expected_exit_contract="$5"
+  shift 5
   local -a shards=("$@")
   local audit_file="$shard_dir/scheduler.audit.jsonl"
   local manifest_file="${PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT:-$shard_dir/claim-smoke-audit.json}"
@@ -308,6 +356,8 @@ phase_loop_claim_smoke_run_scheduler() {
   local pid
   local pgid
   local status
+  local expected_exit_codes
+  local accepted
   local index
   local i
   local -a active_pids=()
@@ -382,10 +432,11 @@ phase_loop_claim_smoke_run_scheduler() {
       phase_loop_claim_smoke_start_process_group "$BASH" "$script_path" >"$stdout_log" 2>"$stderr_log"
       pid="$PHASE_LOOP_CLAIM_SMOKE_LAST_PID"
       pgid="$PHASE_LOOP_CLAIM_SMOKE_LAST_PGID"
+      expected_exit_codes="$(phase_loop_claim_smoke_expected_exit_codes "$shard" "$expected_exit_contract")"
       active_pids+=("$pid")
       active_pgids+=("$pgid")
       active_shards+=("$shard")
-      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start"
+      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" ""
       index=$((index + 1))
     done
     for ((i = 0; i < ${#active_pids[@]}; i += 1)); do
@@ -397,13 +448,19 @@ phase_loop_claim_smoke_run_scheduler() {
         status="$?"
       fi
       pgid="${active_pgids[$i]}"
+      expected_exit_codes="$(phase_loop_claim_smoke_expected_exit_codes "$shard" "$expected_exit_contract")"
+      if phase_loop_claim_smoke_exit_allowed "$status" "$expected_exit_codes"; then
+        accepted=true
+      else
+        accepted=false
+      fi
       if phase_loop_claim_smoke_group_has_live_members "$pgid"; then
         phase_loop_claim_smoke_terminate_process_group "$pid" 3 "$pgid"
       fi
-      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_finished "$shard" "$pid" "$pgid" "$([ "$status" -eq 0 ] && echo passed || echo failed)" "$status" "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" ""
-      if [ "$status" -ne 0 ]; then
+      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_finished "$shard" "$pid" "$pgid" "$([ "$accepted" = true ] && echo passed || echo failed)" "$status" "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" "expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" "$accepted"
+      if [ "$accepted" != true ]; then
         claim_smoke_failed=1
-        echo "phase-loop claim smoke shard failed: $shard exit=$status" >&2
+        echo "phase-loop claim smoke shard failed: $shard actual_exit=$status expected_exit_codes=$expected_exit_codes" >&2
         cat "$shard_dir/$shard.stdout.log" >&2 || true
         cat "$shard_dir/$shard.stderr.log" >&2 || true
       fi

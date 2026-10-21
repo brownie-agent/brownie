@@ -125,9 +125,11 @@ esac
 if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   claim_smoke_shard_dir="$(mktemp -d)"
   claim_smoke_shards=(core terminal completion terminal-absent queue pr guards feedback lifecycle)
+  claim_smoke_expected_exit_contract="guards=76"
   phase_loop_claim_smoke_run_scheduler \
     "$claim_smoke_shard_dir" "$0" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
-    "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" "${claim_smoke_shards[@]}"
+    "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" "$claim_smoke_expected_exit_contract" \
+    "${claim_smoke_shards[@]}"
   exit "$?"
 fi
 

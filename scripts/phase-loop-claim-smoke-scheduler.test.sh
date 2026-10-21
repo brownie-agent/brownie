@@ -19,6 +19,9 @@ case "${PHASE_LOOP_CLAIM_SMOKE_SECTION:-}" in
   fast)
     printf 'fast shard completed\n'
     ;;
+  expected|unexpected)
+    exit 76
+    ;;
   slow)
     sleep 30 &
     child_pid="$!"
@@ -62,13 +65,34 @@ PY
 normal_output="$fixture_root/normal-audit.json"
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$normal_output" \
   bash "$scheduler_driver" "$normal_output" \
-  "$fixture_root/normal-shards" "$fixture_script" 2 10 fast fast fast fast fast fast fast fast \
-  2>"$fixture_root/normal-driver.stderr"
+  "$fixture_root/normal-shards" "$fixture_script" 2 10 "" fast fast fast fast fast fast fast fast \
+  2>"$fixture_root/normal-driver.stderr" || {
+    cat "$fixture_root/normal-driver.stderr" >&2 || true
+    exit 1
+  }
 assert_json "$normal_output" 'manifest["scheduler_timed_out"] is False'
 assert_json "$normal_output" 'len([r for r in manifest["records"] if r.get("event") == "shard_finished" and r.get("status") == "passed"]) == 8'
 assert_json "$normal_output" 'all(r.get("pid") and r.get("pgid") and r.get("stdout_path") and r.get("stderr_path") and r.get("temp_root") and r.get("state_root") and r.get("workspace_root") for r in manifest["records"] if r.get("event") == "shard_started")'
 grep -Fq '"event": "shard_started"' "$fixture_root/normal-driver.stderr"
 grep -Fq '"event": "shard_finished"' "$fixture_root/normal-driver.stderr"
+
+expected_output="$fixture_root/expected-audit.json"
+PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$expected_output" \
+  bash "$scheduler_driver" "$expected_output" \
+  "$fixture_root/expected-shards" "$fixture_script" 2 10 "expected=76" expected \
+  2>"$fixture_root/expected-driver.stderr"
+assert_json "$expected_output" 'any(r.get("event") == "shard_finished" and r.get("shard") == "expected" and r.get("exit_code") == 76 and r.get("expected_exit_codes") == [76] and r.get("accepted") is True and r.get("status") == "passed" for r in manifest["records"])'
+
+unexpected_output="$fixture_root/unexpected-audit.json"
+set +e
+PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$unexpected_output" \
+  bash "$scheduler_driver" "$unexpected_output" \
+  "$fixture_root/unexpected-shards" "$fixture_script" 2 10 "" unexpected \
+  2>"$fixture_root/unexpected-driver.stderr"
+unexpected_status="$?"
+set -e
+[ "$unexpected_status" -ne 0 ]
+assert_json "$unexpected_output" 'any(r.get("event") == "shard_finished" and r.get("shard") == "unexpected" and r.get("exit_code") == 76 and r.get("expected_exit_codes") == [0] and r.get("accepted") is False and r.get("status") == "failed" for r in manifest["records"])'
 
 child_pid_file="$fixture_root/slow-child.pid"
 timeout_output="$fixture_root/timeout-audit.json"
@@ -76,7 +100,7 @@ set +e
 PHASE_LOOP_CLAIM_SMOKE_CHILD_PID_FILE="$child_pid_file" \
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$timeout_output" \
   bash "$scheduler_driver" "$timeout_output" \
-  "$fixture_root/timeout-shards" "$fixture_script" 2 2 slow fast \
+  "$fixture_root/timeout-shards" "$fixture_script" 2 2 "" slow fast \
   2>"$fixture_root/timeout-driver.stderr"
 timeout_status="$?"
 set -e
