@@ -112,9 +112,11 @@ function parseJsonFromCommandOutput(text) {
   }
 }
 
-function runTodoQueueIntegrity(repoRoot) {
-  const scriptPath = path.join(repoRoot, 'scripts/phase-loop-todo-queue-integrity.mjs');
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+function runTodoQueueIntegrity(repoRoot, options = {}) {
+  const trustedController = typeof options.controlPlaneRoot === 'string';
+  const scriptPath = path.join(trustedController ? options.controlPlaneRoot : repoRoot, 'scripts/phase-loop-todo-queue-integrity.mjs');
+  const todoPath = trustedController ? (options.todoPath ?? path.join(repoRoot, '.brownie/todo.md')) : '.brownie/todo.md';
+  const breakdownPath = trustedController ? (options.breakdownPath ?? path.join(repoRoot, '.brownie/todo-breakdown.md')) : '.brownie/todo-breakdown.md';
   if (!fs.existsSync(scriptPath) || !fs.existsSync(todoPath)) {
     return {
       available: false,
@@ -124,13 +126,10 @@ function runTodoQueueIntegrity(repoRoot) {
   }
 
   try {
-    const stdout = execFileSync(process.execPath, [
-      'scripts/phase-loop-todo-queue-integrity.mjs',
-      '--repo',
-      repoRoot,
-      '--todo',
-      '.brownie/todo.md'
-    ], {
+    const commandArgs = trustedController
+      ? [scriptPath, '--repo', repoRoot, '--todo', todoPath, '--breakdown', breakdownPath]
+      : ['scripts/phase-loop-todo-queue-integrity.mjs', '--repo', repoRoot, '--todo', '.brownie/todo.md'];
+    const stdout = execFileSync(process.execPath, commandArgs, {
       cwd: repoRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe']
@@ -642,21 +641,21 @@ function addIssue(issues, severity, code, message, recommendation, extra = {}) {
   });
 }
 
-function diagnosticsPath(repoRoot, timestamp) {
+function diagnosticsPath(stateRoot, timestamp) {
   const safeTimestamp = timestamp.replace(/[^0-9A-Za-z_.-]+/gu, '-');
-  return path.join(repoRoot, '.brownie/private/phase-loop/supervisor-diagnostics', `${safeTimestamp}.json`);
+  return path.join(stateRoot, 'supervisor-diagnostics', `${safeTimestamp}.json`);
 }
 
 export function diagnosePhaseLoop(options = {}) {
   const repoRoot = path.resolve(options.repoRoot ?? defaultRepoRoot);
   const timestamp = options.timestamp ?? new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z');
-  const stateRoot = path.join(repoRoot, '.brownie/private/phase-loop');
+  const stateRoot = options.stateRoot ?? path.join(repoRoot, '.brownie/private/phase-loop');
   const statusPath = path.join(stateRoot, 'status.json');
   const progressPath = path.join(stateRoot, 'progress-state.json');
   const claimPath = path.join(stateRoot, 'todo-claims/current.json');
   const repairFeedbackPath = path.join(stateRoot, 'todo-claims/repair-feedback.json');
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
+  const todoPath = options.todoPath ?? path.join(repoRoot, '.brownie/todo.md');
+  const breakdownPath = options.breakdownPath ?? path.join(repoRoot, '.brownie/todo-breakdown.md');
   const pidPath = path.join(stateRoot, 'phase-loop.pid');
 
   const status = readJsonOrNull(statusPath);
@@ -681,7 +680,11 @@ export function diagnosePhaseLoop(options = {}) {
         blockedPath: path.join(stateRoot, 'todo-claims/blocked.jsonl')
       })
     : null;
-  const todoQueueIntegrity = runTodoQueueIntegrity(repoRoot);
+  const todoQueueIntegrity = runTodoQueueIntegrity(repoRoot, {
+    controlPlaneRoot: options.controlPlaneRoot,
+    todoPath,
+    breakdownPath
+  });
   const statusVerificationFailureAnalysis = analyzeVerificationFailure(status, selectedTodo, repoRoot);
   const repairFeedbackVerificationFailureAnalysis = analyzeRepairFeedbackVerificationFailure(repairFeedback, selectedTodo, repoRoot);
   const verificationFailureAnalysis = statusVerificationFailureAnalysis.detected
@@ -860,7 +863,12 @@ export function diagnosePhaseLoop(options = {}) {
 
   let todoGuardErrors = [];
   try {
-    todoGuardErrors = validateTodoDecomposition(repoRoot, '.brownie/todo.md');
+    const trustedController = typeof options.controlPlaneRoot === 'string';
+    todoGuardErrors = validateTodoDecomposition(
+      repoRoot,
+      trustedController ? todoPath : '.brownie/todo.md',
+      trustedController ? breakdownPath : '.brownie/todo-breakdown.md'
+    );
   } catch (error) {
     todoGuardErrors = [`todo_decomposition_guard_exception:${error?.message ?? String(error)}`];
   }
@@ -1129,7 +1137,7 @@ export function diagnosePhaseLoop(options = {}) {
   };
 
   if (options.write !== false) {
-    const outputPath = diagnosticsPath(repoRoot, timestamp);
+    const outputPath = diagnosticsPath(stateRoot, timestamp);
     fs.mkdirSync(path.dirname(outputPath), { recursive: true, mode: 0o700 });
     fs.writeFileSync(outputPath, `${JSON.stringify(result, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     result.written_path = path.relative(repoRoot, outputPath);

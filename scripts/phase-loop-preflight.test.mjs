@@ -69,6 +69,37 @@ test('accepts Brownie-managed state changes when only an owner blocker remains',
   assert(!result.errors.some((error) => error.code === 'dirty_delivery_required'), JSON.stringify(result.errors));
 });
 
+test('allows claim-smoke recovery to deliver dirty workspace progress for a pending completed claim', () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), '- [ ] E-owner: Owner must provide release credentials:\n  Route: owner.\n  Verification: external owner handoff.\n');
+  fs.writeFileSync(path.join(repo, 'README.md'), 'dirty\n');
+  const claim = path.join(os.tmpdir(), `brownie-pending-completion-claim-${Date.now()}.json`);
+  fs.writeFileSync(claim, JSON.stringify({
+    status: 'completed',
+    completion_cleanup_pending: true,
+    completion_pr_pending: false
+  }));
+  const previous = process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = '1';
+  try {
+    const fixtureResult = validatePhaseLoopPreflight({
+      repo,
+      controlPlaneRoot: repositoryRoot,
+      profile: 'claim-smoke-fixture',
+      claim,
+      skipCommands: true
+    });
+    assert(!fixtureResult.errors.some((error) => error.code === 'dirty_delivery_required'), JSON.stringify(fixtureResult.errors));
+
+    const productionResult = validatePhaseLoopPreflight({ repo, claim, skipCommands: true });
+    assert(productionResult.errors.some((error) => error.code === 'dirty_delivery_required'), JSON.stringify(productionResult.errors));
+  } finally {
+    if (previous === undefined) delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+    else process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = previous;
+    fs.rmSync(claim, { force: true });
+  }
+});
+
 test('accepts an absolute TODO path inside the repository', () => {
   const repo = makeRepo();
   const result = validatePhaseLoopPreflight({
@@ -115,6 +146,7 @@ test('accepts a workspace TODO snapshot and records source, fingerprint, and que
     todo: snapshotTodo,
     breakdown,
     snapshotSource: sourceTodo,
+    controllerFingerprint: `sha256:${'a'.repeat(64)}`,
     skipCommands: true
   });
   assert.equal(result.valid, true, JSON.stringify(result.errors));
@@ -122,6 +154,7 @@ test('accepts a workspace TODO snapshot and records source, fingerprint, and que
   assert.equal(result.snapshot_audit.snapshot_path, snapshotTodo);
   assert.equal(result.snapshot_audit.source_sha256, result.snapshot_audit.snapshot_sha256);
   assert.match(result.snapshot_audit.queue_cas, /^sha256:[0-9a-f]{64}$/u);
+  assert.equal(result.snapshot_audit.controller_source_fingerprint, `sha256:${'a'.repeat(64)}`);
   fs.rmSync(sourceTodo);
 });
 
@@ -141,8 +174,117 @@ test('runs the TODO guard against the configured snapshot path and rejects malfo
     /TODO decomposition guard failed/u
   );
   const preflight = fs.readFileSync(path.join(repositoryRoot, 'scripts/phase-loop-preflight.mjs'), 'utf8');
-  assert.match(preflight, /guard-todo-decomposition\.mjs', '--todo', todoPath, '--breakdown', breakdownPath/u);
-  assert.match(preflight, /phase-loop-todo-queue-integrity\.mjs', '--repo', repoRoot, '--todo', todoPath, '--breakdown', breakdownPath/u);
+  assert.match(preflight, /guard-todo-decomposition\.mjs'\), '--repo', policyRoot, '--todo', absoluteTodoPath, '--breakdown', absoluteBreakdownPath/u);
+  assert.match(preflight, /phase-loop-todo-queue-integrity\.mjs'\), '--repo', repoRoot, '--todo', absoluteTodoPath, '--breakdown', absoluteBreakdownPath/u);
+});
+
+test('snapshot audit rejection preserves claim, ledger, status, and runtime state', () => {
+  const repo = makeRepo();
+  const sourceTodo = path.join(os.tmpdir(), `brownie-snapshot-protected-${Date.now()}.md`);
+  const snapshotTodo = path.join(repo, '.brownie', 'todo-snapshot.md');
+  const breakdown = path.join(repo, '.brownie', 'todo-breakdown.md');
+  const stateDir = path.join(repo, '.brownie', 'private', 'phase-loop');
+  fs.mkdirSync(path.join(stateDir, 'todo-claims'), { recursive: true });
+  fs.mkdirSync(path.join(stateDir, 'runs'), { recursive: true });
+  const protectedFiles = [
+    path.join(stateDir, 'todo-claims', 'current.json'),
+    path.join(stateDir, 'status.json'),
+    path.join(stateDir, 'task-ledger.jsonl'),
+    path.join(stateDir, 'runs', 'runtime.bin')
+  ];
+  for (const file of protectedFiles) fs.writeFileSync(file, `protected:${path.basename(file)}\n`);
+  const sourceText = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+  fs.writeFileSync(sourceTodo, sourceText);
+  fs.writeFileSync(snapshotTodo, `${sourceText}\nmalformed audited mutation\n`);
+  fs.writeFileSync(breakdown, '# snapshot breakdown\n');
+  const digestFiles = () => protectedFiles.map((file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex'));
+  const before = digestFiles();
+  const result = validatePhaseLoopPreflight({
+    repo,
+    todo: snapshotTodo,
+    breakdown,
+    snapshotSource: sourceTodo,
+    snapshotAudit: path.join(repo, '.brownie', 'missing-snapshot-audit.json'),
+    controllerFingerprint: `sha256:${'b'.repeat(64)}`,
+    skipCommands: true
+  });
+  assert.equal(result.valid, false, JSON.stringify(result.errors));
+  assert(result.errors.some((error) => error.code === 'todo_snapshot_mutation_audit_missing'), JSON.stringify(result.errors));
+  assert.deepEqual(digestFiles(), before);
+  fs.rmSync(sourceTodo);
+});
+
+test('runs required preflight commands from the controller root when the workspace has older scripts', () => {
+  const repo = makeRepo();
+  const workspaceScriptNames = [
+    'guard-todo-decomposition.mjs',
+    'phase-loop-todo-queue-integrity.mjs',
+    'guard-release-contract.mjs',
+    'guard-runtime-release-readiness.mjs'
+  ];
+  for (const name of workspaceScriptNames) {
+    fs.writeFileSync(path.join(repo, 'scripts', name), 'process.exit(91);\n');
+  }
+  execFileSync('git', ['add', '.'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'old workspace control scripts'], { cwd: repo, stdio: 'ignore' });
+  const controlPlaneRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-controller-root-'));
+  fs.mkdirSync(path.join(controlPlaneRoot, 'scripts'), { recursive: true });
+  for (const name of workspaceScriptNames) {
+    fs.writeFileSync(path.join(controlPlaneRoot, 'scripts', name), '#!/usr/bin/env node\nprocess.exit(0);\n');
+  }
+  const result = validatePhaseLoopPreflight({ repo, controlPlaneRoot });
+  assert.equal(result.valid, true, JSON.stringify(result, null, 2));
+  assert.deepEqual(result.command_results.map((entry) => entry.exit_code), [0, 0, 0, 0]);
+});
+
+test('rejects the claim-smoke fixture profile without its explicit test-only marker', () => {
+  const repo = makeRepo();
+  const previous = process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  try {
+    const result = validatePhaseLoopPreflight({ repo, profile: 'claim-smoke-fixture', skipCommands: true });
+    assert.equal(result.valid, false, JSON.stringify(result, null, 2));
+    assert(result.errors.some((error) => error.code === 'phase_loop_preflight_fixture_profile_forbidden'), JSON.stringify(result.errors));
+  } finally {
+    if (previous === undefined) delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+    else process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = previous;
+  }
+});
+
+test('allows an external temporary queue only under the explicit claim-smoke fixture profile', () => {
+  const repo = makeRepo();
+  const outsideTodo = path.join(os.tmpdir(), `brownie-claim-smoke-todo-${Date.now()}.md`);
+  fs.writeFileSync(outsideTodo, '- [ ] B-01: durable claim task\n');
+  const previous = process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = '1';
+  try {
+    const result = validatePhaseLoopPreflight({
+      repo,
+      controlPlaneRoot: repositoryRoot,
+      profile: 'claim-smoke-fixture',
+      todo: outsideTodo
+    });
+    assert.equal(result.valid, true, JSON.stringify(result, null, 2));
+    assert.equal(result.command_results.length, 1);
+  } finally {
+    if (previous === undefined) delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+    else process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = previous;
+    fs.rmSync(outsideTodo, { force: true });
+  }
+});
+
+test('keeps production preflight strict when a controller root is supplied', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-phase-loop-minimal-workspace-'));
+  fs.mkdirSync(path.join(repo, '.brownie'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), '- [ ] E-1: Patch only `README.md`:\n  Route: documentation.\n  Verification: inspect README.md.\n');
+  execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.name', 'test'], { cwd: repo });
+  execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: repo });
+  execFileSync('git', ['add', '.'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
+  const result = validatePhaseLoopPreflight({ repo, controlPlaneRoot: repositoryRoot, skipCommands: true });
+  assert.equal(result.valid, false, JSON.stringify(result, null, 2));
+  assert(result.errors.some((error) => error.code === 'required_file_unreadable' || error.code === 'readiness_audit_hash_mismatch'), JSON.stringify(result.errors));
 });
 
 test('accepts sequential controller-owned completion mutations for multiple TODOs', () => {
@@ -249,6 +391,10 @@ test('places the strict preflight boundary before claim rebaseline and forbids l
   assert.ok(controller.indexOf('return 78', boundary) < rebaseline);
   assert.doesNotMatch(controller.slice(boundary, restoreTransition), /write_bdk_trajectory_event/u);
   const preflightFunction = controller.indexOf('run_phase_loop_preflight()');
+  const preflightCommand = controller.indexOf('node "$ROOT_DIR/scripts/phase-loop-preflight.mjs"', preflightFunction);
+  const fixtureProfileRejection = controller.indexOf('phase_loop_preflight_fixture_profile_rejected=true', preflightFunction);
+  assert.ok(fixtureProfileRejection >= 0);
+  assert.ok(fixtureProfileRejection < preflightCommand);
   const auditFailure = controller.indexOf('if ! write_phase_loop_snapshot_audit "$run_stamp" "$output"; then', preflightFunction);
   assert.ok(auditFailure >= 0);
   assert.ok(auditFailure < rebaseline);
@@ -256,6 +402,15 @@ test('places the strict preflight boundary before claim rebaseline and forbids l
   const auditFailureBoundary = controller.slice(auditFailure, auditFailureReturn);
   assert.match(auditFailureBoundary, /phase_loop_snapshot_audit_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden/u);
   assert.doesNotMatch(auditFailureBoundary, /phase_loop_rebaseline_stale_claim|write_bdk_trajectory_event|run_brownie_runtime/u);
+});
+
+test('expands optional snapshot arguments safely and rejects incomplete snapshot configuration', () => {
+  const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
+  const preflightFunction = controller.indexOf('run_phase_loop_preflight()');
+  const preflightBody = controller.slice(preflightFunction, controller.indexOf('\n}\n\n', preflightFunction) + 3);
+  assert.match(preflightBody, /phase_loop_preflight_snapshot_audit_missing=true/u);
+  assert.match(preflightBody, /\$\{snapshot_args\[@\]\+"\$\{snapshot_args\[@\]\}"\}/u);
+  assert.doesNotMatch(preflightBody, /"\$\{snapshot_args\[@\]\}"\s*\n\s*2>&1/u);
 });
 
 test('bounded implementation leaves are not instructed to re-split their TODO on missing patch context', () => {

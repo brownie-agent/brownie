@@ -4,17 +4,56 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { diagnosePhaseLoop } from './phase-loop-supervisor-diagnose.mjs';
+import { diagnosePhaseLoop as runDiagnosis } from './phase-loop-supervisor-diagnose.mjs';
 import { dispatchSelfUpdate } from './phase-loop-self-update.mjs';
 import { loadTodoState } from './phase-loop-todo-state.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const defaultRepoRoot = path.resolve(__dirname, '..');
+let activeControlPlaneRoot = defaultRepoRoot;
+let activeTodoPath = null;
+let activeBreakdownPath = null;
+let activeStateRoot = null;
+
+function controlPlaneScript(relativePath) {
+  return path.join(activeControlPlaneRoot, relativePath);
+}
+
+function workspaceTodoPath(repoRoot) {
+  return activeTodoPath ?? path.join(repoRoot, '.brownie/todo.md');
+}
+
+function workspaceBreakdownPath(repoRoot) {
+  return activeBreakdownPath ?? path.join(repoRoot, '.brownie/todo-breakdown.md');
+}
+
+function workspaceStateRoot(repoRoot) {
+  return activeStateRoot ?? path.join(repoRoot, '.brownie/private/phase-loop');
+}
+
+function workspaceStatePath(repoRoot, relativePath) {
+  return path.join(workspaceStateRoot(repoRoot), relativePath);
+}
+
+function diagnosePhaseLoop(options = {}) {
+  const repoRoot = options.repoRoot ?? defaultRepoRoot;
+  return runDiagnosis({
+    ...options,
+    todoPath: workspaceTodoPath(repoRoot),
+    breakdownPath: workspaceBreakdownPath(repoRoot),
+    stateRoot: workspaceStateRoot(repoRoot),
+    controlPlaneRoot: activeControlPlaneRoot
+  });
+}
 
 function parseArgs(argv) {
   const args = {
     repo: defaultRepoRoot,
+    controlPlaneRoot: defaultRepoRoot,
+    todo: null,
+    breakdown: null,
+    stateDir: null,
     write: true,
     repair: true,
     start: false,
@@ -27,6 +66,14 @@ function parseArgs(argv) {
       continue;
     } else if (arg === '--repo') {
       args.repo = path.resolve(argv[++index]);
+    } else if (arg === '--control-plane-root') {
+      args.controlPlaneRoot = path.resolve(argv[++index]);
+    } else if (arg === '--todo') {
+      args.todo = path.resolve(argv[++index]);
+    } else if (arg === '--breakdown') {
+      args.breakdown = path.resolve(argv[++index]);
+    } else if (arg === '--state-dir') {
+      args.stateDir = path.resolve(argv[++index]);
     } else if (arg === '--write') {
       args.write = true;
     } else if (arg === '--no-write') {
@@ -81,16 +128,18 @@ function runTextCommand(repoRoot, command, args) {
 
 function runTodoQueueIntegrity(repoRoot) {
   return runJsonCommand(repoRoot, process.execPath, [
-    'scripts/phase-loop-todo-queue-integrity.mjs',
+    controlPlaneScript('scripts/phase-loop-todo-queue-integrity.mjs'),
     '--repo',
     repoRoot,
     '--todo',
-    '.brownie/todo.md'
+    workspaceTodoPath(repoRoot),
+    '--breakdown',
+    workspaceBreakdownPath(repoRoot)
   ]);
 }
 
 function maybeArchiveResolvedRepairFeedback(repoRoot) {
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const feedback = readJsonOrNull(feedbackPath);
   if (!feedback || feedback.completed === true) return { attempted: false, reason: 'no_active_repair_feedback' };
   const verification = feedback.verification && typeof feedback.verification === 'object' ? feedback.verification : {};
@@ -113,10 +162,10 @@ function maybeArchiveResolvedRepairFeedback(repoRoot) {
     return { attempted: false, reason: 'feedback_kind_requires_its_own_verification', kind: feedback.kind ?? null };
   }
   try {
-    runTextCommand(repoRoot, process.execPath, ['scripts/guard-todo-decomposition.mjs']);
+    runTextCommand(repoRoot, process.execPath, [controlPlaneScript('scripts/guard-todo-decomposition.mjs'), '--repo', repoRoot, '--todo', workspaceTodoPath(repoRoot), '--breakdown', workspaceBreakdownPath(repoRoot)]);
     const integrity = runTodoQueueIntegrity(repoRoot);
     if (integrity.valid !== true) return { attempted: false, reason: 'todo_queue_integrity_still_invalid', integrity };
-    const archiveDir = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback-archive');
+    const archiveDir = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback-archive');
     fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
     const stamp = new Date().toISOString().replace(/[-:.]/gu, '').replace(/Z$/u, 'Z');
     const archivePath = path.join(archiveDir, `${stamp}.json`);
@@ -147,7 +196,7 @@ function maybeArchiveResolvedRepairFeedback(repoRoot) {
 function completedLeafRecoveryState(repoRoot, diagnostic) {
   const selectedId = todoIdFromFirstLine(todoFirstLine(selectedTodoBlock(diagnostic)));
   if (!selectedId) return { completed: false, reason: 'selected_todo_id_missing' };
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+  const todoPath = workspaceTodoPath(repoRoot);
   let todoText = '';
   try {
     todoText = fs.readFileSync(todoPath, 'utf8');
@@ -169,7 +218,7 @@ function completedLeafRecoveryState(repoRoot, diagnostic) {
 
 function maybeResolveCompletedLeafRepairFeedback(repoRoot, completion) {
   if (!completion?.completed) return { attempted: false, reason: 'selected_leaf_not_durably_completed' };
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const feedback = readJsonOrNull(feedbackPath);
   if (!feedback || feedback.completed === true) return { attempted: false, reason: 'no_active_repair_feedback' };
   const feedbackId = todoIdFromFirstLine(feedback.selected_todo_first_line ?? todoFirstLine(feedback.selected_todo));
@@ -177,7 +226,7 @@ function maybeResolveCompletedLeafRepairFeedback(repoRoot, completion) {
     return { attempted: false, reason: 'active_feedback_targets_different_todo', feedback_todo_id: feedbackId ?? null };
   }
   try {
-    const archiveDir = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback-archive');
+    const archiveDir = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback-archive');
     fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
     const stamp = new Date().toISOString().replace(/[-:.]/gu, '').replace(/Z$/u, 'Z');
     const archivePath = path.join(archiveDir, `${stamp}-durable-completion.json`);
@@ -205,13 +254,13 @@ function maybeRepairTodoContract(repoRoot, diagnostic) {
   }
   try {
     const result = runJsonCommand(repoRoot, process.execPath, [
-      'scripts/repair-todo-decomposition.mjs',
+      controlPlaneScript('scripts/repair-todo-decomposition.mjs'),
       '--claim',
-      path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json'),
+      workspaceStatePath(repoRoot, 'todo-claims/current.json'),
       '--todo',
-      '.brownie/todo.md',
+      workspaceTodoPath(repoRoot),
       '--breakdown',
-      '.brownie/todo-breakdown.md',
+      workspaceBreakdownPath(repoRoot),
       '--run-stamp',
       new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z')
     ], {
@@ -254,24 +303,24 @@ function maybeRepairTodoQueueIntegrity(repoRoot, diagnostic) {
     });
   }
 
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
   try {
     const diagnosticText = [
       detail,
       JSON.stringify(diagnostic)
     ].filter(Boolean).join('\n');
     const repairResult = runJsonCommand(repoRoot, process.execPath, [
-      'scripts/phase-loop-preclaim-recovery.mjs',
+      controlPlaneScript('scripts/phase-loop-preclaim-recovery.mjs'),
       '--repo',
       repoRoot,
       '--claim',
       claimPath,
       '--todo',
-      '.brownie/todo.md',
+      workspaceTodoPath(repoRoot),
       '--breakdown',
-      '.brownie/todo-breakdown.md',
+      workspaceBreakdownPath(repoRoot),
       '--state-dir',
-      path.join(repoRoot, '.brownie/private/phase-loop'),
+      workspaceStateRoot(repoRoot),
       '--diagnostic',
       diagnosticText,
       '--run-stamp',
@@ -324,8 +373,18 @@ function readJsonOrNull(filePath) {
   }
 }
 
-function removeActiveClaimForArchive(claimPath) {
+function removeActiveClaimForArchive(claimPath, expectedSnapshot = null) {
   try {
+    if (typeof expectedSnapshot === 'string') {
+      const currentSnapshot = fs.readFileSync(claimPath, 'utf8');
+      if (currentSnapshot !== expectedSnapshot) {
+        return {
+          ok: false,
+          reason: 'active_claim_changed_during_cleanup',
+          error: 'active claim changed after the archive snapshot was captured'
+        };
+      }
+    }
     fs.rmSync(claimPath);
     return { ok: true };
   } catch (error) {
@@ -426,7 +485,7 @@ function verifyDelegationPullRequestProvenance(repoRoot, pullRequestUrl, impleme
 // item. This prevents a merged fix from being selected again merely because a
 // stale controller claim still refers to the old TODO.
 function maybeReconcileAcknowledgedDelegation(repoRoot, provenanceVerifier) {
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const inspected = inspectDelegationFeedback(feedbackPath);
   if (inspected.state === 'missing') return { attempted: false, reason: 'delegation_feedback_missing' };
   if (inspected.state === 'resolved') return { attempted: false, reason: 'delegation_already_resolved' };
@@ -464,13 +523,13 @@ function maybeReconcileAcknowledgedDelegation(repoRoot, provenanceVerifier) {
     };
   }
 
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+  const todoPath = workspaceTodoPath(repoRoot);
   const todoText = fs.existsSync(todoPath) ? fs.readFileSync(todoPath, 'utf8') : '';
   if (!liveUncheckedTodoIds(todoText).has(selectedTodoId)) {
     return { attempted: true, ok: false, reason: 'delegated_todo_not_live_fail_closed', todo_id: selectedTodoId };
   }
 
-  const completionDirectory = path.join(repoRoot, '.brownie/private/phase-loop/todo-completions');
+  const completionDirectory = workspaceStatePath(repoRoot, 'todo-completions');
   const completionPath = path.join(
     completionDirectory,
     `delegation-${selectedTodoId.replace(/[^A-Za-z0-9_.-]+/gu, '-')}-${implementationCommit}.json`
@@ -597,7 +656,7 @@ function completedTodoIds(todoText) {
 
 function durableBlockedTodoIds(repoRoot) {
   const ids = new Set();
-  const blockedPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/blocked.jsonl');
+  const blockedPath = workspaceStatePath(repoRoot, 'todo-claims/blocked.jsonl');
   for (const record of readJsonl(blockedPath)) {
     const explicitId = typeof record.todo_id === 'string' ? record.todo_id.trim() : '';
     if (explicitId) {
@@ -685,8 +744,8 @@ function appendFailureLedgerEvent(repoRoot, diagnostic) {
       reason: 'no_actionable_failure_event'
     };
   }
-  const ledgerPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
+  const ledgerPath = workspaceStatePath(repoRoot, 'todo-claims/failure-ledger.jsonl');
+  const todoPath = workspaceTodoPath(repoRoot);
   const selectedBlock = fs.existsSync(todoPath)
     ? todoBlocks(fs.readFileSync(todoPath, 'utf8')).find((candidate) => candidate.first_line === firstLine)?.block ?? firstLine
     : firstLine;
@@ -758,7 +817,7 @@ function terminalStopClassFromRunEvidence(repoRoot, entry) {
   if (!/^\d{8}T\d{6}Z$/u.test(stamp ?? '') || !/^run_[0-9a-f-]+$/u.test(runId ?? '')) {
     return null;
   }
-  const evidencePath = path.join(repoRoot, '.brownie/private/phase-loop/runs', `${stamp}.stdout.log`);
+  const evidencePath = workspaceStatePath(repoRoot, path.join('runs', `${stamp}.stdout.log`));
   try {
     const payload = JSON.parse(fs.readFileSync(evidencePath, 'utf8'));
     const automation = payload?.automation ?? payload?.run?.automation ?? {};
@@ -787,7 +846,7 @@ function hasContiguousTerminalRunEvidence(repoRoot, terminalEvents) {
   }
   const earliest = [...stamps].sort()[0];
   const latest = [...stamps].sort().at(-1);
-  const runsDir = path.join(repoRoot, '.brownie/private/phase-loop/runs');
+  const runsDir = workspaceStatePath(repoRoot, 'runs');
   try {
     const logs = fs.readdirSync(runsDir)
       .filter((name) => /^\d{8}T\d{6}Z\.stdout\.log$/u.test(name))
@@ -815,7 +874,7 @@ function failureLedgerSummary(repoRoot, diagnostic, currentEventResult) {
       replan_reason: 'no_selected_todo'
     };
   }
-  const ledgerPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  const ledgerPath = workspaceStatePath(repoRoot, 'todo-claims/failure-ledger.jsonl');
   const ledger = readJsonl(ledgerPath);
   // A controller upgrade can add audit fields to an event whose stable ID was
   // already recorded.  Overlay the freshly observed event in memory instead
@@ -1052,12 +1111,8 @@ function todoBlocks(todoText) {
 }
 
 function phaseLoopControllerFingerprint(repoRoot) {
-  const files = ['phase-loop.sh', 'scripts/phase-loop-todo-evaluator.mjs'];
-  // Diagnostic tests use an isolated state fixture rather than a controller
-  // checkout. In that case, fingerprint the executing controller itself.
-  const controllerRoot = files.every((file) => fs.existsSync(path.join(repoRoot, file)))
-    ? repoRoot
-    : defaultRepoRoot;
+  const files = ['phase-loop.sh', 'scripts/phase-loop-controller-source-manifest.json', 'scripts/phase-loop-todo-evaluator.mjs'];
+  const controllerRoot = activeControlPlaneRoot;
   const manifest = files.map((file) => {
     const content = fs.readFileSync(path.join(controllerRoot, file));
     return `${crypto.createHash('sha256').update(content).digest('hex')}  ${file}\n`;
@@ -1069,9 +1124,9 @@ function appendStalledTodoBlockedRecord(repoRoot, diagnostic, ledgerSummary) {
   if (!ledgerSummary?.should_replan) {
     return { attempted: false, reason: 'failure_ledger_threshold_not_met' };
   }
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const blockedPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/blocked.jsonl');
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
+  const todoPath = workspaceTodoPath(repoRoot);
+  const blockedPath = workspaceStatePath(repoRoot, 'todo-claims/blocked.jsonl');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
   const claim = readJsonOrNull(claimPath);
   const selectedTodo = claim?.selected_todo ?? selectedTodoBlock(diagnostic);
   const firstLine = todoFirstLine(selectedTodo) ?? ledgerSummary.selected_todo_first_line;
@@ -1135,8 +1190,8 @@ function ensureStalledTodoDecompositionRequest(repoRoot, diagnostic, ledgerSumma
   if (!ledgerSummary?.should_replan) {
     return { attempted: false, reason: 'failure_ledger_threshold_not_met' };
   }
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
+  const todoPath = workspaceTodoPath(repoRoot);
+  const breakdownPath = workspaceBreakdownPath(repoRoot);
   if (!fs.existsSync(todoPath)) {
     return { attempted: true, ok: false, reason: 'todo_missing' };
   }
@@ -1283,13 +1338,13 @@ function postRepairValidation(repoRoot, repairs, diagnostic) {
       kind: 'command',
       name: 'guard-todo-decomposition',
       command: process.execPath,
-      args: ['scripts/guard-todo-decomposition.mjs']
+      args: [controlPlaneScript('scripts/guard-todo-decomposition.mjs'), '--repo', repoRoot, '--todo', workspaceTodoPath(repoRoot), '--breakdown', workspaceBreakdownPath(repoRoot)]
     });
     steps.push({
       kind: 'command',
       name: 'phase-loop-todo-queue-integrity',
       command: process.execPath,
-      args: ['scripts/phase-loop-todo-queue-integrity.mjs']
+      args: [controlPlaneScript('scripts/phase-loop-todo-queue-integrity.mjs'), '--repo', repoRoot, '--todo', workspaceTodoPath(repoRoot), '--breakdown', workspaceBreakdownPath(repoRoot)]
     });
   }
   if (changedPaths.has('.brownie/private/phase-loop/todo-claims/repair-feedback.json')) {
@@ -1406,7 +1461,7 @@ function writeCompletedDependencyRebaselineReceipt(repoRoot, { beforeTodoText, a
   if (completedPrunes.length === 0) {
     return null;
   }
-  const directory = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/dependency-rebaselines');
+  const directory = workspaceStatePath(repoRoot, 'todo-claims/dependency-rebaselines');
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const timestamp = new Date().toISOString();
   const receipt = {
@@ -1444,8 +1499,8 @@ function removeBreakdownRepairSections(breakdownText, idsToRemove) {
 }
 
 function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
+  const todoPath = workspaceTodoPath(repoRoot);
+  const breakdownPath = workspaceBreakdownPath(repoRoot);
   if (!fs.existsSync(todoPath)) {
     return { attempted: false, reason: 'todo_missing' };
   }
@@ -1546,11 +1601,11 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
       || projectionStatus === 'no_eligible_task'
     );
 
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
-  const blockedPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/blocked.jsonl');
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
+  const todoPath = workspaceTodoPath(repoRoot);
+  const breakdownPath = workspaceBreakdownPath(repoRoot);
+  const blockedPath = workspaceStatePath(repoRoot, 'todo-claims/blocked.jsonl');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
   if (!fs.existsSync(todoPath)) {
     return { attempted: true, ok: false, reason: 'todo_missing' };
   }
@@ -1616,8 +1671,7 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   if (activeClaim?.claim_id && todoIdFromFirstLine(activeClaim.selected_todo) === selectedId) {
     const stamp = new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
     const archivePath = path.join(
-      repoRoot,
-      '.brownie/private/phase-loop/todo-claims',
+      path.dirname(claimPath),
       `terminal-stalled-replan-${stamp}.json`
     );
     const archivedClaim = {
@@ -1668,9 +1722,9 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
 }
 
 function maybeRepairRejectedBoundedLeafReplanResidue(repoRoot, diagnostic) {
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
-  const ledgerPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/failure-ledger.jsonl');
+  const todoPath = workspaceTodoPath(repoRoot);
+  const breakdownPath = workspaceBreakdownPath(repoRoot);
+  const ledgerPath = workspaceStatePath(repoRoot, 'todo-claims/failure-ledger.jsonl');
   if (!fs.existsSync(todoPath)) {
     return { attempted: true, ok: false, reason: 'todo_missing' };
   }
@@ -1720,7 +1774,7 @@ function maybeRepairRejectedBoundedLeafReplanResidue(repoRoot, diagnostic) {
       breakdownRemoved = nextBreakdown.removed;
     }
   }
-  const blockedPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/blocked.jsonl');
+  const blockedPath = workspaceStatePath(repoRoot, 'todo-claims/blocked.jsonl');
   const blockedRecords = readJsonl(blockedPath);
   const retainedBlockedRecords = blockedRecords.filter((record) => !(
     record?.block_reason === 'stalled_leaf_contract_replan' &&
@@ -1758,19 +1812,31 @@ function maybeArchiveStaleActiveClaim(repoRoot, diagnostic) {
   if (!codes.has('active_claim_not_selected_by_live_queue')) {
     return { attempted: false, reason: 'active_claim_matches_live_queue_or_not_reported' };
   }
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
-  const claim = readJsonOrNull(claimPath);
-  if (!claim) {
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
+  let claimSnapshot;
+  let claim;
+  try {
+    claimSnapshot = fs.readFileSync(claimPath, 'utf8');
+    claim = JSON.parse(claimSnapshot);
+  } catch (error) {
+    return {
+      attempted: true,
+      ok: false,
+      reason: error?.code === 'ENOENT' ? 'active_claim_missing_before_archive' : 'claim_missing_or_invalid',
+      error: error?.message ?? String(error)
+    };
+  }
+  if (!claim || typeof claim !== 'object' || Array.isArray(claim)) {
     return { attempted: true, ok: false, reason: 'claim_missing_or_invalid' };
   }
   const stamp = new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
   const archivePath = path.join(
-    repoRoot,
-    '.brownie/private/phase-loop/todo-claims',
+    path.dirname(claimPath),
     `stale-current-${stamp}.json`
   );
   const archived = {
     ...claim,
+    claim_snapshot_sha256: crypto.createHash('sha256').update(claimSnapshot).digest('hex'),
     archived_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
     archived_by: 'phase-loop-supervisor-control',
     archive_reason: 'active_claim_not_selected_by_live_queue',
@@ -1778,7 +1844,7 @@ function maybeArchiveStaleActiveClaim(repoRoot, diagnostic) {
   };
   try {
     fs.writeFileSync(archivePath, `${JSON.stringify(archived, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    const removal = removeActiveClaimForArchive(claimPath);
+    const removal = removeActiveClaimForArchive(claimPath, claimSnapshot);
     if (!removal.ok) {
       return { attempted: true, ok: false, ...removal, path: path.relative(repoRoot, archivePath) };
     }
@@ -1801,7 +1867,7 @@ function maybeArchiveStaleActiveClaim(repoRoot, diagnostic) {
 }
 
 function maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, diagnostic, ledgerSummary) {
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
   const claim = readJsonOrNull(claimPath);
   // A malformed active claim is a hard safety boundary.  Check it before the
   // generic replan precedence so repeated no-progress cannot mutate the TODO
@@ -1838,7 +1904,7 @@ function maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, diagnostic, ledgerS
   const legacyBaselineFiles = Array.isArray(claim?.baseline_diff_files)
     ? claim.baseline_diff_files.map((file) => String(file)).sort()
     : [];
-  const legacyTodoPath = path.join(repoRoot, '.brownie/todo.md');
+  const legacyTodoPath = workspaceTodoPath(repoRoot);
   let legacyTodoMatches = false;
   try {
     legacyTodoMatches = typeof claim?.baseline_todo_text === 'string'
@@ -1876,8 +1942,8 @@ function maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, diagnostic, ledgerS
     try {
       const current = baselineDirtyWorkspace(repoRoot);
       const managedFiles = current.files.filter((file) => !file.startsWith('.brownie/private/'));
-      const todoText = fs.readFileSync(path.join(repoRoot, '.brownie/todo.md'), 'utf8');
-      const breakdownText = fs.readFileSync(path.join(repoRoot, '.brownie/todo-breakdown.md'), 'utf8');
+      const todoText = fs.readFileSync(workspaceTodoPath(repoRoot), 'utf8');
+      const breakdownText = fs.readFileSync(workspaceBreakdownPath(repoRoot), 'utf8');
       if (JSON.stringify(managedFiles) !== JSON.stringify(legacyBaselineFiles)) {
         auditableLegacyBaseline = false;
       } else {
@@ -1927,8 +1993,7 @@ function maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, diagnostic, ledgerS
 
   const stamp = new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z');
   const archivePath = path.join(
-    repoRoot,
-    '.brownie/private/phase-loop/todo-claims',
+    path.dirname(claimPath),
     `terminal-no-eligible-current-${stamp}.json`
   );
   const archived = {
@@ -1993,8 +2058,8 @@ function maybeRepairDerivedTodoPrefixAndLedger(repoRoot, diagnostic) {
   if (!codes.has('todo_contract_invalid') || !errorText.includes('TODO id must preserve parent prefix')) {
     return { attempted: false, reason: 'no_derived_todo_prefix_violation' };
   }
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
+  const todoPath = workspaceTodoPath(repoRoot);
+  const breakdownPath = workspaceBreakdownPath(repoRoot);
   if (!fs.existsSync(todoPath)) {
     return { attempted: true, ok: false, reason: 'todo_missing' };
   }
@@ -2069,8 +2134,8 @@ function maybeRepairMissingDerivedBreakdownLedger(repoRoot, diagnostic) {
   const missingIds = [...errorText.matchAll(/todo-breakdown\.md: missing derived leaf TODO id ([A-Za-z0-9_-]+)/gu)]
     .map((match) => match[1]);
   if (missingIds.length === 0) return { attempted: false, reason: 'no_missing_derived_breakdown_ledger' };
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
+  const todoPath = workspaceTodoPath(repoRoot);
+  const breakdownPath = workspaceBreakdownPath(repoRoot);
   if (!fs.existsSync(todoPath) || !fs.existsSync(breakdownPath)) {
     return { attempted: true, ok: false, reason: 'todo_or_breakdown_missing' };
   }
@@ -2121,8 +2186,8 @@ function maybeRepairMissingDerivedBreakdownLedger(repoRoot, diagnostic) {
 // reconstruct the supersession relationship. Preserve its source in an
 // archive, then move only live stalled-replan children into their parent.
 function maybeMigrateLegacyDerivedBreakdownLedger(repoRoot) {
-  const todoPath = path.join(repoRoot, '.brownie/todo.md');
-  const breakdownPath = path.join(repoRoot, '.brownie/todo-breakdown.md');
+  const todoPath = workspaceTodoPath(repoRoot);
+  const breakdownPath = workspaceBreakdownPath(repoRoot);
   if (!fs.existsSync(todoPath) || !fs.existsSync(breakdownPath)) {
     return { attempted: false, reason: 'todo_or_breakdown_missing' };
   }
@@ -2176,7 +2241,7 @@ function maybeMigrateLegacyDerivedBreakdownLedger(repoRoot) {
     migrations.push({ todo_id: id, parent_todo_id: parentId });
   }
   if (migrations.length === 0) return { attempted: false, reason: 'no_legacy_derived_ledger_sections' };
-  const archiveDir = path.join(repoRoot, '.brownie/private/phase-loop/recovery-archives');
+  const archiveDir = workspaceStatePath(repoRoot, 'recovery-archives');
   fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
   const archivePath = path.join(archiveDir, `legacy-derived-breakdown-ledger-${new Date().toISOString().replace(/[:.]/gu, '-')}.md`);
   fs.writeFileSync(archivePath, originalBreakdown, { encoding: 'utf8', mode: 0o600 });
@@ -2194,14 +2259,14 @@ function maybeWriteTodoContractReplanFeedback(repoRoot, diagnostic, ledgerSummar
       ledger_summary: ledgerSummary
     };
   }
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const claim = readJsonOrNull(claimPath);
   const selectedTodo = claim?.selected_todo ?? selectedTodoBlock(diagnostic);
   const selectedRoute = diagnostic.progress?.selected_todo?.route ?? null;
   const selectedId = ledgerSummary.todo_id ?? todoIdFromFirstLine(todoFirstLine(selectedTodo));
-  const todoText = fs.existsSync(path.join(repoRoot, '.brownie/todo.md'))
-    ? fs.readFileSync(path.join(repoRoot, '.brownie/todo.md'), 'utf8')
+  const todoText = fs.existsSync(workspaceTodoPath(repoRoot))
+    ? fs.readFileSync(workspaceTodoPath(repoRoot), 'utf8')
     : '';
   const todoState = loadTodoState(repoRoot, todoText);
   const liveTodoIds = liveUncheckedTodoIds(todoText);
@@ -2313,7 +2378,7 @@ function maybeWriteDelegationPendingFeedback(repoRoot, diagnostic, ledgerSummary
   if (!delegationReasons.has(ledgerSummary?.replan_reason)) {
     return { attempted: false, reason: ledgerSummary?.replan_reason ?? 'failure_ledger_threshold_not_met' };
   }
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const existing = inspectDelegationFeedback(feedbackPath);
   if (existing.state === 'unreadable') {
     return { attempted: true, ok: false, reason: 'delegation_feedback_unreadable_fail_closed' };
@@ -2330,7 +2395,7 @@ function maybeWriteDelegationPendingFeedback(repoRoot, diagnostic, ledgerSummary
           : 'delegation_completion_preserved'
     };
   }
-  const claim = readJsonOrNull(path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json'));
+  const claim = readJsonOrNull(workspaceStatePath(repoRoot, 'todo-claims/current.json'));
   const selectedTodo = claim?.selected_todo ?? selectedTodoBlock(diagnostic);
   const feedback = {
     schema_version: 1,
@@ -2367,8 +2432,8 @@ function maybeWriteSemanticVerificationRepairFeedback(repoRoot, diagnostic) {
     return { attempted: false, reason: 'semantic_verification_failure_not_reported' };
   }
   const stalled = codes.has('semantic_verification_repair_stalled') || codes.has('stale_no_progress_projection_during_running_loop');
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const claim = readJsonOrNull(claimPath);
   const selectedTodo = claim?.selected_todo ?? diagnostic.verification_failure?.selected_todo?.first_line ?? null;
   const feedback = {
@@ -2440,8 +2505,8 @@ function maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, diagnostic) {
   if (!codes.has('bounded_leaf_refinement_rejected')) {
     return { attempted: false, reason: 'bounded_leaf_refinement_rejection_not_reported' };
   }
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const claim = readJsonOrNull(claimPath);
   const applyRejection = diagnostic.apply_rejection ?? {};
   const selectedTodo = claim?.selected_todo ?? applyRejection?.selected_todo?.first_line ?? null;
@@ -2509,8 +2574,8 @@ function maybeWriteBoundedLeafApplyRejectionFeedback(repoRoot, diagnostic) {
 // terminal no-progress state with no target-specific instruction.
 function maybeWriteSelectedTargetRedelegationFeedback(repoRoot, diagnostic) {
   const integrity = (diagnostic.issues ?? []).find((issue) => issue.code === 'progress_integrity_invalid');
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const claim = readJsonOrNull(claimPath);
   const feedback = readJsonOrNull(feedbackPath);
   const violation = (integrity?.errors ?? []).find((error) => error?.code === 'selected_target_not_changed');
@@ -2570,8 +2635,8 @@ function maybeWriteInvalidPatchRepairFeedback(repoRoot, diagnostic) {
   if (!codes.has('invalid_workspace_write_patch_repeated')) {
     return { attempted: false, reason: 'invalid_patch_not_reported' };
   }
-  const claimPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json');
-  const feedbackPath = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json');
+  const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
+  const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const claim = readJsonOrNull(claimPath);
   const invalidPatch = diagnostic.invalid_patch ?? {};
   const selectedTodo = claim?.selected_todo ?? invalidPatch?.selected_todo?.first_line ?? null;
@@ -2655,8 +2720,8 @@ function workerLaunchReceiptPath(repoRoot, receiptPath = defaultWorkerLaunchRece
 export function inspectWorkerLaunchReceipt(repoRoot, options = {}) {
   const receiptPath = workerLaunchReceiptPath(repoRoot, options.receiptPath);
   const now = options.now instanceof Date ? options.now : new Date(options.now ?? Date.now());
-  const claim = readJsonOrNull(path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/current.json')) ?? {};
-  const feedback = readJsonOrNull(path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/repair-feedback.json')) ?? {};
+  const claim = readJsonOrNull(workspaceStatePath(repoRoot, 'todo-claims/current.json')) ?? {};
+  const feedback = readJsonOrNull(workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json')) ?? {};
   const delegation = feedback.delegation && typeof feedback.delegation === 'object' ? feedback.delegation : {};
   if (!fs.existsSync(receiptPath)) {
     return { ok: false, reason: 'dispatch_not_started', receipt_path: path.relative(repoRoot, receiptPath) };
@@ -2792,7 +2857,7 @@ function maybeStartPhaseLoop(repoRoot, enabled, diagnostic, options = {}) {
     };
   }
   try {
-    const stdout = runTextCommand(repoRoot, './phase-loop.sh', ['start']);
+    const stdout = runTextCommand(repoRoot, controlPlaneScript('phase-loop.sh'), ['start']);
     return { attempted: true, ok: true, stdout };
   } catch (error) {
     return {
@@ -2807,6 +2872,10 @@ function maybeStartPhaseLoop(repoRoot, enabled, diagnostic, options = {}) {
 
 export function controlPhaseLoop(options = {}) {
   const repoRoot = path.resolve(options.repoRoot ?? defaultRepoRoot);
+  activeControlPlaneRoot = path.resolve(options.controlPlaneRoot ?? defaultRepoRoot);
+  activeTodoPath = path.resolve(options.todoPath ?? path.join(repoRoot, '.brownie/todo.md'));
+  activeBreakdownPath = path.resolve(options.breakdownPath ?? path.join(repoRoot, '.brownie/todo-breakdown.md'));
+  activeStateRoot = path.resolve(options.stateRoot ?? path.join(repoRoot, '.brownie/private/phase-loop'));
   const delegationProvenanceVerifier = options.delegationProvenanceVerifier
     ?? ((_, pullRequestUrl, implementationCommit) => verifyDelegationPullRequestProvenance(
       repoRoot,
@@ -3110,6 +3179,7 @@ export function controlPhaseLoop(options = {}) {
     control_kind: 'brownie_phase_loop_supervisor_control',
     generated_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
     repo_root: repoRoot,
+    control_plane_root: activeControlPlaneRoot,
     initial_summary: initial.summary,
     repair: {
       failure_ledger: failureLedger,
@@ -3151,6 +3221,10 @@ if (process.argv[1] === __filename) {
   const args = parseArgs(process.argv);
   const result = controlPhaseLoop({
     repoRoot: args.repo,
+    controlPlaneRoot: args.controlPlaneRoot,
+    todoPath: args.todo,
+    breakdownPath: args.breakdown,
+    stateRoot: args.stateDir,
     write: args.write,
     repair: args.repair,
     start: args.start,

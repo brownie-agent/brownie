@@ -125,8 +125,14 @@ function readJson(absoluteOrRelativePath) {
 }
 
 function packageScripts() {
-  const pkg = JSON.parse(readText('package.json'));
-  return new Set(Object.keys(pkg.scripts ?? {}));
+  try {
+    const pkg = JSON.parse(readText('package.json'));
+    return new Set(Object.keys(pkg.scripts ?? {}));
+  } catch (error) {
+    const wrapped = new Error(`workspace package.json is invalid or unreadable: ${error.message}`);
+    wrapped.code = 'workspace_package_json_invalid';
+    throw wrapped;
+  }
 }
 
 function uncheckedTodoBlocks(text) {
@@ -1673,12 +1679,25 @@ export function repairTodoDecomposition({
 
 if (process.argv[1] === __filename) {
   const args = parseArgs(process.argv);
-  const result = repairTodoDecomposition({
-    claimPath: args.get('claim') ?? '.brownie/private/phase-loop/todo-claims/current.json',
-    todoPath: args.get('todo') ?? '.brownie/todo.md',
-    breakdownPath: args.get('breakdown') ?? '.brownie/todo-breakdown.md',
-    runStamp: args.get('run-stamp') ?? new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z')
-  });
+  let result;
+  try {
+    result = repairTodoDecomposition({
+      claimPath: args.get('claim') ?? '.brownie/private/phase-loop/todo-claims/current.json',
+      todoPath: args.get('todo') ?? '.brownie/todo.md',
+      breakdownPath: args.get('breakdown') ?? '.brownie/todo-breakdown.md',
+      runStamp: args.get('run-stamp') ?? new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z')
+    });
+  } catch (error) {
+    result = {
+      schema_version: 1,
+      applied: false,
+      eligible: true,
+      blocked: true,
+      reason: error.code === 'workspace_package_json_invalid' ? error.code : 'todo_decomposition_repair_failed',
+      error_code: error.code ?? 'todo_decomposition_repair_failed',
+      error_message: error.message
+    };
+  }
   console.log(JSON.stringify(result, null, 2));
   process.exit(result.applied ? 0 : result.eligible ? 1 : 2);
 }

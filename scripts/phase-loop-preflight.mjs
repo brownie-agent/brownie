@@ -22,8 +22,11 @@ function parseArgs(argv) {
     claim: '.brownie/private/phase-loop/todo-claims/current.json',
     todo: '.brownie/todo.md',
     breakdown: '.brownie/todo-breakdown.md',
+    controlPlaneRoot: null,
+    controllerFingerprint: null,
     snapshotSource: null,
     snapshotAudit: null,
+    profile: 'production',
     skipCommands: false
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -38,10 +41,16 @@ function parseArgs(argv) {
       args.todo = argv[++index];
     } else if (arg === '--breakdown') {
       args.breakdown = argv[++index];
+    } else if (arg === '--control-plane-root') {
+      args.controlPlaneRoot = argv[++index];
+    } else if (arg === '--controller-fingerprint') {
+      args.controllerFingerprint = argv[++index];
     } else if (arg === '--snapshot-source') {
       args.snapshotSource = argv[++index];
     } else if (arg === '--snapshot-audit') {
       args.snapshotAudit = argv[++index];
+    } else if (arg === '--profile') {
+      args.profile = argv[++index];
     } else if (arg === '--skip-commands') {
       args.skipCommands = true;
     } else {
@@ -51,12 +60,15 @@ function parseArgs(argv) {
   return args;
 }
 
-function requiredPathInRepository(repoRoot, requestedPath, errors) {
+function requiredPathInRepository(repoRoot, requestedPath, errors, options = {}) {
   const lexicalRepoRoot = path.resolve(repoRoot);
   const realRepoRoot = fs.realpathSync(repoRoot);
   const resolvedPath = path.resolve(lexicalRepoRoot, requestedPath);
   const relativePath = path.relative(lexicalRepoRoot, resolvedPath);
   if (relativePath === '..' || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    if (options.allowOutsideRepository === true) {
+      return resolvedPath;
+    }
     errors.push({
       code: 'required_file_outside_repository',
       path: requestedPath,
@@ -81,8 +93,8 @@ function requiredPathInRepository(repoRoot, requestedPath, errors) {
   return resolvedPath;
 }
 
-function readText(repoRoot, requestedPath, errors) {
-  const resolvedPath = requiredPathInRepository(repoRoot, requestedPath, errors);
+function readText(repoRoot, requestedPath, errors, options = {}) {
+  const resolvedPath = requiredPathInRepository(repoRoot, requestedPath, errors, options);
   if (!resolvedPath) {
     return '';
   }
@@ -119,7 +131,7 @@ function sha256Text(text) {
   return `sha256:${crypto.createHash('sha256').update(text).digest('hex')}`;
 }
 
-function todoSnapshotAudit({ repoRoot, todoPath, todoText, breakdownPath, breakdownText, snapshotSource, snapshotAuditPath, errors }) {
+function todoSnapshotAudit({ repoRoot, todoPath, todoText, breakdownPath, breakdownText, snapshotSource, snapshotAuditPath, controllerFingerprint, errors }) {
   if (!snapshotSource) {
     return null;
   }
@@ -156,6 +168,7 @@ function todoSnapshotAudit({ repoRoot, todoPath, todoText, breakdownPath, breakd
       && audit.snapshot_path === path.resolve(repoRoot, todoPath)
       && audit.snapshot_sha256 === snapshotSha256
       && audit.queue_cas === queueCas
+      && (!controllerFingerprint || audit.controller_source_fingerprint === controllerFingerprint)
       && Number.isInteger(audit.generation)
       && audit.generation > 0
       && audit.mutation?.kind === 'completed_todo_removal'
@@ -185,6 +198,7 @@ function todoSnapshotAudit({ repoRoot, todoPath, todoText, breakdownPath, breakd
     breakdown_path: path.resolve(repoRoot, breakdownPath),
     breakdown_sha256: breakdownSha256,
     queue_cas: queueCas,
+    controller_source_fingerprint: controllerFingerprint ?? null,
     generation,
     ...(mutation ? { mutation } : {})
   };
@@ -411,12 +425,28 @@ function validateReleaseEvidence(repoRoot, errors) {
   }
 }
 
-function validateDirtyDelivery(repoRoot, todoText, errors) {
+function hasPendingCompletionClaim(claimPath) {
+  if (!claimPath) {
+    return false;
+  }
+  try {
+    const claim = JSON.parse(fs.readFileSync(path.resolve(claimPath), 'utf8'));
+    return claim?.status === 'completed'
+      && (claim.completion_cleanup_pending === true || claim.completion_pr_pending === true);
+  } catch {
+    return false;
+  }
+}
+
+function validateDirtyDelivery(repoRoot, todoText, errors, options = {}) {
   const dirtyFiles = gitDirtyFiles(repoRoot);
   if (dirtyFiles.length === 0) {
     return;
   }
   if (!hasImplementableTodo(todoText)) {
+    if (options.allowPendingCompletionRecovery === true && hasPendingCompletionClaim(options.claimPath)) {
+      return;
+    }
     errors.push({
       code: 'dirty_delivery_required',
       dirty_files: dirtyFiles,
@@ -425,16 +455,25 @@ function validateDirtyDelivery(repoRoot, todoText, errors) {
   }
 }
 
-function validateRequiredCommands(repoRoot, todoPath, breakdownPath, errors) {
-  const commands = [
-    ['node', ['scripts/guard-todo-decomposition.mjs', '--todo', todoPath, '--breakdown', breakdownPath]],
-    ['node', ['scripts/phase-loop-todo-queue-integrity.mjs', '--repo', repoRoot, '--todo', todoPath, '--breakdown', breakdownPath]],
-    ['node', ['scripts/guard-release-contract.mjs']],
-    ['node', ['scripts/guard-runtime-release-readiness.mjs']]
-  ];
+function validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors) {
+  const controlScripts = path.join(controlPlaneRoot, 'scripts');
+  const absoluteTodoPath = path.resolve(repoRoot, todoPath);
+  const absoluteBreakdownPath = path.resolve(repoRoot, breakdownPath);
+  const fixtureProfile = profile === 'claim-smoke-fixture';
+  const policyRoot = fixtureProfile ? controlPlaneRoot : repoRoot;
+  const queueIntegrityCommand = ['node', [path.join(controlScripts, 'phase-loop-todo-queue-integrity.mjs'), '--repo', repoRoot, '--todo', absoluteTodoPath, '--breakdown', absoluteBreakdownPath]];
+  const commands = fixtureProfile
+    ? [queueIntegrityCommand]
+    : [
+      ['node', [path.join(controlScripts, 'guard-todo-decomposition.mjs'), '--repo', policyRoot, '--todo', absoluteTodoPath, '--breakdown', absoluteBreakdownPath]],
+      queueIntegrityCommand,
+      ['node', [path.join(controlScripts, 'guard-release-contract.mjs'), '--repo', policyRoot]],
+      ['node', [path.join(controlScripts, 'guard-runtime-release-readiness.mjs'), '--repo', policyRoot]]
+    ];
   const results = [];
   for (const [command, args] of commands) {
-    const result = runCommand(repoRoot, command, args);
+    const commandRoot = args.includes(path.join(controlScripts, 'phase-loop-todo-queue-integrity.mjs')) ? repoRoot : policyRoot;
+    const result = runCommand(commandRoot, command, args);
     results.push(result);
     if (result.exit_code !== 0) {
       errors.push({
@@ -452,13 +491,31 @@ function validateRequiredCommands(repoRoot, todoPath, breakdownPath, errors) {
 
 export function validatePhaseLoopPreflight(options = {}) {
   const repoRoot = path.resolve(options.repo ?? defaultRepoRoot);
+  const controlPlaneRoot = path.resolve(options.controlPlaneRoot ?? repoRoot);
+  const profile = options.profile ?? 'production';
   const errors = [];
   const warnings = [];
+  if (!['production', 'claim-smoke-fixture'].includes(profile)) {
+    errors.push({
+      code: 'phase_loop_preflight_profile_unknown',
+      profile,
+      message: `Unknown phase-loop preflight profile: ${profile}`
+    });
+  }
+  if (profile === 'claim-smoke-fixture' && process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY !== '1') {
+    errors.push({
+      code: 'phase_loop_preflight_fixture_profile_forbidden',
+      profile,
+      message: 'The claim-smoke fixture profile requires the explicit test-only PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 marker.'
+    });
+  }
   const todoPath = options.todo ?? '.brownie/todo.md';
-  const todoText = readText(repoRoot, todoPath, errors);
+  const fixtureProfile = profile === 'claim-smoke-fixture';
+  const fixturePathOptions = fixtureProfile ? { allowOutsideRepository: true } : {};
+  const todoText = readText(repoRoot, todoPath, errors, fixturePathOptions);
   const breakdownPath = options.breakdown ?? '.brownie/todo-breakdown.md';
   const breakdownText = options.snapshotSource
-    ? readText(repoRoot, breakdownPath, errors)
+    ? readText(repoRoot, breakdownPath, errors, fixturePathOptions)
     : null;
   const snapshotAudit = errors.some((error) => error.code === 'required_file_outside_repository')
     ? null
@@ -470,16 +527,21 @@ export function validatePhaseLoopPreflight(options = {}) {
       breakdownText,
       snapshotSource: options.snapshotSource,
       snapshotAuditPath: options.snapshotAudit,
+      controllerFingerprint: options.controllerFingerprint,
       errors
     });
-  validateReleaseEvidence(repoRoot, errors);
-  validateDirtyDelivery(repoRoot, todoText, errors);
-  const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, errors);
+  validateReleaseEvidence(profile === 'claim-smoke-fixture' ? controlPlaneRoot : repoRoot, errors);
+  validateDirtyDelivery(repoRoot, todoText, errors, {
+    allowPendingCompletionRecovery: fixtureProfile,
+    claimPath: options.claim
+  });
+  const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors);
 
   return {
     schema_version: 1,
     valid: errors.length === 0,
     stage: options.stage ?? 'general',
+    profile,
     errors,
     warnings,
     ...(snapshotAudit ? { snapshot_audit: snapshotAudit } : {}),

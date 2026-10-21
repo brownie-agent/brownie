@@ -16,6 +16,20 @@ import { readTrackedBreakdownReplanRecords } from './phase-loop-todo-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+test('nested supervisor repair uses the explicit controller source root', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'phase-loop-supervisor-control.mjs'), 'utf8');
+  assert.match(source, /--control-plane-root/u);
+  assert.match(source, /--todo/u);
+  assert.match(source, /--breakdown/u);
+  assert.match(source, /--state-dir/u);
+  assert.match(source, /workspaceTodoPath\(repoRoot\)/u);
+  assert.match(source, /workspaceStateRoot\(repoRoot\)/u);
+  assert.match(source, /controlPlaneScript\('scripts\/phase-loop-todo-queue-integrity\.mjs'\)/u);
+  assert.match(source, /controlPlaneScript\('scripts\/repair-todo-decomposition\.mjs'\)/u);
+  assert.match(source, /controlPlaneScript\('scripts\/phase-loop-preclaim-recovery\.mjs'\)/u);
+  assert.doesNotMatch(source, /runJsonCommand\(repoRoot, process\.execPath, \[\s*'scripts\/(?:phase-loop-todo-queue-integrity|repair-todo-decomposition|phase-loop-preclaim-recovery)\.mjs'/u);
+});
+
 const runtimeEvidenceTodo = `- [ ] E-21c-runtime-operational-evidence-impl-2-target-02: Patch only \`scripts/guard-runtime-operational-evidence.test.mjs\` to require runtime operational evidence to model release operation as executable fail-closed evidence:
   Route: implementation.
   Source TODO: E-21c-runtime-operational-evidence.
@@ -342,6 +356,17 @@ test('retains TODO-contract replan feedback until the replan has explicit comple
   assert.equal(result.repair.resolved_repair_feedback_archive.reason, 'feedback_kind_requires_its_own_verification');
   assert.equal(feedback.completed, false);
   assert.equal(feedback.verification.completed, false);
+  assert.equal(fs.existsSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback-archive')), false);
+});
+
+test('does not treat missing repair feedback as a resolved repair receipt', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+
+  assert.equal(result.repair.resolved_repair_feedback_archive.attempted, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.resolved_repair_feedback_archive.reason, 'no_active_repair_feedback');
   assert.equal(fs.existsSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback-archive')), false);
 });
 
@@ -789,6 +814,52 @@ test('does not start when post-replan stale claim archival fails', () => {
     assert.equal(result.start.reason, 'post_replan_stale_claim_archive_failed');
   } finally {
     fs.writeFileSync = originalWriteFileSync;
+  }
+});
+
+test('fails closed when a post-replan stale claim disappears after its audit snapshot', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/phase-loop.pid'), `${process.pid}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'no_progress', run_id: 'run-replan-archive-enoent', consecutive_failures: 0
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 3, run_stamp: '20261008T000300Z',
+    progress_projection: {
+      cli_status: 'no_eligible_task', closure: 'no_eligible_task',
+      claim_id: 'claim-replan-archive-enoent', selected_todo: runtimeEvidenceTodo
+    }
+  });
+  const claimPath = path.join(repo, '.brownie/private/phase-loop/todo-claims/current.json');
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/current.json', {
+    claim_id: 'claim-replan-archive-enoent', status: 'claimed', selected_todo: runtimeEvidenceTodo
+  });
+  const originalRmSync = fs.rmSync;
+  fs.rmSync = function guardedRemove(file, ...args) {
+    if (String(file) === claimPath) {
+      originalRmSync.call(this, file, ...args);
+      const error = new Error('simulated stale claim disappearance after audit snapshot');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return originalRmSync.call(this, file, ...args);
+  };
+  try {
+    const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: true });
+    assert.equal(result.repair.post_replan_stale_active_claim.ok, false, JSON.stringify(result, null, 2));
+    assert.equal(result.repair.post_replan_stale_active_claim.reason, 'active_claim_disappeared_during_cleanup');
+    assert.equal(result.start.attempted, false, JSON.stringify(result, null, 2));
+    assert.equal(result.start.reason, 'post_replan_stale_claim_archive_failed');
+    assert.equal(fs.existsSync(claimPath), false);
+    const archives = fs.readdirSync(path.dirname(claimPath))
+      .filter((name) => name.startsWith('stale-current-'));
+    assert.equal(archives.length, 1);
+    const archived = JSON.parse(fs.readFileSync(path.join(path.dirname(claimPath), archives[0]), 'utf8'));
+    assert.equal(archived.claim_id, 'claim-replan-archive-enoent');
+    assert.match(archived.claim_snapshot_sha256, /^[a-f0-9]{64}$/u);
+  } finally {
+    fs.rmSync = originalRmSync;
   }
 });
 

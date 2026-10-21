@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
@@ -13,6 +16,11 @@ const policy = {
   implementation_branch_prefixes: ['brownie-agent/', 'phase-loop/'],
   review_branch_prefixes: ['codex/']
 };
+
+test('controller passes the implementation workspace to actor preflight', () => {
+  const controller = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'phase-loop.sh'), 'utf8');
+  assert.match(controller, /phase-loop-actor-preflight\.mjs" --role implementation --repo-root "\$PHASE_LOOP_WORKSPACE_ROOT"/u);
+});
 
 test('accepts brownie-agent implementation actor on implementation branch', () => {
   const errors = validatePhaseLoopActorPreflight({
