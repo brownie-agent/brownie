@@ -1,0 +1,62 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const controller = fs.readFileSync(path.join(repoRoot, 'phase-loop.sh'), 'utf8');
+
+function mismatchRecoveryBlock() {
+  const start = controller.indexOf('if [ "$runtime_admission_status" -ne 0 ]; then');
+  const end = controller.indexOf('  bind_runtime_stdout_to_active_claim "$stdout_log"', start);
+  assert(start >= 0 && end > start, 'runtime admission mismatch recovery block must exist');
+  return controller.slice(start, end);
+}
+
+test('runtime mismatch recovery restores delegated scope, target, and pre-runtime claim snapshots', () => {
+  const block = mismatchRecoveryBlock();
+  assert.match(block, /phase-loop-delegated-scope\.mjs/);
+  assert.match(block, /active_target_snapshot/);
+  assert.match(block, /cp \"\$active_target_snapshot\"/);
+  assert.match(block, /restore_claim_snapshot_before_runtime \"\$claim_snapshot_before_runtime\"/);
+  assert.doesNotMatch(block, /\n\s+write_todo_claim\b/);
+});
+
+test('public blocked-event canonicalization preserves owner stops without contradictory continuation', () => {
+  assert.match(controller, /reason in \{\"explicit_blocker\", \"explicit_blocker_pre_runtime\"\}/);
+  assert.match(controller, /payload\.get\("owner_blocked"\) is True/);
+  assert.match(controller, /payload\[\"owner_blocked\"\] = True/);
+  assert.match(controller, /payload\.pop\("continuation_required", None\)/);
+});
+
+test('claim snapshot restore validates durable identity before writing current claim', () => {
+  const start = controller.indexOf('restore_claim_snapshot_before_runtime()');
+  const end = controller.indexOf('\ncompleted_todo_cleanup_pending()', start);
+  assert(start >= 0 && end > start, 'claim snapshot restore helper must exist');
+  const helper = controller.slice(start, end);
+  assert.match(helper, /claim\.get\("claim_id"\)/);
+  assert.match(helper, /claim\.get\("selected_todo"\)/);
+  assert.match(helper, /destination\.write_text/);
+});
+
+test('runtime CLI attests the active claim before admission validation and covers run/resume payloads', () => {
+  const exportClaim = controller.indexOf('export BROWNIE_PHASE_LOOP_CLAIM_ID=');
+  const validation = controller.indexOf(
+    'phase-loop-runtime-admission.mjs" validate',
+    exportClaim,
+  );
+  const binder = controller.indexOf('  bind_runtime_stdout_to_active_claim "$stdout_log"', validation);
+  assert(validation >= 0 && binder > validation, 'admission validation must precede post-processing binder');
+  assert(exportClaim >= 0 && exportClaim < validation, 'claim ID must be exported before runtime execution');
+
+  const cli = fs.readFileSync(
+    path.join(repoRoot, 'crates/brownie-cli/src/runtime_client.rs'),
+    'utf8',
+  );
+  assert.match(cli, /PHASE_LOOP_CLAIM_ID_ENV/);
+  assert.match(cli, /PHASE_LOOP_ADMISSION_FILE_ENV/);
+  assert.match(cli, /attest_phase_loop_claim_id\(\s*cli_run_or_advance_payload/);
+  assert.match(cli, /attest_phase_loop_claim_id\(\s*cli_resume_payload/);
+  assert.match(cli, /attest_phase_loop_claim_id_payload/);
+});
