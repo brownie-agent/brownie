@@ -138,6 +138,13 @@ with pathlib.Path(audit_file).open("a", encoding="utf-8") as handle:
 PY
 }
 
+phase_loop_claim_smoke_emit_audit_event() {
+  local audit_file="$1"
+  shift
+  phase_loop_claim_smoke_append_audit_event "$audit_file" "$@"
+  tail -n 1 "$audit_file" >&2 || true
+}
+
 phase_loop_claim_smoke_write_audit_manifest() {
   local shard_dir="$1"
   local output_file="$2"
@@ -320,23 +327,23 @@ phase_loop_claim_smoke_run_scheduler() {
       pid="${active_pids[$i]}"
       pgid="${active_pgids[$i]}"
       if phase_loop_claim_smoke_process_is_live "$pid" || phase_loop_claim_smoke_group_has_live_members "$pgid"; then
-        phase_loop_claim_smoke_terminate_process_group "$pid" 3 "$pgid"
+        phase_loop_claim_smoke_terminate_process_group "$pid" 3 "$pgid" || true
         shard="${active_shards[$i]}"
         control_root="$shard_dir/$shard-control-root"
         stdout_log="$shard_dir/$shard.stdout.log"
         stderr_log="$shard_dir/$shard.stderr.log"
-        phase_loop_claim_smoke_append_audit_event "$audit_file" shard_timeout "$shard" "$pid" "$pgid" timed_out 124 "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "scheduler watchdog expired"
+        phase_loop_claim_smoke_append_audit_event "$audit_file" shard_timeout "$shard" "$pid" "$pgid" timed_out 124 "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "scheduler watchdog expired" || true
       fi
     done
-    phase_loop_claim_smoke_write_audit_manifest "$shard_dir" "$manifest_file" "$scheduler_timed_out"
-    if [ "$cleanup_status" -ne 0 ] || [ "$scheduler_timed_out" -eq 1 ]; then
+    phase_loop_claim_smoke_write_audit_manifest "$shard_dir" "$manifest_file" "$scheduler_timed_out" || true
+    if [ "$cleanup_status" -ne 0 ] || [ "$scheduler_timed_out" -eq 1 ] || [ "$claim_smoke_failed" -ne 0 ]; then
       echo "phase-loop claim smoke audit: $manifest_file" >&2
-      cat "$manifest_file" >&2
+      cat "$manifest_file" >&2 || true
     fi
     if [ "$manifest_file" != "$shard_dir/claim-smoke-audit.json" ]; then
       :
     fi
-    rm -rf -- "$shard_dir"
+    rm -rf -- "$shard_dir" || true
   }
 
   phase_loop_claim_smoke_scheduler_signal() {
@@ -348,7 +355,7 @@ phase_loop_claim_smoke_run_scheduler() {
   trap phase_loop_claim_smoke_scheduler_signal TERM INT
   (
     sleep "$watchdog_seconds"
-    phase_loop_claim_smoke_append_audit_event "$audit_file" scheduler_timeout "" "" "" timed_out 124 "" "" "" "" "$PWD" "watchdog expired after ${watchdog_seconds}s"
+    phase_loop_claim_smoke_emit_audit_event "$audit_file" scheduler_timeout "" "" "" timed_out 124 "" "" "" "" "$PWD" "watchdog expired after ${watchdog_seconds}s"
     kill -TERM "$scheduler_parent_pid" 2>/dev/null || true
   ) &
   watchdog_pid="$!"
@@ -378,7 +385,7 @@ phase_loop_claim_smoke_run_scheduler() {
       active_pids+=("$pid")
       active_pgids+=("$pgid")
       active_shards+=("$shard")
-      phase_loop_claim_smoke_append_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start"
+      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start"
       index=$((index + 1))
     done
     for ((i = 0; i < ${#active_pids[@]}; i += 1)); do
@@ -393,7 +400,7 @@ phase_loop_claim_smoke_run_scheduler() {
       if phase_loop_claim_smoke_group_has_live_members "$pgid"; then
         phase_loop_claim_smoke_terminate_process_group "$pid" 3 "$pgid"
       fi
-      phase_loop_claim_smoke_append_audit_event "$audit_file" shard_finished "$shard" "$pid" "$pgid" "$([ "$status" -eq 0 ] && echo passed || echo failed)" "$status" "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" ""
+      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_finished "$shard" "$pid" "$pgid" "$([ "$status" -eq 0 ] && echo passed || echo failed)" "$status" "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" ""
       if [ "$status" -ne 0 ]; then
         claim_smoke_failed=1
         echo "phase-loop claim smoke shard failed: $shard exit=$status" >&2

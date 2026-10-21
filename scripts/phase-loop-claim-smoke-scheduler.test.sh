@@ -62,10 +62,13 @@ PY
 normal_output="$fixture_root/normal-audit.json"
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$normal_output" \
   bash "$scheduler_driver" "$normal_output" \
-  "$fixture_root/normal-shards" "$fixture_script" 2 10 fast fast fast fast fast fast fast fast
+  "$fixture_root/normal-shards" "$fixture_script" 2 10 fast fast fast fast fast fast fast fast \
+  2>"$fixture_root/normal-driver.stderr"
 assert_json "$normal_output" 'manifest["scheduler_timed_out"] is False'
 assert_json "$normal_output" 'len([r for r in manifest["records"] if r.get("event") == "shard_finished" and r.get("status") == "passed"]) == 8'
 assert_json "$normal_output" 'all(r.get("pid") and r.get("pgid") and r.get("stdout_path") and r.get("stderr_path") and r.get("temp_root") and r.get("state_root") and r.get("workspace_root") for r in manifest["records"] if r.get("event") == "shard_started")'
+rg -q '"event": "shard_started"' "$fixture_root/normal-driver.stderr"
+rg -q '"event": "shard_finished"' "$fixture_root/normal-driver.stderr"
 
 child_pid_file="$fixture_root/slow-child.pid"
 timeout_output="$fixture_root/timeout-audit.json"
@@ -78,6 +81,7 @@ PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$timeout_output" \
 timeout_status="$?"
 set -e
 [ "$timeout_status" -ne 0 ]
+rg -q '"event": "scheduler_timeout"' "$fixture_root/timeout-driver.stderr"
 assert_json "$timeout_output" 'manifest["scheduler_timed_out"] is True'
 assert_json "$timeout_output" 'any(r.get("event") == "scheduler_timeout" for r in manifest["records"])'
 assert_json "$timeout_output" 'any(r.get("event") == "shard_timeout" and r.get("shard") == "slow" and r.get("pid") and r.get("pgid") and r.get("stdout_tail") is not None and r.get("stderr_tail") is not None for r in manifest["records"])'
