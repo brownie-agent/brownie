@@ -178,6 +178,17 @@ export function evaluateBdkPublicHarnessTrajectory(records, { allowPartial = fal
         repair_hint: 'Repair-required terminal events must declare continuation_required=true or owner_blocked=true; they must never be interpreted as completion.'
       });
     }
+    const contradictoryBlockedEvents = events.filter((event) => event.type === 'todo.blocked'
+      && event.payload?.owner_blocked === true
+      && event.payload?.continuation_required === true);
+    if (contradictoryBlockedEvents.length > 0) {
+      failures.push({
+        class: 'contradictory_blocked_event',
+        run_claim: key,
+        actual: contradictoryBlockedEvents.map((event) => event.type),
+        repair_hint: 'Owner-blocked events must not also request continuation.'
+      });
+    }
     for (const event of events) {
       if (event.claim_id !== event.root_claim_id) {
         failures.push({

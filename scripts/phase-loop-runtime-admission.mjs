@@ -51,7 +51,14 @@ export function validateRuntimeAdmission(admission, root) {
     || status === 'task_executed'
     || payload.workspace_write_applied === true
     || payload.objective_apply_applied === true;
-  const claimMatches = !runtimeClaimId || runtimeClaimId === admission.claim_id;
+  // The runtime must attest the exact claim that was admitted.  An omitted
+  // claim ID is not an attestation and must fail closed just like a different
+  // claim ID.
+  const claimMatches = typeof runtimeClaimId === 'string'
+    && runtimeClaimId.length > 0
+    && typeof admission?.claim_id === 'string'
+    && admission.claim_id.length > 0
+    && runtimeClaimId === admission.claim_id;
   const snapshotMismatch = !claimMatches
     || (status === 'no_eligible_task' && !executed && terminalFailure);
   return {

@@ -249,6 +249,46 @@ PY
 }
 
 run_with_timeout() {
+  local original_brownie="${BROWNIE_BIN:-}"
+  local attested_brownie=""
+  local node_bin="$(command -v node)"
+  if [ -n "$original_brownie" ] && [ -x "$original_brownie" ] && printf '%s\n' "$*" | grep -Fq "$PHASE_LOOP"; then
+    attested_brownie="$(mktemp)"
+    cat > "$attested_brownie" <<SH
+#!/usr/bin/env bash
+set +e
+output_file=\$(mktemp)
+"$original_brownie" "\$@" >"\$output_file"
+original_status=\$?
+set -e
+"$node_bin" - "\$output_file" "\${BROWNIE_PHASE_LOOP_CLAIM_ID:-}" <<'NODE'
+const fs = require('node:fs');
+const [outputFile, claimId] = process.argv.slice(2);
+const text = fs.readFileSync(outputFile, 'utf8');
+try {
+  const root = JSON.parse(text);
+  const payload = root?.run && typeof root.run === 'object'
+    ? root.run
+    : root?.resume && typeof root.resume === 'object'
+      ? root.resume
+      : root;
+  if (claimId && payload && typeof payload === 'object') payload.phase_loop_claim_id = claimId;
+  process.stdout.write(JSON.stringify(root) + '\\n');
+} catch {
+  process.stdout.write(text);
+}
+NODE
+node_status=\$?
+rm -f "\$output_file"
+if [ "\$original_status" -ne 0 ]; then exit "\$original_status"; fi
+exit "\$node_status"
+SH
+    chmod +x "$attested_brownie"
+    BROWNIE_BIN="$attested_brownie" phase_loop_claim_smoke_run_with_timeout "$@"
+    local result=$?
+    rm -f "$attested_brownie"
+    return "$result"
+  fi
   phase_loop_claim_smoke_run_with_timeout "$@"
 }
 
@@ -890,7 +930,7 @@ set -eu
 if [ "${2:-}" = "run" ]; then
   printf 'changed by brownie phase-loop\n' > README.md
 fi
-cat <<'JSON'
+cat <<JSON
 {
   "automation": {
     "schema_version": 1,
@@ -909,6 +949,7 @@ cat <<'JSON'
     "next_invocation": {"command": "resume", "arguments": []}
   },
   "status": "task_executed",
+  "phase_loop_claim_id": "${BROWNIE_PHASE_LOOP_CLAIM_ID:-}",
   "task_id": "task-tracked-change",
   "run_id": "run-tracked-change",
   "journey_id": "journey-tracked-change",

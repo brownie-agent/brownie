@@ -74,6 +74,17 @@ test('accepts an owner-blocked event without treating it as completion', () => {
   assert.equal(result.ok, true);
 });
 
+test('rejects contradictory owner-blocked continuation flags', () => {
+  const result = evaluateBdkPublicHarnessTrajectory([
+    record('todo.claimed'),
+    record('workflow.routed'),
+    record('skill.selected'),
+    record('todo.blocked', { owner_blocked: true, continuation_required: true, reason: 'explicit_blocker_pre_runtime' })
+  ]);
+  assert.equal(result.ok, false);
+  assert(result.failures.some((failure) => failure.class === 'contradictory_blocked_event'));
+});
+
 test('accepts a repair-feedback-only trajectory in partial mode', () => {
   const result = evaluateBdkPublicHarnessTrajectory([
     record('todo.claimed'),

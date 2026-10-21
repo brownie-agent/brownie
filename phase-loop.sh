@@ -223,8 +223,11 @@ if event_type == "todo.replanned":
     payload.setdefault("recovery_scope", "selected_claim")
 elif event_type == "todo.blocked":
     reason = str(payload.get("reason") or "")
-    if reason == "explicit_blocker":
-        payload.setdefault("owner_blocked", True)
+    if reason in {"explicit_blocker", "explicit_blocker_pre_runtime"} or payload.get("owner_blocked") is True:
+        # Owner-controlled stops are terminal without a continuation.  Never
+        # publish contradictory owner_blocked + continuation_required flags.
+        payload["owner_blocked"] = True
+        payload.pop("continuation_required", None)
     else:
         payload.setdefault("continuation_required", True)
 
@@ -9912,6 +9915,47 @@ PY
   sync_parent_dir "$TODO_CLAIM_DIR"
 }
 
+restore_claim_snapshot_before_runtime() {
+  local snapshot="$1"
+  local timestamp tmp_claim
+  if [ -z "$snapshot" ] || [ ! -s "$snapshot" ]; then
+    return 1
+  fi
+  timestamp="$(now_utc)"
+  tmp_claim="$TODO_CLAIM_FILE.$$.$RANDOM.restore.tmp"
+  python3 - "$snapshot" "$tmp_claim" "$timestamp" "$run_stamp" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+timestamp = sys.argv[3]
+run_stamp = sys.argv[4]
+try:
+    claim = json.loads(source.read_text(encoding="utf-8"))
+except Exception as error:
+    raise SystemExit(f"claim snapshot unreadable: {error}")
+if not isinstance(claim, dict) or not str(claim.get("claim_id") or "") or not str(claim.get("selected_todo") or ""):
+    raise SystemExit("claim snapshot lacks durable claim identity")
+claim["status"] = "in_progress"
+claim["run_stamp"] = run_stamp
+claim["updated_at"] = timestamp
+history = claim.setdefault("status_history", [])
+if not isinstance(history, list):
+    history = []
+    claim["status_history"] = history
+history.append({"status": "in_progress", "run_stamp": run_stamp, "updated_at": timestamp})
+destination.parent.mkdir(parents=True, exist_ok=True)
+destination.write_text(json.dumps(claim, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+os.chmod(destination, 0o600)
+PY
+  mv "$tmp_claim" "$TODO_CLAIM_FILE"
+  chmod 600 "$TODO_CLAIM_FILE"
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
 completed_todo_cleanup_pending() {
   [ "$(claim_status 2>/dev/null || true)" = "completed" ] &&
     [ "$(claim_field completion_cleanup_pending 2>/dev/null || true)" = "true" ]
@@ -14905,9 +14949,32 @@ PY
     runtime_admission_status=$?
   fi
   if [ "$runtime_admission_status" -ne 0 ]; then
+    # Admission failure is a post-execution boundary failure. Roll back both
+    # layers of workspace authority before returning: delegated scope restores
+    # every out-of-scope tracked file, while the exact pre-runtime target
+    # snapshot restores writes inside the declared target as well.
+    local mismatch_scope_output mismatch_scope_status=0 mismatch_target_status=0 mismatch_claim_status=0
+    set +e
+    mismatch_scope_output="$(node "$ROOT_DIR/scripts/phase-loop-delegated-scope.mjs" \
+      --workspace "$PHASE_LOOP_WORKSPACE_ROOT" \
+      --backup "$delegated_scope_backup" \
+      --objective "$(claim_field selected_todo)" 2>&1)"
+    mismatch_scope_status=$?
+    if [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$active_target_snapshot" ]; then
+      cp "$active_target_snapshot" "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path"
+      mismatch_target_status=$?
+    fi
+    # Do not call write_todo_claim here: if Runtime removed current.json that
+    # helper would synthesize a fresh claim from live inputs. Recovery must
+    # restore the durable claim captured immediately before Runtime instead.
+    restore_claim_snapshot_before_runtime "$claim_snapshot_before_runtime"
+    mismatch_claim_status=$?
+    set -e
     write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
-    write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
-    detail="Runtime did not admit the claimed task before execution; preserved the claim for bounded snapshot-mismatch recovery. admission=$runtime_admission_validation stdout=$stdout_log stderr=$stderr_log"
+    detail="Runtime did not admit the claimed task before execution; restored the pre-runtime delegated scope, target, and claim snapshots before bounded recovery. admission=$runtime_admission_validation scope_status=$mismatch_scope_status target_status=$mismatch_target_status claim_status=$mismatch_claim_status scope=$mismatch_scope_output stdout=$stdout_log stderr=$stderr_log"
+    if [ "$mismatch_scope_status" -ne 0 ] || [ "$mismatch_target_status" -ne 0 ] || [ "$mismatch_claim_status" -ne 0 ]; then
+      detail="Runtime admission mismatch recovery was incomplete; refusing to continue with partially restored state. $detail"
+    fi
     write_status "no_progress" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
     printf '%s run=%s runtime_admission_recovery_required=true admission=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_stamp" "$runtime_admission_validation" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
     write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"runtime_admission_snapshot_mismatch","continuation_required":true,"recovery_scope":"selected_claim","owner_blocked":false}'
