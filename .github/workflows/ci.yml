@@ -21,8 +21,11 @@ jobs:
         env:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.name }}
+          PHASE_LOOP_REJECTED_HEAD_SHA: ${{ vars.PHASE_LOOP_REJECTED_HEAD_SHA }}
+          PHASE_LOOP_REJECTED_PR_NUMBER: ${{ vars.PHASE_LOOP_REJECTED_PR_NUMBER }}
         run: |
           case "$PR_HEAD_REF" in
             brownie-agent/*|phase-loop/*) ;;
@@ -35,6 +38,9 @@ jobs:
           if [ "$PR_HEAD_OWNER" != "brownie-agent" ] || [ "$PR_HEAD_REPO" != "brownie" ]; then
             echo "Implementation pull-request admission failed: expected head brownie-agent/brownie, got $PR_HEAD_OWNER/$PR_HEAD_REPO" >&2
             exit 1
+          fi
+          if [ -n "$PHASE_LOOP_REJECTED_HEAD_SHA" ] || [ -n "$PHASE_LOOP_REJECTED_PR_NUMBER" ]; then
+            node scripts/phase-loop-pr-author-guard.mjs --event-path "$GITHUB_EVENT_PATH"
           fi
           echo "Implementation pull-request author guard passed for $PR_HEAD_REF."
 
