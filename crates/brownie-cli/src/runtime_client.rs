@@ -5013,6 +5013,19 @@ mod tests {
     }
 
     #[test]
+    fn delegated_controller_repair_cannot_apply_an_unrelated_workspace_mutation() {
+        let objective = "Repair the phase-loop controller. Patch only `phase-loop.sh`; do not modify README, TODO, release metadata, or product functionality.";
+
+        assert!(objective_scope_allows_proposal_path(Some(objective), "phase-loop.sh").unwrap());
+        assert!(!objective_scope_allows_proposal_path(Some(objective), "README.md").unwrap());
+        assert!(!objective_scope_allows_proposal_path(
+            Some(objective),
+            "crates/brownie-runtime/src/lib.rs"
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn boundary_names_runtime_authority_without_policy_copy() {
         let client = RuntimeClient::default();
         assert_eq!(client.boundary().authority, RuntimeAuthority::RustRuntime);

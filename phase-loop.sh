@@ -57,8 +57,6 @@ PHASE_LOOP_REBASELINE_RETRY_ALLOWED=0
 PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE=""
 PHASE_LOOP_RUNTIME_EXECUTION_CONFIRMED=0
 
-BROWNIE_BIN="${BROWNIE_BIN:-"$ROOT_DIR/target/debug/brownie"}"
-PHASE_LOOP_DEFAULT_BROWNIE_BIN="$ROOT_DIR/target/debug/brownie"
 PHASE_LOOP_PROMPT="${PHASE_LOOP_PROMPT:-"$ROOT_DIR/phase-loop.md"}"
 PHASE_LOOP_TODO="${PHASE_LOOP_TODO:-"$ROOT_DIR/.brownie/todo.md"}"
 PHASE_LOOP_TODO_BREAKDOWN="${PHASE_LOOP_TODO_BREAKDOWN:-"$(dirname "$PHASE_LOOP_TODO")/todo-breakdown.md"}"
@@ -66,6 +64,8 @@ PHASE_LOOP_TODO_SNAPSHOT_SOURCE="${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}"
 PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-"$STATE_DIR/todo-snapshot-audits"}"
 PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-"$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/current.json"}"
 PHASE_LOOP_WORKSPACE_ROOT="${PHASE_LOOP_WORKSPACE_ROOT:-"$ROOT_DIR"}"
+BROWNIE_BIN="${BROWNIE_BIN:-"$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"}"
+PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
 PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"/Users/satoshitanaka/.codex/automations/brownie-cli-phase-loop"}"
 PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-"$ROOT_DIR/.brownie/private/runtime-store"}"
 PHASE_LOOP_INTERVAL_SECONDS="${PHASE_LOOP_INTERVAL_SECONDS:-5}"
@@ -461,7 +461,7 @@ check_brownie_binary_freshness() {
     return 0
   fi
   local runtime_bin
-  runtime_bin="${BROWNIE_RUNTIME_PATH:-"$ROOT_DIR/target/debug/brownie-runtime"}"
+  runtime_bin="${BROWNIE_RUNTIME_PATH:-"$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie-runtime"}"
   python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$BROWNIE_BIN" "$runtime_bin" <<'PY'
 import pathlib
 import subprocess
@@ -12653,7 +12653,7 @@ PY
 
 validate_phase_loop_bootstrap() {
   local run_stamp="${1:-bootstrap-check}"
-  local configured_cli="${BROWNIE_BIN:-$ROOT_DIR/target/debug/brownie}"
+  local configured_cli="${BROWNIE_BIN:-$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie}"
   local configured_runtime="${BROWNIE_RUNTIME_PATH:-}"
   local resolved_cli resolved_runtime="" cli_reason="" runtime_reason=""
   local runtime_path_source="${PHASE_LOOP_RUNTIME_PATH_SOURCE:-cli-delegated}"
