@@ -94,7 +94,14 @@ export function validateExecutionContext(context, options = {}) {
 }
 
 export function auditExecutionContext(context, errors = []) {
-  const payload = { schema_version: 1, recorded_at: new Date().toISOString(), ...context, errors };
+  const auditInput = { schema_version: 1, ...context, errors };
+  const payload = {
+    schema_version: 1,
+    audit_sha256: sha256(JSON.stringify(auditInput)),
+    recorded_at: new Date().toISOString(),
+    ...context,
+    errors
+  };
   const text = JSON.stringify(payload, null, 2);
   return text.length > MAX_AUDIT_BYTES ? `${text.slice(0, MAX_AUDIT_BYTES - 32)}\n  "audit_truncated": true\n}\n` : `${text}\n`;
 }

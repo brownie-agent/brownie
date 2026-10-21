@@ -25,6 +25,7 @@ test('binds workspace-derived defaults and writes bounded audit', () => {
   assert.equal(result.context.state_root, path.join(workspace, '.brownie/private/phase-loop'));
   assert.equal(result.context.cli_root, path.join(workspace, 'target/debug/brownie'));
   assert(result.audit.length <= 8192);
+  assert.match(JSON.parse(result.audit).audit_sha256, /^sha256:[a-f0-9]{64}$/u);
 });
 
 test('rejects stale controller and cross-workspace state before dispatch', () => {
