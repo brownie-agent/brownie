@@ -6,7 +6,7 @@
   "description": "Brownie Code-OSS extension and Rust runtime workspace.",
   "scripts": {
     "build": "pnpm --filter brownie-vsix build",
-    "check": "pnpm --filter brownie-vsix check && pnpm phase-loop:run-state:test && pnpm phase-loop:watchdog:errexit:test && pnpm phase-loop:claim-lifecycle:test && pnpm phase-loop:delegation-admission:test && pnpm guard:phase-loop-pr-author:test && pnpm guard:release-contract && pnpm guard:trace-binding && pnpm guard:js-added-function-reachability",
+    "check": "pnpm --filter brownie-vsix check && pnpm guard:runtime-release-readiness:freshness && pnpm phase-loop:run-state:test && pnpm phase-loop:watchdog:errexit:test && pnpm phase-loop:claim-lifecycle:test && pnpm phase-loop:delegation-admission:test && pnpm guard:phase-loop-pr-author:test && pnpm guard:release-contract && pnpm guard:trace-binding && pnpm guard:js-added-function-reachability",
     "guard:control-plane-authority": "node scripts/guard-control-plane-authority.mjs",
     "guard:control-plane-authority:test": "node --test scripts/guard-control-plane-authority.test.mjs",
     "guard:diagnostics": "node scripts/guard-diagnostics-api.mjs",
@@ -98,6 +98,8 @@
     "phase-loop:contract-rebaseline:test": "node --test scripts/phase-loop-todo-contract-rebaseline.test.mjs",
     "phase-loop:preflight": "node scripts/phase-loop-preflight.mjs",
     "phase-loop:preflight:test": "node --test scripts/phase-loop-preflight.test.mjs",
+    "phase-loop:execution-context:test": "node --test scripts/phase-loop-execution-context.test.mjs",
+    "phase-loop:delegated-scope:test": "node --test scripts/phase-loop-delegated-scope.test.mjs",
     "phase-loop:supervisor-diagnose": "node scripts/phase-loop-supervisor-diagnose.mjs --write",
     "phase-loop:supervisor-diagnose:test": "node --test scripts/phase-loop-supervisor-diagnose.test.mjs",
     "phase-loop:supervisor-control": "node scripts/phase-loop-supervisor-control.mjs --repair --start",

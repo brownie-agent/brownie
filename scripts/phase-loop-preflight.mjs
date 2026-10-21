@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { bindExecutionContext } from './phase-loop-execution-context.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,6 +24,12 @@ function parseArgs(argv) {
     todo: '.brownie/todo.md',
     breakdown: '.brownie/todo-breakdown.md',
     controlPlaneRoot: null,
+    stateRoot: null,
+    cliRoot: null,
+    runtimeRoot: null,
+    baseCommit: null,
+    expectedActor: null,
+    contextAudit: null,
     controllerFingerprint: null,
     snapshotSource: null,
     snapshotAudit: null,
@@ -43,6 +50,18 @@ function parseArgs(argv) {
       args.breakdown = argv[++index];
     } else if (arg === '--control-plane-root') {
       args.controlPlaneRoot = argv[++index];
+    } else if (arg === '--state-root') {
+      args.stateRoot = argv[++index];
+    } else if (arg === '--cli-root') {
+      args.cliRoot = argv[++index];
+    } else if (arg === '--runtime-root') {
+      args.runtimeRoot = argv[++index];
+    } else if (arg === '--base-commit') {
+      args.baseCommit = argv[++index];
+    } else if (arg === '--expected-actor') {
+      args.expectedActor = argv[++index];
+    } else if (arg === '--context-audit') {
+      args.contextAudit = argv[++index];
     } else if (arg === '--controller-fingerprint') {
       args.controllerFingerprint = argv[++index];
     } else if (arg === '--snapshot-source') {
@@ -495,6 +514,21 @@ export function validatePhaseLoopPreflight(options = {}) {
   const profile = options.profile ?? 'production';
   const errors = [];
   const warnings = [];
+  const executionContext = bindExecutionContext({
+    workspaceRoot: repoRoot,
+    controllerRoot: controlPlaneRoot,
+    stateRoot: options.stateRoot,
+    cliRoot: options.cliRoot,
+    runtimeRoot: options.runtimeRoot,
+    todoPath: path.resolve(repoRoot, options.todo ?? '.brownie/todo.md'),
+    baseCommit: options.baseCommit,
+    expectedActor: options.expectedActor,
+    allowExternalController: profile === 'claim-smoke-fixture',
+    allowExternalState: profile === 'claim-smoke-fixture',
+    allowExternalTodo: profile === 'claim-smoke-fixture',
+    auditPath: options.contextAudit
+  });
+  errors.push(...executionContext.errors);
   if (!['production', 'claim-smoke-fixture'].includes(profile)) {
     errors.push({
       code: 'phase_loop_preflight_profile_unknown',
@@ -545,6 +579,7 @@ export function validatePhaseLoopPreflight(options = {}) {
     errors,
     warnings,
     ...(snapshotAudit ? { snapshot_audit: snapshotAudit } : {}),
+    execution_context: { ...executionContext.context, errors: executionContext.errors },
     command_results: commandResults
   };
 }

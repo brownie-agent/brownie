@@ -2,7 +2,8 @@
 set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="${PHASE_LOOP_STATE_DIR:-"$ROOT_DIR/.brownie/private/phase-loop"}"
+PHASE_LOOP_WORKSPACE_ROOT="${PHASE_LOOP_WORKSPACE_ROOT:-"$ROOT_DIR"}"
+STATE_DIR="${PHASE_LOOP_STATE_DIR:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/phase-loop"}"
 RUN_DIR="$STATE_DIR/runs"
 LOG_DIR="$STATE_DIR/logs"
 PID_FILE="$STATE_DIR/phase-loop.pid"
@@ -57,17 +58,18 @@ PHASE_LOOP_REBASELINE_RETRY_ALLOWED=0
 PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE=""
 PHASE_LOOP_RUNTIME_EXECUTION_CONFIRMED=0
 
-PHASE_LOOP_PROMPT="${PHASE_LOOP_PROMPT:-"$ROOT_DIR/phase-loop.md"}"
-PHASE_LOOP_TODO="${PHASE_LOOP_TODO:-"$ROOT_DIR/.brownie/todo.md"}"
+PHASE_LOOP_PROMPT="${PHASE_LOOP_PROMPT:-"$PHASE_LOOP_WORKSPACE_ROOT/phase-loop.md"}"
+PHASE_LOOP_TODO="${PHASE_LOOP_TODO:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/todo.md"}"
 PHASE_LOOP_TODO_BREAKDOWN="${PHASE_LOOP_TODO_BREAKDOWN:-"$(dirname "$PHASE_LOOP_TODO")/todo-breakdown.md"}"
 PHASE_LOOP_TODO_SNAPSHOT_SOURCE="${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}"
 PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-"$STATE_DIR/todo-snapshot-audits"}"
 PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-"$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/current.json"}"
-PHASE_LOOP_WORKSPACE_ROOT="${PHASE_LOOP_WORKSPACE_ROOT:-"$ROOT_DIR"}"
 BROWNIE_BIN="${BROWNIE_BIN:-"$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"}"
 PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
-PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"/Users/satoshitanaka/.codex/automations/brownie-cli-phase-loop"}"
-PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-"$ROOT_DIR/.brownie/private/runtime-store"}"
+PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"
+PHASE_LOOP_BASE_COMMIT="${PHASE_LOOP_BASE_COMMIT:-}"
+PHASE_LOOP_EXPECTED_ACTOR="${PHASE_LOOP_EXPECTED_ACTOR:-brownie-agent}"
+PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/runtime-store"}"
 PHASE_LOOP_INTERVAL_SECONDS="${PHASE_LOOP_INTERVAL_SECONDS:-5}"
 PHASE_LOOP_FAILURE_BACKOFF_SECONDS="${PHASE_LOOP_FAILURE_BACKOFF_SECONDS:-60}"
 PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS="${PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS:-900}"
@@ -12634,6 +12636,60 @@ load_env() {
   fi
 }
 
+bind_phase_loop_execution_context() {
+  local context_script="$ROOT_DIR/scripts/phase-loop-execution-context.mjs"
+  local context_audit="$STATE_DIR/execution-context.json"
+  if [ ! -f "$context_script" ]; then
+    PHASE_LOOP_CONTEXT_DIAGNOSTIC="missing execution-context contract: $context_script"
+    return 78
+  fi
+  local output status
+  set +e
+  output="$(node "$context_script" \
+    --workspace "$PHASE_LOOP_WORKSPACE_ROOT" \
+    --controller "$PHASE_LOOP_CONTROL_ROOT" \
+    --state "$STATE_DIR" \
+    --cli "${BROWNIE_BIN:-$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie}" \
+    --runtime "${BROWNIE_RUNTIME_PATH:-$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie-runtime}" \
+    --todo "$PHASE_LOOP_TODO" \
+    ${PHASE_LOOP_BASE_COMMIT:+--base-commit "$PHASE_LOOP_BASE_COMMIT"} \
+    --actor "$PHASE_LOOP_EXPECTED_ACTOR" \
+    ${PHASE_LOOP_PREFLIGHT_PROFILE:+$([ "$PHASE_LOOP_PREFLIGHT_PROFILE" = "claim-smoke-fixture" ] && printf '%s ' '--allow-external-controller --allow-external-state --allow-external-todo')} \
+    --audit "$context_audit" 2>&1)"
+  status=$?
+  set -e
+  PHASE_LOOP_CONTEXT_DIAGNOSTIC="$output"
+  if [ "$status" -ne 0 ]; then
+    return 78
+  fi
+  # All directories used by the controller are rebound to the validated
+  # workspace-derived state root before any claim or Runtime dispatch.
+  RUN_DIR="$STATE_DIR/runs"
+  LOG_DIR="$STATE_DIR/logs"
+  PID_FILE="$STATE_DIR/phase-loop.pid"
+  SUPERVISOR_OWNER_FILE="$STATE_DIR/phase-loop-owner.json"
+  LOCK_DIR="$STATE_DIR/phase-loop.lock"
+  STOP_FILE="$STATE_DIR/stop"
+  STATUS_FILE="$STATE_DIR/status.json"
+  SUPERVISOR_LOG="$LOG_DIR/supervisor.log"
+  TODO_CLAIM_DIR="$STATE_DIR/todo-claims"
+  TODO_CLAIM_FILE="$TODO_CLAIM_DIR/current.json"
+  TODO_QUEUE_STATE_FILE="$TODO_CLAIM_DIR/todo-queue-state.json"
+  TODO_BLOCKED_FILE="$TODO_CLAIM_DIR/blocked.jsonl"
+  TODO_REPAIR_FEEDBACK_FILE="$TODO_CLAIM_DIR/repair-feedback.json"
+  PROGRESS_STATE_FILE="$STATE_DIR/progress-state.json"
+  BDK_TRAJECTORY_DIR="$STATE_DIR/trajectories"
+  KNOWN_GOOD_DIR="$STATE_DIR/known-good-targets"
+  BDK_TRAJECTORY_FILE="${PHASE_LOOP_BDK_TRAJECTORY_FILE:-$STATE_DIR/bdk-trajectory.jsonl}"
+  BDK_HARNESS_FEEDBACK_FILE="$STATE_DIR/bdk-harness-feedback.json"
+  PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
+  LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
+  PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-$STATE_DIR/todo-snapshot-audits}"
+  PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/current.json}"
+  mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
+  return 0
+}
+
 resolve_phase_loop_binary_path() {
   local configured_path="$1"
   if [[ "$configured_path" = /* ]]; then
@@ -12771,6 +12827,11 @@ PY
 }
 
 phase_loop_require_approved_controller_baseline() {
+  if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" = "claim-smoke-fixture" ] && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
+    PHASE_LOOP_CONTROL_PLANE_FINGERPRINT="sha256:$(shasum -a 256 "$ROOT_DIR/phase-loop.sh" "$ROOT_DIR/scripts/phase-loop-preflight.mjs" | shasum -a 256 | awk '{print $1}')"
+    printf '%s controller_source_baseline_guard_fixture_bypass=true profile=%s fingerprint=%s\n' "$(now_utc)" "$PHASE_LOOP_PREFLIGHT_PROFILE" "$PHASE_LOOP_CONTROL_PLANE_FINGERPRINT" >> "$SUPERVISOR_LOG"
+    return 0
+  fi
   local guard_script="$ROOT_DIR/scripts/phase-loop-source-baseline-guard.mjs"
   if [ ! -f "$guard_script" ]; then
     PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT="missing guard script: $guard_script"
@@ -13402,6 +13463,12 @@ run_phase_loop_preflight() {
       --todo "$PHASE_LOOP_TODO" \
       --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" \
       --control-plane-root "$ROOT_DIR" \
+      --state-root "$STATE_DIR" \
+      --cli-root "$BROWNIE_BIN" \
+      --runtime-root "${BROWNIE_RUNTIME_PATH:-$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie-runtime}" \
+      ${PHASE_LOOP_BASE_COMMIT:+--base-commit "$PHASE_LOOP_BASE_COMMIT"} \
+      --expected-actor "$PHASE_LOOP_EXPECTED_ACTOR" \
+      --context-audit "$STATE_DIR/execution-context.json" \
       --profile "$PHASE_LOOP_PREFLIGHT_PROFILE" \
       --controller-fingerprint "$PHASE_LOOP_CONTROL_PLANE_FINGERPRINT" \
       --claim "$TODO_CLAIM_FILE" \
@@ -13677,6 +13744,10 @@ PY
 
 _run_brownie_once() {
   load_env
+  if ! bind_phase_loop_execution_context; then
+    printf '%s execution_context_bind_failed=true result=%s\n' "$(now_utc)" "$PHASE_LOOP_CONTEXT_DIAGNOSTIC" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
   if ! validate_terminal_failure_retry_cap; then
     return 78
   fi
@@ -13685,7 +13756,7 @@ _run_brownie_once() {
   local release_contract_before release_contract_repair_output release_contract_repair_status
   local phase_value_manifest_before phase_value_manifest_repair_output phase_value_manifest_repair_status
   local workspace_status_before
-  local active_target_path active_target_snapshot active_target_syntax_output active_target_syntax_status claim_snapshot_before_runtime
+  local active_target_path active_target_snapshot active_target_syntax_output active_target_syntax_status claim_snapshot_before_runtime delegated_scope_backup delegated_scope_output delegated_scope_status
   local use_resume=0
   local CLAIM_CREATED_THIS_RUN=0
   local CLAIM_REPLACED_BLOCKED=0
@@ -14091,6 +14162,17 @@ PY
   claim_snapshot_before_runtime="$RUN_DIR/$run_stamp.claim.before-runtime.json"
   cp "$TODO_CLAIM_FILE" "$claim_snapshot_before_runtime"
   chmod 600 "$claim_snapshot_before_runtime" 2>/dev/null || true
+  delegated_scope_backup="$RUN_DIR/$run_stamp.delegated-scope"
+  if ! node "$ROOT_DIR/scripts/phase-loop-delegated-scope.mjs" \
+      --capture 1 \
+      --workspace "$PHASE_LOOP_WORKSPACE_ROOT" \
+      --backup "$delegated_scope_backup" \
+      --objective "$(claim_field selected_todo)" >/dev/null 2>&1; then
+    detail="Unable to capture the delegated objective tracked-file baseline; refusing Runtime dispatch. backup=$delegated_scope_backup"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
   active_target_path="$(active_claim_patch_only_target 2>/dev/null || true)"
   # Re-snapshot after claim replacement/refresh so recovery and target repair
   # are bound to the live claim, TODO contract, and target selected for this
@@ -14734,6 +14816,42 @@ PY
   ) > "$stdout_log" 2> "$stderr_log"
   exit_code=$?
   bind_runtime_stdout_to_active_claim "$stdout_log"
+  set +e
+  delegated_scope_output="$(node "$ROOT_DIR/scripts/phase-loop-delegated-scope.mjs" \
+    --workspace "$PHASE_LOOP_WORKSPACE_ROOT" \
+    --backup "$delegated_scope_backup" \
+    --objective "$(claim_field selected_todo)" 2>&1)"
+  delegated_scope_status=$?
+  set -e
+  if [ "$delegated_scope_status" -ne 0 ]; then
+    local delegated_scope_feedback
+    delegated_scope_feedback="$(python3 - "$delegated_scope_output" <<'PY'
+import json
+import sys
+try:
+    evidence = json.loads(sys.argv[1])
+except Exception:
+    evidence = {"raw": sys.argv[1][-4000:]}
+print(json.dumps({
+    "completed": False,
+    "reason": "delegated_objective_scope_violation_rolled_back",
+    "expected": "Runtime may mutate only files declared by the selected TODO.",
+    "actual": evidence,
+    "repair_hint": "The supervisor rolled back every tracked file outside the declared target set. Retry with a bounded workspace.write restricted to the selected TODO targets; do not replace README.md or other unrelated files.",
+    "evidence": evidence,
+}, sort_keys=True))
+PY
+)"
+    write_repair_feedback "$run_stamp" "$delegated_scope_feedback" "$stdout_log" "$stderr_log" || true
+    if active_todo_claim_exists; then
+      write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    fi
+    detail="Rejected delegated objective mutation outside its declared target set and restored the unrelated tracked files. evidence=$delegated_scope_output"
+    write_status "no_progress" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
+    printf '%s run=%s delegated_scope_violation_rolled_back=true evidence=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_stamp" "$delegated_scope_output" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+    write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"delegated_objective_scope_violation_rolled_back"}'
+    return 76
+  fi
   if [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ] && {
     [ "${active_target_path##*.}" = "json" ] || [ "${active_target_path##*.}" = "jsonc" ];
   }; then
