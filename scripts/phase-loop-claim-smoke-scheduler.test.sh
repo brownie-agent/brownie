@@ -19,6 +19,9 @@ case "${PHASE_LOOP_CLAIM_SMOKE_SECTION:-}" in
   fast)
     printf 'fast shard completed\n'
     ;;
+  queue|queue-claim|queue-recovery|queue-integrity)
+    printf 'queue shard completed\n'
+    ;;
   expected|unexpected)
     exit 76
     ;;
@@ -59,7 +62,7 @@ import json
 import sys
 
 manifest = json.loads(open(sys.argv[1], encoding="utf-8").read())
-safe_globals = {"__builtins__": {}}
+safe_globals = {"__builtins__": {}, "manifest": manifest, "len": len, "all": all, "any": any}
 safe_locals = {"manifest": manifest, "len": len, "all": all, "any": any}
 assert eval(sys.argv[2], safe_globals, safe_locals), sys.argv[2]
 PY
@@ -79,6 +82,15 @@ assert_json "$normal_output" 'all(r.get("pid") and r.get("pgid") and r.get("stdo
 assert_json "$normal_output" 'all(r.get("started_monotonic_ns") and r.get("deadline_monotonic_ns") and r["deadline_monotonic_ns"] > r["started_monotonic_ns"] for r in manifest["records"] if r.get("event") == "shard_started")'
 grep -Fq '"event": "shard_started"' "$fixture_root/normal-driver.stderr"
 grep -Fq '"event": "shard_finished"' "$fixture_root/normal-driver.stderr"
+
+capacity_output="$fixture_root/capacity-audit.json"
+PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT=4 \
+  PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$capacity_output" \
+  bash "$scheduler_driver" "$capacity_output" \
+  "$fixture_root/capacity-shards" "$fixture_script" 2 10 90 "" fast fast queue-claim queue-recovery queue-integrity fast \
+  2>"$fixture_root/capacity-driver.stderr"
+assert_json "$capacity_output" 'all(any(r.get("event") == "shard_started" and r.get("shard") == shard and "batch_size=1" in r.get("detail", "") and "batch_rationale=queue_serialized_for_low_cpu_90s_deadline" in r.get("detail", "") and "cpu_count=4" in r.get("detail", "") for r in manifest["records"]) for shard in ["queue-claim", "queue-recovery", "queue-integrity"])'
+assert_json "$capacity_output" 'any(r.get("event") == "shard_started" and r.get("shard") == "fast" and "batch_start=5" in r.get("detail", "") for r in manifest["records"])'
 
 expected_output="$fixture_root/expected-audit.json"
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$expected_output" \

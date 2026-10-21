@@ -378,6 +378,9 @@ phase_loop_claim_smoke_run_scheduler() {
   local now_monotonic_ns
   local command_timeout_detail
   local active_done_count
+  local effective_batch_size
+  local batch_rationale
+  local shard_cpu_count
   local index
   local i
   local -a active_pids=()
@@ -440,7 +443,20 @@ phase_loop_claim_smoke_run_scheduler() {
     active_started_ns=()
     active_deadline_ns=()
     active_done=()
-    claim_smoke_batch_end=$((batch_start + batch_size))
+    effective_batch_size="$batch_size"
+    batch_rationale="configured_batch_size"
+    shard_cpu_count="${PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT:-unknown}"
+    if [ "${PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT:-0}" -le 4 ] && \
+      [ "$command_timeout_seconds" -le 90 ] && \
+      case "${shards[$batch_start]:-}" in
+        queue|queue-claim|queue-recovery|queue-integrity) ;;
+        *) false ;;
+      esac && \
+      [ "$batch_size" -gt 1 ]; then
+      effective_batch_size=1
+      batch_rationale="queue_serialized_for_low_cpu_90s_deadline"
+    fi
+    claim_smoke_batch_end=$((batch_start + effective_batch_size))
     if [ "$claim_smoke_batch_end" -gt "${#shards[@]}" ]; then
       claim_smoke_batch_end="${#shards[@]}"
     fi
@@ -467,7 +483,7 @@ phase_loop_claim_smoke_run_scheduler() {
       active_started_ns+=("$started_monotonic_ns")
       active_deadline_ns+=("$deadline_monotonic_ns")
       active_done+=(0)
-      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" "" "$started_monotonic_ns" "$deadline_monotonic_ns"
+      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start batch_size=$effective_batch_size batch_rationale=$batch_rationale command_timeout_seconds=$command_timeout_seconds cpu_count=$shard_cpu_count expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" "" "$started_monotonic_ns" "$deadline_monotonic_ns"
       index=$((index + 1))
     done
     active_done_count=0

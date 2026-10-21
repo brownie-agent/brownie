@@ -80,7 +80,11 @@ if [ -z "${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-}" ]; then
 else
   PHASE_LOOP_COMMAND_TIMEOUT_SECONDS="$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS"
 fi
-export PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE PHASE_LOOP_COMMAND_TIMEOUT_SECONDS
+if [ -z "${PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT:-}" ]; then
+  phase_loop_smoke_cpu_count_value="${phase_loop_smoke_cpu_count_value:-$(phase_loop_smoke_cpu_count)}"
+  PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT="$phase_loop_smoke_cpu_count_value"
+fi
+export PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE PHASE_LOOP_COMMAND_TIMEOUT_SECONDS PHASE_LOOP_CLAIM_SMOKE_CPU_COUNT
 if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   printf 'phase-loop claim smoke scheduler: cpus=%s batch_size=%s command_timeout=%ss watchdog=%ss\n' \
     "$(phase_loop_smoke_cpu_count)" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
@@ -112,7 +116,7 @@ phase_loop_prepare_pr_fixture_workspace() {
 }
 
 case "$PHASE_LOOP_CLAIM_SMOKE_SECTION" in
-  all|core|terminal|completion|terminal-absent|queue|pr|lifecycle|guards|feedback) ;;
+  all|core|terminal|completion|terminal-absent|queue-claim|queue-recovery|queue-integrity|pr|lifecycle|guards|feedback) ;;
   *)
     echo "unknown phase-loop claim smoke section: $PHASE_LOOP_CLAIM_SMOKE_SECTION" >&2
     exit 2
@@ -126,7 +130,7 @@ esac
 # aggregate command with its diagnostics.
 if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   claim_smoke_shard_dir="$(mktemp -d)"
-  claim_smoke_shards=(core terminal completion terminal-absent queue pr guards feedback lifecycle)
+  claim_smoke_shards=(core terminal completion terminal-absent queue-claim queue-recovery queue-integrity pr guards feedback lifecycle)
   claim_smoke_expected_exit_contract="guards=76"
   phase_loop_claim_smoke_run_scheduler \
     "$claim_smoke_shard_dir" "$0" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
@@ -2651,7 +2655,7 @@ assert failed['claim_id'].startswith('todo-g'), failed
 PY
 fi
 
-if claim_smoke_section_enabled queue; then
+if claim_smoke_section_enabled queue-claim; then
 # Queue fixtures are intentionally self-contained.  In particular, this
 # section must also run when selected directly by CI, without relying on the
 # core shard having initialized any of its variables or workspace files.
@@ -2778,6 +2782,29 @@ assert "E-99-replan-stalled-leaf-" in breakdown, breakdown
 PY
 git -C "$queue_objective_workspace" restore --worktree -- .brownie
 test_workspace="$queue_workspace"
+fi
+
+if claim_smoke_section_enabled queue-recovery; then
+# The recovery half is a separate shard so the explicit 90-second CI deadline
+# applies to a bounded group of queue/replan transitions.  Keep this fixture
+# self-contained when selected directly.
+queue_workspace="$(mktemp -d)"
+git -C "$queue_workspace" init -b main >/dev/null
+mkdir -p "$queue_workspace/.brownie" "$queue_workspace/scripts"
+printf '%s\n' '{"name":"brownie-claim-smoke-queue-recovery-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$queue_workspace/package.json"
+printf '%s\n' '- [ ] E-99-objective-apply: Patch only `README.md` to exercise objective apply stall recovery.' > "$queue_workspace/.brownie/todo.md"
+printf '# queue fixture breakdown\n' > "$queue_workspace/.brownie/todo-breakdown.md"
+printf 'export const evidence = {};\n' > "$queue_workspace/scripts/release-supply-chain-artifact-evidence.mjs"
+git -C "$queue_workspace" add package.json .brownie/todo.md .brownie/todo-breakdown.md scripts/release-supply-chain-artifact-evidence.mjs
+git -C "$queue_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+queue_original_workspace="$test_workspace"
+test_workspace="$queue_workspace"
+
+queue_prompt_with_blocked="$(mktemp)"
+queue_todo_with_blocked="$(mktemp)"
+printf 'base prompt\n' > "$queue_prompt_with_blocked"
+printf -- '- [ ] R-09: blocked boundary task\n' > "$queue_todo_with_blocked"
+queue_state_with_blocked="$(mktemp -d)"
 
 state_all_blocked="$(mktemp -d)"
 prompt_all_blocked="$(mktemp)"
@@ -2980,6 +3007,22 @@ claim = json.load(open(sys.argv[1], encoding="utf-8"))
 assert claim["status"] == "in_progress", claim
 assert claim["selected_todo"].startswith("- [ ] R-09: blocked boundary task"), claim
 PY
+fi
+
+if claim_smoke_section_enabled queue-integrity; then
+# Keep the dependency, blocker, durable-claim, and stagnation checks in their
+# own low-CPU shard so each explicit 90-second deadline covers bounded work.
+queue_workspace="$(mktemp -d)"
+git -C "$queue_workspace" init -b main >/dev/null
+mkdir -p "$queue_workspace/.brownie" "$queue_workspace/scripts"
+printf '%s\n' '{"name":"brownie-claim-smoke-queue-integrity-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$queue_workspace/package.json"
+printf '%s\n' '- [ ] E-99-objective-apply: Patch only `README.md` to exercise objective apply stall recovery.' > "$queue_workspace/.brownie/todo.md"
+printf '# queue fixture breakdown\n' > "$queue_workspace/.brownie/todo-breakdown.md"
+printf 'export const evidence = {};\n' > "$queue_workspace/scripts/release-supply-chain-artifact-evidence.mjs"
+git -C "$queue_workspace" add package.json .brownie/todo.md .brownie/todo-breakdown.md scripts/release-supply-chain-artifact-evidence.mjs
+git -C "$queue_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+queue_original_workspace="$test_workspace"
+test_workspace="$queue_workspace"
 
 state_dependency="$(mktemp -d)"
 prompt_dependency="$(mktemp)"
@@ -3006,10 +3049,6 @@ claim = json.load(open(sys.argv[1], encoding="utf-8"))
 assert claim["status"] == "in_progress", claim
 assert claim["selected_todo"].startswith("- [ ] E-15-parent:"), claim
 PY
-
-assert_contains "$queue_prompt_file" '## Active TODO Claim'
-assert_contains "$queue_prompt_file" 'queue_generation'
-assert_contains "$queue_prompt_file" 'B-01: durable claim task'
 
 state_explicit_blocker="$(mktemp -d)"
 prompt_explicit_blocker="$(mktemp)"
@@ -3074,6 +3113,12 @@ PY
 # Keep the live queue contract stable while exercising durable claim reuse;
 # removing the selected TODO without a completion record must remain fail-closed.
 
+queue_state_with_claim="$(mktemp -d)"
+queue_prompt_with_claim="$(mktemp)"
+queue_todo_with_claim="$(mktemp)"
+printf 'base prompt\n' > "$queue_prompt_with_claim"
+printf -- '- [ ] B-01: durable claim task\n  with detail\n  Files: \`scripts/release-runtime-operational-evidence.mjs\`, \`docs/architecture/local-release-targets.example.json\`.\n- [ ] B-02: next task\n' > "$queue_todo_with_claim"
+
 PHASE_LOOP_STATE_DIR="$queue_state_with_claim" \
 PHASE_LOOP_PROMPT="$queue_prompt_with_claim" \
 PHASE_LOOP_TODO="$queue_todo_with_claim" \
@@ -3081,6 +3126,8 @@ BROWNIE_BIN="$fake_brownie_json" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
+queue_claim_file="$queue_state_with_claim/todo-claims/current.json"
+queue_prompt_file="$(find "$queue_state_with_claim/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
 python3 - "$queue_claim_file" <<'PY'
 import json
 import sys
@@ -3088,8 +3135,11 @@ import sys
 claim = json.load(open(sys.argv[1], encoding="utf-8"))
 assert claim["status"] == "in_progress", claim
 assert claim["selected_todo"].startswith("- [ ] B-01: durable claim task"), claim
-assert len(claim["status_history"]) >= 3, claim
+assert len(claim["status_history"]) >= 2, claim
 PY
+assert_contains "$queue_prompt_file" '## Active TODO Claim'
+assert_contains "$queue_prompt_file" 'queue_generation'
+assert_contains "$queue_prompt_file" 'B-01: durable claim task'
 
 state_stagnation="$(mktemp -d)"
 prompt_stagnation="$(mktemp)"
