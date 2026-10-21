@@ -39,3 +39,24 @@ test('claim snapshot restore validates durable identity before writing current c
   assert.match(helper, /claim\.get\("selected_todo"\)/);
   assert.match(helper, /destination\.write_text/);
 });
+
+test('runtime CLI attests the active claim before admission validation and covers run/resume payloads', () => {
+  const exportClaim = controller.indexOf('export BROWNIE_PHASE_LOOP_CLAIM_ID=');
+  const validation = controller.indexOf(
+    'phase-loop-runtime-admission.mjs" validate',
+    exportClaim,
+  );
+  const binder = controller.indexOf('  bind_runtime_stdout_to_active_claim "$stdout_log"', validation);
+  assert(validation >= 0 && binder > validation, 'admission validation must precede post-processing binder');
+  assert(exportClaim >= 0 && exportClaim < validation, 'claim ID must be exported before runtime execution');
+
+  const cli = fs.readFileSync(
+    path.join(repoRoot, 'crates/brownie-cli/src/runtime_client.rs'),
+    'utf8',
+  );
+  assert.match(cli, /PHASE_LOOP_CLAIM_ID_ENV/);
+  assert.match(cli, /PHASE_LOOP_ADMISSION_FILE_ENV/);
+  assert.match(cli, /attest_phase_loop_claim_id\(\s*cli_run_or_advance_payload/);
+  assert.match(cli, /attest_phase_loop_claim_id\(\s*cli_resume_payload/);
+  assert.match(cli, /attest_phase_loop_claim_id_payload/);
+});

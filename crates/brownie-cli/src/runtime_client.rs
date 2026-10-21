@@ -29,6 +29,8 @@ const RUNTIME_PATH_ENV: &str = "BROWNIE_RUNTIME_PATH";
 const RUNTIME_TIMEOUT_MS_ENV: &str = "BROWNIE_RUNTIME_TIMEOUT_MS";
 const RUNTIME_OBJECTIVE_TIMEOUT_MS_ENV: &str = "BROWNIE_RUNTIME_OBJECTIVE_TIMEOUT_MS";
 const CLI_RUN_MODE_ID_ENV: &str = "BROWNIE_CLI_RUN_MODE_ID";
+const PHASE_LOOP_CLAIM_ID_ENV: &str = "BROWNIE_PHASE_LOOP_CLAIM_ID";
+const PHASE_LOOP_ADMISSION_FILE_ENV: &str = "BROWNIE_PHASE_LOOP_ADMISSION_FILE";
 const DEFAULT_READ_ONLY_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_OBJECTIVE_EXECUTION_TIMEOUT_MS: u64 = 120_000;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -278,12 +280,11 @@ impl RuntimeClient {
             result
         };
         if json_output {
-            return json_result(
-                "run",
-                "run",
+            let payload = attest_phase_loop_claim_id(
                 cli_run_or_advance_payload(&result)
                     .map_err(|error| debug_invalid_response("run_payload", error))?,
-            );
+            )?;
+            return json_result("run", "run", payload);
         }
 
         bounded_output(
@@ -328,7 +329,11 @@ impl RuntimeClient {
             self.follow_objective_proposal_apply_route_if_available(result, None)?
         };
         if json_output {
-            return json_result("resume", "resume", cli_resume_payload(&result)?);
+            return json_result(
+                "resume",
+                "resume",
+                attest_phase_loop_claim_id(cli_resume_payload(&result)?)?,
+            );
         }
 
         bounded_output(render_resume_result(&result)?)
@@ -946,6 +951,62 @@ fn json_result(command: &str, key: &str, result: Value) -> Result<String, Runtim
     }
     payload.insert(key.to_string(), result);
     bounded_output(format!("{}\n", Value::Object(payload)))
+}
+
+fn attest_phase_loop_claim_id(payload: Value) -> Result<Value, RuntimeClientError> {
+    let Some(claim_id) = env::var_os(PHASE_LOOP_CLAIM_ID_ENV) else {
+        // The controller deliberately rejects an omitted attestation.  Keep
+        // the payload unaugmented so that an absent claim cannot be turned
+        // into an implicit or synthetic identity here.
+        return Ok(payload);
+    };
+    let claim_id = claim_id
+        .into_string()
+        .map_err(|_| RuntimeClientError::InvalidResponse)?;
+    if claim_id.is_empty() || claim_id.chars().count() > MAX_TEXT_FIELD_CHARS {
+        return Err(RuntimeClientError::InvalidResponse);
+    }
+
+    let admission_path =
+        env::var_os(PHASE_LOOP_ADMISSION_FILE_ENV).ok_or(RuntimeClientError::InvalidResponse)?;
+    let admission_text =
+        std::fs::read_to_string(admission_path).map_err(|_| RuntimeClientError::InvalidResponse)?;
+    let admission: Value =
+        serde_json::from_str(&admission_text).map_err(|_| RuntimeClientError::InvalidResponse)?;
+    let admitted_claim_id = admission
+        .get("claim_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(RuntimeClientError::InvalidResponse)?;
+    attest_phase_loop_claim_id_payload(payload, &claim_id, admitted_claim_id)
+}
+
+fn attest_phase_loop_claim_id_payload(
+    mut payload: Value,
+    claim_id: &str,
+    admitted_claim_id: &str,
+) -> Result<Value, RuntimeClientError> {
+    if claim_id.is_empty()
+        || claim_id.chars().count() > MAX_TEXT_FIELD_CHARS
+        || admitted_claim_id.is_empty()
+        || claim_id != admitted_claim_id
+    {
+        return Err(RuntimeClientError::InvalidResponse);
+    }
+    let object = payload
+        .as_object_mut()
+        .ok_or(RuntimeClientError::InvalidResponse)?;
+    object.insert(
+        "phase_loop_claim_id".to_string(),
+        Value::String(claim_id.to_string()),
+    );
+    if let Some(automation) = object.get_mut("automation").and_then(Value::as_object_mut) {
+        automation.insert(
+            "phase_loop_claim_id".to_string(),
+            Value::String(claim_id.to_string()),
+        );
+    }
+    Ok(payload)
 }
 
 fn bounded_output(output: String) -> Result<String, RuntimeClientError> {
@@ -5936,6 +5997,29 @@ mod tests {
         );
         assert!(params.get("verification_recovery_source").is_none());
         assert!(params.get("objective_proposal_apply_target").is_none());
+    }
+
+    #[test]
+    fn phase_loop_claim_attestation_is_propagated_to_run_payload_and_automation() {
+        let payload = attest_phase_loop_claim_id_payload(
+            json!({"status": "task_executed", "automation": {"status": "task_executed"}}),
+            "claim-current",
+            "claim-current",
+        )
+        .unwrap();
+        assert_eq!(payload["phase_loop_claim_id"], "claim-current");
+        assert_eq!(
+            payload["automation"]["phase_loop_claim_id"],
+            "claim-current"
+        );
+    }
+
+    #[test]
+    fn phase_loop_claim_attestation_rejects_absent_or_mismatched_ids() {
+        assert!(attest_phase_loop_claim_id_payload(json!({}), "", "claim-current").is_err());
+        assert!(
+            attest_phase_loop_claim_id_payload(json!({}), "claim-other", "claim-current").is_err()
+        );
     }
 
     #[test]
