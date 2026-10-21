@@ -67,12 +67,14 @@ fi
 # configured for the old eight-way fan-out.  Otherwise give each child a
 # bounded amount of headroom proportional to the reduced parallelism; this
 # is still below the suite watchdog and avoids false timeout failures caused
-# by CPU contention rather than a hung controller.
+# by CPU contention rather than a hung controller.  The six-way local default
+# is deliberately generous because the terminal fixtures are CPU-heavy when
+# all shards share one host.
 if [ -z "${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-}" ]; then
   case "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" in
     1) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
     2) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
-    3|4|5|6) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=60 ;;
+    3|4|5|6) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=180 ;;
     *) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=45 ;;
   esac
 else
@@ -128,7 +130,8 @@ if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   claim_smoke_expected_exit_contract="guards=76"
   phase_loop_claim_smoke_run_scheduler \
     "$claim_smoke_shard_dir" "$0" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
-    "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" "$claim_smoke_expected_exit_contract" \
+    "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" \
+    "$claim_smoke_expected_exit_contract" \
     "${claim_smoke_shards[@]}"
   exit "$?"
 fi

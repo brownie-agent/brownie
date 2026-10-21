@@ -28,6 +28,9 @@ case "${PHASE_LOOP_CLAIM_SMOKE_SECTION:-}" in
     printf '%s\n' "$child_pid" > "${PHASE_LOOP_CLAIM_SMOKE_CHILD_PID_FILE:?}"
     wait "$child_pid"
     ;;
+  stall)
+    sleep 30
+    ;;
   *)
     printf 'unexpected shard: %s\n' "${PHASE_LOOP_CLAIM_SMOKE_SECTION:-}" >&2
     exit 2
@@ -65,7 +68,7 @@ PY
 normal_output="$fixture_root/normal-audit.json"
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$normal_output" \
   bash "$scheduler_driver" "$normal_output" \
-  "$fixture_root/normal-shards" "$fixture_script" 2 10 "" fast fast fast fast fast fast fast fast \
+  "$fixture_root/normal-shards" "$fixture_script" 2 10 10 "" fast fast fast fast fast fast fast fast \
   2>"$fixture_root/normal-driver.stderr" || {
     cat "$fixture_root/normal-driver.stderr" >&2 || true
     exit 1
@@ -73,13 +76,14 @@ PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$normal_output" \
 assert_json "$normal_output" 'manifest["scheduler_timed_out"] is False'
 assert_json "$normal_output" 'len([r for r in manifest["records"] if r.get("event") == "shard_finished" and r.get("status") == "passed"]) == 8'
 assert_json "$normal_output" 'all(r.get("pid") and r.get("pgid") and r.get("stdout_path") and r.get("stderr_path") and r.get("temp_root") and r.get("state_root") and r.get("workspace_root") for r in manifest["records"] if r.get("event") == "shard_started")'
+assert_json "$normal_output" 'all(r.get("started_monotonic_ns") and r.get("deadline_monotonic_ns") and r["deadline_monotonic_ns"] > r["started_monotonic_ns"] for r in manifest["records"] if r.get("event") == "shard_started")'
 grep -Fq '"event": "shard_started"' "$fixture_root/normal-driver.stderr"
 grep -Fq '"event": "shard_finished"' "$fixture_root/normal-driver.stderr"
 
 expected_output="$fixture_root/expected-audit.json"
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$expected_output" \
   bash "$scheduler_driver" "$expected_output" \
-  "$fixture_root/expected-shards" "$fixture_script" 2 10 "expected=76" expected \
+  "$fixture_root/expected-shards" "$fixture_script" 2 10 10 "expected=76" expected \
   2>"$fixture_root/expected-driver.stderr"
 assert_json "$expected_output" 'any(r.get("event") == "shard_finished" and r.get("shard") == "expected" and r.get("exit_code") == 76 and r.get("expected_exit_codes") == [76] and r.get("accepted") is True and r.get("status") == "passed" for r in manifest["records"])'
 
@@ -87,7 +91,7 @@ unexpected_output="$fixture_root/unexpected-audit.json"
 set +e
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$unexpected_output" \
   bash "$scheduler_driver" "$unexpected_output" \
-  "$fixture_root/unexpected-shards" "$fixture_script" 2 10 "" unexpected \
+  "$fixture_root/unexpected-shards" "$fixture_script" 2 10 10 "" unexpected \
   2>"$fixture_root/unexpected-driver.stderr"
 unexpected_status="$?"
 set -e
@@ -100,7 +104,7 @@ set +e
 PHASE_LOOP_CLAIM_SMOKE_CHILD_PID_FILE="$child_pid_file" \
 PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$timeout_output" \
   bash "$scheduler_driver" "$timeout_output" \
-  "$fixture_root/timeout-shards" "$fixture_script" 2 2 "" slow fast \
+  "$fixture_root/timeout-shards" "$fixture_script" 2 2 10 "" slow fast \
   2>"$fixture_root/timeout-driver.stderr"
 timeout_status="$?"
 set -e
@@ -116,6 +120,24 @@ if phase_loop_claim_smoke_process_is_live "$slow_child_pid"; then
   echo "scheduler left fixture descendant alive: pid=$slow_child_pid" >&2
   exit 1
 fi
+
+stall_output="$fixture_root/stall-audit.json"
+set +e
+PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT="$stall_output" \
+  bash "$scheduler_driver" "$stall_output" \
+  "$fixture_root/stall-shards" "$fixture_script" 1 10 1 "" stall \
+  2>"$fixture_root/stall-driver.stderr"
+stall_status="$?"
+set -e
+[ "$stall_status" -ne 0 ]
+if grep -Fq 'scheduler_timeout' "$fixture_root/stall-driver.stderr"; then
+  echo 'per-shard deadline regression unexpectedly reached the scheduler watchdog' >&2
+  cat "$fixture_root/stall-driver.stderr" >&2
+  exit 1
+fi
+assert_json "$stall_output" 'manifest["scheduler_timed_out"] is False'
+assert_json "$stall_output" 'any(r.get("event") == "command_timeout" and r.get("shard") == "stall" and r.get("exit_code") == 124 and r.get("accepted") is False for r in manifest["records"])'
+assert_json "$stall_output" 'any(r.get("event") == "shard_finished" and r.get("shard") == "stall" and r.get("exit_code") == 124 and r.get("status") == "failed" and r.get("accepted") is False for r in manifest["records"])'
 
 command_audit="$fixture_root/command-audit.jsonl"
 set +e

@@ -7,6 +7,14 @@ phase_loop_claim_smoke_now_utc() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+phase_loop_claim_smoke_monotonic_ns() {
+  if command -v perl >/dev/null 2>&1; then
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'print int(clock_gettime(CLOCK_MONOTONIC) * 1000000000), qq(\n)'
+  else
+    python3 -c 'import time; print(time.monotonic_ns())'
+  fi
+}
+
 phase_loop_claim_smoke_process_group() {
   local pid="$1"
   ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true
@@ -93,8 +101,10 @@ phase_loop_claim_smoke_append_audit_event() {
   local detail="${13}"
   local expected_exit_codes="${14:-0}"
   local accepted="${15:-}"
+  local started_monotonic_ns="${16:-}"
+  local deadline_monotonic_ns="${17:-}"
   mkdir -p "$(dirname "$audit_file")"
-  python3 - "$audit_file" "$event" "$shard" "$pid" "$pgid" "$status" "$exit_code" "$stdout_path" "$stderr_path" "$control_root" "$state_root" "$workspace_root" "$detail" "$expected_exit_codes" "$accepted" <<'PY'
+  python3 - "$audit_file" "$event" "$shard" "$pid" "$pgid" "$status" "$exit_code" "$stdout_path" "$stderr_path" "$control_root" "$state_root" "$workspace_root" "$detail" "$expected_exit_codes" "$accepted" "$started_monotonic_ns" "$deadline_monotonic_ns" <<'PY'
 import json
 import pathlib
 import sys
@@ -116,6 +126,8 @@ from datetime import datetime, timezone
     detail,
     expected_exit_codes,
     accepted,
+    started_monotonic_ns,
+    deadline_monotonic_ns,
 ) = sys.argv[1:]
 
 def optional(value):
@@ -138,6 +150,8 @@ record = {
     "detail": optional(detail),
     "expected_exit_codes": [int(code) for code in expected_exit_codes.split(",") if code.strip().lstrip("-").isdigit()],
     "accepted": True if accepted == "true" else False if accepted == "false" else None,
+    "started_monotonic_ns": int(started_monotonic_ns) if started_monotonic_ns.isdigit() else None,
+    "deadline_monotonic_ns": int(deadline_monotonic_ns) if deadline_monotonic_ns.isdigit() else None,
 }
 with pathlib.Path(audit_file).open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -337,8 +351,9 @@ phase_loop_claim_smoke_run_scheduler() {
   local script_path="$2"
   local batch_size="$3"
   local watchdog_seconds="$4"
-  local expected_exit_contract="$5"
-  shift 5
+  local command_timeout_seconds="$5"
+  local expected_exit_contract="$6"
+  shift 6
   local -a shards=("$@")
   local audit_file="$shard_dir/scheduler.audit.jsonl"
   local manifest_file="${PHASE_LOOP_CLAIM_SMOKE_AUDIT_OUTPUT:-$shard_dir/claim-smoke-audit.json}"
@@ -358,11 +373,19 @@ phase_loop_claim_smoke_run_scheduler() {
   local status
   local expected_exit_codes
   local accepted
+  local started_monotonic_ns
+  local deadline_monotonic_ns
+  local now_monotonic_ns
+  local command_timeout_detail
+  local active_done_count
   local index
   local i
   local -a active_pids=()
   local -a active_pgids=()
   local -a active_shards=()
+  local -a active_started_ns=()
+  local -a active_deadline_ns=()
+  local -a active_done=()
 
   mkdir -p "$shard_dir"
 
@@ -414,6 +437,9 @@ phase_loop_claim_smoke_run_scheduler() {
     active_pids=()
     active_pgids=()
     active_shards=()
+    active_started_ns=()
+    active_deadline_ns=()
+    active_done=()
     claim_smoke_batch_end=$((batch_start + batch_size))
     if [ "$claim_smoke_batch_end" -gt "${#shards[@]}" ]; then
       claim_smoke_batch_end="${#shards[@]}"
@@ -433,36 +459,70 @@ phase_loop_claim_smoke_run_scheduler() {
       pid="$PHASE_LOOP_CLAIM_SMOKE_LAST_PID"
       pgid="$PHASE_LOOP_CLAIM_SMOKE_LAST_PGID"
       expected_exit_codes="$(phase_loop_claim_smoke_expected_exit_codes "$shard" "$expected_exit_contract")"
+      started_monotonic_ns="$(phase_loop_claim_smoke_monotonic_ns)"
+      deadline_monotonic_ns=$((started_monotonic_ns + command_timeout_seconds * 1000000000))
       active_pids+=("$pid")
       active_pgids+=("$pgid")
       active_shards+=("$shard")
-      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" ""
+      active_started_ns+=("$started_monotonic_ns")
+      active_deadline_ns+=("$deadline_monotonic_ns")
+      active_done+=(0)
+      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_started "$shard" "$pid" "$pgid" running "" "$stdout_log" "$stderr_log" "$control_root" "$control_root" "$PWD" "batch_start=$batch_start expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" "" "$started_monotonic_ns" "$deadline_monotonic_ns"
       index=$((index + 1))
     done
-    for ((i = 0; i < ${#active_pids[@]}; i += 1)); do
-      pid="${active_pids[$i]}"
-      shard="${active_shards[$i]}"
-      if wait "$pid"; then
-        status=0
-      else
-        status="$?"
-      fi
-      pgid="${active_pgids[$i]}"
-      expected_exit_codes="$(phase_loop_claim_smoke_expected_exit_codes "$shard" "$expected_exit_contract")"
-      if phase_loop_claim_smoke_exit_allowed "$status" "$expected_exit_codes"; then
-        accepted=true
-      else
-        accepted=false
-      fi
-      if phase_loop_claim_smoke_group_has_live_members "$pgid"; then
-        phase_loop_claim_smoke_terminate_process_group "$pid" 3 "$pgid"
-      fi
-      phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_finished "$shard" "$pid" "$pgid" "$([ "$accepted" = true ] && echo passed || echo failed)" "$status" "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" "expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" "$accepted"
-      if [ "$accepted" != true ]; then
-        claim_smoke_failed=1
-        echo "phase-loop claim smoke shard failed: $shard actual_exit=$status expected_exit_codes=$expected_exit_codes" >&2
-        cat "$shard_dir/$shard.stdout.log" >&2 || true
-        cat "$shard_dir/$shard.stderr.log" >&2 || true
+    active_done_count=0
+    while [ "$active_done_count" -lt "${#active_pids[@]}" ]; do
+      now_monotonic_ns="$(phase_loop_claim_smoke_monotonic_ns)"
+      for ((i = 0; i < ${#active_pids[@]}; i += 1)); do
+        if [ "${active_done[$i]:-0}" -eq 1 ]; then
+          continue
+        fi
+        pid="${active_pids[$i]}"
+        pgid="${active_pgids[$i]}"
+        shard="${active_shards[$i]}"
+        started_monotonic_ns="${active_started_ns[$i]}"
+        deadline_monotonic_ns="${active_deadline_ns[$i]}"
+        expected_exit_codes="$(phase_loop_claim_smoke_expected_exit_codes "$shard" "$expected_exit_contract")"
+
+        if ! phase_loop_claim_smoke_process_is_live "$pid"; then
+          if wait "$pid"; then
+            status=0
+          else
+            status="$?"
+          fi
+          if phase_loop_claim_smoke_exit_allowed "$status" "$expected_exit_codes"; then
+            accepted=true
+          else
+            accepted=false
+          fi
+          if phase_loop_claim_smoke_group_has_live_members "$pgid"; then
+            phase_loop_claim_smoke_terminate_process_group "$pid" 3 "$pgid"
+          fi
+          phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_finished "$shard" "$pid" "$pgid" "$([ "$accepted" = true ] && echo passed || echo failed)" "$status" "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" "expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" "$accepted" "$started_monotonic_ns" "$deadline_monotonic_ns"
+          if [ "$accepted" != true ]; then
+            claim_smoke_failed=1
+            echo "phase-loop claim smoke shard failed: $shard actual_exit=$status expected_exit_codes=$expected_exit_codes" >&2
+            cat "$shard_dir/$shard.stdout.log" >&2 || true
+            cat "$shard_dir/$shard.stderr.log" >&2 || true
+          fi
+          active_done[$i]=1
+          active_done_count=$((active_done_count + 1))
+        elif [ "$now_monotonic_ns" -ge "$deadline_monotonic_ns" ]; then
+          command_timeout_detail="parent shard deadline expired after ${command_timeout_seconds}s"
+          echo "phase-loop claim smoke shard timed out after ${command_timeout_seconds}s: shard=${shard} pid=${pid} pgid=${pgid}" >&2
+          phase_loop_claim_smoke_emit_audit_event "$audit_file" command_timeout "$shard" "$pid" "$pgid" timed_out 124 "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" "$command_timeout_detail" "$expected_exit_codes" false "$started_monotonic_ns" "$deadline_monotonic_ns"
+          phase_loop_claim_smoke_terminate_process_group "$pid" 1 "$pgid" || true
+          wait "$pid" 2>/dev/null || true
+          phase_loop_claim_smoke_emit_audit_event "$audit_file" shard_finished "$shard" "$pid" "$pgid" failed 124 "$shard_dir/$shard.stdout.log" "$shard_dir/$shard.stderr.log" "$shard_dir/$shard-control-root" "$shard_dir/$shard-control-root" "$PWD" "$command_timeout_detail expected_exit_codes=$expected_exit_codes" "$expected_exit_codes" false "$started_monotonic_ns" "$deadline_monotonic_ns"
+          claim_smoke_failed=1
+          cat "$shard_dir/$shard.stdout.log" >&2 || true
+          cat "$shard_dir/$shard.stderr.log" >&2 || true
+          active_done[$i]=1
+          active_done_count=$((active_done_count + 1))
+        fi
+      done
+      if [ "$active_done_count" -lt "${#active_pids[@]}" ]; then
+        sleep 1
       fi
     done
     if [ "$claim_smoke_failed" -ne 0 ]; then
