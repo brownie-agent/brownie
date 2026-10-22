@@ -2282,6 +2282,19 @@ fn cli_run_payload(result: &Value) -> Result<Value, RuntimeClientError> {
             }
         }
     }
+    // Keep execution evidence when the drive itself reaches a terminal
+    // closure. The top-level drive status may be `no_eligible_task` even
+    // though an advance already ran the admitted task; dropping this field
+    // makes the controller confuse a valid snapshot with a dispatch failure.
+    let task_execution_confirmed = object
+        .get("executed_count")
+        .and_then(Value::as_u64)
+        .map(|count| count > 0)
+        .unwrap_or(false);
+    payload.insert(
+        "task_execution_confirmed".to_string(),
+        Value::Bool(task_execution_confirmed),
+    );
     if let Some(journey) = journey {
         for key in ["journey_id", "task_id", "run_id"] {
             if let Some(value) = journey.get(key) {
@@ -6230,6 +6243,7 @@ mod tests {
         .unwrap();
         let payload = cli_run_payload(&result).unwrap();
         assert_eq!(payload["completion_closure_status"], "no_eligible_task");
+        assert_eq!(payload["task_execution_confirmed"], true);
         assert_eq!(payload["completion_closure_terminal_task_count"], 1);
         assert_eq!(payload["blocked"], true);
         assert_eq!(payload["terminal_failure"], true);

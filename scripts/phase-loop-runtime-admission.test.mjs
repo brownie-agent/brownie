@@ -37,8 +37,28 @@ test('requires explicit recovery when a claimed task disappears before execution
     }
   });
   assert.equal(result.ok, false);
-  assert.equal(result.snapshot_mismatch, true);
+  assert.equal(result.snapshot_mismatch, false);
+  assert.equal(result.admission_attested, true);
+  assert.equal(result.execution_not_started, true);
   assert.equal(result.reason, 'claimed_task_not_admitted');
+});
+
+test('accepts a terminal closure when the runtime explicitly reports execution', () => {
+  const admission = createRuntimeAdmission({ claim, runStamp: 'run-1' });
+  const result = validateRuntimeAdmission(admission, {
+    run: {
+      status: 'no_eligible_task',
+      phase_loop_claim_id: claim.claim_id,
+      stop_reason: 'terminal_task_failed',
+      task_execution_confirmed: true,
+      ...runtimeSnapshot(admission),
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.snapshot_mismatch, false);
+  assert.equal(result.execution_not_started, false);
+  assert.equal(result.task_execution_confirmed, true);
+  assert.equal(result.reason, 'runtime_admission_confirmed');
 });
 
 test('rejects a matching claim ID when the runtime snapshot differs', () => {
