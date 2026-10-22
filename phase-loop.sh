@@ -17063,8 +17063,14 @@ case "${1:-status}" in
       printf '%s\n' "phase-loop run-once refused: durable supervisor ownership is active or cannot be safely reclaimed" >&2
       exit 75
     fi
+    # The lock has a live owner, but a one-shot is not a durable supervisor.
+    # Keep its lock identity separately so ordinary run status writes retain
+    # a null supervisor_pid rather than publishing this transient PID.
+    PHASE_LOOP_RUN_ONCE_LOCK_PID="$PHASE_LOOP_SUPERVISOR_PID"
+    PHASE_LOOP_RUN_ONCE_LOCK_GENERATION="$PHASE_LOOP_SUPERVISOR_GENERATION"
+    unset PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION
     CONSECUTIVE_FAILURES=0
-    trap 'run_once_exit_code=$?; phase_loop_release_supervisor_lock; phase_loop_finalize_unexpected_exit "$run_once_exit_code"' EXIT
+    trap 'run_once_exit_code=$?; PHASE_LOOP_SUPERVISOR_PID="$PHASE_LOOP_RUN_ONCE_LOCK_PID"; PHASE_LOOP_SUPERVISOR_GENERATION="$PHASE_LOOP_RUN_ONCE_LOCK_GENERATION"; phase_loop_release_supervisor_lock; unset PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION; phase_loop_finalize_unexpected_exit "$run_once_exit_code"' EXIT
     trap 'phase_loop_handle_run_signal INT' INT
     trap 'phase_loop_handle_run_signal TERM' TERM
     run_brownie_once
