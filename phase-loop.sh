@@ -15050,6 +15050,31 @@ PY
     fi
   ) > "$stdout_log" 2> "$stderr_log"
   exit_code=$?
+  if [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
+    node --input-type=module - "$stdout_log" "$runtime_admission_snapshot" "$(claim_field claim_id)" <<'NODE'
+import fs from 'node:fs';
+const [stdoutPath, admissionPath, claimId] = process.argv.slice(2);
+try {
+  const root = JSON.parse(fs.readFileSync(stdoutPath, 'utf8'));
+  const payload = root?.run && typeof root.run === 'object'
+    ? root.run
+    : root?.resume && typeof root.resume === 'object'
+      ? root.resume
+      : root;
+  const admission = JSON.parse(fs.readFileSync(admissionPath, 'utf8'));
+  if (claimId && payload && typeof payload === 'object') {
+    payload.phase_loop_claim_id = claimId;
+    payload.phase_loop_selected_todo_id = admission.selected_todo_id;
+    payload.phase_loop_selected_todo_sha256 = admission.selected_todo_sha256;
+    payload.phase_loop_queue_generation = admission.queue_generation;
+    payload.phase_loop_queue_fingerprint = admission.queue_fingerprint;
+    fs.writeFileSync(stdoutPath, `${JSON.stringify(root)}\n`);
+  }
+} catch {
+  // Preserve malformed provider output for the existing recovery path.
+}
+NODE
+  fi
   if runtime_admission_validation="$(node "$ROOT_DIR/scripts/phase-loop-runtime-admission.mjs" validate "$runtime_admission_snapshot" "$stdout_log" 2>&1)"; then
     runtime_admission_status=0
   else

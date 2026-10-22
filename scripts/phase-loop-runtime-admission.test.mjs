@@ -9,6 +9,15 @@ const claim = {
   queue_fingerprint: 'queue-fingerprint'
 };
 
+function runtimeSnapshot(admission) {
+  return {
+    phase_loop_selected_todo_id: admission.selected_todo_id,
+    phase_loop_selected_todo_sha256: admission.selected_todo_sha256,
+    phase_loop_queue_generation: admission.queue_generation,
+    phase_loop_queue_fingerprint: admission.queue_fingerprint,
+  };
+}
+
 test('binds the selected TODO identity into a private runtime admission snapshot', () => {
   const admission = createRuntimeAdmission({ claim, runStamp: 'run-1' });
   assert.equal(admission.claim_id, claim.claim_id);
@@ -18,8 +27,14 @@ test('binds the selected TODO identity into a private runtime admission snapshot
 });
 
 test('requires explicit recovery when a claimed task disappears before execution', () => {
-  const result = validateRuntimeAdmission(createRuntimeAdmission({ claim, runStamp: 'run-1' }), {
-    run: { status: 'no_eligible_task', phase_loop_claim_id: claim.claim_id, stop_reason: 'terminal_task_failed' }
+  const admission = createRuntimeAdmission({ claim, runStamp: 'run-1' });
+  const result = validateRuntimeAdmission(admission, {
+    run: {
+      status: 'no_eligible_task',
+      phase_loop_claim_id: claim.claim_id,
+      stop_reason: 'terminal_task_failed',
+      ...runtimeSnapshot(admission),
+    }
   });
   assert.equal(result.ok, false);
   assert.equal(result.snapshot_mismatch, true);
@@ -55,12 +70,14 @@ test('rejects a claim snapshot drift before dispatch', () => {
 });
 
 test('allows a nonterminal no-eligible result to use the existing bounded recovery path', () => {
-  const result = validateRuntimeAdmission(createRuntimeAdmission({ claim, runStamp: 'run-1' }), {
+  const admission = createRuntimeAdmission({ claim, runStamp: 'run-1' });
+  const result = validateRuntimeAdmission(admission, {
     run: {
       status: 'no_eligible_task',
       phase_loop_claim_id: claim.claim_id,
       stop_reason: 'budget_exhausted',
-      automation: { continuation_required: true }
+      automation: { continuation_required: true },
+      ...runtimeSnapshot(admission),
     }
   });
   assert.equal(result.ok, true);
@@ -68,16 +85,43 @@ test('allows a nonterminal no-eligible result to use the existing bounded recove
 });
 
 test('accepts a runtime result that proves task execution', () => {
-  const result = validateRuntimeAdmission(createRuntimeAdmission({ claim, runStamp: 'run-1' }), {
+  const admission = createRuntimeAdmission({ claim, runStamp: 'run-1' });
+  const result = validateRuntimeAdmission(admission, {
     run: {
       status: 'task_executed',
       phase_loop_claim_id: claim.claim_id,
       task_id: 'task-1',
-      execution: { started: true }
+      execution: { started: true },
+      ...runtimeSnapshot(admission),
     }
   });
   assert.equal(result.ok, true);
   assert.equal(result.task_execution_confirmed, true);
+});
+
+test('rejects a matching claim ID when the runtime omits the admission snapshot', () => {
+  const admission = createRuntimeAdmission({ claim, runStamp: 'run-1' });
+  const result = validateRuntimeAdmission(admission, {
+    run: { status: 'task_executed', phase_loop_claim_id: claim.claim_id, execution: { started: true } }
+  });
+  assert.equal(result.claim_matches, true);
+  assert.equal(result.snapshot_mismatch, true);
+  assert.equal(result.reason, 'runtime_admission_snapshot_mismatch');
+});
+
+test('rejects a matching claim ID when the runtime provides only a partial snapshot', () => {
+  const admission = createRuntimeAdmission({ claim, runStamp: 'run-1' });
+  const result = validateRuntimeAdmission(admission, {
+    run: {
+      status: 'task_executed',
+      phase_loop_claim_id: claim.claim_id,
+      phase_loop_selected_todo_id: admission.selected_todo_id,
+      execution: { started: true }
+    }
+  });
+  assert.equal(result.claim_matches, true);
+  assert.equal(result.snapshot_mismatch, true);
+  assert.equal(result.reason, 'runtime_admission_snapshot_mismatch');
 });
 
 test('rejects an execution result that omits the claim ID', () => {

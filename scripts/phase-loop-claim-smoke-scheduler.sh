@@ -593,7 +593,10 @@ phase_loop_claim_smoke_run_scheduler() {
         fi
       done
       if [ "$active_done_count" -lt "${#active_pids[@]}" ]; then
-        sleep 1
+        # Keep the scheduler deadline authoritative even when a shard exits
+        # during the polling interval; one-second polling can consume the
+        # watchdog's cleanup margin on contended CI workers.
+        sleep 0.1
       fi
     done
     if [ "$claim_smoke_failed" -ne 0 ]; then

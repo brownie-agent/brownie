@@ -86,9 +86,9 @@ export function validateRuntimeAdmission(admission, root) {
     queue_generation: payload.phase_loop_queue_generation ?? payload.automation?.phase_loop_queue_generation,
     queue_fingerprint: payload.phase_loop_queue_fingerprint ?? payload.automation?.phase_loop_queue_fingerprint,
   };
-  const snapshotFieldsPresent = Object.values(runtimeSnapshot).some((value) => value !== undefined);
-  const snapshotMatches = !snapshotFieldsPresent || Object.keys(runtimeSnapshot).every((field) =>
-    String(runtimeSnapshot[field] ?? '') === String(admission?.[field] ?? '')
+  const snapshotFieldsPresent = Object.values(runtimeSnapshot).every((value) => value !== undefined);
+  const snapshotMatches = snapshotFieldsPresent && Object.keys(runtimeSnapshot).every((field) =>
+    runtimeSnapshot[field] === admission?.[field]
   );
   const snapshotMismatch = !claimMatches || !snapshotMatches
     || (status === 'no_eligible_task' && !executed && terminalFailure);
