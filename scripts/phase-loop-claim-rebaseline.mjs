@@ -306,6 +306,10 @@ export function writeTerminalExecutionEvidence({
     || terminalTaskCount > 0
   );
   const explicitSignals = [
+    // Runtime admission is the authoritative attestation that the selected
+    // task executed, including terminal no_eligible_task closures where the
+    // workspace digest is unchanged.
+    payload.task_execution_confirmed === true,
     execution.started === true,
     taskExecutedTerminalFailure,
     payload.objective_apply_applied === true,
@@ -337,6 +341,7 @@ export function writeTerminalExecutionEvidence({
       payload_status: runtimeStatus,
       terminal_completion_final_state: payload.terminal_completion_final_state ?? terminalCompletionEvidence.final_state ?? null,
       terminal_completion_task_status: payload.terminal_completion_task_status ?? terminalCompletionEvidence.task_status ?? null,
+      task_execution_confirmed: payload.task_execution_confirmed === true,
       stop_class: payload.stop_class ?? automation.stop_class ?? null,
       stop_reason: payload.stop_reason ?? automation.stop_reason ?? null,
     },
