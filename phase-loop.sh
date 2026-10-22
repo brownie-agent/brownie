@@ -8596,11 +8596,15 @@ feedback = {
 }
 # A retry-cap-zero path first records a minimal redelegation marker, then
 # enriches it here from the current runtime ledger. Keep that recovery
-# contract intact: otherwise this writer would erase the indication that a
-# new bounded owner is required.
-for key in ("kind", "recovery_state", "retry_cap", "execution_evidence_path"):
-    if key in previous:
-        feedback[key] = previous[key]
+# contract intact only for that marker from this same run: carrying typed
+# recovery fields from a prior run would publish stale evidence as current.
+if (
+    previous.get("kind") == "phase_loop_terminal_failure_redelegation_required"
+    and str(previous.get("run_stamp") or "") == run_stamp
+):
+    for key in ("kind", "recovery_state", "retry_cap", "execution_evidence_path"):
+        if key in previous:
+            feedback[key] = previous[key]
 
 # A terminal closure without TaskFailed/AgentLoopCompleted detail is itself a
 # diagnosable, fail-closed cause. Persist it rather than making the next
@@ -17049,15 +17053,18 @@ case "${1:-status}" in
     exit 78
     ;;
   run-once)
-    # Do not let a manual one-shot overwrite the durable owner state of a
-    # validated supervisor. That would strand the supervisor with a null PID.
+    # Serialize the one-shot with supervisor acquisition.  A mere is_running
+    # snapshot races start/supervise and can still let this process overwrite
+    # durable owner state after the supervisor becomes live.
     load_env
-    if is_running; then
-      printf '%s\n' "phase-loop run-once refused: a supervisor already owns pid $(cat "$PID_FILE")" >&2
+    PHASE_LOOP_SUPERVISOR_PID="$$"
+    PHASE_LOOP_SUPERVISOR_GENERATION="run-once-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+    if ! acquire_lock; then
+      printf '%s\n' "phase-loop run-once refused: durable supervisor ownership is active or cannot be safely reclaimed" >&2
       exit 75
     fi
     CONSECUTIVE_FAILURES=0
-    trap 'phase_loop_finalize_unexpected_exit "$?"' EXIT
+    trap 'run_once_exit_code=$?; phase_loop_release_supervisor_lock; phase_loop_finalize_unexpected_exit "$run_once_exit_code"' EXIT
     trap 'phase_loop_handle_run_signal INT' INT
     trap 'phase_loop_handle_run_signal TERM' TERM
     run_brownie_once
