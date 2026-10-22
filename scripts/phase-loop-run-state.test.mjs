@@ -384,10 +384,12 @@ test('does not replace a continuation refreshed during ownership inspection', ()
   assert.equal(fs.existsSync(path.join(stateDir, 'run-state-recovery.jsonl')), false);
 });
 
-test('run-once installs exit and signal terminalization hooks after entering running state', () => {
+test('run-once serializes ownership and installs exit and signal terminalization hooks', () => {
   const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
   const controller = fs.readFileSync(path.join(repoRoot, 'phase-loop.sh'), 'utf8');
-  assert.ok(controller.includes("trap 'phase_loop_finalize_unexpected_exit \"$?\"' EXIT"));
+  assert.match(controller, /PHASE_LOOP_SUPERVISOR_GENERATION="run-once-/u);
+  assert.match(controller, /if ! acquire_lock; then[\s\S]*run-once refused/u);
+  assert.ok(controller.includes("trap 'run_once_exit_code=$?; phase_loop_release_supervisor_lock; phase_loop_finalize_unexpected_exit \"$run_once_exit_code\"' EXIT"));
   assert.ok(controller.includes("trap 'phase_loop_handle_run_signal INT' INT"));
   assert.ok(controller.includes("trap 'phase_loop_handle_run_signal TERM' TERM"));
   assert.match(controller, /Unexpected phase-loop run-once exit; terminalized status/u);
