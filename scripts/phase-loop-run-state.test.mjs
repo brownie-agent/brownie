@@ -389,8 +389,8 @@ test('run-once serializes ownership and installs exit and signal terminalization
   const controller = fs.readFileSync(path.join(repoRoot, 'phase-loop.sh'), 'utf8');
   assert.match(controller, /PHASE_LOOP_SUPERVISOR_GENERATION="run-once-/u);
   assert.match(controller, /if ! acquire_lock; then[\s\S]*run-once refused/u);
-  assert.match(controller, /PHASE_LOOP_RUN_ONCE_LOCK_PID=.*unset PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION/us);
-  assert.ok(controller.includes("phase_loop_release_supervisor_lock; unset PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION; phase_loop_finalize_unexpected_exit \"$run_once_exit_code\"' EXIT"));
+  assert.match(controller, /PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID=1/u);
+  assert.ok(controller.includes("phase_loop_release_supervisor_lock; phase_loop_finalize_unexpected_exit \"$run_once_exit_code\"; unset PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION' EXIT"));
   assert.ok(controller.includes("trap 'phase_loop_handle_run_signal INT' INT"));
   assert.ok(controller.includes("trap 'phase_loop_handle_run_signal TERM' TERM"));
   assert.match(controller, /Unexpected phase-loop run-once exit; terminalized status/u);

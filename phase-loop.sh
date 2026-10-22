@@ -410,7 +410,7 @@ write_status() {
   local escaped_supervisor_generation
   escaped_supervisor_generation="$(printf '%s' "${PHASE_LOOP_SUPERVISOR_GENERATION:-}" | json_escape)"
   local supervisor_pid_json="null"
-  if [[ "${PHASE_LOOP_SUPERVISOR_PID:-}" =~ ^[0-9]+$ ]]; then
+  if [ "${PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID:-0}" != "1" ] && [[ "${PHASE_LOOP_SUPERVISOR_PID:-}" =~ ^[0-9]+$ ]]; then
     supervisor_pid_json="${PHASE_LOOP_SUPERVISOR_PID}"
   fi
   local claim_lifecycle_json escaped_claim_state escaped_claim_id escaped_claim_error_code escaped_claim_error_message claim_id_json
@@ -17064,13 +17064,10 @@ case "${1:-status}" in
       exit 75
     fi
     # The lock has a live owner, but a one-shot is not a durable supervisor.
-    # Keep its lock identity separately so ordinary run status writes retain
-    # a null supervisor_pid rather than publishing this transient PID.
-    PHASE_LOOP_RUN_ONCE_LOCK_PID="$PHASE_LOOP_SUPERVISOR_PID"
-    PHASE_LOOP_RUN_ONCE_LOCK_GENERATION="$PHASE_LOOP_SUPERVISOR_GENERATION"
-    unset PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION
+    # Keep its identity for ownership checks while suppressing it in status.
+    PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID=1
     CONSECUTIVE_FAILURES=0
-    trap 'run_once_exit_code=$?; PHASE_LOOP_SUPERVISOR_PID="$PHASE_LOOP_RUN_ONCE_LOCK_PID"; PHASE_LOOP_SUPERVISOR_GENERATION="$PHASE_LOOP_RUN_ONCE_LOCK_GENERATION"; phase_loop_release_supervisor_lock; unset PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION; phase_loop_finalize_unexpected_exit "$run_once_exit_code"' EXIT
+    trap 'run_once_exit_code=$?; phase_loop_release_supervisor_lock; phase_loop_finalize_unexpected_exit "$run_once_exit_code"; unset PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION' EXIT
     trap 'phase_loop_handle_run_signal INT' INT
     trap 'phase_loop_handle_run_signal TERM' TERM
     run_brownie_once
