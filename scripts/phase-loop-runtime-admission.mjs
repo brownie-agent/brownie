@@ -100,21 +100,30 @@ export function validateRuntimeAdmission(admission, root) {
   const snapshotMatches = snapshotFieldsPresent && Object.keys(runtimeSnapshot).every((field) =>
     runtimeSnapshot[field] === admission?.[field]
   );
-  const snapshotMismatch = !claimMatches || !snapshotMatches
-    || (status === 'no_eligible_task' && !executed && terminalFailure);
+  const snapshotMismatch = !claimMatches || !snapshotMatches;
+  const executionNotStarted = !executed
+    && status === 'no_eligible_task'
+    && terminalFailure;
+  const cause = !claimMatches
+    ? 'runtime_claim_snapshot_mismatch'
+    : (!snapshotMatches
+      ? 'runtime_admission_snapshot_mismatch'
+      : (executionNotStarted ? 'claimed_task_not_admitted' : 'runtime_admission_confirmed'));
   return {
-    ok: !snapshotMismatch,
+    // A matching snapshot is an attestation success, but a terminal result
+    // without execution evidence remains a fail-closed admission failure.
+    ok: !snapshotMismatch && !executionNotStarted,
     claim_matches: claimMatches,
     snapshot_mismatch: snapshotMismatch,
+    admission_attested: claimMatches && snapshotMatches,
+    execution_not_started: executionNotStarted,
     task_execution_confirmed: executed,
     status,
     terminal_failure: terminalFailure,
     task_id: taskId,
     runtime_run_id: runtimeRunId,
-    reason: snapshotMismatch
-      ? (!claimMatches ? 'runtime_claim_snapshot_mismatch'
-        : (!snapshotMatches ? 'runtime_admission_snapshot_mismatch' : 'claimed_task_not_admitted'))
-      : 'runtime_admission_confirmed',
+    cause,
+    reason: cause,
   };
 }
 

@@ -135,3 +135,65 @@ test('requires current-run task execution evidence before terminal failure recor
   });
   assert.equal(rejected.code, 'terminal_failure_retry_cap_zero_requires_redelegation');
 });
+
+test('preserves admitted execution for terminal no-eligible closure without workspace change', () => {
+  const f = fixture();
+  const snapshot = path.join(f.runs, 'claim.before-runtime.json');
+  const evidence = path.join(f.runs, 'run.execution-evidence.json');
+  writeJson(snapshot, { ok: true, claim: { claim_id: 'claim-current', selected_todo: f.selected } });
+  const stdout = path.join(f.runs, 'run.stdout.log');
+  writeJson(stdout, {
+    run: {
+      run_id: 'runtime-current',
+      phase_loop_claim_id: 'claim-current',
+      status: 'no_eligible_task',
+      stop_class: 'terminal_failure',
+      stop_reason: 'terminal_task_failed',
+      executed_count: 1,
+      task_execution_confirmed: true,
+    },
+  });
+  const result = writeTerminalExecutionEvidence({
+    stdoutPath: stdout,
+    claimSnapshotPath: snapshot,
+    outputPath: evidence,
+    runStamp: 'run-current',
+    workspaceBefore: 'unchanged-workspace',
+    workspaceAfter: 'unchanged-workspace',
+  });
+  assert.equal(result.task_execution_confirmed, true);
+  assert.equal(result.signals.task_execution_confirmed, true);
+  assert.equal(result.signals.payload_status, 'no_eligible_task');
+  const durable = recordTerminalFailureRecovery(f.root, {
+    selected_todo: f.selected,
+    claim_id: 'claim-current',
+    run_id: 'runtime-current',
+    retry_cap: 1,
+    controller_fingerprint: 'controller-current',
+    execution_evidence: {
+      ...result,
+      selected_todo_sha256: crypto.createHash('sha256').update(f.selected).digest('hex'),
+    },
+  });
+  assert.equal(durable.ok, true, durable);
+});
+
+test('keeps genuine unexecuted terminal no-eligible results fail-closed', () => {
+  const f = fixture();
+  const snapshot = path.join(f.runs, 'claim.before-runtime.json');
+  const evidence = path.join(f.runs, 'run.execution-evidence.json');
+  writeJson(snapshot, { ok: true, claim: { claim_id: 'claim-current', selected_todo: f.selected } });
+  const stdout = path.join(f.runs, 'run.stdout.log');
+  writeJson(stdout, {
+    run: {
+      run_id: 'runtime-current',
+      phase_loop_claim_id: 'claim-current',
+      status: 'no_eligible_task',
+      stop_class: 'terminal_failure',
+      stop_reason: 'terminal_task_failed',
+      executed_count: 0,
+    },
+  });
+  const result = writeTerminalExecutionEvidence({ stdoutPath: stdout, claimSnapshotPath: snapshot, outputPath: evidence, runStamp: 'run-current' });
+  assert.equal(result.task_execution_confirmed, false);
+});

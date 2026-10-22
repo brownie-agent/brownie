@@ -15085,6 +15085,9 @@ NODE
     runtime_admission_status=$?
   fi
   if [ "$runtime_admission_status" -ne 0 ]; then
+    local runtime_admission_cause runtime_admission_snapshot_mismatch
+    runtime_admission_cause="$(printf '%s' "$runtime_admission_validation" | python3 -c 'import json,sys; value=json.load(sys.stdin); print(value.get("cause") or value.get("reason") or "runtime_admission_validation_failed")' 2>/dev/null || printf '%s' "runtime_admission_validation_failed")"
+    runtime_admission_snapshot_mismatch="$(printf '%s' "$runtime_admission_validation" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("snapshot_mismatch") else "0")' 2>/dev/null || printf '%s' "1")"
     # Admission failure is a post-execution boundary failure. Roll back both
     # layers of workspace authority before returning: delegated scope restores
     # every out-of-scope tracked file, while the exact pre-runtime target
@@ -15107,13 +15110,17 @@ NODE
     mismatch_claim_status=$?
     set -e
     write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
-    detail="Runtime did not admit the claimed task before execution; restored the pre-runtime delegated scope, target, and claim snapshots before bounded recovery. admission=$runtime_admission_validation scope_status=$mismatch_scope_status target_status=$mismatch_target_status claim_status=$mismatch_claim_status scope=$mismatch_scope_output stdout=$stdout_log stderr=$stderr_log"
+    if [ "$runtime_admission_cause" = "claimed_task_not_admitted" ] && [ "$runtime_admission_snapshot_mismatch" = "0" ]; then
+      detail="Runtime attested the admitted claim snapshot but produced no task execution evidence; classified as execution_not_started and restored the pre-runtime delegated scope, target, and claim snapshots before bounded recovery. admission=$runtime_admission_validation scope_status=$mismatch_scope_status target_status=$mismatch_target_status claim_status=$mismatch_claim_status scope=$mismatch_scope_output stdout=$stdout_log stderr=$stderr_log"
+    else
+      detail="Runtime admission snapshot mismatch; restored the pre-runtime delegated scope, target, and claim snapshots before bounded recovery. admission=$runtime_admission_validation scope_status=$mismatch_scope_status target_status=$mismatch_target_status claim_status=$mismatch_claim_status scope=$mismatch_scope_output stdout=$stdout_log stderr=$stderr_log"
+    fi
     if [ "$mismatch_scope_status" -ne 0 ] || [ "$mismatch_target_status" -ne 0 ] || [ "$mismatch_claim_status" -ne 0 ]; then
       detail="Runtime admission mismatch recovery was incomplete; refusing to continue with partially restored state. $detail"
     fi
     write_status "no_progress" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
-    printf '%s run=%s runtime_admission_recovery_required=true admission=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_stamp" "$runtime_admission_validation" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
-    write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"runtime_admission_snapshot_mismatch","continuation_required":true,"recovery_scope":"selected_claim","owner_blocked":false}'
+    printf '%s run=%s runtime_admission_recovery_required=true runtime_admission_cause=%s snapshot_mismatch=%s admission=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_stamp" "$runtime_admission_cause" "$runtime_admission_snapshot_mismatch" "$runtime_admission_validation" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+    write_bdk_trajectory_event "$run_stamp" "todo.replanned" "{\"reason\":\"$runtime_admission_cause\",\"snapshot_mismatch\":$([ "$runtime_admission_snapshot_mismatch" = "1" ] && printf true || printf false),\"continuation_required\":true,\"recovery_scope\":\"selected_claim\",\"owner_blocked\":false}"
     return 76
   fi
   bind_runtime_stdout_to_active_claim "$stdout_log"
