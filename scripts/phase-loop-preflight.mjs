@@ -543,6 +543,13 @@ export function validatePhaseLoopPreflight(options = {}) {
       message: 'The claim-smoke fixture profile requires the explicit test-only PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 marker.'
     });
   }
+  if (profile !== 'claim-smoke-fixture' && process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY === '1') {
+    errors.push({
+      code: 'phase_loop_preflight_fixture_marker_forbidden',
+      profile,
+      message: 'The PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 marker is permitted only with the claim-smoke-fixture profile.'
+    });
+  }
   const todoPath = options.todo ?? '.brownie/todo.md';
   const fixtureProfile = profile === 'claim-smoke-fixture';
   const fixturePathOptions = fixtureProfile ? { allowOutsideRepository: true } : {};

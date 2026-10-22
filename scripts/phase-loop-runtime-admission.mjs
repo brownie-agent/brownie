@@ -8,8 +8,18 @@ function sha256(value) {
   return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
 }
 
+const MAX_ATTESTED_TODO_ID_CHARS = 128;
+const ATTESTED_TODO_ID_PREFIX_CHARS = 48;
+
 export function selectedTodoId(selectedTodo = '') {
-  return String(selectedTodo).split('\n')[0].match(/^\s*(?:[-*]|\d+[.)])\s+\[\s\]\s+([^:\s]+)/u)?.[1] ?? '';
+  const id = String(selectedTodo).split('\n')[0].match(/^\s*(?:[-*]|\d+[.)])\s+\[\s\]\s+([^:\s]+)/u)?.[1] ?? '';
+  return canonicalizeAttestedTodoId(id);
+}
+
+export function canonicalizeAttestedTodoId(id = '') {
+  const value = String(id);
+  if (Array.from(value).length <= MAX_ATTESTED_TODO_ID_CHARS) return value;
+  return `${Array.from(value).slice(0, ATTESTED_TODO_ID_PREFIX_CHARS).join('')}~sha256:${sha256(value)}`;
 }
 
 export function createRuntimeAdmission({ claim, runStamp }) {
@@ -26,6 +36,27 @@ export function createRuntimeAdmission({ claim, runStamp }) {
     status: 'admitted',
     task_id: null,
     runtime_run_id: null,
+  };
+}
+
+export function compareRuntimeAdmissionSnapshot(admission, claim) {
+  const selectedTodo = String(claim?.selected_todo ?? '');
+  const expected = {
+    claim_id: String(claim?.claim_id ?? ''),
+    selected_todo_id: selectedTodoId(selectedTodo),
+    selected_todo_sha256: sha256(selectedTodo),
+    queue_generation: claim?.queue_generation ?? null,
+    queue_fingerprint: String(claim?.queue_fingerprint ?? ''),
+  };
+  const mismatches = Object.keys(expected).filter((field) =>
+    String(admission?.[field] ?? '') !== String(expected[field] ?? '')
+  );
+  return {
+    ok: mismatches.length === 0,
+    mismatches,
+    expected,
+    actual: Object.fromEntries(Object.keys(expected).map((field) => [field, admission?.[field] ?? null])),
+    reason: mismatches.length === 0 ? 'runtime_admission_snapshot_confirmed' : 'runtime_admission_snapshot_mismatch',
   };
 }
 
@@ -59,7 +90,17 @@ export function validateRuntimeAdmission(admission, root) {
     && typeof admission?.claim_id === 'string'
     && admission.claim_id.length > 0
     && runtimeClaimId === admission.claim_id;
-  const snapshotMismatch = !claimMatches
+  const runtimeSnapshot = {
+    selected_todo_id: payload.phase_loop_selected_todo_id ?? payload.automation?.phase_loop_selected_todo_id,
+    selected_todo_sha256: payload.phase_loop_selected_todo_sha256 ?? payload.automation?.phase_loop_selected_todo_sha256,
+    queue_generation: payload.phase_loop_queue_generation ?? payload.automation?.phase_loop_queue_generation,
+    queue_fingerprint: payload.phase_loop_queue_fingerprint ?? payload.automation?.phase_loop_queue_fingerprint,
+  };
+  const snapshotFieldsPresent = Object.values(runtimeSnapshot).every((value) => value !== undefined);
+  const snapshotMatches = snapshotFieldsPresent && Object.keys(runtimeSnapshot).every((field) =>
+    runtimeSnapshot[field] === admission?.[field]
+  );
+  const snapshotMismatch = !claimMatches || !snapshotMatches
     || (status === 'no_eligible_task' && !executed && terminalFailure);
   return {
     ok: !snapshotMismatch,
@@ -71,7 +112,8 @@ export function validateRuntimeAdmission(admission, root) {
     task_id: taskId,
     runtime_run_id: runtimeRunId,
     reason: snapshotMismatch
-      ? (claimMatches ? 'claimed_task_not_admitted' : 'runtime_claim_snapshot_mismatch')
+      ? (!claimMatches ? 'runtime_claim_snapshot_mismatch'
+        : (!snapshotMatches ? 'runtime_admission_snapshot_mismatch' : 'claimed_task_not_admitted'))
       : 'runtime_admission_confirmed',
   };
 }
@@ -104,6 +146,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToP
       process.exit(0);
     }
     const result = validateRuntimeAdmission(admission, root);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exit(result.ok ? 0 : 78);
+  }
+  if (command === 'verify' && firstPath && secondPath) {
+    const admission = JSON.parse(fs.readFileSync(firstPath, 'utf8'));
+    const claim = JSON.parse(fs.readFileSync(secondPath, 'utf8'));
+    const result = compareRuntimeAdmissionSnapshot(admission, claim);
     process.stdout.write(`${JSON.stringify(result)}\n`);
     process.exit(result.ok ? 0 : 78);
   }

@@ -13562,6 +13562,10 @@ run_phase_loop_preflight() {
     printf '%s run=%s phase_loop_preflight_fixture_profile_rejected=true profile=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_PREFLIGHT_PROFILE" >> "$SUPERVISOR_LOG"
     return 78
   fi
+  if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" != "claim-smoke-fixture" ] && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
+    printf '%s run=%s phase_loop_preflight_fixture_marker_rejected=true profile=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_PREFLIGHT_PROFILE" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
   if [ ! -f "$ROOT_DIR/scripts/phase-loop-preflight.mjs" ]; then
     printf '%s run=%s phase_loop_preflight_missing=true path=%s\n' "$(now_utc)" "$run_stamp" "$ROOT_DIR/scripts/phase-loop-preflight.mjs" >> "$SUPERVISOR_LOG"
     return 78
@@ -15018,6 +15022,16 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"exact_line_fast_path_failed"}'
     return 74
   fi
+  if ! runtime_admission_validation="$({
+    node "$ROOT_DIR/scripts/phase-loop-runtime-admission.mjs" verify \
+      "$runtime_admission_snapshot" "$TODO_CLAIM_FILE"
+  } 2>&1)"; then
+    detail="Runtime admission snapshot became unstable before dispatch; refusing Runtime start. admission=$runtime_admission_snapshot claim=$TODO_CLAIM_FILE result=$runtime_admission_validation"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_admission_snapshot_mismatch","owner_blocked":true}'
+    return 78
+  fi
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     export BROWNIE_WORKSPACE_ROOT="${BROWNIE_WORKSPACE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"
@@ -15040,6 +15054,31 @@ PY
     fi
   ) > "$stdout_log" 2> "$stderr_log"
   exit_code=$?
+  if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" = "claim-smoke-fixture" ] && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
+    node --input-type=module - "$stdout_log" "$runtime_admission_snapshot" "$(claim_field claim_id)" <<'NODE'
+import fs from 'node:fs';
+const [stdoutPath, admissionPath, claimId] = process.argv.slice(2);
+try {
+  const root = JSON.parse(fs.readFileSync(stdoutPath, 'utf8'));
+  const payload = root?.run && typeof root.run === 'object'
+    ? root.run
+    : root?.resume && typeof root.resume === 'object'
+      ? root.resume
+      : root;
+  const admission = JSON.parse(fs.readFileSync(admissionPath, 'utf8'));
+  if (claimId && payload && typeof payload === 'object') {
+    payload.phase_loop_claim_id = claimId;
+    payload.phase_loop_selected_todo_id = admission.selected_todo_id;
+    payload.phase_loop_selected_todo_sha256 = admission.selected_todo_sha256;
+    payload.phase_loop_queue_generation = admission.queue_generation;
+    payload.phase_loop_queue_fingerprint = admission.queue_fingerprint;
+    fs.writeFileSync(stdoutPath, `${JSON.stringify(root)}\n`);
+  }
+} catch {
+  // Preserve malformed provider output for the existing recovery path.
+}
+NODE
+  fi
   if runtime_admission_validation="$(node "$ROOT_DIR/scripts/phase-loop-runtime-admission.mjs" validate "$runtime_admission_snapshot" "$stdout_log" 2>&1)"; then
     runtime_admission_status=0
   else

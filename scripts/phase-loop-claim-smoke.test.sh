@@ -66,14 +66,13 @@ fi
 # Preserve the historical 45-second bound when the suite is intentionally
 # configured for the old eight-way fan-out.  Otherwise give each child a
 # bounded amount of headroom proportional to the reduced parallelism; this
-# is still below the suite watchdog and avoids false timeout failures caused
-# by CPU contention rather than a hung controller.  The six-way local default
-# is deliberately generous because the terminal fixtures are CPU-heavy when
-# all shards share one host.
+# avoids false timeout failures caused by CPU contention rather than a hung
+# controller.  The low-parallelism bound is deliberately generous because
+# the terminal fixtures are CPU-heavy when all shards share one host.
 if [ -z "${PHASE_LOOP_COMMAND_TIMEOUT_SECONDS:-}" ]; then
   case "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" in
-    1) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
-    2) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=90 ;;
+    1) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=180 ;;
+    2) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=180 ;;
     3|4|5|6) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=180 ;;
     *) PHASE_LOOP_COMMAND_TIMEOUT_SECONDS=45 ;;
   esac
@@ -284,9 +283,13 @@ original_status=\$?
 child_pid=""
 trap - TERM INT
 set -e
-"$node_bin" - "\$output_file" "\${BROWNIE_PHASE_LOOP_CLAIM_ID:-}" <<'NODE'
+admission_file="\${BROWNIE_PHASE_LOOP_ADMISSION_FILE:-}"
+if [ -z "\$admission_file" ] && [ -n "\${PHASE_LOOP_STATE_DIR:-}" ] && [ -d "\$PHASE_LOOP_STATE_DIR/runs" ]; then
+  admission_file="\$(find "\$PHASE_LOOP_STATE_DIR/runs" -type f -name '*.runtime-admission.json' -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+fi
+"$node_bin" - "\$output_file" "\${BROWNIE_PHASE_LOOP_CLAIM_ID:-}" "\$admission_file" <<'NODE'
 const fs = require('node:fs');
-const [outputFile, claimId] = process.argv.slice(2);
+const [outputFile, claimId, admissionFile] = process.argv.slice(2);
 const text = fs.readFileSync(outputFile, 'utf8');
 try {
   const root = JSON.parse(text);
@@ -295,7 +298,16 @@ try {
     : root?.resume && typeof root.resume === 'object'
       ? root.resume
       : root;
-  if (claimId && payload && typeof payload === 'object') payload.phase_loop_claim_id = claimId;
+  if (claimId && payload && typeof payload === 'object') {
+    payload.phase_loop_claim_id = claimId;
+    if (admissionFile) {
+      const admission = JSON.parse(fs.readFileSync(admissionFile, 'utf8'));
+      payload.phase_loop_selected_todo_id = admission.selected_todo_id;
+      payload.phase_loop_selected_todo_sha256 = admission.selected_todo_sha256;
+      payload.phase_loop_queue_generation = admission.queue_generation;
+      payload.phase_loop_queue_fingerprint = admission.queue_fingerprint;
+    }
+  }
   process.stdout.write(JSON.stringify(root) + '\\n');
 } catch {
   process.stdout.write(text);

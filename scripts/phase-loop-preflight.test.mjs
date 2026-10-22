@@ -93,6 +93,7 @@ test('allows claim-smoke recovery to deliver dirty workspace progress for a pend
 
     const productionResult = validatePhaseLoopPreflight({ repo, claim, skipCommands: true });
     assert(productionResult.errors.some((error) => error.code === 'dirty_delivery_required'), JSON.stringify(productionResult.errors));
+    assert(productionResult.errors.some((error) => error.code === 'phase_loop_preflight_fixture_marker_forbidden'), JSON.stringify(productionResult.errors));
   } finally {
     if (previous === undefined) delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
     else process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = previous;
@@ -251,6 +252,23 @@ test('rejects the claim-smoke fixture profile without its explicit test-only mar
   }
 });
 
+test('rejects the fixture marker outside the claim-smoke fixture profile', () => {
+  const repo = makeRepo();
+  const previous = process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+  process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = '1';
+  try {
+    const productionResult = validatePhaseLoopPreflight({ repo, profile: 'production', skipCommands: true });
+    assert.equal(productionResult.valid, false, JSON.stringify(productionResult, null, 2));
+    assert(productionResult.errors.some((error) => error.code === 'phase_loop_preflight_fixture_marker_forbidden'), JSON.stringify(productionResult.errors));
+
+    const otherResult = validatePhaseLoopPreflight({ repo, profile: 'other', skipCommands: true });
+    assert(otherResult.errors.some((error) => error.code === 'phase_loop_preflight_fixture_marker_forbidden'), JSON.stringify(otherResult.errors));
+  } finally {
+    if (previous === undefined) delete process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY;
+    else process.env.PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY = previous;
+  }
+});
+
 test('allows an external temporary queue only under the explicit claim-smoke fixture profile', () => {
   const repo = makeRepo();
   const outsideTodo = path.join(os.tmpdir(), `brownie-claim-smoke-todo-${Date.now()}.md`);
@@ -395,6 +413,9 @@ test('places the strict preflight boundary before claim rebaseline and forbids l
   const fixtureProfileRejection = controller.indexOf('phase_loop_preflight_fixture_profile_rejected=true', preflightFunction);
   assert.ok(fixtureProfileRejection >= 0);
   assert.ok(fixtureProfileRejection < preflightCommand);
+  const fixtureMarkerRejection = controller.indexOf('phase_loop_preflight_fixture_marker_rejected=true', preflightFunction);
+  assert.ok(fixtureMarkerRejection >= 0);
+  assert.ok(fixtureMarkerRejection < preflightCommand);
   const auditFailure = controller.indexOf('if ! write_phase_loop_snapshot_audit "$run_stamp" "$output"; then', preflightFunction);
   assert.ok(auditFailure >= 0);
   assert.ok(auditFailure < rebaseline);
@@ -411,6 +432,15 @@ test('expands optional snapshot arguments safely and rejects incomplete snapshot
   assert.match(preflightBody, /phase_loop_preflight_snapshot_audit_missing=true/u);
   assert.match(preflightBody, /\$\{snapshot_args\[@\]\+"\$\{snapshot_args\[@\]\}"\}/u);
   assert.doesNotMatch(preflightBody, /"\$\{snapshot_args\[@\]\}"\s*\n\s*2>&1/u);
+});
+
+test('limits runtime admission payload fabrication to the claim-smoke fixture profile', () => {
+  const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
+  const fabrication = controller.indexOf('node --input-type=module - "$stdout_log" "$runtime_admission_snapshot"');
+  assert(fabrication >= 0);
+  const guard = controller.lastIndexOf('if [', fabrication);
+  assert.match(controller.slice(guard, fabrication), /\$PHASE_LOOP_PREFLIGHT_PROFILE.*claim-smoke-fixture/);
+  assert.match(controller.slice(guard, fabrication), /PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0\}\" = \"1\"/);
 });
 
 test('bounded implementation leaves are not instructed to re-split their TODO on missing patch context', () => {
