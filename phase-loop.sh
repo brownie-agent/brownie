@@ -90,6 +90,7 @@ PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES="${PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES:-
 PHASE_LOOP_PROMPT_RETENTION_COUNT="${PHASE_LOOP_PROMPT_RETENTION_COUNT:-20}"
 PHASE_LOOP_STOP_GRACE_SECONDS="${PHASE_LOOP_STOP_GRACE_SECONDS:-15}"
 PHASE_LOOP_STOP_FORCE_SECONDS="${PHASE_LOOP_STOP_FORCE_SECONDS:-5}"
+PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS="${PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS:-30}"
 PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS="${PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS:-30}"
 PHASE_LOOP_SLEEP_POLL_SECONDS="${PHASE_LOOP_SLEEP_POLL_SECONDS:-1}"
 PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES="${PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES:-3}"
@@ -13653,8 +13654,8 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
   return 0
 }
 
-phase_loop_legacy_migration_lock_identity() {
-  python3 - "$LEGACY_MIGRATION_LOCK_DIR" <<'PY'
+phase_loop_lock_identity_for_path() {
+  python3 - "$1" <<'PY'
 import os
 import sys
 
@@ -13665,6 +13666,77 @@ except OSError:
     raise SystemExit(0)
 print(f"{stat_result.st_dev}:{stat_result.st_ino}")
 PY
+}
+
+phase_loop_lock_identity() {
+  phase_loop_lock_identity_for_path "$LOCK_DIR"
+}
+
+phase_loop_legacy_migration_lock_identity() {
+  phase_loop_lock_identity_for_path "$LEGACY_MIGRATION_LOCK_DIR"
+}
+
+phase_loop_supervisor_lock_ownerless_stale() {
+  python3 - "$LOCK_DIR" "$PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS" <<'PY'
+import os
+import sys
+import time
+
+try:
+    age = time.time() - os.stat(sys.argv[1]).st_mtime
+    grace = float(sys.argv[2])
+except (OSError, ValueError):
+    print("0")
+    raise SystemExit(0)
+print("1" if age >= grace else "0")
+PY
+}
+
+phase_loop_supervisor_lock_active() {
+  if [ ! -d "$LOCK_DIR" ]; then
+    return 1
+  fi
+  local owner_file="$LOCK_DIR/owner.json"
+  if [ ! -f "$owner_file" ]; then
+    if [ "$(phase_loop_supervisor_lock_ownerless_stale)" = "1" ]; then
+      return 1
+    fi
+    return 0
+  fi
+  if python3 - "$owner_file" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+try:
+    owner = json.loads(open(sys.argv[1], encoding='utf-8').read())
+    pid = int(owner['pid'])
+    expected_start = str(owner['start_time'])
+    expected_command = str(owner['command'])
+    expected_root = os.path.realpath(str(owner['root_dir']))
+    if pid <= 1 or not expected_start or not expected_command or not expected_root:
+        raise ValueError
+    os.kill(pid, 0)
+    try:
+        actual_start = subprocess.check_output(['ps', '-p', str(pid), '-o', 'lstart='], text=True, stderr=subprocess.DEVNULL).strip()
+        actual_command = subprocess.check_output(['ps', '-p', str(pid), '-o', 'command='], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.SubprocessError):
+        # Some restricted hosts deny process inspection. kill(0) still gives
+        # a safe liveness result; keep the owner active rather than reclaiming
+        # a live supervisor merely because metadata inspection is unavailable.
+        raise SystemExit(0)
+except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError):
+    raise SystemExit(1)
+
+if expected_start == 'unavailable' or expected_command == 'unavailable':
+    raise SystemExit(0)
+raise SystemExit(0 if actual_start == expected_start and actual_command == expected_command else 1)
+PY
+  then
+    return 0
+  fi
+  return 1
 }
 
 phase_loop_legacy_migration_lock_ownerless_stale() {
@@ -13799,22 +13871,47 @@ acquire_lock() {
     return 1
   fi
   if mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo "$$" > "$LOCK_DIR/pid"
-    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+    if ! phase_loop_write_supervisor_lock_owner; then
+      rm -rf "$LOCK_DIR"
+      printf '%s supervisor ownership publication failed; refusing to run concurrently\n' "$(now_utc)" >&2
+      return 78
+    fi
+    trap 'phase_loop_release_supervisor_lock' EXIT
     return 0
   fi
   PHASE_LOOP_LOCK_BLOCKER="supervisor"
-  local lock_pid
-  lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-  if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
-    rm -rf "$LOCK_DIR"
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-      echo "$$" > "$LOCK_DIR/pid"
-      trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
-      printf '%s reclaimed stale phase-loop lock from pid=%s\n' "$(now_utc)" "$lock_pid" >> "$SUPERVISOR_LOG"
-      return 0
+  if phase_loop_supervisor_lock_active; then
+    printf '%s phase-loop supervisor ownership is already held; refusing concurrent supervisor (lock=%s)\n' \
+      "$(now_utc)" "$LOCK_DIR" >&2
+    return 1
+  fi
+  local inspected_lock_identity current_lock_identity quarantine_dir quarantine_identity
+  inspected_lock_identity="$(phase_loop_lock_identity)"
+  if [ -z "$inspected_lock_identity" ]; then
+    printf '%s phase-loop supervisor lock changed while inspecting; refusing startup\n' "$(now_utc)" >&2
+    return 1
+  fi
+  current_lock_identity="$inspected_lock_identity"
+  quarantine_dir="$STATE_DIR/phase-loop-stale-lock.$$.${RANDOM}"
+  if mv "$LOCK_DIR" "$quarantine_dir" 2>/dev/null; then
+    quarantine_identity="$(phase_loop_lock_identity_for_path "$quarantine_dir")"
+    if [ -n "$quarantine_identity" ] && [ "$quarantine_identity" = "$inspected_lock_identity" ]; then
+      rm -rf "$quarantine_dir"
+      sync_parent_dir "$STATE_DIR"
+      if mkdir "$LOCK_DIR" 2>/dev/null && phase_loop_write_supervisor_lock_owner; then
+        trap 'phase_loop_release_supervisor_lock' EXIT
+        printf '%s reclaimed stale phase-loop supervisor lock\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+        return 0
+      fi
+      rm -rf "$LOCK_DIR"
+    else
+      # The lock was replaced during inspection; never remove or adopt it.
+      [ -d "$quarantine_dir" ] && mv "$quarantine_dir" "$LOCK_DIR" 2>/dev/null || true
+      printf '%s phase-loop supervisor lock changed during stale-owner recovery; refusing startup\n' "$(now_utc)" >&2
+      return 1
     fi
   fi
+  printf '%s stale phase-loop supervisor lock recovery failed; refusing startup\n' "$(now_utc)" >&2
   return 1
 }
 
@@ -16368,6 +16465,59 @@ PY
   sync_parent_dir "$STATE_DIR"
 }
 
+phase_loop_write_supervisor_lock_owner() {
+  local timestamp tmp_owner start_time command
+  timestamp="$(now_utc)"
+  start_time="$(ps -p "$PHASE_LOOP_SUPERVISOR_PID" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//')"
+  command="$(ps -p "$PHASE_LOOP_SUPERVISOR_PID" -o command= 2>/dev/null | sed 's/^ *//;s/ *$//')"
+  tmp_owner="$LOCK_DIR/owner.json.$$.$RANDOM.tmp"
+  [ -n "$start_time" ] || start_time="unavailable"
+  [ -n "$command" ] || command="unavailable"
+  python3 - "$tmp_owner" "$PHASE_LOOP_SUPERVISOR_PID" "$PHASE_LOOP_SUPERVISOR_GENERATION" "$ROOT_DIR" "$timestamp" "$start_time" "$command" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+payload = {
+    "schema_version": 1,
+    "pid": int(sys.argv[2]),
+    "generation": sys.argv[3],
+    "root_dir": os.path.realpath(sys.argv[4]),
+    "started_at": sys.argv[5],
+    "start_time": sys.argv[6],
+    "command": sys.argv[7],
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(path, 0o600)
+PY
+  mv "$tmp_owner" "$LOCK_DIR/owner.json"
+  printf '%s\n' "$PHASE_LOOP_SUPERVISOR_PID" > "$LOCK_DIR/pid"
+  sync_parent_dir "$LOCK_DIR"
+}
+
+phase_loop_release_supervisor_lock() {
+  [ -d "$LOCK_DIR" ] || return 0
+  python3 - "$LOCK_DIR/owner.json" "$PHASE_LOOP_SUPERVISOR_PID" "$PHASE_LOOP_SUPERVISOR_GENERATION" <<'PY'
+import json
+import sys
+try:
+    owner = json.load(open(sys.argv[1], encoding='utf-8'))
+    owned = owner.get('pid') == int(sys.argv[2]) and owner.get('generation') == sys.argv[3]
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    owned = False
+raise SystemExit(0 if owned else 1)
+PY
+  if [ "$?" -eq 0 ]; then
+    rm -rf "$LOCK_DIR"
+    sync_parent_dir "$STATE_DIR"
+  fi
+}
+
 phase_loop_drain_deferred_signal() {
   if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -ne 1 ] && [ -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" ]; then
     PHASE_LOOP_DEFERRED_SIGNAL_CODE="$(cat "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" 2>/dev/null || true)"
@@ -16563,16 +16713,16 @@ PY
 
 supervise() {
   load_env
+  PHASE_LOOP_SUPERVISOR_PID="$$"
+  PHASE_LOOP_SUPERVISOR_GENERATION="supervisor-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
   if ! acquire_lock; then
     if [ "${PHASE_LOOP_LOCK_BLOCKER:-}" = "legacy_migration" ]; then
       exit 75
     fi
-    write_status "already_running" "Another phase-loop.sh instance holds the lock." "" "" 0
-    exit 0
+    write_status "already_running" "Another phase-loop.sh supervisor owns the durable control-plane lock; refusing concurrent execution." "" "75" 0
+    exit 75
   fi
 
-  PHASE_LOOP_SUPERVISOR_PID="$$"
-  PHASE_LOOP_SUPERVISOR_GENERATION="supervisor-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
   write_supervisor_owner
   echo "$PHASE_LOOP_SUPERVISOR_PID" > "$PID_FILE"
   write_status "supervising" "Supervisor started." "" "" 0

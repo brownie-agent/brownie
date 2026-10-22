@@ -82,6 +82,16 @@ not review, approve, merge, or relax branch protection for its own pull request.
 Brownie must not use the `globalpocket` account for TODO implementation,
 commit, push, or pull request creation.
 
+If an implementation pull request is rejected, remediation must be a successor
+commit with a fresh head SHA. Re-running checks or opening a retry pull request
+at the rejected head SHA is not a remediation: it can leave a required failure
+attached to the exact commit that the valid retry needs. The PR-author admission
+guard accepts an explicitly identified remediation only when its head SHA differs
+from the rejected head SHA; when it rejects the retry, its diagnostic names the
+rejected SHA and instructs the actor to push a new commit on top of it. Record
+`PHASE_LOOP_REJECTED_HEAD_SHA` and `PHASE_LOOP_REJECTED_PR_NUMBER` in the
+workflow admission context when applying this contract.
+
 Codex running as `globalpocket` owns the review and merge lifecycle for
 Brownie-created pull requests only: review the PR, request changes when needed,
 approve when policy allows it, and merge after required checks and review policy

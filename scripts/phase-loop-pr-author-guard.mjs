@@ -4,11 +4,38 @@ import { pathToFileURL } from 'node:url';
 
 export const implementationBranchPrefixes = Object.freeze(['brownie-agent/', 'phase-loop/']);
 
+export function validateImplementationPullRequestRemediation({
+  headSha,
+  rejectedHeadSha,
+  rejectedPullRequestNumber
+} = {}) {
+  const priorSha = typeof rejectedHeadSha === 'string' ? rejectedHeadSha.trim() : '';
+  if (!priorSha && rejectedPullRequestNumber === undefined) return [];
+
+  const retrySha = typeof headSha === 'string' ? headSha.trim() : '';
+  const rejectedLabel = rejectedPullRequestNumber === undefined
+    ? 'the rejected implementation pull request'
+    : `rejected implementation pull request #${rejectedPullRequestNumber}`;
+  if (!priorSha) {
+    return [`${rejectedLabel} remediation requires the rejected head SHA; record it and create a fresh successor commit before retrying.`];
+  }
+  if (!retrySha) {
+    return [`${rejectedLabel} remediation requires a fresh successor SHA; push a new commit on top of ${priorSha.slice(0, 12)} before retrying.`];
+  }
+  if (retrySha === priorSha) {
+    return [`${rejectedLabel} remediation must use a fresh successor SHA; ${retrySha.slice(0, 12)} is still the rejected head. Push a new commit on top of ${priorSha.slice(0, 12)} and retry.`];
+  }
+  return [];
+}
+
 export function validateImplementationPullRequest({
   author,
   headRef,
+  headSha,
   headRepoOwner,
   headRepoName,
+  rejectedHeadSha,
+  rejectedPullRequestNumber,
   expectedActor = 'brownie-agent',
   branchPrefixes = implementationBranchPrefixes,
   expectedRepoName = 'brownie'
@@ -31,7 +58,7 @@ export function validateImplementationPullRequest({
   if (normalizedRepo !== expectedRepoName) {
     return [`implementation pull requests on ${normalizedHeadRef} must originate from ${expectedActor}/${expectedRepoName}; head repository was ${normalizedOwner || '(unknown)'}/${normalizedRepo || '(unknown)'}.`];
   }
-  return [];
+  return validateImplementationPullRequestRemediation({ headSha, rejectedHeadSha, rejectedPullRequestNumber });
 }
 
 export function readPullRequestEvent(eventPath) {
@@ -43,8 +70,11 @@ export function readPullRequestEvent(eventPath) {
     return {
       author: event?.pull_request?.user?.login ?? '',
       headRef: event?.pull_request?.head?.ref ?? '',
+      headSha: event?.pull_request?.head?.sha ?? '',
       headRepoOwner: event?.pull_request?.head?.repo?.owner?.login ?? '',
-      headRepoName: event?.pull_request?.head?.repo?.name ?? ''
+      headRepoName: event?.pull_request?.head?.repo?.name ?? '',
+      rejectedHeadSha: process.env.PHASE_LOOP_REJECTED_HEAD_SHA ?? '',
+      rejectedPullRequestNumber: process.env.PHASE_LOOP_REJECTED_PR_NUMBER || undefined
     };
   } catch (error) {
     return { author: '', headRef: '', error: error.message };
