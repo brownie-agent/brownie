@@ -29,6 +29,27 @@ export function createRuntimeAdmission({ claim, runStamp }) {
   };
 }
 
+export function compareRuntimeAdmissionSnapshot(admission, claim) {
+  const selectedTodo = String(claim?.selected_todo ?? '');
+  const expected = {
+    claim_id: String(claim?.claim_id ?? ''),
+    selected_todo_id: selectedTodoId(selectedTodo),
+    selected_todo_sha256: sha256(selectedTodo),
+    queue_generation: claim?.queue_generation ?? null,
+    queue_fingerprint: String(claim?.queue_fingerprint ?? ''),
+  };
+  const mismatches = Object.keys(expected).filter((field) =>
+    String(admission?.[field] ?? '') !== String(expected[field] ?? '')
+  );
+  return {
+    ok: mismatches.length === 0,
+    mismatches,
+    expected,
+    actual: Object.fromEntries(Object.keys(expected).map((field) => [field, admission?.[field] ?? null])),
+    reason: mismatches.length === 0 ? 'runtime_admission_snapshot_confirmed' : 'runtime_admission_snapshot_mismatch',
+  };
+}
+
 function runtimePayload(root) {
   if (root?.run && typeof root.run === 'object') return root.run;
   if (root?.resume && typeof root.resume === 'object') return root.resume;
@@ -59,7 +80,17 @@ export function validateRuntimeAdmission(admission, root) {
     && typeof admission?.claim_id === 'string'
     && admission.claim_id.length > 0
     && runtimeClaimId === admission.claim_id;
-  const snapshotMismatch = !claimMatches
+  const runtimeSnapshot = {
+    selected_todo_id: payload.phase_loop_selected_todo_id ?? payload.automation?.phase_loop_selected_todo_id,
+    selected_todo_sha256: payload.phase_loop_selected_todo_sha256 ?? payload.automation?.phase_loop_selected_todo_sha256,
+    queue_generation: payload.phase_loop_queue_generation ?? payload.automation?.phase_loop_queue_generation,
+    queue_fingerprint: payload.phase_loop_queue_fingerprint ?? payload.automation?.phase_loop_queue_fingerprint,
+  };
+  const snapshotFieldsPresent = Object.values(runtimeSnapshot).some((value) => value !== undefined);
+  const snapshotMatches = !snapshotFieldsPresent || Object.keys(runtimeSnapshot).every((field) =>
+    String(runtimeSnapshot[field] ?? '') === String(admission?.[field] ?? '')
+  );
+  const snapshotMismatch = !claimMatches || !snapshotMatches
     || (status === 'no_eligible_task' && !executed && terminalFailure);
   return {
     ok: !snapshotMismatch,
@@ -71,7 +102,8 @@ export function validateRuntimeAdmission(admission, root) {
     task_id: taskId,
     runtime_run_id: runtimeRunId,
     reason: snapshotMismatch
-      ? (claimMatches ? 'claimed_task_not_admitted' : 'runtime_claim_snapshot_mismatch')
+      ? (!claimMatches ? 'runtime_claim_snapshot_mismatch'
+        : (!snapshotMatches ? 'runtime_admission_snapshot_mismatch' : 'claimed_task_not_admitted'))
       : 'runtime_admission_confirmed',
   };
 }
@@ -104,6 +136,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToP
       process.exit(0);
     }
     const result = validateRuntimeAdmission(admission, root);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exit(result.ok ? 0 : 78);
+  }
+  if (command === 'verify' && firstPath && secondPath) {
+    const admission = JSON.parse(fs.readFileSync(firstPath, 'utf8'));
+    const claim = JSON.parse(fs.readFileSync(secondPath, 'utf8'));
+    const result = compareRuntimeAdmissionSnapshot(admission, claim);
     process.stdout.write(`${JSON.stringify(result)}\n`);
     process.exit(result.ok ? 0 : 78);
   }

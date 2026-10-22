@@ -15018,6 +15018,16 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"exact_line_fast_path_failed"}'
     return 74
   fi
+  if ! runtime_admission_validation="$({
+    node "$ROOT_DIR/scripts/phase-loop-runtime-admission.mjs" verify \
+      "$runtime_admission_snapshot" "$TODO_CLAIM_FILE"
+  } 2>&1)"; then
+    detail="Runtime admission snapshot became unstable before dispatch; refusing Runtime start. admission=$runtime_admission_snapshot claim=$TODO_CLAIM_FILE result=$runtime_admission_validation"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_admission_snapshot_mismatch","owner_blocked":true}'
+    return 78
+  fi
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     export BROWNIE_WORKSPACE_ROOT="${BROWNIE_WORKSPACE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"

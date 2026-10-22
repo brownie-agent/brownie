@@ -978,13 +978,25 @@ fn attest_phase_loop_claim_id(payload: Value) -> Result<Value, RuntimeClientErro
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or(RuntimeClientError::InvalidResponse)?;
-    attest_phase_loop_claim_id_payload(payload, &claim_id, admitted_claim_id)
+    let admitted_snapshot = admission
+        .as_object()
+        .and_then(|object| {
+            Some((
+                object.get("selected_todo_id")?.clone(),
+                object.get("selected_todo_sha256")?.clone(),
+                object.get("queue_generation")?.clone(),
+                object.get("queue_fingerprint")?.clone(),
+            ))
+        })
+        .ok_or(RuntimeClientError::InvalidResponse)?;
+    attest_phase_loop_claim_id_payload(payload, &claim_id, admitted_claim_id, &admitted_snapshot)
 }
 
 fn attest_phase_loop_claim_id_payload(
     mut payload: Value,
     claim_id: &str,
     admitted_claim_id: &str,
+    admitted_snapshot: &(Value, Value, Value, Value),
 ) -> Result<Value, RuntimeClientError> {
     if claim_id.is_empty()
         || claim_id.chars().count() > MAX_TEXT_FIELD_CHARS
@@ -1005,7 +1017,39 @@ fn attest_phase_loop_claim_id_payload(
             "phase_loop_claim_id".to_string(),
             Value::String(claim_id.to_string()),
         );
+        automation.insert(
+            "phase_loop_selected_todo_id".to_string(),
+            admitted_snapshot.0.clone(),
+        );
+        automation.insert(
+            "phase_loop_selected_todo_sha256".to_string(),
+            admitted_snapshot.1.clone(),
+        );
+        automation.insert(
+            "phase_loop_queue_generation".to_string(),
+            admitted_snapshot.2.clone(),
+        );
+        automation.insert(
+            "phase_loop_queue_fingerprint".to_string(),
+            admitted_snapshot.3.clone(),
+        );
     }
+    object.insert(
+        "phase_loop_selected_todo_id".to_string(),
+        admitted_snapshot.0.clone(),
+    );
+    object.insert(
+        "phase_loop_selected_todo_sha256".to_string(),
+        admitted_snapshot.1.clone(),
+    );
+    object.insert(
+        "phase_loop_queue_generation".to_string(),
+        admitted_snapshot.2.clone(),
+    );
+    object.insert(
+        "phase_loop_queue_fingerprint".to_string(),
+        admitted_snapshot.3.clone(),
+    );
     Ok(payload)
 }
 
@@ -6005,6 +6049,12 @@ mod tests {
             json!({"status": "task_executed", "automation": {"status": "task_executed"}}),
             "claim-current",
             "claim-current",
+            &(
+                json!("E-23b-target-02"),
+                json!("sha256:selected"),
+                json!(543),
+                json!("queue-fingerprint"),
+            ),
         )
         .unwrap();
         assert_eq!(payload["phase_loop_claim_id"], "claim-current");
@@ -6016,10 +6066,22 @@ mod tests {
 
     #[test]
     fn phase_loop_claim_attestation_rejects_absent_or_mismatched_ids() {
-        assert!(attest_phase_loop_claim_id_payload(json!({}), "", "claim-current").is_err());
-        assert!(
-            attest_phase_loop_claim_id_payload(json!({}), "claim-other", "claim-current").is_err()
+        let snapshot = (
+            json!("E-23b-target-02"),
+            json!("sha256:selected"),
+            json!(543),
+            json!("queue-fingerprint"),
         );
+        assert!(
+            attest_phase_loop_claim_id_payload(json!({}), "", "claim-current", &snapshot).is_err()
+        );
+        assert!(attest_phase_loop_claim_id_payload(
+            json!({}),
+            "claim-other",
+            "claim-current",
+            &snapshot
+        )
+        .is_err());
     }
 
     #[test]
