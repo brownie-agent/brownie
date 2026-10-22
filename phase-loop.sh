@@ -8594,6 +8594,21 @@ feedback = {
     "stdout_log": str(stdout_log),
     "stderr_log": str(stderr_log),
 }
+# A retry-cap-zero path first records a minimal redelegation marker, then
+# enriches it here from the current runtime ledger. Keep that recovery
+# contract intact: otherwise this writer would erase the indication that a
+# new bounded owner is required.
+for key in ("kind", "recovery_state", "retry_cap", "execution_evidence_path"):
+    if key in previous:
+        feedback[key] = previous[key]
+
+# A terminal closure without TaskFailed/AgentLoopCompleted detail is itself a
+# diagnosable, fail-closed cause. Persist it rather than making the next
+# owner infer a reason from the generic no_eligible_task envelope.
+terminal_cause = ledger_summary or str(payload.get("completion_summary_preview") or "").strip()
+if not terminal_cause:
+    terminal_cause = "terminal_task_failed_without_completion_detail"
+feedback["terminal_failure_cause"] = terminal_cause[:1000]
 if llm_provider_failures:
     provider_failure_memory_path.parent.mkdir(parents=True, exist_ok=True)
     with open(provider_failure_memory_path, "a", encoding="utf-8") as memory_handle:
@@ -16144,6 +16159,11 @@ PY
           write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
           detail="Brownie reported a terminal failure while retry_cap=0; preserved the current claim as redelegatable recovery instead of terminalizing it. evidence=$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
           write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-0}"
+          # A retry cap prevents blind retries; it must not discard the
+          # causal evidence required for a bounded re-delegation.
+          if active_todo_claim_exists; then
+            write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
+          fi
           printf '%s run=%s terminal_retry_cap_zero_redelegation=true recovery_state=redelegatable evidence=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
           write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"retry_cap_zero_redelegation_required","recovery_state":"redelegatable"}'
           return 76
@@ -17029,6 +17049,13 @@ case "${1:-status}" in
     exit 78
     ;;
   run-once)
+    # Do not let a manual one-shot overwrite the durable owner state of a
+    # validated supervisor. That would strand the supervisor with a null PID.
+    load_env
+    if is_running; then
+      printf '%s\n' "phase-loop run-once refused: a supervisor already owns pid $(cat "$PID_FILE")" >&2
+      exit 75
+    fi
     CONSECUTIVE_FAILURES=0
     trap 'phase_loop_finalize_unexpected_exit "$?"' EXIT
     trap 'phase_loop_handle_run_signal INT' INT

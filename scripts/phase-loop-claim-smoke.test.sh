@@ -1220,6 +1220,7 @@ assert claim["status_history"][-1]["status"] == "in_progress", claim
 assert feedback.get("kind") == "phase_loop_terminal_failure_redelegation_required", feedback
 assert feedback["claim_id"] == claim["claim_id"], feedback
 assert feedback["recovery_state"] == "redelegatable", feedback
+assert feedback["terminal_failure_cause"] == "terminal_task_failed_without_completion_detail", feedback
 assert not blocked, blocked
 assert "terminal_failure_transaction" not in ledger, ledger
 PY
