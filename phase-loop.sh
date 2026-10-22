@@ -13562,6 +13562,10 @@ run_phase_loop_preflight() {
     printf '%s run=%s phase_loop_preflight_fixture_profile_rejected=true profile=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_PREFLIGHT_PROFILE" >> "$SUPERVISOR_LOG"
     return 78
   fi
+  if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" != "claim-smoke-fixture" ] && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
+    printf '%s run=%s phase_loop_preflight_fixture_marker_rejected=true profile=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_PREFLIGHT_PROFILE" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
   if [ ! -f "$ROOT_DIR/scripts/phase-loop-preflight.mjs" ]; then
     printf '%s run=%s phase_loop_preflight_missing=true path=%s\n' "$(now_utc)" "$run_stamp" "$ROOT_DIR/scripts/phase-loop-preflight.mjs" >> "$SUPERVISOR_LOG"
     return 78
@@ -15050,7 +15054,7 @@ PY
     fi
   ) > "$stdout_log" 2> "$stderr_log"
   exit_code=$?
-  if [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
+  if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" = "claim-smoke-fixture" ] && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
     node --input-type=module - "$stdout_log" "$runtime_admission_snapshot" "$(claim_field claim_id)" <<'NODE'
 import fs from 'node:fs';
 const [stdoutPath, admissionPath, claimId] = process.argv.slice(2);
