@@ -36,6 +36,8 @@ const DEFAULT_OBJECTIVE_EXECUTION_TIMEOUT_MS: u64 = 120_000;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_STATUS_FIELD_CHARS: usize = 128;
 const MAX_RENDERED_OUTPUT_CHARS: usize = 16 * 1024;
+const MAX_ATTESTED_TODO_ID_CHARS: usize = 128;
+const ATTESTED_TODO_ID_PREFIX_CHARS: usize = 48;
 const MAX_TEXT_FIELD_CHARS: usize = 256;
 const MAX_TASK_LIST_ROWS: usize = 10;
 const MAX_TASK_LIST_GROUP_ROWS: usize = 5;
@@ -992,6 +994,21 @@ fn attest_phase_loop_claim_id(payload: Value) -> Result<Value, RuntimeClientErro
     attest_phase_loop_claim_id_payload(payload, &claim_id, admitted_claim_id, &admitted_snapshot)
 }
 
+fn canonicalize_attested_todo_id(value: &str) -> Result<String, RuntimeClientError> {
+    if value.is_empty() {
+        return Err(RuntimeClientError::InvalidResponse);
+    }
+    if value.chars().count() <= MAX_ATTESTED_TODO_ID_CHARS {
+        return Ok(value.to_string());
+    }
+    let prefix: String = value.chars().take(ATTESTED_TODO_ID_PREFIX_CHARS).collect();
+    let canonical = format!("{}~{}", prefix, sha256_fingerprint(value.as_bytes()));
+    if canonical.chars().count() > MAX_ATTESTED_TODO_ID_CHARS {
+        return Err(RuntimeClientError::InvalidResponse);
+    }
+    Ok(canonical)
+}
+
 fn attest_phase_loop_claim_id_payload(
     mut payload: Value,
     claim_id: &str,
@@ -1008,6 +1025,12 @@ fn attest_phase_loop_claim_id_payload(
     let object = payload
         .as_object_mut()
         .ok_or(RuntimeClientError::InvalidResponse)?;
+    let selected_todo_id = admitted_snapshot
+        .0
+        .as_str()
+        .ok_or(RuntimeClientError::InvalidResponse)
+        .and_then(canonicalize_attested_todo_id)?;
+    let selected_todo_id = Value::String(selected_todo_id);
     object.insert(
         "phase_loop_claim_id".to_string(),
         Value::String(claim_id.to_string()),
@@ -1019,7 +1042,7 @@ fn attest_phase_loop_claim_id_payload(
         );
         automation.insert(
             "phase_loop_selected_todo_id".to_string(),
-            admitted_snapshot.0.clone(),
+            selected_todo_id.clone(),
         );
         automation.insert(
             "phase_loop_selected_todo_sha256".to_string(),
@@ -1034,10 +1057,7 @@ fn attest_phase_loop_claim_id_payload(
             admitted_snapshot.3.clone(),
         );
     }
-    object.insert(
-        "phase_loop_selected_todo_id".to_string(),
-        admitted_snapshot.0.clone(),
-    );
+    object.insert("phase_loop_selected_todo_id".to_string(), selected_todo_id);
     object.insert(
         "phase_loop_selected_todo_sha256".to_string(),
         admitted_snapshot.1.clone(),
@@ -6082,6 +6102,49 @@ mod tests {
             &snapshot
         )
         .is_err());
+    }
+
+    #[test]
+    fn phase_loop_claim_attestation_keeps_long_root_id_cli_envelope_bounded() {
+        let raw_id = "E-root-identity-".to_string() + &"x".repeat(500);
+        let bounded_id = canonicalize_attested_todo_id(&raw_id).unwrap();
+        assert!(bounded_id.chars().count() <= MAX_ATTESTED_TODO_ID_CHARS);
+        assert_eq!(bounded_id.chars().count(), 120);
+        assert_eq!(
+            bounded_id,
+            format!(
+                "{}~{}",
+                raw_id.chars().take(48).collect::<String>(),
+                sha256_fingerprint(raw_id.as_bytes())
+            )
+        );
+        let mut one_character_different = raw_id.clone();
+        one_character_different.pop();
+        one_character_different.push('y');
+        assert_ne!(
+            canonicalize_attested_todo_id(&raw_id).unwrap(),
+            canonicalize_attested_todo_id(&one_character_different).unwrap()
+        );
+        let payload = attest_phase_loop_claim_id_payload(
+            json!({"status": "task_executed", "automation": {"status": "task_executed"}}),
+            "claim-long-root-id",
+            "claim-long-root-id",
+            &(
+                json!(raw_id),
+                json!("sha256:selected-root"),
+                json!(543),
+                json!("queue-fingerprint"),
+            ),
+        )
+        .unwrap();
+        let rendered = json_result("run", "run", payload).unwrap();
+        let envelope: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(envelope["run"]["phase_loop_selected_todo_id"], bounded_id);
+        assert_eq!(
+            envelope["run"]["automation"]["phase_loop_selected_todo_id"],
+            envelope["run"]["phase_loop_selected_todo_id"]
+        );
+        assert!(rendered.chars().count() <= MAX_RENDERED_OUTPUT_CHARS);
     }
 
     #[test]

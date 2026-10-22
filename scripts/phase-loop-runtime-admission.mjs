@@ -8,8 +8,18 @@ function sha256(value) {
   return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
 }
 
+const MAX_ATTESTED_TODO_ID_CHARS = 128;
+const ATTESTED_TODO_ID_PREFIX_CHARS = 48;
+
 export function selectedTodoId(selectedTodo = '') {
-  return String(selectedTodo).split('\n')[0].match(/^\s*(?:[-*]|\d+[.)])\s+\[\s\]\s+([^:\s]+)/u)?.[1] ?? '';
+  const id = String(selectedTodo).split('\n')[0].match(/^\s*(?:[-*]|\d+[.)])\s+\[\s\]\s+([^:\s]+)/u)?.[1] ?? '';
+  return canonicalizeAttestedTodoId(id);
+}
+
+export function canonicalizeAttestedTodoId(id = '') {
+  const value = String(id);
+  if (Array.from(value).length <= MAX_ATTESTED_TODO_ID_CHARS) return value;
+  return `${Array.from(value).slice(0, ATTESTED_TODO_ID_PREFIX_CHARS).join('')}~sha256:${sha256(value)}`;
 }
 
 export function createRuntimeAdmission({ claim, runStamp }) {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { compareRuntimeAdmissionSnapshot, createRuntimeAdmission, validateRuntimeAdmission } from './phase-loop-runtime-admission.mjs';
+import { canonicalizeAttestedTodoId, compareRuntimeAdmissionSnapshot, createRuntimeAdmission, validateRuntimeAdmission } from './phase-loop-runtime-admission.mjs';
 
 const claim = {
   claim_id: 'todo-g543-abc',
@@ -139,4 +139,56 @@ test('requires recovery when runtime reports a different claim', () => {
   });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'runtime_claim_snapshot_mismatch');
+});
+
+test('bounds a long root TODO identity while retaining deterministic mismatch detection', () => {
+  const rootId = `E-${'root-identity-'.repeat(500)}`;
+  const longClaim = {
+    ...claim,
+    selected_todo: `- [ ] ${rootId}: implement the bounded admission regression`,
+  };
+  const admission = createRuntimeAdmission({ claim: longClaim, runStamp: 'run-long-root-id' });
+  assert.ok(admission.selected_todo_id.length <= 128);
+  assert.match(admission.selected_todo_id, /^E-root-identity-.+~sha256:[a-f0-9]{64}$/u);
+  assert.equal(admission.selected_todo_id, canonicalizeAttestedTodoId(rootId));
+  assert.equal(Array.from(admission.selected_todo_id).length, 120);
+
+  const valid = validateRuntimeAdmission(admission, {
+    run: {
+      status: 'task_executed',
+      phase_loop_claim_id: longClaim.claim_id,
+      execution: { started: true },
+      ...runtimeSnapshot(admission),
+    },
+  });
+  assert.equal(valid.ok, true);
+
+  const mismatched = validateRuntimeAdmission(admission, {
+    run: {
+      status: 'task_executed',
+      phase_loop_claim_id: longClaim.claim_id,
+      execution: { started: true },
+      ...runtimeSnapshot({ ...admission, selected_todo_id: `${admission.selected_todo_id}x` }),
+    },
+  });
+  assert.equal(mismatched.ok, false);
+  assert.equal(mismatched.reason, 'runtime_admission_snapshot_mismatch');
+});
+
+test('detects a one-character canonical identity mismatch', () => {
+  const rootId = `E-${'root-identity-'.repeat(500)}`;
+  const admission = createRuntimeAdmission({
+    claim: { ...claim, selected_todo: `- [ ] ${rootId}: work` },
+    runStamp: 'run-one-character-mismatch',
+  });
+  const result = validateRuntimeAdmission(admission, {
+    run: {
+      status: 'task_executed',
+      phase_loop_claim_id: claim.claim_id,
+      execution: { started: true },
+      ...runtimeSnapshot({ ...admission, selected_todo_id: `${admission.selected_todo_id.slice(0, -1)}0` }),
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'runtime_admission_snapshot_mismatch');
 });
