@@ -45,6 +45,11 @@ PHASE_LOOP_PREFLIGHT_PROFILE="${PHASE_LOOP_PREFLIGHT_PROFILE:-production}"
 PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC=""
 PHASE_LOOP_ENV_SOURCES="process environment"
 PHASE_LOOP_RUNTIME_PATH_SOURCE="cli-delegated"
+PHASE_LOOP_RUNTIME_PATH_EXPLICIT=0
+if [ -n "${BROWNIE_RUNTIME_PATH:-}" ]; then
+  PHASE_LOOP_RUNTIME_PATH_EXPLICIT=1
+fi
+PHASE_LOOP_BROWNIE_BIN_SOURCE="workspace-default"
 PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 PHASE_LOOP_SUPERVISOR_PID=""
 PHASE_LOOP_SUPERVISOR_GENERATION=""
@@ -503,6 +508,12 @@ check_brownie_binary_freshness() {
   if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 1 ]; then
     return 0
   fi
+  # An external controller binary is governed by the approved controller
+  # baseline, not by the supervised workspace's Rust source timestamps.  It
+  # must never enter the workspace rebuild path, which cannot replace it.
+  if [ "${PHASE_LOOP_BROWNIE_BIN_SOURCE:-workspace-default}" = "controller-default" ]; then
+    return 0
+  fi
   local runtime_bin
   runtime_bin="${BROWNIE_RUNTIME_PATH:-"$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie-runtime"}"
   python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$BROWNIE_BIN" "$runtime_bin" <<'PY'
@@ -596,6 +607,9 @@ rebuild_brownie_binaries_for_freshness() {
     return 0
   fi
   if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 1 ]; then
+    return 1
+  fi
+  if [ "${PHASE_LOOP_BROWNIE_BIN_SOURCE:-workspace-default}" = "controller-default" ]; then
     return 1
   fi
   (
@@ -12741,10 +12755,34 @@ load_env() {
   if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ] && [ -n "${BROWNIE_BIN:-}" ] && [ "$BROWNIE_BIN" != "$PHASE_LOOP_DEFAULT_BROWNIE_BIN" ]; then
     PHASE_LOOP_BROWNIE_BIN_EXPLICIT=1
   fi
-  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ]; then
-    BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+  if [ -n "${BROWNIE_RUNTIME_PATH:-}" ]; then
+    PHASE_LOOP_RUNTIME_PATH_EXPLICIT=1
   fi
-  PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+  # An external, approved controller can carry a newer CLI admission contract
+  # than the workspace checkout it supervises.  Prefer its paired debug
+  # binaries when both are present, rather than dispatching a stale workspace
+  # binary that cannot attest the runtime-admission snapshot.  Explicit
+  # BROWNIE_BIN/BROWNIE_RUNTIME_PATH overrides remain authoritative.
+  local controller_cli_default="$ROOT_DIR/target/debug/brownie"
+  local controller_runtime_default="$ROOT_DIR/target/debug/brownie-runtime"
+  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ] \
+    && [ "$ROOT_DIR" != "$PHASE_LOOP_WORKSPACE_ROOT" ] \
+    && [ -x "$controller_cli_default" ] \
+    && { [ "$PHASE_LOOP_RUNTIME_PATH_EXPLICIT" -eq 1 ] || [ -x "$controller_runtime_default" ]; }; then
+    BROWNIE_BIN="$controller_cli_default"
+    if [ "$PHASE_LOOP_RUNTIME_PATH_EXPLICIT" -eq 0 ]; then
+      BROWNIE_RUNTIME_PATH="$controller_runtime_default"
+    fi
+    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$controller_cli_default"
+    PHASE_LOOP_BROWNIE_BIN_SOURCE="controller-default"
+  elif [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ]; then
+    BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+    PHASE_LOOP_BROWNIE_BIN_SOURCE="workspace-default"
+  else
+    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+    PHASE_LOOP_BROWNIE_BIN_SOURCE="explicit"
+  fi
   RUN_DIR="$STATE_DIR/runs"
   LOG_DIR="$STATE_DIR/logs"
   PID_FILE="$STATE_DIR/phase-loop.pid"
@@ -12766,7 +12804,7 @@ load_env() {
   PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
   LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
   mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
-  if [ -n "${BROWNIE_RUNTIME_PATH:-}" ]; then
+  if [ "$PHASE_LOOP_RUNTIME_PATH_EXPLICIT" -eq 1 ]; then
     PHASE_LOOP_RUNTIME_PATH_SOURCE="explicit"
   else
     PHASE_LOOP_RUNTIME_PATH_SOURCE="cli-delegated"
