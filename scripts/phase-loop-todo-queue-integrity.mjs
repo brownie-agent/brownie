@@ -152,7 +152,12 @@ function breakdownDependencies(text) {
       continue;
     }
     const match = line.match(/^-\s+([^:]+):\s*(.*?)\s*$/u);
-    if (match) dependencies.set(match[1].trim(), normalizedDependencies(match[2]));
+    if (match) {
+      const id = match[1].trim();
+      const values = dependencies.get(id) ?? [];
+      values.push(normalizedDependencies(match[2]));
+      dependencies.set(id, values);
+    }
   }
   return dependencies;
 }
@@ -323,14 +328,14 @@ export function validateTodoQueueIntegrity({
   for (const [id, block] of after.entries()) {
     if (!breakdownDependenciesByTodo.has(id)) continue;
     const todoDependencies = normalizedDependencies(lineValue(block, 'Depends on'));
-    const ledgerDependencies = breakdownDependenciesByTodo.get(id);
-    if (!sameArray(todoDependencies, ledgerDependencies)) {
+    const ledgerDependencyEntries = breakdownDependenciesByTodo.get(id);
+    if (ledgerDependencyEntries.some((ledgerDependencies) => !sameArray(todoDependencies, ledgerDependencies))) {
       errors.push({
         code: 'todo_breakdown_dependency_mismatch',
         message: 'Live TODO dependencies must match the durable breakdown dependency graph before claim selection.',
         todo_id: id,
         todo_dependencies: todoDependencies,
-        breakdown_dependencies: ledgerDependencies
+        breakdown_dependencies: ledgerDependencyEntries
       });
     }
   }

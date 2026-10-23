@@ -99,8 +99,31 @@ Dependency graph:
     message: 'Live TODO dependencies must match the durable breakdown dependency graph before claim selection.',
     todo_id: 'E-20b-stateful-soak-real-workload',
     todo_dependencies: ['E-20a-golden-journey-workspace-mutation'],
-    breakdown_dependencies: []
+    breakdown_dependencies: [[]]
   });
+});
+
+test('rejects conflicting duplicate dependency graph entries for a live TODO', () => {
+  const result = validateTodoQueueIntegrity({
+    todoBefore: queue(e20a, e20b),
+    todoAfter: queue(e20a, e20b),
+    afterBreakdownText: `# Brownie TODO breakdown
+
+Dependency graph:
+- E-20b-stateful-soak-real-workload: E-20a-golden-journey-workspace-mutation
+
+## stale duplicate
+
+Dependency graph:
+- E-20b-stateful-soak-real-workload: <none>
+`
+  });
+
+  assert.equal(result.valid, false);
+  assert.deepEqual(result.errors.find((error) => error.code === 'todo_breakdown_dependency_mismatch')?.breakdown_dependencies, [
+    ['E-20a-golden-journey-workspace-mutation'],
+    []
+  ]);
 });
 
 test('rejects pruning a completed prerequisite without an approved contract rebaseline record', () => {
