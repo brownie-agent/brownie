@@ -634,6 +634,26 @@ impl FakeLlm {
                 ),
             };
         }
+        if let Some(path) = extract_selected_create_only_target(&prompt_text) {
+            let intent = serde_json::json!({
+                "tool_requests": [{
+                    "tool_id": "workspace.write",
+                    "reason": "Create the selected bounded leaf target without touching unrelated workspace files.",
+                    "input": {
+                        "path": path,
+                        "operation": "create_file",
+                        "content": "// Brownie bounded Create-only proposal.\n"
+                    }
+                }]
+            });
+            return LlmResponse {
+                content: format!(
+                    "Fake LLM bounded Create-only leaf request with {} messages.\n\n```brownie-tool-intent\n{}\n```",
+                    request.messages.len(),
+                    serde_json::to_string_pretty(&intent).expect("fake intent serializes")
+                ),
+            };
+        }
 
         let mut requests = vec![(
             "workspace.read",
@@ -717,6 +737,31 @@ impl FakeLlm {
             ),
         }
     }
+}
+
+fn extract_selected_create_only_target(prompt_text: &str) -> Option<String> {
+    prompt_text.lines().find_map(|line| {
+        let line = line.trim_start();
+        if !line.starts_with("- [ ]") {
+            return None;
+        }
+        let lowered = line.to_ascii_lowercase();
+        let marker = "create only `";
+        let start = lowered.find(marker)? + marker.len();
+        let remainder = &line[start..];
+        let (path, _) = remainder.split_once('`')?;
+        let path = path.trim();
+        if path.is_empty()
+            || (path.starts_with('.')
+                && !path.starts_with(".github/")
+                && !path.starts_with(".brownie/"))
+            || path.starts_with('/')
+            || path.split('/').any(|segment| segment == "..")
+        {
+            return None;
+        }
+        Some(path.to_string())
+    })
 }
 
 fn extract_agentmodes_orchestrated_coding_mode_id(prompt_text: &str) -> Option<String> {
@@ -1335,6 +1380,25 @@ mod tests {
         assert!(content.contains("```brownie-tool-intent"));
         assert!(content.contains("workspace.read"));
         assert!(content.contains(r#""path": "README.md""#));
+    }
+
+    #[test]
+    fn fake_llm_honors_selected_create_only_leaf_target() {
+        let request = LlmRequest {
+            model: FAKE_LLM_MODEL.into(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content: "## Selected TODO\n\n- [ ] E-23b-target: Create only `scripts/release-artifact-roundtrip-e2e.test.mjs`:\n  Route: implementation.".into(),
+            }],
+        };
+
+        let content = FakeLlm::complete(&request).content;
+
+        assert!(content.contains("workspace.write"));
+        assert!(content.contains("create_file"));
+        assert!(content.contains("scripts/release-artifact-roundtrip-e2e.test.mjs"));
+        assert!(!content.contains("README.md"));
+        assert!(!content.contains("workspace.read"));
     }
 
     #[test]
