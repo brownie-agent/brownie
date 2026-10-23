@@ -39,6 +39,19 @@ function graph(text) {
   }
   return result;
 }
+function hasDependencyCycle(dependencyGraph) {
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (todoId) => {
+    if (visiting.has(todoId)) return true;
+    if (visited.has(todoId)) return false;
+    visiting.add(todoId);
+    const entries = dependencyGraph.get(todoId) ?? [];
+    if (entries.some((entry) => entry.some((dependency) => dependency === todoId || (dependencyGraph.has(dependency) && visit(dependency))))) return true;
+    visiting.delete(todoId); visited.add(todoId); return false;
+  };
+  return [...dependencyGraph.keys()].some(visit);
+}
 function atomicWrite(filePath, content) {
   const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   fs.writeFileSync(temporary, content, { encoding: 'utf8', mode: 0o600 });
@@ -81,6 +94,7 @@ export function reconcileTodoBreakdown({ repoRoot, todoPath = '.brownie/todo.md'
   // integrity check, rather than merely to the already-dirty workspace.
   const queueBaseline = loadCliInput({ repo: repoRoot, todo: todoPath, breakdown: breakdownPath });
   const durableGraph = graph(beforeBreakdown);
+  if (hasDependencyCycle(durableGraph)) return { applied: false, reason: 'cyclic_durable_dependency_graph' };
   const live = blocks(beforeTodo);
   const failures = [];
   for (const block of live) {
@@ -112,7 +126,9 @@ export function reconcileTodoBreakdown({ repoRoot, todoPath = '.brownie/todo.md'
     const receipt = buildContractRebaselineReceipt({
       repoRoot, beforeTodoText: queueBaseline.todoBefore ?? beforeTodo, afterTodoText: afterTodo,
       beforeBreakdownText: queueBaseline.beforeBreakdownText ?? beforeBreakdown, afterBreakdownText: beforeBreakdown,
-      todoIds: changed, runStamp, eventKey: key, diagnostic,
+      // Receipts bind whole-queue hashes. Reissue every surviving dependency
+      // drift so an earlier exact receipt cannot be invalidated by this repair.
+      runStamp, eventKey: key, diagnostic,
       verification: {
         repair_command: 'node scripts/phase-loop-todo-breakdown-reconcile.mjs',
         guard_command: 'node scripts/guard-todo-decomposition.mjs',
