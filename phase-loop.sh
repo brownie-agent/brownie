@@ -548,11 +548,10 @@ def source_exists(relative):
     return (repo_root / relative).exists()
 
 def is_cli_input(relative):
-    return (
-        relative in {"Cargo.lock", "Cargo.toml", "crates/brownie-cli/Cargo.toml", "crates/brownie-protocol/Cargo.toml"}
-        or relative.startswith("crates/brownie-cli/src/")
-        or relative.startswith("crates/brownie-protocol/src/")
-    )
+    # The CLI links workspace crates transitively (for example brownie-llm).
+    # Treat every tracked Rust workspace input as a CLI input: maintaining a
+    # partial hand-written dependency list silently permits stale binaries.
+    return relative in {"Cargo.lock", "Cargo.toml"} or relative.startswith("crates/")
 
 def is_runtime_input(relative):
     return (

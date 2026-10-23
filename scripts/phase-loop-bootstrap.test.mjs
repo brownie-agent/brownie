@@ -530,3 +530,41 @@ test('detects stale controller binaries against controller Rust sources', () => 
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
 });
+
+test('detects a stale controller CLI when an indirect workspace crate changes', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const controllerBinDirectory = path.join(fixture.controllerRoot, 'target', 'debug');
+    const dependencySourceDirectory = path.join(fixture.controllerRoot, 'crates', 'brownie-llm', 'src');
+    fs.mkdirSync(controllerBinDirectory, { recursive: true });
+    fs.mkdirSync(dependencySourceDirectory, { recursive: true });
+    executableFixture(controllerBinDirectory, 'brownie');
+    executableFixture(controllerBinDirectory, 'brownie-runtime');
+    initializeControllerRustFixture(fixture.controllerRoot);
+    fs.writeFileSync(path.join(fixture.controllerRoot, 'crates', 'brownie-llm', 'Cargo.toml'), '[package]\nname = "brownie-llm"\nversion = "0.0.0"\n');
+    const dependencySource = path.join(dependencySourceDirectory, 'lib.rs');
+    fs.writeFileSync(dependencySource, 'pub fn fixture() {}\n');
+    spawnSync('git', ['add', 'crates/brownie-llm'], { cwd: fixture.controllerRoot, stdio: 'ignore' });
+    spawnSync('git', ['commit', '-m', 'add indirect crate fixture'], { cwd: fixture.controllerRoot, stdio: 'ignore' });
+    const oldTime = new Date(Date.now() - 10_000);
+    const newTime = new Date(Date.now() + 10_000);
+    fs.utimesSync(path.join(controllerBinDirectory, 'brownie'), oldTime, oldTime);
+    fs.utimesSync(path.join(controllerBinDirectory, 'brownie-runtime'), oldTime, oldTime);
+    fs.utimesSync(dependencySource, newTime, newTime);
+
+    const result = spawnSync('bash', [fixture.controller, 'check-binary-freshness'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stdout, /brownie CLI binary is stale/u);
+    assert.match(result.stdout, /crates\/brownie-llm\/src\/lib\.rs/u);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
