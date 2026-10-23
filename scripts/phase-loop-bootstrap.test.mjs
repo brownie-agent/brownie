@@ -138,6 +138,33 @@ test('prefers a paired external-controller CLI before admitting Runtime dispatch
   }
 });
 
+test('preserves an explicit Runtime override while selecting an external-controller CLI', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const controllerBinDirectory = path.join(fixture.controllerRoot, 'target', 'debug');
+    const overrideDirectory = path.join(fixture.root, 'runtime-override');
+    fs.mkdirSync(controllerBinDirectory, { recursive: true });
+    fs.mkdirSync(overrideDirectory, { recursive: true });
+    executableFixture(controllerBinDirectory, 'brownie');
+    const runtime = executableFixture(overrideDirectory, 'brownie-runtime');
+    const result = spawnSync('bash', ['-x', fixture.controller, 'check-runtime-bootstrap'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot,
+        BROWNIE_RUNTIME_PATH: runtime
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, new RegExp(`BROWNIE_BIN=${path.join(controllerBinDirectory, 'brownie').replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}`));
+    assert.match(result.stderr, new RegExp(`configured_runtime=${runtime.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}`));
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('derives the default CLI from a workspace selected by controller phase-loop.env', () => {
   const fixture = externalControllerFixture();
   try {
@@ -409,6 +436,39 @@ test('does not skip freshness checks for a default binary under a symlinked work
     });
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stdout, /binary freshness check failed/u);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('uses controller-baseline freshness for an external controller binary', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const workspaceSource = path.join(fixture.workspaceRoot, 'crates', 'brownie-cli', 'src');
+    const controllerBinDirectory = path.join(fixture.controllerRoot, 'target', 'debug');
+    fs.mkdirSync(workspaceSource, { recursive: true });
+    fs.mkdirSync(controllerBinDirectory, { recursive: true });
+    fs.writeFileSync(path.join(fixture.workspaceRoot, 'Cargo.lock'), '# fixture\n');
+    fs.writeFileSync(path.join(fixture.workspaceRoot, 'crates', 'brownie-cli', 'Cargo.toml'), '[package]\nname = "brownie-cli"\nversion = "0.0.0"\n');
+    const source = path.join(workspaceSource, 'lib.rs');
+    fs.writeFileSync(source, 'pub fn fixture() {}\n');
+    executableFixture(controllerBinDirectory, 'brownie');
+    executableFixture(controllerBinDirectory, 'brownie-runtime');
+    const oldTime = new Date(Date.now() - 10_000);
+    const newTime = new Date(Date.now() + 10_000);
+    fs.utimesSync(path.join(controllerBinDirectory, 'brownie'), oldTime, oldTime);
+    fs.utimesSync(path.join(controllerBinDirectory, 'brownie-runtime'), oldTime, oldTime);
+    fs.utimesSync(source, newTime, newTime);
+    const result = spawnSync('bash', [fixture.controller, 'check-binary-freshness'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
