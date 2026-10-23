@@ -743,7 +743,10 @@ impl FakeLlm {
 }
 
 fn extract_selected_create_only_targets(prompt_text: &str) -> Option<Vec<String>> {
-    let selected_todo = prompt_text.split_once("## Selected TODO")?.1;
+    // Runtime requests combine multiple messages. The stable instruction
+    // message can mention this heading before the effective prompt, so select
+    // the last occurrence, which is the concrete invocation contract.
+    let selected_todo = prompt_text.rsplit_once("## Selected TODO")?.1;
     let selected_todo = selected_todo
         .split_once("\n## ")
         .map(|(section, _)| section)
@@ -1430,6 +1433,29 @@ mod tests {
         assert!(content.contains("create_file"));
         assert!(!content.contains("README.md"));
         assert!(!content.contains("workspace.read"));
+    }
+
+    #[test]
+    fn fake_llm_uses_last_selected_todo_across_multiple_messages() {
+        let request = LlmRequest {
+            model: FAKE_LLM_MODEL.into(),
+            messages: vec![
+                LlmMessage {
+                    role: "system".into(),
+                    content: "When ## Selected TODO is present, follow the effective prompt.".into(),
+                },
+                LlmMessage {
+                    role: "user".into(),
+                    content: "## Selected TODO\n\n- [ ] E-23b-target: Create only `scripts/release-artifact-roundtrip-e2e.test.mjs`:\n  Route: implementation.".into(),
+                },
+            ],
+        };
+
+        let content = FakeLlm::complete(&request).content;
+
+        assert!(content.contains("scripts/release-artifact-roundtrip-e2e.test.mjs"));
+        assert!(content.contains("create_file"));
+        assert!(!content.contains("README.md"));
     }
 
     #[test]
