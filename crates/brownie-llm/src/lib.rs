@@ -488,6 +488,30 @@ impl FakeLlm {
                 };
             }
         }
+        // A selected Create-only leaf is an explicit runtime contract. Check
+        // it before generic recovery heuristics: repair feedback can contain
+        // historical `Tool Execution`/`bytes_read` text that must not route
+        // this invocation to the fallback README patch.
+        if let Some(paths) = extract_selected_create_only_targets(&prompt_text) {
+            let intent = serde_json::json!({
+                "tool_requests": paths.into_iter().map(|path| serde_json::json!({
+                    "tool_id": "workspace.write",
+                    "reason": "Create a selected bounded leaf target without touching unrelated workspace files.",
+                    "input": {
+                        "path": path,
+                        "operation": "create_file",
+                        "content": "// Brownie bounded Create-only proposal.\n"
+                    }
+                })).collect::<Vec<_>>()
+            });
+            return LlmResponse {
+                content: format!(
+                    "Fake LLM bounded Create-only leaf request with {} messages.\n\n```brownie-tool-intent\n{}\n```",
+                    request.messages.len(),
+                    serde_json::to_string_pretty(&intent).expect("fake intent serializes")
+                ),
+            };
+        }
         if prompt.contains("tool execution:")
             && prompt.contains("mcp.github.search_code")
             && prompt.contains("completed")
@@ -634,27 +658,6 @@ impl FakeLlm {
                 ),
             };
         }
-        if let Some(paths) = extract_selected_create_only_targets(&prompt_text) {
-            let intent = serde_json::json!({
-                "tool_requests": paths.into_iter().map(|path| serde_json::json!({
-                    "tool_id": "workspace.write",
-                    "reason": "Create a selected bounded leaf target without touching unrelated workspace files.",
-                    "input": {
-                        "path": path,
-                        "operation": "create_file",
-                        "content": "// Brownie bounded Create-only proposal.\n"
-                    }
-                })).collect::<Vec<_>>()
-            });
-            return LlmResponse {
-                content: format!(
-                    "Fake LLM bounded Create-only leaf request with {} messages.\n\n```brownie-tool-intent\n{}\n```",
-                    request.messages.len(),
-                    serde_json::to_string_pretty(&intent).expect("fake intent serializes")
-                ),
-            };
-        }
-
         let mut requests = vec![(
             "workspace.read",
             "Inspect workspace context before proceeding.",
@@ -1407,6 +1410,24 @@ mod tests {
         assert!(content.contains("create_file"));
         assert!(content.contains("scripts/release-artifact-roundtrip-e2e.test.mjs"));
         assert!(content.contains("scripts/release-artifact-roundtrip-e2e.mjs"));
+        assert!(!content.contains("README.md"));
+        assert!(!content.contains("workspace.read"));
+    }
+
+    #[test]
+    fn fake_llm_prioritizes_selected_create_only_leaf_over_repair_feedback() {
+        let request = LlmRequest {
+            model: FAKE_LLM_MODEL.into(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content: "Tool Execution:\n- workspace.read: Completed bytes_read=42\n\n## Previous Repair Feedback\n- invalid_patch_proposal_0: path=README.md\n\n## Selected TODO\n\n- [ ] E-23b-target: Create only `scripts/release-artifact-roundtrip-e2e.test.mjs`:\n  Route: implementation.".into(),
+            }],
+        };
+
+        let content = FakeLlm::complete(&request).content;
+
+        assert!(content.contains("scripts/release-artifact-roundtrip-e2e.test.mjs"));
+        assert!(content.contains("create_file"));
         assert!(!content.contains("README.md"));
         assert!(!content.contains("workspace.read"));
     }
