@@ -103,7 +103,7 @@ export function reconcileTodoBreakdown({ repoRoot, todoPath = '.brownie/todo.md'
     if (!entries) continue;
     // The durable ledger can retain identical entries across historical
     // sections. Identical entries add no ambiguity; only distinct graphs do.
-    if (new Set(entries.map(normalizedDependencyKey)).size !== 1) failures.push({ todo_id: id(block), reason: 'conflicting_dependency_graph' });
+    if (new Set(entries.map((entry) => normalizedDependencyKey(entry))).size !== 1) failures.push({ todo_id: id(block), reason: 'conflicting_dependency_graph' });
   }
   if (failures.length) return { applied: false, reason: 'ambiguous_durable_dependency_graph', failures };
   let afterTodo = beforeTodo;
