@@ -47,6 +47,22 @@ function atomicWrite(filePath, content) {
 function replaceDependencies(block, next) {
   return block.replace(/^(\s*Depends on:\s*).*$/mu, `$1${next.length ? next.join(', ') : '<none>'}.`);
 }
+function recoverInterruptedReconciliation(repoRoot, currentTodo) {
+  const root = path.join(repoRoot, '.brownie/private/phase-loop/todo-claims/dependency-reconciliations');
+  let entries = [];
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return null; }
+  const matches = entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(root, entry.name)).filter((directory) => {
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(directory, 'record.json'), 'utf8'));
+      return record.status === 'started' && record.intended_after_todo_sha256 === sha256(currentTodo);
+    } catch { return false; }
+  });
+  if (matches.length !== 1) return null;
+  const directory = matches[0];
+  const snapshot = path.join(directory, 'todo.before.md');
+  if (!fs.existsSync(snapshot)) throw new Error('interrupted dependency reconciliation snapshot is missing');
+  return { directory, todo: fs.readFileSync(snapshot, 'utf8') };
+}
 
 // Reconciles only a complete, non-conflicting durable graph.  It never guesses
 // a dependency edge or partially applies a repair.
@@ -55,6 +71,12 @@ export function reconcileTodoBreakdown({ repoRoot, todoPath = '.brownie/todo.md'
   const breakdownFile = path.resolve(repoRoot, breakdownPath);
   const beforeTodo = fs.readFileSync(todoFile, 'utf8');
   const beforeBreakdown = fs.readFileSync(breakdownFile, 'utf8');
+  const interrupted = recoverInterruptedReconciliation(repoRoot, beforeTodo);
+  if (interrupted) {
+    atomicWrite(todoFile, interrupted.todo);
+    fs.writeFileSync(path.join(interrupted.directory, 'record.json'), `${JSON.stringify({ schema_version: 1, record_type: 'todo_breakdown_dependency_reconciliation', status: 'interrupted_reverted', rollback_snapshot: { todo: path.join(interrupted.directory, 'todo.before.md'), breakdown: path.join(interrupted.directory, 'todo-breakdown.before.md') } }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    return { applied: false, reason: 'interrupted_reconciliation_reverted', recovery_path: path.relative(repoRoot, interrupted.directory) };
+  }
   // The receipt must bind to the exact baseline used by the next CLI
   // integrity check, rather than merely to the already-dirty workspace.
   const queueBaseline = loadCliInput({ repo: repoRoot, todo: todoPath, breakdown: breakdownPath });
