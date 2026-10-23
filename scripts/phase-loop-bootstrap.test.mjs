@@ -13,6 +13,7 @@ function baseEnvironment() {
   const environment = { ...process.env };
   delete environment.BROWNIE_BIN;
   delete environment.BROWNIE_RUNTIME_PATH;
+  delete environment.BROWNIE_STORE_ROOT;
   delete environment.PHASE_LOOP_WORKSPACE_ROOT;
   delete environment.PHASE_LOOP_STATE_DIR;
   delete environment.PHASE_LOOP_TODO;
@@ -75,6 +76,7 @@ test('loads env files only after ROOT_DIR is established', () => {
   assert.ok(bootstrapValidation >= 0);
   assert.ok(bootstrapValidation < source.indexOf('phase_loop_rebaseline_stale_claim "$run_stamp"', runOnce));
   assert.ok(bootstrapValidation < source.indexOf('todo_first_raw_pending_is_recorded_blocked', runOnce));
+  assert.match(source, /export BROWNIE_STORE_ROOT="\$PHASE_LOOP_BROWNIE_STORE_ROOT"/u);
 });
 
 test('accepts explicit absolute executable paths', () => {
