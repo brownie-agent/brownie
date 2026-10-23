@@ -1452,6 +1452,33 @@ function pruneDependsOn(todoText, idsToRemove) {
   return { text, changed: pruned.length > 0, pruned };
 }
 
+function pruneBreakdownDependencies(breakdownText, idsToRemove) {
+  let inGraph = false;
+  const pruned = [];
+  const text = String(breakdownText ?? '').split('\n').map((line) => {
+    if (line.trim() === 'Dependency graph:') {
+      inGraph = true;
+      return line;
+    }
+    if (inGraph && (/^#{1,6}\s/u.test(line) || ['Verification ledger:', 'History:', 'Quality rubric:'].includes(line.trim()))) {
+      inGraph = false;
+      return line;
+    }
+    if (!inGraph) return line;
+    const match = line.match(/^(\s*-\s+[^:]+:\s*)(.*?)(\s*)$/u);
+    if (!match) return line;
+    const raw = match[2].trim();
+    if (!raw || raw === '<none>') return line;
+    const dependencies = raw.split(/\s*,\s*/u).map((entry) => entry.trim()).filter(Boolean);
+    const remaining = dependencies.filter((dependency) => !idsToRemove.has(dependency));
+    if (remaining.length === dependencies.length) return line;
+    const nextValue = remaining.length > 0 ? remaining.join(', ') : '<none>';
+    pruned.push({ from: raw, to: nextValue, pruned_dependency_ids: dependencies.filter((dependency) => idsToRemove.has(dependency)) });
+    return `${match[1]}${nextValue}${match[3]}`;
+  }).join('\n');
+  return { text, changed: pruned.length > 0, pruned };
+}
+
 function writeCompletedDependencyRebaselineReceipt(repoRoot, { beforeTodoText, afterTodoText, prunedDependencyLines, completedIds }) {
   const completedPrunes = (prunedDependencyLines ?? []).filter((entry) => (
     Array.isArray(entry.pruned_dependency_ids) &&
@@ -1546,8 +1573,23 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
 
   const removedBlocks = removeTodoBlocksById(todoText, idsToRemove);
   const prunedDepends = pruneDependsOn(removedBlocks.text, idsToRemove);
+  let breakdownRemoved = [];
+  let prunedBreakdown = { text: null, changed: false, pruned: [] };
+  let nextBreakdown = null;
+  if (fs.existsSync(breakdownPath)) {
+    const breakdownText = fs.readFileSync(breakdownPath, 'utf8');
+    const removed = removeBreakdownRepairSections(breakdownText, idsToRemove);
+    prunedBreakdown = pruneBreakdownDependencies(removed.text, idsToRemove);
+    nextBreakdown = prunedBreakdown.text;
+    breakdownRemoved = removed.removed;
+  }
+
   fs.writeFileSync(todoPath, prunedDepends.text, { encoding: 'utf8', mode: 0o600 });
   fsyncFileAndParent(todoPath);
+  if (nextBreakdown !== null && (breakdownRemoved.length > 0 || prunedBreakdown.changed)) {
+    fs.writeFileSync(breakdownPath, nextBreakdown, { encoding: 'utf8', mode: 0o600 });
+    fsyncFileAndParent(breakdownPath);
+  }
   const dependencyRebaselineReceipt = writeCompletedDependencyRebaselineReceipt(repoRoot, {
     beforeTodoText: todoText,
     afterTodoText: prunedDepends.text,
@@ -1555,25 +1597,15 @@ function maybeRepairNonLiveTodoResidue(repoRoot, diagnostic) {
     completedIds
   });
 
-  let breakdownRemoved = [];
-  if (fs.existsSync(breakdownPath)) {
-    const breakdownText = fs.readFileSync(breakdownPath, 'utf8');
-    const nextBreakdown = removeBreakdownRepairSections(breakdownText, idsToRemove);
-    if (nextBreakdown.removed.length > 0) {
-      fs.writeFileSync(breakdownPath, nextBreakdown.text, { encoding: 'utf8', mode: 0o600 });
-      fsyncFileAndParent(breakdownPath);
-      breakdownRemoved = nextBreakdown.removed;
-    }
-  }
-
   return {
     attempted: true,
     ok: true,
     changed: true,
-    paths: ['.brownie/todo.md', ...(breakdownRemoved.length > 0 ? ['.brownie/todo-breakdown.md'] : []), ...(dependencyRebaselineReceipt ? [dependencyRebaselineReceipt] : [])],
+    paths: ['.brownie/todo.md', ...(breakdownRemoved.length > 0 || prunedBreakdown.changed ? ['.brownie/todo-breakdown.md'] : []), ...(dependencyRebaselineReceipt ? [dependencyRebaselineReceipt] : [])],
     removed_todo_ids: removedBlocks.removed,
     invalidated_completion_record_count: todoState.invalidatedCompletionRecords.length,
     pruned_dependency_lines: prunedDepends.pruned,
+    pruned_breakdown_dependency_lines: prunedBreakdown.pruned,
     dependency_rebaseline_receipt: dependencyRebaselineReceipt,
     removed_breakdown_sections: breakdownRemoved,
     reasons
