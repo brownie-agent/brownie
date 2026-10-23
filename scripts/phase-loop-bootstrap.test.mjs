@@ -79,6 +79,12 @@ test('loads env files only after ROOT_DIR is established', () => {
   assert.match(source, /export BROWNIE_STORE_ROOT="\$PHASE_LOOP_BROWNIE_STORE_ROOT"/u);
 });
 
+test('cleans cached controller artifacts before a freshness-triggered rebuild', () => {
+  const source = fs.readFileSync(controllerPath, 'utf8');
+  const rebuild = source.slice(source.indexOf('rebuild_brownie_binaries_for_freshness()'));
+  assert.match(rebuild, /cargo clean && cargo build -p brownie-cli --bin brownie -p brownie-runtime --bin brownie-runtime/u);
+});
+
 test('accepts explicit absolute executable paths', () => {
   const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-absolute-'));
   try {
