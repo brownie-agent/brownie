@@ -634,17 +634,17 @@ impl FakeLlm {
                 ),
             };
         }
-        if let Some(path) = extract_selected_create_only_target(&prompt_text) {
+        if let Some(paths) = extract_selected_create_only_targets(&prompt_text) {
             let intent = serde_json::json!({
-                "tool_requests": [{
+                "tool_requests": paths.into_iter().map(|path| serde_json::json!({
                     "tool_id": "workspace.write",
-                    "reason": "Create the selected bounded leaf target without touching unrelated workspace files.",
+                    "reason": "Create a selected bounded leaf target without touching unrelated workspace files.",
                     "input": {
                         "path": path,
                         "operation": "create_file",
                         "content": "// Brownie bounded Create-only proposal.\n"
                     }
-                }]
+                })).collect::<Vec<_>>()
             });
             return LlmResponse {
                 content: format!(
@@ -739,28 +739,37 @@ impl FakeLlm {
     }
 }
 
-fn extract_selected_create_only_target(prompt_text: &str) -> Option<String> {
-    prompt_text.lines().find_map(|line| {
+fn extract_selected_create_only_targets(prompt_text: &str) -> Option<Vec<String>> {
+    let selected_todo = prompt_text.split_once("## Selected TODO")?.1;
+    let selected_todo = selected_todo
+        .split_once("\n## ")
+        .map(|(section, _)| section)
+        .unwrap_or(selected_todo);
+    selected_todo.lines().find_map(|line| {
         let line = line.trim_start();
         if !line.starts_with("- [ ]") {
             return None;
         }
         let lowered = line.to_ascii_lowercase();
-        let marker = "create only `";
+        let marker = "create only";
         let start = lowered.find(marker)? + marker.len();
         let remainder = &line[start..];
-        let (path, _) = remainder.split_once('`')?;
-        let path = path.trim();
-        if path.is_empty()
-            || (path.starts_with('.')
-                && !path.starts_with(".github/")
-                && !path.starts_with(".brownie/"))
-            || path.starts_with('/')
-            || path.split('/').any(|segment| segment == "..")
-        {
-            return None;
-        }
-        Some(path.to_string())
+        let paths = remainder
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::trim)
+            .filter(|path| {
+                !path.is_empty()
+                    && (!path.starts_with('.')
+                        || path.starts_with(".github/")
+                        || path.starts_with(".brownie/"))
+                    && !path.starts_with('/')
+                    && !path.split('/').any(|segment| segment == "..")
+            })
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        (!paths.is_empty()).then_some(paths)
     })
 }
 
@@ -1383,12 +1392,12 @@ mod tests {
     }
 
     #[test]
-    fn fake_llm_honors_selected_create_only_leaf_target() {
+    fn fake_llm_honors_selected_create_only_leaf_targets() {
         let request = LlmRequest {
             model: FAKE_LLM_MODEL.into(),
             messages: vec![LlmMessage {
                 role: "user".into(),
-                content: "## Selected TODO\n\n- [ ] E-23b-target: Create only `scripts/release-artifact-roundtrip-e2e.test.mjs`:\n  Route: implementation.".into(),
+                content: "## Selected TODO\n\n- [ ] E-23b-target: Create only `scripts/release-artifact-roundtrip-e2e.test.mjs` and `scripts/release-artifact-roundtrip-e2e.mjs`:\n  Route: implementation.\n\n## TODO Queue Snapshot\n\n- [ ] E-23b-sibling: Create only `README.md`:\n  Route: implementation.".into(),
             }],
         };
 
@@ -1397,6 +1406,7 @@ mod tests {
         assert!(content.contains("workspace.write"));
         assert!(content.contains("create_file"));
         assert!(content.contains("scripts/release-artifact-roundtrip-e2e.test.mjs"));
+        assert!(content.contains("scripts/release-artifact-roundtrip-e2e.mjs"));
         assert!(!content.contains("README.md"));
         assert!(!content.contains("workspace.read"));
     }
