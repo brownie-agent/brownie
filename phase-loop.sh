@@ -617,7 +617,12 @@ rebuild_brownie_binaries_for_freshness() {
   fi
   (
     cd "$build_root" || exit 70
-    cargo build -p brownie-cli --bin brownie -p brownie-runtime --bin brownie-runtime
+    # A controller can move between commits while its target directory remains
+    # intact. Cargo may then retain a stale transitive crate artifact despite a
+    # source mtime freshness failure, so remove the cached build graph before
+    # rebuilding the paired binaries. The following freshness recheck remains
+    # the admission gate.
+    cargo clean && cargo build -p brownie-cli --bin brownie -p brownie-runtime --bin brownie-runtime
   )
 }
 
