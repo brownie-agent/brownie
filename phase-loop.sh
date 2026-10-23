@@ -12741,10 +12741,26 @@ load_env() {
   if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ] && [ -n "${BROWNIE_BIN:-}" ] && [ "$BROWNIE_BIN" != "$PHASE_LOOP_DEFAULT_BROWNIE_BIN" ]; then
     PHASE_LOOP_BROWNIE_BIN_EXPLICIT=1
   fi
-  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ]; then
+  # An external, approved controller can carry a newer CLI admission contract
+  # than the workspace checkout it supervises.  Prefer its paired debug
+  # binaries when both are present, rather than dispatching a stale workspace
+  # binary that cannot attest the runtime-admission snapshot.  Explicit
+  # BROWNIE_BIN/BROWNIE_RUNTIME_PATH overrides remain authoritative.
+  local controller_cli_default="$ROOT_DIR/target/debug/brownie"
+  local controller_runtime_default="$ROOT_DIR/target/debug/brownie-runtime"
+  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ] \
+    && [ "$ROOT_DIR" != "$PHASE_LOOP_WORKSPACE_ROOT" ] \
+    && [ -x "$controller_cli_default" ] \
+    && [ -x "$controller_runtime_default" ]; then
+    BROWNIE_BIN="$controller_cli_default"
+    BROWNIE_RUNTIME_PATH="$controller_runtime_default"
+    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$controller_cli_default"
+  elif [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ]; then
     BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
+  else
+    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
   fi
-  PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
   RUN_DIR="$STATE_DIR/runs"
   LOG_DIR="$STATE_DIR/logs"
   PID_FILE="$STATE_DIR/phase-loop.pid"

@@ -110,6 +110,34 @@ test('resolves default CLI from the selected workspace for an external control p
   }
 });
 
+test('prefers a paired external-controller CLI before admitting Runtime dispatch', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const controllerBinDirectory = path.join(fixture.controllerRoot, 'target', 'debug');
+    fs.mkdirSync(controllerBinDirectory, { recursive: true });
+    executableFixture(controllerBinDirectory, 'brownie');
+    executableFixture(controllerBinDirectory, 'brownie-runtime');
+    const result = spawnSync('bash', ['-x', fixture.controller, 'check-runtime-bootstrap'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      code: 'phase_loop_bootstrap_ready'
+    });
+    assert.match(result.stderr, new RegExp(`BROWNIE_BIN=${path.join(controllerBinDirectory, 'brownie').replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}`));
+    assert.match(result.stderr, new RegExp(`BROWNIE_RUNTIME_PATH=${path.join(controllerBinDirectory, 'brownie-runtime').replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}`));
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('derives the default CLI from a workspace selected by controller phase-loop.env', () => {
   const fixture = externalControllerFixture();
   try {
