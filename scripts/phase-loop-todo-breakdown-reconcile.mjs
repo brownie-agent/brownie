@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { buildContractRebaselineReceipt, writeContractRebaselineReceipt } from './phase-loop-todo-contract-rebaseline.mjs';
-import { validateTodoQueueIntegrity } from './phase-loop-todo-queue-integrity.mjs';
+import { loadCliInput, validateTodoQueueIntegrity } from './phase-loop-todo-queue-integrity.mjs';
 import { validateTodoDecomposition } from './guard-todo-decomposition.mjs';
 
 function sha256(value) { return crypto.createHash('sha256').update(value, 'utf8').digest('hex'); }
@@ -55,6 +55,9 @@ export function reconcileTodoBreakdown({ repoRoot, todoPath = '.brownie/todo.md'
   const breakdownFile = path.resolve(repoRoot, breakdownPath);
   const beforeTodo = fs.readFileSync(todoFile, 'utf8');
   const beforeBreakdown = fs.readFileSync(breakdownFile, 'utf8');
+  // The receipt must bind to the exact baseline used by the next CLI
+  // integrity check, rather than merely to the already-dirty workspace.
+  const queueBaseline = loadCliInput({ repo: repoRoot, todo: todoPath, breakdown: breakdownPath });
   const durableGraph = graph(beforeBreakdown);
   const live = blocks(beforeTodo);
   const failures = [];
@@ -80,11 +83,13 @@ export function reconcileTodoBreakdown({ repoRoot, todoPath = '.brownie/todo.md'
   fs.mkdirSync(recoveryDir, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(recoveryDir, 'todo.before.md'), beforeTodo, { encoding: 'utf8', mode: 0o600 });
   fs.writeFileSync(path.join(recoveryDir, 'todo-breakdown.before.md'), beforeBreakdown, { encoding: 'utf8', mode: 0o600 });
+  const recordPath = path.join(recoveryDir, 'record.json');
+  fs.writeFileSync(recordPath, `${JSON.stringify({ schema_version: 1, record_type: 'todo_breakdown_dependency_reconciliation', status: 'started', before_todo_sha256: sha256(beforeTodo), intended_after_todo_sha256: sha256(afterTodo), rollback_snapshot: { todo: path.join(recoveryDir, 'todo.before.md'), breakdown: path.join(recoveryDir, 'todo-breakdown.before.md') } }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   atomicWrite(todoFile, afterTodo);
   try {
     const receipt = buildContractRebaselineReceipt({
-      repoRoot, beforeTodoText: beforeTodo, afterTodoText: afterTodo,
-      beforeBreakdownText: beforeBreakdown, afterBreakdownText: beforeBreakdown,
+      repoRoot, beforeTodoText: queueBaseline.todoBefore ?? beforeTodo, afterTodoText: afterTodo,
+      beforeBreakdownText: queueBaseline.beforeBreakdownText ?? beforeBreakdown, afterBreakdownText: beforeBreakdown,
       todoIds: changed, runStamp, eventKey: key, diagnostic,
       verification: {
         repair_command: 'node scripts/phase-loop-todo-breakdown-reconcile.mjs',
@@ -93,18 +98,15 @@ export function reconcileTodoBreakdown({ repoRoot, todoPath = '.brownie/todo.md'
       }
     });
     const decompositionErrors = validateTodoDecomposition(repoRoot, todoPath, breakdownPath);
-    const integrity = validateTodoQueueIntegrity({
-      todoBefore: beforeTodo, todoAfter: afterTodo, beforeBreakdownText: beforeBreakdown,
-      afterBreakdownText: beforeBreakdown, contractRebaselineRecords: receipt ? [receipt] : []
-    });
+    const integrity = validateTodoQueueIntegrity({ ...queueBaseline, todoAfter: afterTodo, afterBreakdownText: beforeBreakdown, contractRebaselineRecords: receipt ? [...queueBaseline.contractRebaselineRecords, receipt] : queueBaseline.contractRebaselineRecords });
     if (decompositionErrors.length || !integrity.valid) throw new Error(JSON.stringify({ decompositionErrors, integrity }));
     const receiptPath = receipt ? writeContractRebaselineReceipt(repoRoot, receipt) : null;
     const record = { schema_version: 1, record_type: 'todo_breakdown_dependency_reconciliation', status: 'applied', run_stamp: runStamp, event_key: key, diagnostic_sha256: sha256(diagnostic), changed_todo_ids: changed, before_todo_sha256: sha256(beforeTodo), after_todo_sha256: sha256(afterTodo), breakdown_sha256: sha256(beforeBreakdown), rollback_snapshot: { todo: path.join(recoveryDir, 'todo.before.md'), breakdown: path.join(recoveryDir, 'todo-breakdown.before.md') }, contract_rebaseline_receipt: receiptPath };
-    fs.writeFileSync(path.join(recoveryDir, 'record.json'), `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     return { applied: true, changed_todo_ids: changed, receipt_path: receiptPath, recovery_path: path.relative(repoRoot, recoveryDir), integrity };
   } catch (error) {
     atomicWrite(todoFile, beforeTodo);
-    fs.writeFileSync(path.join(recoveryDir, 'record.json'), `${JSON.stringify({ schema_version: 1, record_type: 'todo_breakdown_dependency_reconciliation', status: 'failed_reverted', error: error?.message ?? String(error), rollback_snapshot: { todo: path.join(recoveryDir, 'todo.before.md'), breakdown: path.join(recoveryDir, 'todo-breakdown.before.md') } }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fs.writeFileSync(recordPath, `${JSON.stringify({ schema_version: 1, record_type: 'todo_breakdown_dependency_reconciliation', status: 'failed_reverted', error: error?.message ?? String(error), rollback_snapshot: { todo: path.join(recoveryDir, 'todo.before.md'), breakdown: path.join(recoveryDir, 'todo-breakdown.before.md') } }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     return { applied: false, reason: 'validation_failed_reverted', error: error?.message ?? String(error), recovery_path: path.relative(repoRoot, recoveryDir) };
   }
 }
