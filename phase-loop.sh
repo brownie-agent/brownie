@@ -509,14 +509,16 @@ check_brownie_binary_freshness() {
     return 0
   fi
   # An external controller binary is governed by the approved controller
-  # baseline, not by the supervised workspace's Rust source timestamps.  It
-  # must never enter the workspace rebuild path, which cannot replace it.
+  # baseline, not by the supervised workspace's Rust source timestamps.
+  # Check and rebuild against that controller baseline so a controller source
+  # update cannot silently keep dispatching its older paired binaries.
+  local source_root runtime_bin
+  source_root="$PHASE_LOOP_WORKSPACE_ROOT"
   if [ "${PHASE_LOOP_BROWNIE_BIN_SOURCE:-workspace-default}" = "controller-default" ]; then
-    return 0
+    source_root="$ROOT_DIR"
   fi
-  local runtime_bin
   runtime_bin="${BROWNIE_RUNTIME_PATH:-"$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie-runtime"}"
-  python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$BROWNIE_BIN" "$runtime_bin" <<'PY'
+  python3 - "$source_root" "$BROWNIE_BIN" "$runtime_bin" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -609,11 +611,13 @@ rebuild_brownie_binaries_for_freshness() {
   if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 1 ]; then
     return 1
   fi
+  local build_root
+  build_root="$PHASE_LOOP_WORKSPACE_ROOT"
   if [ "${PHASE_LOOP_BROWNIE_BIN_SOURCE:-workspace-default}" = "controller-default" ]; then
-    return 1
+    build_root="$ROOT_DIR"
   fi
   (
-    cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+    cd "$build_root" || exit 70
     cargo build -p brownie-cli --bin brownie -p brownie-runtime --bin brownie-runtime
   )
 }

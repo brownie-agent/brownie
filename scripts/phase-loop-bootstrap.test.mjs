@@ -49,6 +49,22 @@ function externalControllerFixture() {
   return { root, controller, controllerRoot, workspaceRoot, stateRoot };
 }
 
+function initializeControllerRustFixture(controllerRoot) {
+  const sourceDirectory = path.join(controllerRoot, 'crates', 'brownie-cli', 'src');
+  fs.mkdirSync(sourceDirectory, { recursive: true });
+  fs.writeFileSync(path.join(controllerRoot, 'Cargo.toml'), '[workspace]\nmembers = []\n');
+  fs.writeFileSync(path.join(controllerRoot, 'Cargo.lock'), '# fixture\n');
+  fs.writeFileSync(path.join(controllerRoot, 'crates', 'brownie-cli', 'Cargo.toml'), '[package]\nname = "brownie-cli"\nversion = "0.0.0"\n');
+  const source = path.join(sourceDirectory, 'lib.rs');
+  fs.writeFileSync(source, 'pub fn fixture() {}\n');
+  spawnSync('git', ['init'], { cwd: controllerRoot, stdio: 'ignore' });
+  spawnSync('git', ['config', 'user.name', 'test'], { cwd: controllerRoot, stdio: 'ignore' });
+  spawnSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: controllerRoot, stdio: 'ignore' });
+  spawnSync('git', ['add', 'Cargo.toml', 'Cargo.lock', 'crates'], { cwd: controllerRoot, stdio: 'ignore' });
+  spawnSync('git', ['commit', '-m', 'fixture'], { cwd: controllerRoot, stdio: 'ignore' });
+  return source;
+}
+
 test('loads env files only after ROOT_DIR is established', () => {
   const source = fs.readFileSync(controllerPath, 'utf8');
   assert.ok(source.indexOf('ROOT_DIR=') >= 0);
@@ -454,10 +470,19 @@ test('uses controller-baseline freshness for an external controller binary', () 
     fs.writeFileSync(source, 'pub fn fixture() {}\n');
     executableFixture(controllerBinDirectory, 'brownie');
     executableFixture(controllerBinDirectory, 'brownie-runtime');
+    const controllerSource = initializeControllerRustFixture(fixture.controllerRoot);
     const oldTime = new Date(Date.now() - 10_000);
     const newTime = new Date(Date.now() + 10_000);
     fs.utimesSync(path.join(controllerBinDirectory, 'brownie'), oldTime, oldTime);
     fs.utimesSync(path.join(controllerBinDirectory, 'brownie-runtime'), oldTime, oldTime);
+    for (const controllerInput of [
+      path.join(fixture.controllerRoot, 'Cargo.toml'),
+      path.join(fixture.controllerRoot, 'Cargo.lock'),
+      path.join(fixture.controllerRoot, 'crates', 'brownie-cli', 'Cargo.toml'),
+      controllerSource
+    ]) {
+      fs.utimesSync(controllerInput, oldTime, oldTime);
+    }
     fs.utimesSync(source, newTime, newTime);
     const result = spawnSync('bash', [fixture.controller, 'check-binary-freshness'], {
       cwd: fixture.controllerRoot,
@@ -469,6 +494,36 @@ test('uses controller-baseline freshness for an external controller binary', () 
       encoding: 'utf8'
     });
     assert.equal(result.status, 0, result.stderr);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('detects stale controller binaries against controller Rust sources', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const controllerBinDirectory = path.join(fixture.controllerRoot, 'target', 'debug');
+    fs.mkdirSync(controllerBinDirectory, { recursive: true });
+    executableFixture(controllerBinDirectory, 'brownie');
+    executableFixture(controllerBinDirectory, 'brownie-runtime');
+    const controllerSource = initializeControllerRustFixture(fixture.controllerRoot);
+    const oldTime = new Date(Date.now() - 10_000);
+    const newTime = new Date(Date.now() + 10_000);
+    fs.utimesSync(path.join(controllerBinDirectory, 'brownie'), oldTime, oldTime);
+    fs.utimesSync(path.join(controllerBinDirectory, 'brownie-runtime'), oldTime, oldTime);
+    fs.utimesSync(controllerSource, newTime, newTime);
+
+    const result = spawnSync('bash', [fixture.controller, 'check-binary-freshness'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stdout, /brownie CLI binary is stale/u);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
