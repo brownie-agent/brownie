@@ -27,6 +27,7 @@ function dependencyValue(block) {
 function dependencies(value) {
   return String(value).split(/\s*,\s*/u).map((entry) => entry.trim()).filter((entry) => entry && entry !== '<none>');
 }
+function normalizedDependencyKey(values) { return JSON.stringify([...values].sort()); }
 function graph(text) {
   const result = new Map();
   let active = false;
@@ -100,7 +101,9 @@ export function reconcileTodoBreakdown({ repoRoot, todoPath = '.brownie/todo.md'
   for (const block of live) {
     const entries = durableGraph.get(id(block));
     if (!entries) continue;
-    if (entries.length !== 1) failures.push({ todo_id: id(block), reason: 'duplicate_or_conflicting_dependency_graph' });
+    // The durable ledger can retain identical entries across historical
+    // sections. Identical entries add no ambiguity; only distinct graphs do.
+    if (new Set(entries.map((entry) => normalizedDependencyKey(entry))).size !== 1) failures.push({ todo_id: id(block), reason: 'conflicting_dependency_graph' });
   }
   if (failures.length) return { applied: false, reason: 'ambiguous_durable_dependency_graph', failures };
   let afterTodo = beforeTodo;
