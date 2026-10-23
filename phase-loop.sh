@@ -15096,7 +15096,10 @@ PY
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     export BROWNIE_WORKSPACE_ROOT="${BROWNIE_WORKSPACE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"
-    export BROWNIE_STORE_ROOT="${BROWNIE_STORE_ROOT:-"$PHASE_LOOP_BROWNIE_STORE_ROOT"}"
+    # A phase-loop claim is valid only for its private runtime store.  Never
+    # inherit an interactive caller's store: it can resume an unrelated,
+    # terminal headless session whose objective does not match this claim.
+    export BROWNIE_STORE_ROOT="$PHASE_LOOP_BROWNIE_STORE_ROOT"
     export PHASE_LOOP_CONTROL_ROOT
     export BROWNIE_PHASE_LOOP_ADMISSION_FILE="$runtime_admission_snapshot"
     export BROWNIE_PHASE_LOOP_CLAIM_ID="$(claim_field claim_id)"
