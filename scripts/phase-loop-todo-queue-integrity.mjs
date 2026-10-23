@@ -126,6 +126,37 @@ function sourceTodoId(block) {
   return source.split(':')[0]?.trim().replace(/[.,;]+$/u, '') ?? '';
 }
 
+function normalizedDependencies(value) {
+  return String(value ?? '')
+    .replace(/[.]$/u, '')
+    .split(/\s*,\s*/u)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry && entry !== '<none>')
+    .sort();
+}
+
+// The breakdown is durable decomposition evidence, not merely prose.  A
+// mismatch here can make the scheduler select a test leaf before its required
+// implementation leaf, so validate every live TODO that has a graph entry.
+function breakdownDependencies(text) {
+  const dependencies = new Map();
+  let inGraph = false;
+  for (const line of String(text ?? '').split('\n')) {
+    if (line.trim() === 'Dependency graph:') {
+      inGraph = true;
+      continue;
+    }
+    if (!inGraph) continue;
+    if (/^#{1,6}\s/u.test(line) || line.trim() === 'Verification ledger:' || line.trim() === 'History:' || line.trim() === 'Quality rubric:') {
+      inGraph = false;
+      continue;
+    }
+    const match = line.match(/^-\s+([^:]+):\s*(.*?)\s*$/u);
+    if (match) dependencies.set(match[1].trim(), normalizedDependencies(match[2]));
+  }
+  return dependencies;
+}
+
 function boundedScopeValues(first, keyword) {
   const start = first.indexOf(keyword);
   if (start < 0) {
@@ -287,6 +318,22 @@ export function validateTodoQueueIntegrity({
   const changedTodoIds = [];
   const addedTodoIds = [];
   const replannedTodoIds = [];
+  const breakdownDependenciesByTodo = breakdownDependencies(afterBreakdownText);
+
+  for (const [id, block] of after.entries()) {
+    if (!breakdownDependenciesByTodo.has(id)) continue;
+    const todoDependencies = normalizedDependencies(lineValue(block, 'Depends on'));
+    const ledgerDependencies = breakdownDependenciesByTodo.get(id);
+    if (!sameArray(todoDependencies, ledgerDependencies)) {
+      errors.push({
+        code: 'todo_breakdown_dependency_mismatch',
+        message: 'Live TODO dependencies must match the durable breakdown dependency graph before claim selection.',
+        todo_id: id,
+        todo_dependencies: todoDependencies,
+        breakdown_dependencies: ledgerDependencies
+      });
+    }
+  }
 
   for (const id of after.keys()) {
     if (completedIds.has(id)) {
