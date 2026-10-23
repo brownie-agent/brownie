@@ -304,6 +304,28 @@ function maybeRepairTodoQueueIntegrity(repoRoot, diagnostic) {
   }
 
   const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
+  // A durable dependency graph is the controller's decomposition evidence.
+  // When the live queue drifted from one unambiguous graph, reconcile it
+  // before asking the broader decomposition recovery to replan the task.
+  try {
+    const diagnosticText = [detail, JSON.stringify(diagnostic)].filter(Boolean).join('\n');
+    const reconciliation = runJsonCommand(repoRoot, process.execPath, [
+      controlPlaneScript('scripts/phase-loop-todo-breakdown-reconcile.mjs'),
+      '--repo', repoRoot,
+      '--todo', workspaceTodoPath(repoRoot),
+      '--breakdown', workspaceBreakdownPath(repoRoot),
+      '--run-stamp', String(diagnostic.phase_loop?.run_id ?? new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z')),
+      '--diagnostic', diagnosticText
+    ]);
+    steps.push({ step: 'deterministic_todo_breakdown_dependency_reconciliation', ok: reconciliation.applied === true, result: reconciliation });
+    if (reconciliation.applied === true) {
+      steps.push({ step: 'queue_integrity_recheck_after_dependency_reconciliation', ok: true, result: runTodoQueueIntegrity(repoRoot) });
+      return { attempted: true, ok: true, steps };
+    }
+  } catch (reconciliationError) {
+    steps.push({ step: 'deterministic_todo_breakdown_dependency_reconciliation', ok: false, error: reconciliationError?.message ?? String(reconciliationError) });
+  }
+
   try {
     const diagnosticText = [
       detail,

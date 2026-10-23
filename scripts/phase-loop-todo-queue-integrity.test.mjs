@@ -233,6 +233,20 @@ test('allows a surviving TODO to rebaseline onto a deterministic child frontier 
   });
 });
 
+test('allows adding a missing prerequisite only with an exact deterministic receipt', () => {
+  const before = queue(e20a, e20b);
+  const after = queue(e20a.replace('Depends on: <none>.', 'Depends on: E-20b-stateful-soak-real-workload.'), e20b);
+  const receipt = buildContractRebaselineReceipt({
+    repoRoot: process.cwd(), beforeTodoText: before, afterTodoText: after,
+    runStamp: 'missing-prerequisite-run', eventKey: 'missing-prerequisite-event',
+    diagnostic: 'todo_breakdown_dependency_mismatch',
+    verification: { repair_command: 'node scripts/phase-loop-todo-breakdown-reconcile.mjs', guard_command: 'node scripts/guard-todo-decomposition.mjs', integrity_command: 'pnpm -s phase-loop:todo-queue-integrity' }
+  });
+  const result = validateTodoQueueIntegrity({ todoBefore: before, todoAfter: after, contractRebaselineRecords: [receipt] });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.equal(result.warnings.find((warning) => warning.code === 'todo_dependency_rebaselined')?.todo_id, 'E-20a-golden-journey-workspace-mutation');
+});
+
 test('fails closed when an approved contract rebaseline record does not match the live before/after contracts', () => {
   const before = queue(e20a, e20b);
   const after = queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'));

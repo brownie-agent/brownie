@@ -150,8 +150,9 @@ function dependencyIds(value) {
 
 function parentTodoIdForChange(change) {
   const beforeDependencies = dependencyIds(change.before_contract.depends_on);
-  const afterDependencies = new Set(dependencyIds(change.after_contract.depends_on));
-  return beforeDependencies.find((dependency) => !afterDependencies.has(dependency)) ?? beforeDependencies[0] ?? null;
+  const afterDependencies = dependencyIds(change.after_contract.depends_on);
+  const afterDependencySet = new Set(afterDependencies);
+  return beforeDependencies.find((dependency) => !afterDependencySet.has(dependency)) ?? beforeDependencies[0] ?? afterDependencies[0] ?? null;
 }
 
 export function buildContractRebaselineReceipt({

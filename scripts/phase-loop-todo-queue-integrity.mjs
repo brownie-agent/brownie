@@ -379,7 +379,11 @@ export function validateTodoQueueIntegrity({
       const afterDependencyValue = lineValue(afterBlock, 'Depends on');
       const afterDependencies = afterDependencyValue
         .split(/\s*,\s*/u).map((entry) => entry.trim()).filter((entry) => entry && entry !== '<none>');
-      if (drift.length === 1 && drift[0] === 'depends_on' && beforeDependencies.length > 0) {
+      // A deterministic controller repair may also add a missing prerequisite
+      // when its single durable breakdown graph proves the original queue was
+      // under-constrained.  Require the same exact receipt; never accept a
+      // bare dependency addition.
+      if (drift.length === 1 && drift[0] === 'depends_on') {
         const beforeTodoSha256 = crypto.createHash('sha256').update(todoBefore ?? '', 'utf8').digest('hex');
         const afterTodoSha256 = crypto.createHash('sha256').update(todoAfter ?? '', 'utf8').digest('hex');
         const beforeBreakdownSha256 = beforeBreakdownText === null
