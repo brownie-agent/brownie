@@ -9180,27 +9180,6 @@ phase_loop_should_resume_active_claim() {
   if ! active_todo_claim_exists; then
     return 1
   fi
-  if [ -f "$TODO_REPAIR_FEEDBACK_FILE" ]; then
-    if python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        claim = json.load(handle)
-    with open(sys.argv[2], encoding="utf-8") as handle:
-        feedback = json.load(handle)
-except Exception:
-    sys.exit(1)
-
-if claim.get("claim_id") and feedback.get("claim_id") == claim.get("claim_id"):
-    sys.exit(0)
-sys.exit(1)
-PY
-    then
-      return 1
-    fi
-  fi
   if [ -f "$BDK_HARNESS_FEEDBACK_FILE" ]; then
     if python3 - "$TODO_CLAIM_FILE" "$BDK_HARNESS_FEEDBACK_FILE" <<'PY'
 import json
@@ -9253,6 +9232,27 @@ sys.exit(1)
 PY
   then
     return 0
+  fi
+  if [ -f "$TODO_REPAIR_FEEDBACK_FILE" ]; then
+    if python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        claim = json.load(handle)
+    with open(sys.argv[2], encoding="utf-8") as handle:
+        feedback = json.load(handle)
+except Exception:
+    sys.exit(1)
+
+if claim.get("claim_id") and feedback.get("claim_id") == claim.get("claim_id"):
+    sys.exit(0)
+sys.exit(1)
+PY
+    then
+      return 1
+    fi
   fi
   if python3 - "$TODO_CLAIM_FILE" <<'PY'
 import json
