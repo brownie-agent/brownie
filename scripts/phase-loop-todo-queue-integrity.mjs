@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import {
   readAllTodoReplanRecords,
   readTodoCompletionRecords,
+  readTodoCompletionInvalidationRecords,
   readTrackedBreakdownReplanRecords,
   resolveTodoState
 } from './phase-loop-todo-state.mjs';
@@ -476,7 +477,8 @@ export function loadCliInput(args) {
   const todoState = resolveTodoState({
     todoText: todoAfter,
     replanRecords,
-    completionRecords: readTodoCompletionRecords(repoRoot)
+    completionRecords: readTodoCompletionRecords(repoRoot),
+    completionInvalidationRecords: readTodoCompletionInvalidationRecords(repoRoot)
   });
   return {
     repoRoot,
