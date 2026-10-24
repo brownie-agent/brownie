@@ -11,6 +11,7 @@ const recoveryScript = path.join(repositoryRoot, 'scripts/phase-loop-preclaim-re
 function makeFixture({ repairableCycle = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-preclaim-recovery-'));
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'scripts/a.test.mjs'), '// materialized target\n');
   fs.mkdirSync(path.join(root, '.github/workflows'), { recursive: true });
   fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-claims'), { recursive: true });
   fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-replans'), { recursive: true });
@@ -39,7 +40,7 @@ function makeFixture({ repairableCycle = true } = {}) {
     + '  Route: implementation.\n'
     + `  Source TODO: ${source}.\n`
     + `  Depends on: ${dependency || '<none>'}.\n`
-    + '  Completion condition: create the fixture.\n'
+    + `  Completion condition: Create only \`${target}\` for the fixture.\n`
     + '  Forbidden changes: do not edit unrelated files.\n'
     + `  Verification: run \`${verification}\`.`;
   const target01 = `${source}-target-01`;
@@ -109,6 +110,9 @@ test('repairs reparable pre-claim decomposition drift and records a reversible t
   assert.equal(record.target_snapshot[0].path, 'scripts/a.mjs');
   assert.equal(record.target_snapshot[0].exists_before, false);
   assert.notEqual(record.before.todo_sha256, record.after.todo_sha256);
+  const repairedTodo = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8');
+  assert.match(repairedTodo, /Completion condition: Patch only `scripts\/a\.test\.mjs` for the fixture\./u);
+  assert.doesNotMatch(repairedTodo, /Completion condition: Create only `scripts\/a\.test\.mjs`/u);
   assert.match(record.contract_rebaseline_receipt, /contract-rebaselines/u);
   const contractReceipt = JSON.parse(fs.readFileSync(path.join(root, record.contract_rebaseline_receipt), 'utf8'));
   assert.equal(contractReceipt.status, 'approved');
