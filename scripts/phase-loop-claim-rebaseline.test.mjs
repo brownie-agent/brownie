@@ -80,6 +80,44 @@ test('isolates stale running r3 claim and records source/queue rebaseline before
   assert.equal(fs.readFileSync(path.join(f.root, 'todo.md'), 'utf8'), `${f.selected}\n`);
 });
 
+test('preserves an ownerless same-queue continuation claim for resume despite historical terminal ledger evidence', () => {
+  const f = fixture();
+  writeJson(path.join(f.stateDir, 'status.json'), {
+    status: 'recovered_stale_running',
+    continuation_required: true,
+    controller_action: 'resume',
+  });
+  writeJson(path.join(f.stateDir, 'progress-state.json'), {
+    classification: 'continuation_required',
+    continuation_required: true,
+    progress_projection: {
+      claim_id: 'todo-g541-roundtrip-r3',
+      controller_action: 'resume',
+      stop_class: 'continuation_required',
+    },
+  });
+  writeJson(path.join(f.claims, 'todo-queue-state.json'), { generation: 541, fingerprint: 'old-queue' });
+  fs.writeFileSync(path.join(f.stateDir, 'task-ledger.jsonl'), `${JSON.stringify({
+    claim_id: 'todo-g541-roundtrip-r3', to_state: 'completed',
+  })}\n`);
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp: '20261020T090000Z',
+    baselineRef: 'origin/main',
+  });
+  assert.equal(result.rebaselined, false, JSON.stringify(result));
+  assert.equal(result.reason, 'continuation_claim_preserved_for_resume');
+  assert.equal(fs.existsSync(f.claimPath), true);
+});
+
 test('requires current-run task execution evidence before terminal failure recording', () => {
   const f = fixture();
   const snapshot = path.join(f.runs, 'claim.before-runtime.json');
