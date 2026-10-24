@@ -13685,6 +13685,9 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
             --todo "$PHASE_LOOP_TODO" \
             --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" 2>&1 || true
         )"
+        if [ -n "$recovery_diagnostic" ]; then
+          recovery_diagnostic="guard-todo-decomposition.mjs: $recovery_diagnostic"
+        fi
         printf '%s run=%s preclaim_recovery_diagnostic_fallback=true stage=%s result=%s\n' "$(now_utc)" "$run_stamp" "$stage" "${recovery_diagnostic:-<no output>}" >> "$SUPERVISOR_LOG"
       fi
       set +e
