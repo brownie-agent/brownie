@@ -152,6 +152,17 @@ export function rebaselineStaleClaim({
   const projection = progress.progress_projection && typeof progress.progress_projection === 'object'
     ? progress.progress_projection : {};
   const claimMatchesProjection = projection.claim_id === claim.claim_id;
+  // A run-once process is expected to exit after it records a durable
+  // continuation.  The next invocation first normalizes that ownerless
+  // "running" status, so do not mistake its historical terminal ledger
+  // entries for a reason to discard the exact claim that Runtime asked us to
+  // resume.  Queue drift remains a hard boundary: only the same admitted
+  // claim and queue may take this path.
+  const resumableContinuation = claimMatchesProjection
+    && status.continuation_required === true
+    && status.controller_action === 'resume'
+    && (progress.continuation_required === true || projection.stop_class === 'continuation_required')
+    && projection.controller_action === 'resume';
   const terminalProjection = claimMatchesProjection && (
     progress.classification === 'terminal_failure'
     || projection.stop_class === 'terminal_failure'
@@ -162,6 +173,14 @@ export function rebaselineStaleClaim({
   ) || (
     claim.queue_fingerprint && queue.fingerprint && claim.queue_fingerprint !== queue.fingerprint
   );
+  if (resumableContinuation && !queueMismatch) {
+    return {
+      ok: true,
+      rebaselined: false,
+      reason: 'continuation_claim_preserved_for_resume',
+      claim_id: claim.claim_id,
+    };
+  }
   const ledgerEvidence = readLedger(ledgerPath).filter((event) => event.claim_id === claim.claim_id && ['failed', 'blocked', 'replanned', 'completed'].includes(event.to_state));
   const priorRuns = priorTerminalEvidence(runsDir, claim.claim_id);
   const staleRun = claim.run_stamp && claim.run_stamp !== runStamp;
