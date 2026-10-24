@@ -14424,6 +14424,16 @@ PY
     return $?
   fi
   if phase_loop_should_resume_active_claim; then
+    # Resume is execution, not a read-only status refresh.  Validate the
+    # current queue projection before reusing a claim so a completed leaf or
+    # protected-contract drift cannot be retried indefinitely.
+    if ! validate_todo_queue_integrity_before_claim "$run_stamp"; then
+      detail="TODO queue integrity failed before resume; refusing to reuse an active claim whose durable completion or protected contract no longer matches the queue projection."
+      printf '%s %s\n%s\n' "$(now_utc)" "$detail" "${PHASE_LOOP_TODO_QUEUE_INTEGRITY_DETAIL:-}" >> "$SUPERVISOR_LOG"
+      write_status "no_progress" "$detail" "todo-queue-integrity-resume-$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
+      write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"todo_queue_integrity_failed_before_resume"}'
+      return 76
+    fi
     use_resume=1
   fi
   if [ "$use_resume" -ne 1 ]; then
