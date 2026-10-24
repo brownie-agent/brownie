@@ -13674,7 +13674,7 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
     status=1
   fi
   if [ "$status" -ne 0 ]; then
-    if [ "$stage" = "pre-claim" ] && [ "${PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0}" != "1" ] && [ -f "$ROOT_DIR/scripts/phase-loop-preclaim-recovery.mjs" ]; then
+    if { [ "$stage" = "pre-claim" ] || [ "$stage" = "pre-completion" ]; } && [ "${PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0}" != "1" ] && [ -f "$ROOT_DIR/scripts/phase-loop-preclaim-recovery.mjs" ]; then
       local recovery_output recovery_status
       set +e
       recovery_output="$(
@@ -13693,6 +13693,16 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
       set -e
       printf '%s run=%s preclaim_recovery_exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$recovery_status" "${recovery_output:-<no output>}" >> "$SUPERVISOR_LOG"
       if [ "$recovery_status" -eq 0 ]; then
+        if [ "$stage" = "pre-completion" ]; then
+          # A runtime write can legitimately materialize a Create-only target
+          # before the task's semantic verification is complete.  Rebaseline
+          # the TODO contract, but do not let this runtime attempt remove the
+          # leaf: the repaired Patch-only claim must be dispatched separately.
+          PHASE_LOOP_PRECOMPLETION_REPLAN_APPLIED=1
+          PHASE_LOOP_PRECOMPLETION_REPLAN_DETAIL="$recovery_output"
+          printf '%s run=%s precompletion_create_only_replan_applied=true result=%s\n' "$(now_utc)" "$run_stamp" "${recovery_output:-<no output>}" >> "$SUPERVISOR_LOG"
+          return 0
+        fi
         PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE=1 run_phase_loop_preflight "$run_stamp" "$stage"
         return $?
       fi
@@ -15666,6 +15676,16 @@ PY
       write_repair_feedback "$run_stamp" "phase-loop pre-completion preflight failed; inspect status detail for the failing guard and fix the selected target or coupled release evidence before marking the TODO complete." "$stdout_log" "$stderr_log" || true
       write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
       return 75
+    fi
+    if [ "${PHASE_LOOP_PRECOMPLETION_REPLAN_APPLIED:-0}" = "1" ]; then
+      refresh_active_todo_claim_from_live_queue "$run_stamp"
+      write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+      clear_repair_feedback
+      detail="A Create-only target was materialized and its TODO was rebaselined to Patch-only before completion; refreshed the active claim and deferred semantic completion to the next runtime attempt. replan=${PHASE_LOOP_PRECOMPLETION_REPLAN_DETAIL:-<no output>} stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+      write_status "last_run_succeeded" "$detail" "$run_id" "0" "0"
+      printf '%s run=%s precompletion_create_only_replan_deferred_completion=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+      write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"create_only_target_materialized_before_semantic_completion"}'
+      return 0
     fi
 
     local verification_completion
