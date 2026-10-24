@@ -549,6 +549,21 @@ test('rejects completed TODO reappearing as an unchecked live queue item', () =>
   )), JSON.stringify(result.errors));
 });
 
+test('CLI accepts a restored TODO when its sole completion receipt has an exact invalidation', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-completion-invalidation-'));
+  fs.mkdirSync(path.join(tmp, '.brownie/private/phase-loop/todo-completions'), { recursive: true });
+  fs.mkdirSync(path.join(tmp, '.brownie/private/phase-loop/todo-completion-invalidations'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, '.brownie/todo.md'), queue(e20a));
+  execFileSync('git', ['init', '-b', 'main'], { cwd: tmp, stdio: 'ignore' });
+  execFileSync('git', ['add', '.brownie/todo.md'], { cwd: tmp, stdio: 'ignore' });
+  execFileSync('git', ['-c', 'user.name=Brownie', '-c', 'user.email=brownie@example.invalid', 'commit', '-m', 'todo baseline'], { cwd: tmp, stdio: 'ignore' });
+  fs.writeFileSync(path.join(tmp, '.brownie/private/phase-loop/todo-completions/claim.json'), `${JSON.stringify({ claim_id: 'false-claim', selected_todo_id: 'E-20a-golden-journey-workspace-mutation' })}\n`);
+  fs.writeFileSync(path.join(tmp, '.brownie/private/phase-loop/todo-completion-invalidations/claim.json'), `${JSON.stringify({ record_type: 'todo_completion_invalidation', selected_todo_id: 'E-20a-golden-journey-workspace-mutation', invalidated_completion_claim_id: 'false-claim', reason: 'dirty_target_automatic_apply_reverted' })}\n`);
+
+  const output = execFileSync('node', [path.resolve('scripts/phase-loop-todo-queue-integrity.mjs'), '--repo', tmp, '--todo', '.brownie/todo.md'], { cwd: path.resolve('.'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  assert.equal(JSON.parse(output).valid, true, output);
+});
+
 test('allows dependency pruning across a three-item queue only when the removed prerequisite is completed', () => {
   const before = queue(e20a, e20b, e20c);
   const after = queue(
