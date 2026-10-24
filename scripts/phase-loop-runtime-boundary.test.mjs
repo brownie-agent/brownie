@@ -60,3 +60,15 @@ test('runtime CLI attests the active claim before admission validation and cover
   assert.match(cli, /attest_phase_loop_claim_id\(\s*cli_resume_payload/);
   assert.match(cli, /attest_phase_loop_claim_id_payload/);
 });
+
+test('terminal todo-decomposition leaves use integrated recovery instead of nested file splitting', () => {
+  const retryCap = controller.indexOf('terminal_failure_retry_cap_zero_redelegation_required');
+  const recovery = controller.indexOf('recover_terminal_todo_decomposition_leaf', retryCap);
+  const supervisor = controller.indexOf('terminal_todo_decomposition_no_eligible', recovery);
+  const recovered = controller.indexOf('phase_loop_terminal_stalled_replan_recovered', supervisor);
+
+  assert(retryCap >= 0 && recovery > retryCap && supervisor > recovery && recovered > supervisor);
+  assert.match(controller, /selected_route != "todo-decomposition"/u);
+  assert.match(controller, /"split \.brownie\/todo\.md and \.brownie\/todo-breakdown\.md into nested file-specific leaves"/u);
+  assert.match(controller, /retire the generated todo-decomposition leaf through integrated supervisor recovery/u);
+});

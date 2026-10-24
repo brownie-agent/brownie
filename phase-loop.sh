@@ -6408,6 +6408,32 @@ run_integrated_supervisor_control() {
   return "$status"
 }
 
+phase_loop_terminal_stalled_replan_recovered() {
+  python3 - "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    feedback = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+
+# A generated todo-decomposition leaf is not an implementation multi-target
+# leaf. Once the integrated controller has retired it and selected its
+# bounded implementation successor, continuing is safe and is not a blind
+# retry of the terminal runtime task.
+if (
+    feedback.get("kind") == "phase_loop_terminal_stalled_replan_recovery"
+    and feedback.get("superseded_replan_todo_id")
+    and feedback.get("selected_todo")
+    and feedback.get("semantic_repair_policy", {}).get("mode") == "force_bounded_leaf_target_patch"
+):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 complete_applied_todo_after_verification() {
   local stdout_log="$1"
   local run_stamp="$2"
@@ -8479,6 +8505,8 @@ if run_id:
 previous_verification = previous.get("verification") if isinstance(previous.get("verification"), dict) else {}
 selected = str(claim.get("selected_todo", "") or "")
 selected_first = selected.splitlines()[0] if selected.splitlines() else ""
+route_match = re.search(r"^\s*Route:\s*([^\.\s]+)", selected, flags=re.MULTILINE)
+selected_route = str(route_match.group(1) if route_match else "").strip().lower()
 scope_match = re.search(r"\b(?:Patch|Create) only\b(?P<scope>[^\n:]+)", selected_first)
 patch_targets = re.findall(r"`([^`\n]+)`", scope_match.group("scope")) if scope_match else []
 json_targets = [target for target in patch_targets if target.endswith((".json", ".jsonc"))]
@@ -8508,7 +8536,7 @@ verification = {
     "llm_provider_failures": llm_provider_failures[-3:],
     "workspace_read_previews": read_previews[-2:],
 }
-if no_eligible_runtime_status and len(patch_targets) > 1:
+if no_eligible_runtime_status and len(patch_targets) > 1 and selected_route != "todo-decomposition":
     verification["repair_hint"] = (
         "Runtime reported no_eligible_task for a TODO whose first line names multiple Patch/Create targets. "
         "Treat this as an over-broad leaf contract: split the active TODO into ordered single-target bounded leaves before retrying implementation."
@@ -8521,6 +8549,22 @@ if no_eligible_runtime_status and len(patch_targets) > 1:
             "retry another read-only pass",
             "mark the TODO complete without changing/verifying every selected target",
             "invent a new verification command",
+        ],
+    }
+elif no_eligible_runtime_status and selected_route == "todo-decomposition":
+    verification["repair_hint"] = (
+        "Runtime reported no_eligible_task while executing a generated todo-decomposition leaf. "
+        "Do not split '.brownie/todo.md' and '.brownie/todo-breakdown.md' into file-specific nested leaves and do not retry this replan leaf. "
+        "Invoke the integrated stalled-replan recovery so it retires this generated leaf and restores the source's bounded implementation successor with its original target and verification contract."
+    )
+    verification["no_eligible_task_recovery"] = {
+        "mode": "recover_terminal_todo_decomposition_leaf",
+        "selected_patch_targets": patch_targets,
+        "required_next_action": "retire the generated todo-decomposition leaf through integrated supervisor recovery and select the source bounded implementation leaf",
+        "forbidden_next_actions": [
+            "split .brownie/todo.md and .brownie/todo-breakdown.md into nested file-specific leaves",
+            "retry the same todo-decomposition claim",
+            "mark the generated leaf complete without replacing it with a bounded successor",
         ],
     }
 latest_provider_failure = llm_provider_failures[-1] if llm_provider_failures else {}
@@ -16251,6 +16295,36 @@ PY
           if active_todo_claim_exists; then
             write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
           fi
+          # A generated todo-decomposition leaf must be retired by the
+          # integrated recovery path. It is not an implementation leaf with
+          # two patch targets, so preserving it as a generic redelegation
+          # would repeat the same no_eligible_task terminal envelope.
+          if python3 - "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    feedback = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+
+raise SystemExit(0 if feedback.get("verification", {}).get("no_eligible_task_recovery", {}).get("mode") == "recover_terminal_todo_decomposition_leaf" else 1)
+PY
+          then
+            local terminal_replan_supervisor_output terminal_replan_supervisor_status
+            set +e
+            terminal_replan_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "terminal_todo_decomposition_no_eligible" 2>&1)"
+            terminal_replan_supervisor_status=$?
+            set -e
+            printf '%s run=%s terminal_todo_decomposition_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$terminal_replan_supervisor_status" "${terminal_replan_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
+            if phase_loop_terminal_stalled_replan_recovered; then
+              detail="Integrated supervisor retired the terminal todo-decomposition leaf and selected its bounded implementation successor; continuing with a fresh claim. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+              write_status "replanned" "$detail" "$run_id" "0" "0"
+              write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"terminal_todo_decomposition_recovered"}'
+              return 0
+            fi
+          fi
           printf '%s run=%s terminal_retry_cap_zero_redelegation=true recovery_state=redelegatable evidence=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
           write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"retry_cap_zero_redelegation_required","recovery_state":"redelegatable"}'
           return 76
@@ -16476,30 +16550,7 @@ PY
         # Supervisor diagnostics may remain non-healthy because they observe the
         # no-progress status written above.  The recovery feedback is the
         # authoritative, atomic proof that this specific migration succeeded.
-        if python3 - "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
-import json
-import pathlib
-import sys
-
-try:
-    feedback = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(1)
-
-# The integrated controller has atomically retired the generated replan and
-# selected a bounded successor.  This is progress, not a retry of the failed
-# runtime task; returning 76 here would make the outer supervisor stop before
-# it can claim that successor.
-if (
-    feedback.get("kind") == "phase_loop_terminal_stalled_replan_recovery"
-    and feedback.get("superseded_replan_todo_id")
-    and feedback.get("selected_todo")
-    and feedback.get("semantic_repair_policy", {}).get("mode") == "force_bounded_leaf_target_patch"
-):
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
-        then
+        if phase_loop_terminal_stalled_replan_recovered; then
           detail="Integrated supervisor recovered the terminal replan and selected a bounded successor; continuing with a fresh claim. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
           write_status "replanned" "$detail" "$run_id" "0" "0"
           printf '%s run=%s terminal_stalled_replan_recovery_continued=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
