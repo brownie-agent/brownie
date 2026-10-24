@@ -271,7 +271,19 @@ function normalizeExistingCreateOnlyScopes(block) {
   const scopeStart = Math.min(...parsedClauses.map(({ start }) => start));
   const scopeEnd = Math.max(...parsedClauses.map(({ end }) => end));
   const replacement = `${line.slice(0, scopeStart)}${rebuiltClauses.join(' and ')}${line.slice(scopeEnd)}`;
-  return block.replace(line, replacement);
+  let normalized = block.replace(line, replacement);
+  // Keep completion criteria aligned with the executable scope contract.  A
+  // leaf that says "Patch only" but still requires "Create only" for the
+  // same existing target is syntactically guard-valid yet impossible for the
+  // Runtime to route.
+  for (const scope of existingCreateScopes) {
+    const escapedScope = scope.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+    normalized = normalized.replace(
+      new RegExp(`Create only \\x60${escapedScope}\\x60`, 'gu'),
+      `Patch only \`${scope}\``
+    );
+  }
+  return normalized;
 }
 
 function boundedScopes(block) {
