@@ -39,6 +39,13 @@ test('controller stops repeated stale continuation scopes before a third blind r
   assert.match(controller, /progress_projection\["stale_continuation_scope_exhausted"\] = stale_continuation_scope_exhausted/);
 });
 
+test('controller validates queue integrity before resuming an active claim', () => {
+  assert.match(controller, /if phase_loop_should_resume_active_claim; then\n    # Resume is execution/);
+  assert.match(controller, /if ! validate_todo_queue_integrity_before_claim "\$run_stamp"; then/);
+  assert.match(controller, /todo_queue_integrity_failed_before_resume/);
+  assert.match(controller, /todo-queue-integrity-resume-\$run_stamp/);
+});
+
 test('claim snapshot restore validates durable identity before writing current claim', () => {
   const start = controller.indexOf('restore_claim_snapshot_before_runtime()');
   const end = controller.indexOf('\ncompleted_todo_cleanup_pending()', start);
