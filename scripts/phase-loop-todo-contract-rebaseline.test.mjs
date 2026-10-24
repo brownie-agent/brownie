@@ -77,6 +77,21 @@ test('matches only an exact approved record and rejects evidence mismatch', () =
   }), false);
 });
 
+test('keeps an approved exact contract rebaseline valid after independent queue additions', () => {
+  const record = receipt();
+  const change = record.contract_changes[0];
+  assert.equal(matchesContractRebaselineRecord(record, {
+    todoId: 'E-child',
+    changedFields: change.changed_fields,
+    beforeContract: structuredClone(change.before_contract),
+    afterContract: structuredClone(change.after_contract),
+    beforeTodoSha256: '0'.repeat(64),
+    afterTodoSha256: '1'.repeat(64),
+    beforeBreakdownSha256: null,
+    afterBreakdownSha256: null
+  }), true);
+});
+
 test('writes an atomic, mode-bounded receipt and is idempotent for the same content', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-contract-rebaseline-'));
   const first = writeContractRebaselineReceipt(root, receipt());

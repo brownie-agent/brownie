@@ -279,9 +279,18 @@ export function matchesContractRebaselineRecord(record, {
   if (record.approval !== 'preclaim_deterministic_repair_guard_passed') return false;
   if (!Array.isArray(record.target_todo_ids) || !record.target_todo_ids.includes(changedTodoId)) return false;
   if (!Array.isArray(record.parent_todo_ids) || record.parent_todo_ids.length === 0) return false;
-  if (record.before_todo_sha256 !== beforeTodoSha256 || record.after_todo_sha256 !== afterTodoSha256) return false;
-  if ((record.before_breakdown_sha256 ?? null) !== (beforeBreakdownSha256 ?? null)) return false;
-  if ((record.after_breakdown_sha256 ?? null) !== (afterBreakdownSha256 ?? null)) return false;
+  // The whole-document hashes are immutable audit anchors for the repair
+  // transaction, not a continuing precondition.  Later queue work may add
+  // independent TODOs, which necessarily changes them without changing this
+  // record's protected before/after contract.  Requiring their equality here
+  // would turn a previously approved rebaseline into a permanent pre-claim
+  // blocker.  The exact per-TODO contracts below remain the authorization.
+  if (!/^[a-f0-9]{64}$/u.test(String(record.before_todo_sha256 ?? ''))
+    || !/^[a-f0-9]{64}$/u.test(String(record.after_todo_sha256 ?? ''))) return false;
+  if ((record.before_breakdown_sha256 ?? null) !== null
+    && !/^[a-f0-9]{64}$/u.test(String(record.before_breakdown_sha256))) return false;
+  if ((record.after_breakdown_sha256 ?? null) !== null
+    && !/^[a-f0-9]{64}$/u.test(String(record.after_breakdown_sha256))) return false;
   if (!record.cause_run?.run_stamp || !record.cause_run?.event_key || !record.cause_run?.diagnostic_sha256) return false;
   if (!record.verification?.repair_command || !record.verification?.guard_command || !record.verification?.integrity_command || record.verification.guard_passed !== true) return false;
   const change = record.contract_changes?.find((entry) => entry.todo_id === changedTodoId);
