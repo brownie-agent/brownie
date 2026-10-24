@@ -134,7 +134,19 @@ export function readTodoCompletionRecords(repoRoot) {
   ));
 }
 
-export function resolveTodoState({ todoText, replanRecords = [], completionRecords = [] }) {
+// Completion receipts are append-only.  A later invalidation record is the
+// only supported way to retract one: it must name both the TODO and the exact
+// completion claim, so a broad TODO-id assertion cannot erase history.
+export function readTodoCompletionInvalidationRecords(repoRoot) {
+  return readJsonRecords(path.join(repoRoot, '.brownie/private/phase-loop/todo-completion-invalidations')).filter((record) => (
+    record?.record_type === 'todo_completion_invalidation'
+    && typeof record?.selected_todo_id === 'string' && record.selected_todo_id.trim()
+    && typeof record?.invalidated_completion_claim_id === 'string' && record.invalidated_completion_claim_id.trim()
+    && typeof record?.reason === 'string' && record.reason.trim()
+  ));
+}
+
+export function resolveTodoState({ todoText, replanRecords = [], completionRecords = [], completionInvalidationRecords = [] }) {
   const blocks = checkboxBlocks(todoText);
   const knownIds = new Set();
   const liveIds = new Set();
@@ -189,12 +201,17 @@ export function resolveTodoState({ todoText, replanRecords = [], completionRecor
 
   const completedIds = new Set([...checkedIds].filter((id) => !supersededIds.has(id)));
   const invalidatedCompletionRecords = [];
+  const invalidatedCompletionKeys = new Set(completionInvalidationRecords.map((record) => (
+    `${record.selected_todo_id.trim()}\u0000${record.invalidated_completion_claim_id.trim()}`
+  )));
   for (const record of completionRecords) {
     const id = typeof record?.selected_todo_id === 'string' ? record.selected_todo_id.trim() : '';
     if (!id) {
       continue;
     }
-    if (record.reason === 'source_parent_completed' || supersededIds.has(id)) {
+    const claimId = typeof record?.claim_id === 'string' ? record.claim_id.trim() : '';
+    if (record.reason === 'source_parent_completed' || supersededIds.has(id)
+      || (claimId && invalidatedCompletionKeys.has(`${id}\u0000${claimId}`))) {
       invalidatedCompletionRecords.push(record);
       continue;
     }
@@ -247,6 +264,7 @@ export function resolveTodoState({ todoText, replanRecords = [], completionRecor
     parentByChild,
     replanRecords: normalizedReplans,
     completionRecords,
+    completionInvalidationRecords,
     invalidatedCompletionRecords,
     warnings,
     errors
@@ -260,7 +278,8 @@ export function loadTodoState(repoRoot, todoText, options = {}) {
       ...readAllTodoReplanRecords(repoRoot, { breakdownPath: options.breakdownPath }),
       ...(options.additionalReplanRecords ?? [])
     ],
-    completionRecords: readTodoCompletionRecords(repoRoot)
+    completionRecords: readTodoCompletionRecords(repoRoot),
+    completionInvalidationRecords: readTodoCompletionInvalidationRecords(repoRoot)
   });
 }
 

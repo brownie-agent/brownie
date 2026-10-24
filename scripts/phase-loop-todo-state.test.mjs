@@ -65,6 +65,41 @@ test('superseded parent resolves only after every generated child completes', ()
   assert(state.resolvedIds.has('E-parent'));
 });
 
+test('an exact durable invalidation retracts only its matching completion receipt', () => {
+  const state = resolveTodoState({
+    todoText: childOne,
+    completionRecords: [
+      { claim_id: 'claim-invalidated', selected_todo_id: 'E-child-1', reason: 'verified_completion' },
+      { claim_id: 'claim-retained', selected_todo_id: 'E-child-1', reason: 'verified_completion' }
+    ],
+    completionInvalidationRecords: [{
+      record_type: 'todo_completion_invalidation',
+      selected_todo_id: 'E-child-1',
+      invalidated_completion_claim_id: 'claim-invalidated',
+      reason: 'dirty_target_automatic_apply_reverted'
+    }]
+  });
+
+  assert(state.completedIds.has('E-child-1'));
+  assert.equal(state.invalidatedCompletionRecords.length, 1);
+});
+
+test('an invalidation retracts a false completion when it is the only receipt', () => {
+  const state = resolveTodoState({
+    todoText: childOne,
+    completionRecords: [{ claim_id: 'claim-false', selected_todo_id: 'E-child-1', reason: 'verified_completion' }],
+    completionInvalidationRecords: [{
+      record_type: 'todo_completion_invalidation',
+      selected_todo_id: 'E-child-1',
+      invalidated_completion_claim_id: 'claim-false',
+      reason: 'dirty_target_automatic_apply_reverted'
+    }]
+  });
+
+  assert(!state.completedIds.has('E-child-1'));
+  assert.equal(state.invalidatedCompletionRecords.length, 1);
+});
+
 test('a generated child cannot belong to multiple superseded parents', () => {
   const state = resolveTodoState({
     todoText: `${parent}\n\n${childOne}\n`,
