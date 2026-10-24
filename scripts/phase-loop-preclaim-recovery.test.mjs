@@ -199,9 +199,10 @@ test('fails closed and restores the preimage when a reparable diagnosis has no s
   assert.equal(record.rollback_performed, true);
 });
 
-test('wires recovery into pre-claim and pre-completion failures, deferring completion after a Create-only replan', () => {
+test('wires recovery into pre-claim boundary and pre-completion failures, deferring completion after a Create-only replan', () => {
   const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
   assert.match(controller, /stage.*pre-claim[\s\S]{0,500}phase-loop-preclaim-recovery\.mjs/u);
+  assert.match(controller, /stage.*pre-claim-boundary/u);
   assert.match(controller, /stage.*pre-completion[\s\S]{0,900}precompletion_create_only_replan_applied/u);
   assert(controller.includes('--max-retries "$PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES"'));
   assert(controller.includes('PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0'));
