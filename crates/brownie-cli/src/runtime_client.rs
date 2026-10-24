@@ -3452,6 +3452,13 @@ fn objective_proposal_apply_params_with_patch_material(
         );
         return Ok(None);
     }
+    if !workspace_path_is_clean_for_automatic_apply(&proposal_path) {
+        debug_invalid_response_note(
+            "objective_proposal_apply_params",
+            "proposal target is dirty, untracked, or workspace status is unavailable; skipping automatic apply",
+        );
+        return Ok(None);
+    }
     let operation = display_string(proposal, "operation")?;
     if !matches!(
         operation.as_str(),
@@ -3597,6 +3604,21 @@ fn objective_proposal_apply_params_with_patch_material(
         );
     }
     Ok(Some(Value::Object(params)))
+}
+
+fn workspace_path_is_clean_for_automatic_apply(path: &str) -> bool {
+    let output = match Command::new("git")
+        .args(["status", "--porcelain=v1", "--", path])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    git_status_porcelain_is_clean(&output.stdout)
+}
+
+fn git_status_porcelain_is_clean(output: &[u8]) -> bool {
+    output.iter().all(u8::is_ascii_whitespace)
 }
 
 fn extract_patch_file_apply_material(
@@ -6304,5 +6326,12 @@ mod tests {
                 ["recovery_mode_id"],
             "implementer"
         );
+    }
+
+    #[test]
+    fn automatic_apply_requires_a_clean_git_status_for_the_target() {
+        assert!(git_status_porcelain_is_clean(b"\n\t"));
+        assert!(!git_status_porcelain_is_clean(b" M scripts/target.rs\n"));
+        assert!(!git_status_porcelain_is_clean(b"?? scripts/target.rs\n"));
     }
 }
