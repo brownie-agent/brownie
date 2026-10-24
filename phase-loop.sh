@@ -13675,7 +13675,18 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
   fi
   if [ "$status" -ne 0 ]; then
     if { [ "$stage" = "pre-claim" ] || [ "$stage" = "pre-claim-boundary" ] || [ "$stage" = "pre-completion" ]; } && [ "${PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0}" != "1" ] && [ -f "$ROOT_DIR/scripts/phase-loop-preclaim-recovery.mjs" ]; then
-      local recovery_output recovery_status
+      local recovery_output recovery_status recovery_diagnostic
+      recovery_diagnostic="$output"
+      if [ -z "$recovery_diagnostic" ] && [ -f "$ROOT_DIR/scripts/guard-todo-decomposition.mjs" ]; then
+        recovery_diagnostic="$(
+          cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+          node "$ROOT_DIR/scripts/guard-todo-decomposition.mjs" \
+            --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
+            --todo "$PHASE_LOOP_TODO" \
+            --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" 2>&1 || true
+        )"
+        printf '%s run=%s preclaim_recovery_diagnostic_fallback=true stage=%s result=%s\n' "$(now_utc)" "$run_stamp" "$stage" "${recovery_diagnostic:-<no output>}" >> "$SUPERVISOR_LOG"
+      fi
       set +e
       recovery_output="$(
         cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
@@ -13687,7 +13698,7 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
           --state-dir "$STATE_DIR" \
           --run-stamp "$run_stamp" \
           --max-retries "$PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES" \
-          --diagnostic "$output" 2>&1
+          --diagnostic "$recovery_diagnostic" 2>&1
       )"
       recovery_status=$?
       set -e

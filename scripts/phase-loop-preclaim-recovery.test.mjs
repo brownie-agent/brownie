@@ -209,4 +209,6 @@ test('wires recovery into pre-claim boundary and pre-completion failures, deferr
   assert(controller.includes('PHASE_LOOP_PRECOMPLETION_REPLAN_APPLIED'));
   assert(controller.includes('precompletion_create_only_replan_deferred_completion=true'));
   assert(controller.includes('create_only_target_materialized_before_semantic_completion'));
+  assert(controller.includes('preclaim_recovery_diagnostic_fallback=true'));
+  assert(controller.includes('node "$ROOT_DIR/scripts/guard-todo-decomposition.mjs"'));
 });
