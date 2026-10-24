@@ -9595,6 +9595,24 @@ objective_apply_stalled = (
 if objective_apply_stalled:
     continuation_required = False
 progress_projection["objective_apply_stalled"] = objective_apply_stalled
+# `stale_progress` with no eligible candidate is not an authorized route.  A
+# continuation can legitimately need one bounded retry while the runtime
+# publishes its durable checkpoint, but retrying the same scoped state again
+# would only hide a missing or mismatched checkpoint.  Stop before a third
+# identical attempt so the supervisor can route a causeful recovery instead.
+stale_continuation_scope_exhausted = (
+    progress_projection["cli_status"] == "stale_progress"
+    and int(progress_projection.get("candidate_count") or 0) == 0
+    and same_count >= 2
+    and not workspace_changed
+    and not completed
+    and not accepted
+    and not finalized
+    and not applied
+)
+if stale_continuation_scope_exhausted:
+    continuation_required = False
+progress_projection["stale_continuation_scope_exhausted"] = stale_continuation_scope_exhausted
 no_progress = exit_code == 0 and not meaningful_progress
 stagnated = no_progress and not continuation_required and same_count >= threshold
 classification = (

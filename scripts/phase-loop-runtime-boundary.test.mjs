@@ -30,6 +30,15 @@ test('public blocked-event canonicalization preserves owner stops without contra
   assert.match(controller, /payload\.pop\("continuation_required", None\)/);
 });
 
+test('controller stops repeated stale continuation scopes before a third blind resume', () => {
+  assert.match(controller, /stale_continuation_scope_exhausted = \(/);
+  assert.match(controller, /progress_projection\["cli_status"\] == "stale_progress"/);
+  assert.match(controller, /int\(progress_projection\.get\("candidate_count"\) or 0\) == 0/);
+  assert.match(controller, /same_count >= 2/);
+  assert.match(controller, /if stale_continuation_scope_exhausted:\n    continuation_required = False/);
+  assert.match(controller, /progress_projection\["stale_continuation_scope_exhausted"\] = stale_continuation_scope_exhausted/);
+});
+
 test('claim snapshot restore validates durable identity before writing current claim', () => {
   const start = controller.indexOf('restore_claim_snapshot_before_runtime()');
   const end = controller.indexOf('\ncompleted_todo_cleanup_pending()', start);
