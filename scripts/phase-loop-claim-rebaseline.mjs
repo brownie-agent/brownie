@@ -305,12 +305,21 @@ export function writeTerminalExecutionEvidence({
     || payload.stop_reason === 'terminal_task_failed'
     || terminalTaskCount > 0
   );
+  const reportedExecutedCount = Number(payload.executed_count ?? execution.executed_count ?? NaN);
+  const noEligibleStatus = ['no_eligible_task', 'no_actionable_work'].includes(String(runtimeStatus ?? ''));
+  // A Runtime admission flag alone is not task evidence for a no-eligible
+  // closure: stale headless sessions can retain it while reporting that zero
+  // tasks executed.  Require the count in that shape, while retaining the
+  // existing evidence paths for an actual task execution.
+  const runtimeAdmissionConfirmed = payload.task_execution_confirmed === true
+    && (!noEligibleStatus || (Number.isFinite(reportedExecutedCount) && reportedExecutedCount > 0));
+  const executionStarted = execution.started === true
+    && (!noEligibleStatus || !Number.isFinite(reportedExecutedCount) || reportedExecutedCount > 0);
   const explicitSignals = [
-    // Runtime admission is the authoritative attestation that the selected
-    // task executed, including terminal no_eligible_task closures where the
-    // workspace digest is unchanged.
-    payload.task_execution_confirmed === true,
-    execution.started === true,
+    // Runtime admission is task evidence except for a no-eligible closure
+    // that explicitly reports zero executed tasks.
+    runtimeAdmissionConfirmed,
+    executionStarted,
     taskExecutedTerminalFailure,
     payload.objective_apply_applied === true,
     ['applied', 'started', 'attempted'].includes(String(payload.objective_apply_status ?? '').toLowerCase()),
@@ -342,6 +351,7 @@ export function writeTerminalExecutionEvidence({
       terminal_completion_final_state: payload.terminal_completion_final_state ?? terminalCompletionEvidence.final_state ?? null,
       terminal_completion_task_status: payload.terminal_completion_task_status ?? terminalCompletionEvidence.task_status ?? null,
       task_execution_confirmed: payload.task_execution_confirmed === true,
+      reported_executed_count: Number.isFinite(reportedExecutedCount) ? reportedExecutedCount : null,
       stop_class: payload.stop_class ?? automation.stop_class ?? null,
       stop_reason: payload.stop_reason ?? automation.stop_reason ?? null,
     },
