@@ -303,7 +303,7 @@ impl RuntimeClient {
         let task_list = self.call_runtime_value(
             TASK_LIST_METHOD,
             Some(cli_resume_task_list_params()),
-            RuntimeRequestClass::ReadOnly,
+            resume_task_list_request_class(),
         )?;
         validate_task_list_result(&task_list)?;
         let result = if let Some((resume_params, resume_candidate)) =
@@ -833,6 +833,14 @@ impl RuntimeClient {
 enum RuntimeRequestClass {
     ReadOnly,
     ObjectiveExecution,
+}
+
+// Resume is an objective-continuation pipeline. Its initial task-list read
+// reconstructs the route and can inspect a large durable headless state, so it
+// must share the continuation budget rather than the interactive read-only
+// budget used by `brownie task list`.
+fn resume_task_list_request_class() -> RuntimeRequestClass {
+    RuntimeRequestClass::ObjectiveExecution
 }
 
 fn env_timeout(name: &str, default_ms: u64) -> Duration {
@@ -5238,6 +5246,14 @@ mod tests {
         assert_eq!(
             client.timeout_for(RuntimeRequestClass::ObjectiveExecution),
             Duration::from_millis(DEFAULT_OBJECTIVE_EXECUTION_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn resume_task_list_uses_objective_execution_timeout_class() {
+        assert_eq!(
+            resume_task_list_request_class(),
+            RuntimeRequestClass::ObjectiveExecution
         );
     }
 
