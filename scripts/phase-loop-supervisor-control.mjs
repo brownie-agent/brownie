@@ -1935,6 +1935,11 @@ function maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, diagnostic, ledgerS
   const projection = diagnostic.progress?.progress_projection ?? {};
   const projectionStatus = projection.cli_status ?? diagnostic.progress?.projection_status ?? null;
   const projectionClosure = projection.closure ?? diagnostic.progress?.projection_closure ?? null;
+  // diagnosePhaseLoop deliberately returns a compact projection summary to
+  // callers.  Use that normalized stop class too; otherwise this repair only
+  // works with an in-memory diagnostic and silently misses the on-disk
+  // terminal/no-eligible state produced by the phase-loop shell controller.
+  const projectionStopClass = projection.stop_class ?? diagnostic.progress?.projection_stop_class ?? null;
   const noEligible = (
     projectionStatus === 'no_eligible_task' ||
     projectionClosure === 'no_eligible_task' ||
@@ -1943,6 +1948,8 @@ function maybeArchiveTerminalNoEligibleActiveClaim(repoRoot, diagnostic, ledgerS
   );
   const terminalTaskFailed = (
     projection.stop_reason === 'terminal_task_failed' ||
+    projectionStopClass === 'terminal_failure' ||
+    projectionStopClass === 'terminal_task_failed' ||
     projection.blocked_by_terminal_task_failure === true ||
     diagnostic.progress?.classification === 'no_progress'
   );

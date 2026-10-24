@@ -178,6 +178,25 @@ test('preserves admitted execution for terminal no-eligible closure without work
   assert.equal(durable.ok, true, durable);
 });
 
+test('rejects a no-eligible admission flag when the runtime reports zero executed tasks', () => {
+  const f = fixture();
+  const snapshot = path.join(f.runs, 'claim-snapshot.json');
+  const evidence = path.join(f.runs, 'execution-evidence.json');
+  writeJson(snapshot, { claim: JSON.parse(fs.readFileSync(f.claimPath, 'utf8')) });
+  const stdout = path.join(f.runs, 'run.stdout.log');
+  writeJson(stdout, {
+    run: {
+      run_id: 'runtime-current', phase_loop_claim_id: 'claim-current',
+      status: 'no_eligible_task', stop_class: 'terminal_failure',
+      stop_reason: 'terminal_task_failed', executed_count: 0,
+      task_execution_confirmed: true,
+    },
+  });
+  const result = writeTerminalExecutionEvidence({ stdoutPath: stdout, claimSnapshotPath: snapshot, outputPath: evidence, runStamp: 'run-current' });
+  assert.equal(result.task_execution_confirmed, false);
+  assert.equal(result.signals.reported_executed_count, 0);
+});
+
 test('keeps genuine unexecuted terminal no-eligible results fail-closed', () => {
   const f = fixture();
   const snapshot = path.join(f.runs, 'claim.before-runtime.json');

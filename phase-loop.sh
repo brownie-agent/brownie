@@ -16212,7 +16212,7 @@ PY
 
     case "$progress_classification" in
       terminal_failure)
-        if [ "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP" -eq 0 ]; then
+        if [ "$PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP" -eq 0 ] && [ "$PHASE_LOOP_RUNTIME_EXECUTION_CONFIRMED" -eq 1 ]; then
           python3 - "$TODO_REPAIR_FEEDBACK_FILE" "$run_stamp" "$run_id" "$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE" "$(claim_field claim_id 2>/dev/null || true)" <<'PY'
 import json
 import os
@@ -16288,6 +16288,20 @@ PY
           write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
           detail="Brownie reported a terminal/no-eligible result without current-run task execution evidence; kept the claim recoverable and refused terminalization. evidence=$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
           write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-0}"
+          # A terminal/no-eligible result with no executed task must not be
+          # retried against the same claim.  The supervisor archives only a
+          # target-matching, baseline-verified claim and records its audit
+          # trail; failure leaves this recoverable claim untouched.
+          local terminal_missing_evidence_supervisor_output terminal_missing_evidence_supervisor_status
+          set +e
+          terminal_missing_evidence_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "terminal_execution_evidence_missing" 2>&1)"
+          terminal_missing_evidence_supervisor_status=$?
+          set -e
+          printf '%s run=%s terminal_execution_evidence_missing_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$terminal_missing_evidence_supervisor_status" "${terminal_missing_evidence_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
+          if ! active_todo_claim_exists; then
+            detail="Brownie reported terminal/no-eligible without executing the selected task; archived the verified claim so the next controller run must mint a fresh target snapshot. evidence=$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+            write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-0}"
+          fi
           printf '%s run=%s terminal_execution_evidence_missing=true recovery_state=redelegatable evidence=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
           write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
           return 76

@@ -1810,7 +1810,7 @@ test('archives terminal no_eligible active claim so the same live TODO can be cl
     detail: 'Brownie run exited successfully but repeated the same non-progress fingerprint'
   });
   writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
-    classification: 'no_progress',
+    classification: 'terminal_failure',
     same_progress_count: 1,
     run_stamp: '20261005T180844Z',
     workspace_changed: false,
