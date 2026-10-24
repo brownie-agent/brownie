@@ -309,12 +309,12 @@ export function writeTerminalExecutionEvidence({
   const noEligibleStatus = ['no_eligible_task', 'no_actionable_work'].includes(String(runtimeStatus ?? ''));
   // A Runtime admission flag alone is not task evidence for a no-eligible
   // closure: stale headless sessions can retain it while reporting that zero
-  // tasks executed.  Require the count in that shape, while retaining the
+  // tasks executed.  Require an explicit positive count in that shape, while retaining the
   // existing evidence paths for an actual task execution.
   const runtimeAdmissionConfirmed = payload.task_execution_confirmed === true
     && (!noEligibleStatus || (Number.isFinite(reportedExecutedCount) && reportedExecutedCount > 0));
   const executionStarted = execution.started === true
-    && (!noEligibleStatus || !Number.isFinite(reportedExecutedCount) || reportedExecutedCount > 0);
+    && (!noEligibleStatus || (Number.isFinite(reportedExecutedCount) && reportedExecutedCount > 0));
   const explicitSignals = [
     // Runtime admission is task evidence except for a no-eligible closure
     // that explicitly reports zero executed tasks.
