@@ -13674,7 +13674,7 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
     status=1
   fi
   if [ "$status" -ne 0 ]; then
-    if { [ "$stage" = "pre-claim" ] || [ "$stage" = "pre-completion" ]; } && [ "${PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0}" != "1" ] && [ -f "$ROOT_DIR/scripts/phase-loop-preclaim-recovery.mjs" ]; then
+    if { [ "$stage" = "pre-claim" ] || [ "$stage" = "pre-claim-boundary" ] || [ "$stage" = "pre-completion" ]; } && [ "${PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0}" != "1" ] && [ -f "$ROOT_DIR/scripts/phase-loop-preclaim-recovery.mjs" ]; then
       local recovery_output recovery_status
       set +e
       recovery_output="$(
