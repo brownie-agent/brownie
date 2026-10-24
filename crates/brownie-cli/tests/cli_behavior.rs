@@ -54,6 +54,7 @@ if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
 next=$((count + 1))
 printf '%s' "$next" > "$count_file"
 if [ -n "$BROWNIE_FAKE_RUNTIME_CAPTURE" ]; then printf '%s\n' "$line" >> "$BROWNIE_FAKE_RUNTIME_CAPTURE"; fi
+if [ "$count" -eq 0 ] && [ -n "$BROWNIE_FAKE_RUNTIME_DELAY_FIRST_SECONDS" ]; then sleep "$BROWNIE_FAKE_RUNTIME_DELAY_FIRST_SECONDS"; fi
 response="$(dirname "$0")/response-${count}.json"
 if [ -f "$response" ]; then
   cat "$response"
@@ -2186,7 +2187,7 @@ fn resume_uses_runtime_owned_route_candidate_for_scoped_run_advance() {
 }
 
 #[test]
-fn json_resume_outputs_bounded_cli_projection() {
+fn json_resume_uses_objective_timeout_for_initial_task_list_and_outputs_bounded_cli_projection() {
     let runtime = fake_runtime_sequence(
         "resume-json",
         &[
@@ -2198,10 +2199,9 @@ fn json_resume_outputs_bounded_cli_projection() {
     let output = Command::new(brownie())
         .args(["--json", "resume"])
         .env("BROWNIE_RUNTIME_PATH", &runtime)
-        .env(
-            "BROWNIE_RUNTIME_TIMEOUT_MS",
-            READ_ONLY_FAKE_RUNTIME_TIMEOUT_MS,
-        )
+        .env("BROWNIE_RUNTIME_TIMEOUT_MS", "50")
+        .env("BROWNIE_RUNTIME_OBJECTIVE_TIMEOUT_MS", "1000")
+        .env("BROWNIE_FAKE_RUNTIME_DELAY_FIRST_SECONDS", "0.2")
         .env("BROWNIE_RUNTIME_PATH_SHOULD_NOT_LEAK", "secret-path")
         .output()
         .unwrap();
