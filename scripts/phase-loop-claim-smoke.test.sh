@@ -710,6 +710,7 @@ cat <<'JSON'
     "terminal_completion_final_state": "Failed",
     "terminal_completion_task_status": "Failed",
     "completion_closure_terminal_task_count": 1,
+    "executed_count": 1,
     "task_execution": {
       "started": true,
       "target_files": ["scripts/provider-target.mjs"],
