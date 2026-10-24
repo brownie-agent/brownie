@@ -2291,6 +2291,16 @@ fn cli_run_payload(result: &Value) -> Result<Value, RuntimeClientError> {
         .and_then(Value::as_u64)
         .map(|count| count > 0)
         .unwrap_or(false);
+    // Preserve the count as well as the derived flag.  Downstream controllers
+    // must distinguish a terminal no-eligible closure after work ran from an
+    // unexecuted dispatch failure, and cannot audit that distinction from the
+    // boolean alone.
+    if let Some(executed_count) = object.get("executed_count") {
+        payload.insert(
+            "executed_count".to_string(),
+            bounded_json_optional_u64(executed_count)?,
+        );
+    }
     payload.insert(
         "task_execution_confirmed".to_string(),
         Value::Bool(task_execution_confirmed),
@@ -6243,6 +6253,7 @@ mod tests {
         .unwrap();
         let payload = cli_run_payload(&result).unwrap();
         assert_eq!(payload["completion_closure_status"], "no_eligible_task");
+        assert_eq!(payload["executed_count"], 1);
         assert_eq!(payload["task_execution_confirmed"], true);
         assert_eq!(payload["completion_closure_terminal_task_count"], 1);
         assert_eq!(payload["blocked"], true);
