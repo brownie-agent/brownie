@@ -1600,6 +1600,30 @@ if not live:
     os.chmod(tmp, 0o600)
     os.replace(tmp, claim_path)
     raise SystemExit(0)
+if live != selected:
+    # A claim is an immutable execution contract. Replacing its selected TODO
+    # after the ledger has recorded queued/claimed/running turns a safe resume
+    # into an illegal second route. Preserve it for audit and re-claim.
+    claim["status"] = "stale_snapshot_rejected"
+    claim["run_stamp"] = run_stamp
+    claim["updated_at"] = timestamp
+    claim["live_selected_todo_sha256"] = hashlib.sha256(live.encode("utf-8")).hexdigest()
+    claim["selected_todo_sha256"] = hashlib.sha256(selected.encode("utf-8")).hexdigest()
+    claim.setdefault("status_history", []).append({
+        "status": "stale_snapshot_rejected",
+        "run_stamp": run_stamp,
+        "updated_at": timestamp,
+        "note": "immutable_selected_todo_changed_in_live_queue",
+    })
+    tmp = claim_path.with_name(f"{claim_path.name}.{os.getpid()}.stale.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, claim_path)
+    raise SystemExit(0)
 fingerprint = hashlib.sha256(todo_text.encode("utf-8")).hexdigest()
 baseline_todo_text = claim.get("baseline_todo_text")
 baseline_matches_live_todo = isinstance(baseline_todo_text, str) and baseline_todo_text == todo_text
@@ -1645,7 +1669,6 @@ try:
     ).strip()
 except Exception:
     baseline_commit = str(claim.get("baseline_commit") or "")
-claim["selected_todo"] = live
 claim["queue_fingerprint"] = fingerprint
 claim["queue_generation"] = generation
 claim["baseline_commit"] = baseline_commit
@@ -1668,7 +1691,7 @@ claim.setdefault("status_history", []).append({
     "status": claim.get("status", "in_progress"),
     "run_stamp": run_stamp,
     "updated_at": timestamp,
-    "note": "refreshed_selected_todo_from_live_queue",
+    "note": "refreshed_claim_context_without_mutating_selected_todo",
 })
 tmp = claim_path.with_name(f"{claim_path.name}.{os.getpid()}.refresh.tmp")
 with open(tmp, "w", encoding="utf-8") as handle:
@@ -10146,11 +10169,19 @@ if not claim:
         "created_at": timestamp,
         "status_history": [],
     }
+if claim and isinstance(claim.get("selected_todo"), str) and claim.get("selected_todo") and claim.get("selected_todo") != sys.argv[4]:
+    # Status/queue updates may not retarget an existing claim.
+    claim.setdefault("snapshot_write_rejections", []).append({
+        "at": timestamp,
+        "requested_selected_todo_sha256": hashlib.sha256(sys.argv[4].encode("utf-8")).hexdigest(),
+        "selected_todo_sha256": hashlib.sha256(claim["selected_todo"].encode("utf-8")).hexdigest(),
+    })
+else:
+    claim["selected_todo"] = sys.argv[4]
 if queue_generation is not None:
     claim["queue_generation"] = queue_generation
 else:
     claim.setdefault("queue_generation", 1)
-claim["selected_todo"] = sys.argv[4]
 claim["queue_fingerprint"] = sys.argv[5]
 claim["status"] = status
 claim["run_stamp"] = sys.argv[8]
@@ -10786,6 +10817,9 @@ claim_first_pending_todo() {
         write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$queue_generation" "$run_stamp"
         return 0
       fi
+      # A changed live contract cannot reuse this immutable claim. Archive it
+      # before selection so the next write cannot overwrite ledger evidence.
+      archive_stale_todo_claim "$run_stamp"
     fi
   fi
   # A terminally failed claim is an immutable attempt. Retain it as a stale
