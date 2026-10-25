@@ -408,6 +408,43 @@ function maybeRepairTodoQueueIntegrity(repoRoot, diagnostic) {
   }
 }
 
+// A terminal generated replan can be discovered after its source leaf has
+// already emitted a durable completion receipt. Never restore that source to
+// the live queue: reconcile completion first, then durable dependency edges.
+function reconcileTerminalReplanRecoveryQueue(repoRoot, runStamp, sourceTodoId) {
+  const steps = [];
+  const optionalRepair = (name, script, args) => {
+    try {
+      const result = runJsonCommand(repoRoot, process.execPath, [controlPlaneScript(script), ...args]);
+      steps.push({ name, applied: result.applied === true, result });
+    } catch (error) {
+      const stdout = error?.stdout?.toString?.() ?? '';
+      try {
+        const result = JSON.parse(stdout);
+        if (result.reason === 'no_completed_todo_projection_drift' || result.reason === 'no_dependency_mismatch') {
+          steps.push({ name, applied: false, result });
+          return;
+        }
+      } catch {}
+      throw error;
+    }
+  };
+  try {
+    optionalRepair('completion_projection', 'scripts/phase-loop-todo-completion-reconcile.mjs', [
+      '--repo', repoRoot, '--todo', workspaceTodoPath(repoRoot), '--run-stamp', runStamp,
+      '--event-key', `terminal-replan-${sourceTodoId}`
+    ]);
+    optionalRepair('dependency_reconciliation', 'scripts/phase-loop-todo-breakdown-reconcile.mjs', [
+      '--repo', repoRoot, '--todo', workspaceTodoPath(repoRoot), '--breakdown', workspaceBreakdownPath(repoRoot),
+      '--run-stamp', runStamp, '--event-key', `terminal-replan-${sourceTodoId}`,
+      '--diagnostic', 'terminal_stalled_replan_recovery'
+    ]);
+    return { ok: true, steps, integrity: runTodoQueueIntegrity(repoRoot) };
+  } catch (error) {
+    return { ok: false, steps, error: error?.stderr?.toString?.() ?? error?.message ?? String(error) };
+  }
+}
+
 function readJsonOrNull(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -1767,6 +1804,14 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
     fsyncFileAndParent(archivePath);
     archivedClaimPath = path.relative(repoRoot, archivePath);
   }
+  const queueRecovery = reconcileTerminalReplanRecoveryQueue(
+    repoRoot,
+    String(diagnostic.phase_loop?.run_id ?? new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z')),
+    sourceId
+  );
+  if (!queueRecovery.ok) {
+    return { attempted: true, ok: false, reason: 'terminal_replan_queue_reconciliation_failed', source_todo_id: sourceId, removed_replan_todo_id: selectedId, queue_recovery: queueRecovery };
+  }
   const patchScope = sourceBlock.first_line ?? sourceBlock.block.split('\n')[0] ?? '';
   const patchTargets = [...patchScope.matchAll(/`([^`]+)`/gu)].map((match) => match[1]);
   const feedback = {
@@ -1797,6 +1842,7 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
     changed: true,
     source_todo_id: sourceId,
     removed_replan_todo_id: selectedId,
+    queue_recovery: queueRecovery,
     paths: ['.brownie/todo.md', ...(breakdownRemoved.length > 0 ? ['.brownie/todo-breakdown.md'] : []), '.brownie/private/phase-loop/todo-claims/blocked.jsonl', ...(archivedClaimPath ? [archivedClaimPath, '.brownie/private/phase-loop/todo-claims/current.json'] : []), '.brownie/private/phase-loop/todo-claims/repair-feedback.json']
   };
 }
