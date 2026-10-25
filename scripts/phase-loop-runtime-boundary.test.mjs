@@ -90,6 +90,7 @@ test('terminal todo-decomposition leaves use integrated recovery instead of nest
 
   assert(retryCap >= 0 && recovery > retryCap && supervisor > recovery && recovered > supervisor);
   assert.match(controller, /selected_route != "todo-decomposition"/u);
+  assert.match(controller, /terminal_task_failed/u);
   assert.match(controller, /"split \.brownie\/todo\.md and \.brownie\/todo-breakdown\.md into nested file-specific leaves"/u);
   assert.match(controller, /retire the generated todo-decomposition leaf through integrated supervisor recovery/u);
 });

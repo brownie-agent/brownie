@@ -8529,6 +8529,15 @@ no_eligible_runtime_status = any(
         payload.get("stop_class"),
     )
 )
+terminal_runtime_status = any(
+    "terminal_task_failed" in str(value) or "terminal_failure" in str(value)
+    for value in (
+        payload.get("status"),
+        payload.get("completion_closure_status"),
+        payload.get("stop_reason"),
+        payload.get("stop_class"),
+    )
+)
 verification = {
     "completed": False,
     "reason": "runtime_terminal_failure",
@@ -8559,9 +8568,9 @@ if no_eligible_runtime_status and len(patch_targets) > 1 and selected_route != "
             "invent a new verification command",
         ],
     }
-elif no_eligible_runtime_status and selected_route == "todo-decomposition":
+elif selected_route == "todo-decomposition" and (no_eligible_runtime_status or terminal_runtime_status):
     verification["repair_hint"] = (
-        "Runtime reported no_eligible_task while executing a generated todo-decomposition leaf. "
+        "Runtime reached terminal/no_eligible state while executing a generated todo-decomposition leaf. "
         "Do not split '.brownie/todo.md' and '.brownie/todo-breakdown.md' into file-specific nested leaves and do not retry this replan leaf. "
         "Invoke the integrated stalled-replan recovery so it retires this generated leaf and restores the source's bounded implementation successor with its original target and verification contract."
     )
