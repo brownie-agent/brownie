@@ -38,6 +38,7 @@
     "scripts/phase-loop-todo-queue-integrity.mjs",
     "scripts/phase-loop-todo-state.mjs",
     "scripts/phase-loop-todo-transactional-migrate.mjs",
+    "scripts/phase-loop-workspace-control-parity-guard.mjs",
     "scripts/release-gate.mjs",
     "scripts/repair-todo-decomposition.mjs",
     "scripts/repair-validator-schema-assumptions.mjs",
@@ -76,6 +77,7 @@
     "scripts/phase-loop-todo-queue-integrity.mjs",
     "scripts/phase-loop-todo-state.mjs",
     "scripts/phase-loop-todo-transactional-migrate.mjs",
+    "scripts/phase-loop-workspace-control-parity-guard.mjs",
     "scripts/release-gate.mjs",
     "scripts/repair-todo-decomposition.mjs",
     "scripts/repair-validator-schema-assumptions.mjs"
