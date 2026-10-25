@@ -9441,6 +9441,11 @@ progress_projection = {
     # must accumulate across invocations, while a genuinely new Runtime
     # session or candidate set starts a distinct bounded recovery scope.
     "candidate_count": count(payload.get("candidate_count")),
+    # A Runtime resume can project an existing objective candidate without its
+    # original preflight fields.  Preserve its stable identity separately from
+    # aggregate/session counters so repeated replays cannot masquerade as new
+    # work and reset the bounded-recovery budget.
+    "objective_apply_continuation_id": text(payload.get("continuation_id")),
     "headless_root_run_id": text(payload.get("headless_root_run_id")),
     "headless_selected_run_id": text(payload.get("headless_selected_run_id")),
     "headless_current_session_sequence": text(payload.get("headless_current_session_sequence")),
@@ -9471,6 +9476,18 @@ if state_path.exists():
 previous_projection = previous.get("progress_projection")
 if not isinstance(previous_projection, dict):
     previous_projection = {}
+
+objective_apply_scope = json.dumps({
+    "claim_id": progress_projection["claim_id"],
+    "queue_generation": progress_projection["queue_generation"],
+    "queue_fingerprint": progress_projection["queue_fingerprint"],
+    "selected_todo": progress_projection["selected_todo"],
+}, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+previous_objective_apply_scope = text(previous_projection.get("objective_apply_authorization_scope"))
+same_objective_apply_scope = (
+    bool(progress_projection["claim_id"])
+    and objective_apply_scope == previous_objective_apply_scope
+)
 
 workspace_changed = workspace_before != workspace_after
 terminal_failed = (
@@ -9546,10 +9563,31 @@ if no_actionable_after_apply and not applied:
 progress_projection["completed_by_no_actionable_after_apply"] = no_actionable_after_apply
 progress_projection["semantic_completion_required"] = semantic_completion_required
 progress_projection["blocked_by_terminal_task_failure"] = terminal_failed
-objective_apply_pending = (
+direct_objective_apply_authorization = (
     progress_projection["next_action"] == "apply_authorized_objective_proposal"
     and text(payload.get("objective_proposal_preflight_status")) == "authorized_preflight_ready"
 )
+# Only an authorization captured for the exact claim/queue snapshot may
+# survive the lossy legacy resume projection.  A legacy response is never an
+# authorization by itself: without a matching durable authorization we stop
+# rather than applying or endlessly replaying an untrusted proposal.
+inherited_objective_apply_authorization = (
+    not direct_objective_apply_authorization
+    and same_objective_apply_scope
+    and previous_projection.get("objective_apply_authorized") is True
+)
+objective_apply_pending = (
+    direct_objective_apply_authorization
+    or inherited_objective_apply_authorization
+)
+objective_apply_authorization_lost = (
+    progress_projection["next_action"] == "apply_authorized_objective_proposal"
+    and progress_projection["candidate_count"] > 0
+    and not objective_apply_pending
+)
+progress_projection["objective_apply_authorization_scope"] = objective_apply_scope
+progress_projection["objective_apply_authorized"] = objective_apply_pending
+progress_projection["objective_apply_authorization_lost"] = objective_apply_authorization_lost
 progress_projection["objective_apply_pending"] = objective_apply_pending
 completed = bool(payload.get("completed")) or bool(automation.get("completed")) or no_actionable_after_apply
 if todo_md_only_apply or selected_first_line_still_pending:
@@ -9614,6 +9652,10 @@ objective_apply_stalled = (
     and not finalized
     and not applied
 )
+if objective_apply_authorization_lost:
+    # Fail closed before the first replay when the controller cannot prove
+    # that the candidate was authorized for this exact TODO snapshot.
+    objective_apply_stalled = True
 if objective_apply_stalled:
     continuation_required = False
 progress_projection["objective_apply_stalled"] = objective_apply_stalled
@@ -9643,7 +9685,7 @@ classification = (
     else "continuation_required"
     if continuation_required
     else "no_progress"
-    if (stagnated or terminal_non_progress)
+    if (stagnated or terminal_non_progress or objective_apply_stalled)
     else "non_progress_success"
     if no_progress
     else "progress"

@@ -959,6 +959,46 @@ cat <<'JSON'
 JSON
 SH
 chmod +x "$fake_brownie_objective_apply_pending"
+fake_brownie_objective_apply_legacy_resume="$(mktemp)"
+cat > "$fake_brownie_objective_apply_legacy_resume" <<'SH'
+#!/usr/bin/env bash
+set -eu
+cat <<'JSON'
+{
+  "command": "resume",
+  "ok": true,
+  "resume": {
+    "automation": {
+      "schema_version": 1,
+      "status": "continuation_required",
+      "controller_action": "resume",
+      "stop_class": "continuation_required",
+      "stop_reason": "bounded_progress",
+      "completed": false,
+      "blocked": false,
+      "retryable": true,
+      "terminal_failure": false,
+      "next_action": "apply_authorized_objective_proposal",
+      "next_invocation": {"command": "resume", "arguments": []},
+      "outcome_source": "legacy_cli_projection"
+    },
+    "status": "task_executed",
+    "candidate_count": 1,
+    "continuation_id": "continuation-objective-apply",
+    "next_action": "apply_authorized_objective_proposal",
+    "completed": false,
+    "blocked": false,
+    "retryable": true,
+    "terminal_failure": false,
+    "controller_action": "resume",
+    "stop_class": "continuation_required",
+    "stop_reason": "bounded_progress",
+    "next_invocation": {"command": "resume", "arguments": []}
+  }
+}
+JSON
+SH
+chmod +x "$fake_brownie_objective_apply_legacy_resume"
 fake_brownie_tracked_workspace_change="$(mktemp)"
 cat > "$fake_brownie_tracked_workspace_change" <<'SH'
 #!/usr/bin/env bash
@@ -2809,7 +2849,15 @@ PHASE_LOOP_STATE_DIR="$state_objective_apply_stalled" \
 PHASE_LOOP_PROMPT="$prompt_objective_apply_stalled" \
 PHASE_LOOP_TODO="$todo_objective_apply_stalled" \
 PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_objective_apply_stalled" \
-BROWNIE_BIN="$fake_brownie_objective_apply_pending" \
+BROWNIE_BIN="$fake_brownie_objective_apply_legacy_resume" \
+PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+PHASE_LOOP_STATE_DIR="$state_objective_apply_stalled" \
+PHASE_LOOP_PROMPT="$prompt_objective_apply_stalled" \
+PHASE_LOOP_TODO="$todo_objective_apply_stalled" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_objective_apply_stalled" \
+BROWNIE_BIN="$fake_brownie_objective_apply_legacy_resume" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
@@ -2818,7 +2866,7 @@ PHASE_LOOP_STATE_DIR="$state_objective_apply_stalled" \
 PHASE_LOOP_PROMPT="$prompt_objective_apply_stalled" \
 PHASE_LOOP_TODO="$todo_objective_apply_stalled" \
 PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_objective_apply_stalled" \
-BROWNIE_BIN="$fake_brownie_objective_apply_pending" \
+BROWNIE_BIN="$fake_brownie_objective_apply_legacy_resume" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 objective_apply_stalled_exit="$?"
@@ -2846,6 +2894,9 @@ assert progress["classification"] == "no_progress", progress
 assert progress["same_progress_count"] == 3, progress
 assert projection["objective_apply_pending"] is True, projection
 assert projection["objective_apply_stalled"] is True, projection
+assert projection["objective_apply_authorized"] is True, projection
+assert projection["objective_apply_authorization_lost"] is False, projection
+assert projection["objective_apply_continuation_id"] == "continuation-objective-apply", projection
 assert claim["status"] == "in_progress", claim
 assert feedback["claim_id"] == claim["claim_id"], feedback
 assert re.fullmatch(r"[a-f0-9]{64}", claim["claim_snapshot_sha256"]), claim
