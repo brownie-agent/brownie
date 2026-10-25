@@ -280,9 +280,7 @@ test('dispatches a requested self-update instead of restarting the stale supervi
   const repo = makeRepo();
   writeTodo(repo);
   writeJson(repo, '.brownie/private/phase-loop/status.json', {
-    // retry_cap=0 writes blocked before it invokes supervisor recovery. This
-    // must still retire the generated replan when the projection is terminal.
-    status: 'blocked',
+    status: 'no_progress',
     run_id: 'run-self-update',
     consecutive_failures: 0
   });
@@ -1491,7 +1489,9 @@ test('recovers a terminal no-eligible generated replan projected onto its bounde
   fs.appendFileSync(path.join(repo, '.brownie/todo.md'), `\n${replanTodo}\n`);
   fs.appendFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `\n## TODO-repair-${replanId}\n\nParent TODO: ${sourceId}\n\nDependency graph:\n- ${replanId}: <none>\n\nVerification ledger:\n- ${replanId}: run \`pnpm --workspace-root guard:todo-decomposition\`\n\nQuality rubric:\n- ${replanId}: bounded recovery replan\n`);
   writeJson(repo, '.brownie/private/phase-loop/status.json', {
-    status: 'no_progress',
+    // retry_cap=0 writes blocked before it invokes supervisor recovery. This
+    // must still retire the generated replan when the projection is terminal.
+    status: 'blocked',
     run_id: 'terminal-replan',
     consecutive_failures: 0,
     detail: 'runtime terminal task failed without a workspace.write proposal'
