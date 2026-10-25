@@ -103,6 +103,60 @@ test('accepts only an exact duplicate replan transaction', () => {
   assert.equal(fs.readFileSync(ledger, 'utf8'), before);
 });
 
+test('reuses only an equivalent queued replacement child for a retry of the same logical TODO', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const child = { task_id: 'C-reuse', route: 'implementation', patch_targets: ['scripts/child.mjs'], verification_commands: ['node --test scripts/child.test.mjs'] };
+  const firstParent = 'P-reuse@claim-one';
+  appendTaskTransition(repo, { task_id: firstParent, to_state: 'queued' });
+  appendTaskTransition(repo, { task_id: firstParent, to_state: 'claimed', claim_id: 'claim-one' });
+  appendTaskTransition(repo, { task_id: firstParent, to_state: 'running', claim_id: 'claim-one' });
+  assert.equal(replanTaskWithChildren(repo, {
+    task_id: firstParent, reason: 'runtime_claim_snapshot_mismatch', children: [child], run_id: 'run-one', claim_id: 'claim-one'
+  }).ok, true);
+
+  const retryParent = 'P-reuse@claim-two';
+  appendTaskTransition(repo, { task_id: retryParent, to_state: 'queued' });
+  appendTaskTransition(repo, { task_id: retryParent, to_state: 'claimed', claim_id: 'claim-two' });
+  appendTaskTransition(repo, { task_id: retryParent, to_state: 'running', claim_id: 'claim-two' });
+  const before = fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl'), 'utf8');
+  const reused = replanTaskWithChildren(repo, {
+    task_id: retryParent, reason: 'runtime_claim_snapshot_mismatch', children: [child], run_id: 'run-two', claim_id: 'claim-two'
+  });
+  assert.equal(reused.ok, true);
+  assert.equal(reused.code, 'replan_reused_children');
+  const after = fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl'), 'utf8');
+  assert.equal(after.slice(0, before.length), before);
+  const projection = taskProjection(readTaskLedger(repo));
+  assert.equal(projection.get(retryParent).to_state, 'replanned');
+  assert.equal(projection.get('C-reuse').to_state, 'queued');
+  assert.equal(validateTaskLedger(readTaskLedger(repo)).ok, true);
+});
+
+test('rejects stale, mismatched, and mixed replacement-child collisions without writing', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const child = { task_id: 'C-collision', route: 'implementation', patch_targets: ['scripts/child.mjs'], verification_commands: ['node --test scripts/child.test.mjs'] };
+  const firstParent = 'P-collision@claim-one';
+  for (const state of ['queued', 'claimed', 'running']) appendTaskTransition(repo, { task_id: firstParent, to_state: state, claim_id: 'claim-one' });
+  replanTaskWithChildren(repo, { task_id: firstParent, reason: 'split', children: [child], run_id: 'run-one', claim_id: 'claim-one' });
+  const retryParent = 'P-collision@claim-two';
+  for (const state of ['queued', 'claimed', 'running']) appendTaskTransition(repo, { task_id: retryParent, to_state: state, claim_id: 'claim-two' });
+  const ledger = path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl');
+  const before = fs.readFileSync(ledger, 'utf8');
+  assert.equal(replanTaskWithChildren(repo, {
+    task_id: retryParent, reason: 'split', children: [{ ...child, patch_targets: ['scripts/other.mjs'] }], run_id: 'run-two', claim_id: 'claim-two'
+  }).code, 'replan_child_collision_not_reusable');
+  assert.equal(replanTaskWithChildren(repo, {
+    task_id: retryParent, reason: 'split', children: [child, { ...child, task_id: 'C-new' }], run_id: 'run-two', claim_id: 'claim-two'
+  }).code, 'replan_child_collision_mixed_set');
+  assert.equal(fs.readFileSync(ledger, 'utf8'), before);
+  appendTaskTransition(repo, { task_id: 'C-collision', to_state: 'claimed', claim_id: 'child-claim' });
+  const beforeStaleCheck = fs.readFileSync(ledger, 'utf8');
+  assert.equal(replanTaskWithChildren(repo, {
+    task_id: retryParent, reason: 'split', children: [child], run_id: 'run-two', claim_id: 'claim-two'
+  }).code, 'replan_child_collision_not_reusable');
+  assert.equal(fs.readFileSync(ledger, 'utf8'), beforeStaleCheck);
+});
+
 test('continues a replacement child claim on the queued child task id', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
   const todo = path.join(repo, '.brownie', 'todo.md');
