@@ -9412,6 +9412,12 @@ def text(value):
         return str(value)
     return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
+def count(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
 progress_projection = {
     "schema_version": 1,
     "commit": head_commit,
@@ -9422,6 +9428,14 @@ progress_projection = {
     "queue_generation": text(claim.get("queue_generation")),
     "queue_fingerprint": text(claim.get("queue_fingerprint")),
     "cli_status": text(payload.get("status")),
+    # These values are part of the stale-continuation authority boundary.
+    # Keep them in the durable fingerprint: a zero-candidate stale response
+    # must accumulate across invocations, while a genuinely new Runtime
+    # session or candidate set starts a distinct bounded recovery scope.
+    "candidate_count": count(payload.get("candidate_count")),
+    "headless_root_run_id": text(payload.get("headless_root_run_id")),
+    "headless_selected_run_id": text(payload.get("headless_selected_run_id")),
+    "headless_current_session_sequence": text(payload.get("headless_current_session_sequence")),
     "controller_action": text(payload.get("controller_action")),
     "stop_class": text(payload.get("stop_class")),
     "stop_reason": text(payload.get("stop_reason")),
