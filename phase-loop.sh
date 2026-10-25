@@ -16595,7 +16595,11 @@ PY
         ;;
       continuation_required)
         detail="Brownie prepared an authorized continuation; the next supervisor iteration will run resume. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
-        write_status "running" "$detail" "$run_id" "$exit_code" "0" "" "true"
+        # `run-once` has no resident supervisor after this function returns.
+        # Never use `running` as a proxy for a planned continuation: process
+        # ownership is authoritative and the explicit state lets status.json
+        # remain truthful even if the supervisor exits before the next resume.
+        write_status "continuation_required" "$detail" "$run_id" "$exit_code" "0" "" "true"
         printf '%s run=%s continuation_required=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
         write_bdk_trajectory_event "$run_stamp" "workflow.routed" '{"source":"runtime","bdk_state":"continuation_required","llm_route":"resume"}'
         ;;
