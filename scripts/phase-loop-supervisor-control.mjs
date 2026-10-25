@@ -1669,7 +1669,12 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   const projectionStopClass = projection.stop_class
     ?? projection.stop_reason
     ?? diagnostic.progress?.projection_stop_class;
-  const terminalNoProposal = diagnostic.phase_loop?.status === 'no_progress'
+  // The shell controller records retry-cap-zero terminal failures as blocked
+  // before it asks this supervisor to retire a generated replan leaf.  Treat
+  // that durable blocked envelope like no_progress only when the Runtime
+  // projection independently proves terminal/no-eligible semantics; otherwise
+  // an ordinary owner block must remain untouched.
+  const terminalNoProposal = ['no_progress', 'blocked'].includes(diagnostic.phase_loop?.status)
     && (
       String(diagnostic.phase_loop?.detail ?? '').includes('objective_apply_stalled')
       || projectionStopClass === 'terminal_failure'
