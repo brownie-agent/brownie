@@ -1511,7 +1511,7 @@ refresh_active_todo_claim_from_live_queue() {
   if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$PHASE_LOOP_TODO" ]; then
     return 0
   fi
-  python3 - "$TODO_CLAIM_FILE" "$PHASE_LOOP_TODO" "$TODO_QUEUE_STATE_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$run_stamp" "$(now_utc)" "$PHASE_LOOP_WORKSPACE_ROOT" <<'PY'
+  python3 - "$TODO_CLAIM_FILE" "$PHASE_LOOP_TODO" "$TODO_QUEUE_STATE_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$run_stamp" "$(now_utc)" "$PHASE_LOOP_WORKSPACE_ROOT" "$STATE_DIR/task-ledger.jsonl" <<'PY'
 import hashlib
 import json
 import os
@@ -1527,6 +1527,7 @@ repair_feedback_path = pathlib.Path(sys.argv[4])
 run_stamp = sys.argv[5]
 timestamp = sys.argv[6]
 workspace = pathlib.Path(sys.argv[7])
+ledger_path = pathlib.Path(sys.argv[8])
 
 def todo_id(block):
     first = block.splitlines()[0] if block.splitlines() else ""
@@ -1590,6 +1591,45 @@ if not live:
         "run_stamp": run_stamp,
         "updated_at": timestamp,
         "note": "selected_todo_id_missing_from_live_queue",
+    })
+    tmp = claim_path.with_name(f"{claim_path.name}.{os.getpid()}.stale.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, claim_path)
+    raise SystemExit(0)
+selected_hash = hashlib.sha256(selected.encode("utf-8")).hexdigest()
+attempt_id = f"{selected_id}@{claim.get('claim_id')}"
+ledger_specs = []
+try:
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        for event in record.get("events", [record]):
+            if event.get("task_id") == attempt_id and event.get("task_spec_sha256"):
+                ledger_specs.append(event["task_spec_sha256"])
+except FileNotFoundError:
+    pass
+except Exception:
+    # A malformed ledger remains the task-ledger validator's responsibility;
+    # do not hide it by inventing a replacement claim here.
+    pass
+if any(spec != selected_hash for spec in ledger_specs):
+    # Claims created before snapshot isolation may already have had their
+    # selected TODO overwritten. Compare against the immutable ledger attempt
+    # so such historical corruption is archived before another route event.
+    claim["status"] = "stale_snapshot_rejected"
+    claim["run_stamp"] = run_stamp
+    claim["updated_at"] = timestamp
+    claim["selected_todo_sha256"] = selected_hash
+    claim["ledger_task_spec_sha256"] = sorted(set(ledger_specs))
+    claim.setdefault("status_history", []).append({
+        "status": "stale_snapshot_rejected",
+        "run_stamp": run_stamp,
+        "updated_at": timestamp,
+        "note": "immutable_selected_todo_ledger_spec_mismatch",
     })
     tmp = claim_path.with_name(f"{claim_path.name}.{os.getpid()}.stale.tmp")
     with open(tmp, "w", encoding="utf-8") as handle:

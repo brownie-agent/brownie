@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -88,7 +89,7 @@ test('archives a blocked active claim and selects its unblocked replan leaf', ()
   assert.ok(fs.existsSync(path.join(claims, 'stale-test-run-1.json')));
 });
 
-test('archives a changed live TODO instead of mutating an in-progress claim snapshot', () => {
+test('archives a claim whose mutable snapshot no longer matches its ledger attempt', () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-immutable-claim-refresh-'));
   const state = path.join(workspace, '.brownie/private/phase-loop-state');
   const todo = path.join(workspace, '.brownie/todo.md');
@@ -108,7 +109,11 @@ test('archives a changed live TODO instead of mutating an in-progress claim snap
   execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
   execFileSync('git', ['add', '.'], { cwd: workspace, stdio: 'ignore' });
   execFileSync('git', ['commit', '-m', 'init'], { cwd: workspace, stdio: 'ignore' });
-  fs.writeFileSync(path.join(claims, 'current.json'), JSON.stringify({ claim_id: 'immutable-claim', selected_todo: original, queue_fingerprint: 'old', queue_generation: 1, status: 'in_progress' }));
+  fs.writeFileSync(path.join(claims, 'current.json'), JSON.stringify({ claim_id: 'immutable-claim', selected_todo: changed, queue_fingerprint: 'old', queue_generation: 1, status: 'in_progress' }));
+  fs.writeFileSync(path.join(state, 'task-ledger.jsonl'), `${JSON.stringify({
+    task_id: 'E-claim-snapshot@immutable-claim', to_state: 'running', sequence: 3,
+    task_spec_sha256: crypto.createHash('sha256').update(original).digest('hex')
+  })}\n`);
 
   execFileSync('bash', ['-c', 'script=$1; set --; source "$script" >/dev/null; claim_first_pending_todo test-run', '_', phaseLoop], {
     cwd: repoRoot,
@@ -118,9 +123,9 @@ test('archives a changed live TODO instead of mutating an in-progress claim snap
 
   const archived = JSON.parse(fs.readFileSync(path.join(claims, 'stale-test-run.json'), 'utf8'));
   const current = JSON.parse(fs.readFileSync(path.join(claims, 'current.json'), 'utf8'));
-  assert.equal(archived.selected_todo, original);
+  assert.equal(archived.selected_todo, changed);
   assert.equal(archived.status, 'stale_snapshot_rejected');
-  assert.equal(archived.status_history.at(-2).note, 'immutable_selected_todo_changed_in_live_queue');
+  assert.equal(archived.status_history.at(-2).note, 'immutable_selected_todo_ledger_spec_mismatch');
   assert.equal(current.selected_todo, changed);
   assert.notEqual(current.claim_id, archived.claim_id);
 });
