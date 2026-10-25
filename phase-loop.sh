@@ -9608,15 +9608,30 @@ try:
     )
 except (TypeError, ValueError):
     previous_objective_apply_target_replay_count = 0
-objective_apply_target_replay_count = (
-    previous_objective_apply_target_replay_count + 1
-    if (
-        objective_apply_pending
-        and same_objective_apply_target_scope
-        and previous_projection.get("objective_apply_pending") is True
+if not objective_apply_pending:
+    objective_apply_target_replay_count = 0
+elif direct_objective_apply_authorization:
+    # The preflight itself has not replayed anything.  Keep an exhausted
+    # target budget when a replacement claim offers the same target again,
+    # but do not charge a newly authorized first attempt.
+    objective_apply_target_replay_count = (
+        previous_objective_apply_target_replay_count
+        if (
+            same_objective_apply_target_scope
+            and previous_projection.get("objective_apply_pending") is True
+        )
+        else 0
     )
-    else 1
-)
+else:
+    # A lossy legacy resume is the replay that consumes this bounded budget.
+    objective_apply_target_replay_count = (
+        previous_objective_apply_target_replay_count + 1
+        if (
+            same_objective_apply_target_scope
+            and previous_projection.get("objective_apply_pending") is True
+        )
+        else 1
+    )
 objective_apply_target_replay_exhausted = (
     objective_apply_pending
     and objective_apply_target_replay_count >= threshold

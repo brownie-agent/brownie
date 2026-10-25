@@ -46,6 +46,9 @@ test('objective-apply replay budget follows the selected TODO across replacement
   assert.match(controller, /objective_apply_target_scope = json\.dumps/);
   assert.match(controller, /same_objective_apply_target_scope = \(/);
   assert.match(controller, /previous_objective_apply_target_replay_count/);
+  assert.match(controller, /if not objective_apply_pending:/);
+  assert.match(controller, /elif direct_objective_apply_authorization:/);
+  assert.match(controller, /A lossy legacy resume is the replay that consumes this bounded budget/);
   assert.match(controller, /objective_apply_target_replay_count >= threshold/);
   assert.match(controller, /same_count >= threshold or objective_apply_target_replay_exhausted/);
   assert.match(controller, /progress_projection\["objective_apply_target_replay_exhausted"\]/);
