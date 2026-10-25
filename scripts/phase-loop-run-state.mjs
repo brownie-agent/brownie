@@ -71,8 +71,19 @@ function hashBytes(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
+// A legacy migration must archive the durable control-plane contract, not an
+// unbounded copy of historical runs.  The latter can make recovery itself
+// unavailable while preserving no additional authority for rebaseline.
+const LEGACY_ARCHIVE_EXCLUDED_TOP_LEVEL = new Set([
+  'legacy-recovery', 'logs', 'trajectories', 'known-good-targets',
+  'recovery-archives', 'archived-stale-state', 'merge-recovery',
+  'preclaim-recovery', 'supervisor-diagnostics', 'todo-snapshots'
+]);
+const LEGACY_ARCHIVE_EXCLUDED_ROOT_FILES = new Set(['bdk-trajectory.jsonl', 'bdk-harness-feedback.json']);
+
 function collectStateFiles(stateDir) {
   const entries = [];
+  const excluded = [];
   const visit = (directory, relativeDirectory = '') => {
     let names;
     try {
@@ -82,10 +93,30 @@ function collectStateFiles(stateDir) {
       throw error;
     }
     for (const name of names) {
-      if (!relativeDirectory && name === 'legacy-recovery') continue;
+      if (!relativeDirectory && LEGACY_ARCHIVE_EXCLUDED_TOP_LEVEL.has(name)) {
+        const stat = fs.lstatSync(path.join(directory, name));
+        excluded.push({ path: name, reason: 'historical_or_observability_artifact', bytes: stat.size });
+        continue;
+      }
+      if (!relativeDirectory && LEGACY_ARCHIVE_EXCLUDED_ROOT_FILES.has(name)) {
+        const stat = fs.lstatSync(path.join(directory, name));
+        excluded.push({ path: name, reason: 'append_only_observability_artifact', bytes: stat.size });
+        continue;
+      }
       const absolute = path.join(directory, name);
       const relative = path.join(relativeDirectory, name);
       const stat = fs.lstatSync(absolute);
+      // Keep the compact claim/target receipts in runs, but do not recursively
+      // copy delegated source trees for every historical run.
+      if (relative.startsWith(`runs${path.sep}`) && stat.isDirectory() && name.endsWith('.delegated-scope')) {
+        excluded.push({ path: relative.split(path.sep).join('/'), reason: 'delegated_source_snapshot', bytes: stat.size });
+        continue;
+      }
+      if (relative.startsWith(`runs${path.sep}`) && (stat.isFile() || stat.isSymbolicLink())
+        && !/(?:\.target\.before|\.claim\.before(?:-runtime)?\.json|\.runtime-admission\.json)$/u.test(name)) {
+        excluded.push({ path: relative.split(path.sep).join('/'), reason: 'historical_run_output', bytes: stat.size });
+        continue;
+      }
       if (stat.isDirectory()) {
         visit(absolute, relative);
       } else if (stat.isFile() || stat.isSymbolicLink()) {
@@ -108,13 +139,13 @@ function collectStateFiles(stateDir) {
     }
   };
   visit(stateDir);
-  return entries;
+  return { entries, excluded };
 }
 
 function stateSnapshot(stateDir) {
-  const files = collectStateFiles(stateDir);
+  const { entries: files, excluded } = collectStateFiles(stateDir);
   const fingerprint = hashBytes(files.map((entry) => `${entry.path}\0${entry.kind}\0${entry.sha256}\0${entry.bytes}`).join('\n'));
-  return { fingerprint, files };
+  return { fingerprint, files, excluded };
 }
 
 function archiveLegacyStateAtomically({ stateDir, recoveryId, reason, now = new Date().toISOString() }) {
@@ -146,7 +177,9 @@ function archiveLegacyStateAtomically({ stateDir, recoveryId, reason, now = new 
       state_dir: stateDir,
       state_fingerprint: before.fingerprint,
       payload_root: 'payload',
-      files: before.files
+      files: before.files,
+      excluded: before.excluded,
+      excluded_bytes: before.excluded.reduce((total, entry) => total + entry.bytes, 0)
     };
     writeJsonAtomically(path.join(temporary, 'manifest.json'), manifest);
     const directories = new Set([temporary, payloadRoot]);
