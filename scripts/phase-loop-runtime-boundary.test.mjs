@@ -37,6 +37,9 @@ test('controller stops repeated stale continuation scopes before a third blind r
   assert.match(controller, /same_count >= 2/);
   assert.match(controller, /if stale_continuation_scope_exhausted:\n    continuation_required = False/);
   assert.match(controller, /progress_projection\["stale_continuation_scope_exhausted"\] = stale_continuation_scope_exhausted/);
+  assert.match(controller, /"candidate_count": count\(payload\.get\("candidate_count"\)\)/);
+  assert.match(controller, /"headless_root_run_id": text\(payload\.get\("headless_root_run_id"\)\)/);
+  assert.match(controller, /"headless_selected_run_id": text\(payload\.get\("headless_selected_run_id"\)\)/);
 });
 
 test('controller validates queue integrity before resuming an active claim', () => {
