@@ -280,7 +280,9 @@ test('dispatches a requested self-update instead of restarting the stale supervi
   const repo = makeRepo();
   writeTodo(repo);
   writeJson(repo, '.brownie/private/phase-loop/status.json', {
-    status: 'no_progress',
+    // retry_cap=0 writes blocked before it invokes supervisor recovery. This
+    // must still retire the generated replan when the projection is terminal.
+    status: 'blocked',
     run_id: 'run-self-update',
     consecutive_failures: 0
   });
