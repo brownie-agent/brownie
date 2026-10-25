@@ -13273,6 +13273,25 @@ phase_loop_require_approved_controller_baseline() {
     return 78
   fi
   printf '%s controller_control_plane_guard_passed=true baseline=%s fingerprint=%s result=%s\n' "$(now_utc)" "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" "$PHASE_LOOP_CONTROL_PLANE_FINGERPRINT" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+  local workspace_parity_guard="$ROOT_DIR/scripts/phase-loop-workspace-control-parity-guard.mjs"
+  if [ ! -f "$workspace_parity_guard" ]; then
+    PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT="missing workspace control-plane parity guard script: $workspace_parity_guard"
+    printf '%s controller_workspace_control_parity_guard_failed=true reason=guard_missing path=%s\n' "$(now_utc)" "$workspace_parity_guard" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  set +e
+  output="$(
+    cd "$ROOT_DIR" || exit 70
+    node "$workspace_parity_guard" --control-root "$ROOT_DIR" --workspace-root "$PHASE_LOOP_WORKSPACE_ROOT" 2>&1
+  )"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT="$output"
+    printf '%s controller_workspace_control_parity_guard_failed=true result=%s\n' "$(now_utc)" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  printf '%s controller_workspace_control_parity_guard_passed=true result=%s\n' "$(now_utc)" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
   return 0
 }
 
