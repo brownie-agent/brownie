@@ -9722,7 +9722,6 @@ progress_projection["todo_md_only_apply_blocked_as_progress"] = todo_md_only_app
 progress_projection["selected_todo_first_line_still_pending_after_todo_md_apply"] = selected_first_line_still_pending
 terminal_non_progress = (
     exit_code == 0
-    and blocked
     and not workspace_changed
     and not completed
     and not accepted
@@ -9732,6 +9731,27 @@ terminal_non_progress = (
         progress_projection["stop_class"] == "terminal_failure"
         or progress_projection["stop_reason"] == "terminal_task_failed"
         or progress_projection["cli_status"] in ("no_eligible_task", "no_actionable_work")
+    )
+    # Runtime's legacy resume projection can report zero candidates with
+    # blocked=false even though an immutable pending claim was supplied.  That
+    # is not a successful no-op: without an explicit terminal classification
+    # it falls through to non_progress_success and the supervisor can keep
+    # retrying an unexecutable claim.  Treat the active-claim/no-candidate
+    # contradiction as terminal so the existing causeful recovery and bounded
+    # retry/delegation path owns it.
+    and (
+        blocked
+        or (
+            bool(progress_projection["claim_id"])
+            and bool(progress_projection["selected_todo"])
+            and int(progress_projection["candidate_count"] or 0) == 0
+            and progress_projection["cli_status"] in ("no_eligible_task", "no_actionable_work")
+            and (
+                progress_projection["cli_status"] == "no_actionable_work"
+                or progress_projection["stop_class"] == "no_actionable_work"
+                or progress_projection["controller_action"] == "stop"
+            )
+        )
     )
 )
 continuation_required = (
