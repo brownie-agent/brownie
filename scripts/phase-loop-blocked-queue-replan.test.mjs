@@ -88,6 +88,43 @@ test('archives a blocked active claim and selects its unblocked replan leaf', ()
   assert.ok(fs.existsSync(path.join(claims, 'stale-test-run-1.json')));
 });
 
+test('archives a changed live TODO instead of mutating an in-progress claim snapshot', () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-immutable-claim-refresh-'));
+  const state = path.join(workspace, '.brownie/private/phase-loop-state');
+  const todo = path.join(workspace, '.brownie/todo.md');
+  const breakdown = path.join(workspace, '.brownie/todo-breakdown.md');
+  const claims = path.join(state, 'todo-claims');
+  const original = '- [ ] E-claim-snapshot: Patch only `scripts/release.mjs`:\n  Route: implementation.\n  Source TODO: E-parent.\n  Depends on: E-prerequisite.\n  Completion condition: original contract.\n  Forbidden changes: do not weaken validation.\n  Verification: run `pnpm check`.';
+  const changed = original.replace('Depends on: E-prerequisite.', 'Depends on: <none>.');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.mkdirSync(claims, { recursive: true });
+  fs.writeFileSync(todo, `${changed}\n`);
+  fs.writeFileSync(breakdown, '# Breakdown\n');
+  fs.writeFileSync(path.join(workspace, 'package.json'), JSON.stringify({ private: true, scripts: { 'phase-loop:todo-queue-integrity': 'node scripts/phase-loop-todo-queue-integrity.mjs' } }));
+  fs.mkdirSync(path.join(workspace, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(workspace, 'scripts/phase-loop-todo-queue-integrity.mjs'), 'process.exit(0);\n');
+  execFileSync('git', ['init', '-b', 'main'], { cwd: workspace, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
+  execFileSync('git', ['add', '.'], { cwd: workspace, stdio: 'ignore' });
+  execFileSync('git', ['commit', '-m', 'init'], { cwd: workspace, stdio: 'ignore' });
+  fs.writeFileSync(path.join(claims, 'current.json'), JSON.stringify({ claim_id: 'immutable-claim', selected_todo: original, queue_fingerprint: 'old', queue_generation: 1, status: 'in_progress' }));
+
+  execFileSync('bash', ['-c', 'script=$1; set --; source "$script" >/dev/null; claim_first_pending_todo test-run', '_', phaseLoop], {
+    cwd: repoRoot,
+    env: { ...process.env, PHASE_LOOP_STATE_DIR: state, PHASE_LOOP_TODO: todo, PHASE_LOOP_TODO_BREAKDOWN: breakdown, PHASE_LOOP_WORKSPACE_ROOT: workspace },
+    stdio: 'pipe'
+  });
+
+  const archived = JSON.parse(fs.readFileSync(path.join(claims, 'stale-test-run.json'), 'utf8'));
+  const current = JSON.parse(fs.readFileSync(path.join(claims, 'current.json'), 'utf8'));
+  assert.equal(archived.selected_todo, original);
+  assert.equal(archived.status, 'stale_snapshot_rejected');
+  assert.equal(archived.status_history.at(-2).note, 'immutable_selected_todo_changed_in_live_queue');
+  assert.equal(current.selected_todo, changed);
+  assert.notEqual(current.claim_id, archived.claim_id);
+});
+
 test('claims a generated blocked-queue decomposition from the same TODO snapshot and CAS', () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-blocked-queue-generated-claim-'));
   const state = path.join(workspace, '.brownie/private/phase-loop-state');
