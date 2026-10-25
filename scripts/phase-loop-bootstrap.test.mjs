@@ -467,6 +467,48 @@ test('does not skip freshness checks for a default binary under a symlinked work
   }
 });
 
+test('does not skip freshness checks for an explicitly selected stale binary', () => {
+  const fixture = externalControllerFixture();
+  try {
+    const sourceDirectory = path.join(fixture.workspaceRoot, 'crates', 'brownie-cli', 'src');
+    const binaryDirectory = path.join(fixture.workspaceRoot, 'target', 'debug');
+    fs.mkdirSync(sourceDirectory, { recursive: true });
+    fs.mkdirSync(binaryDirectory, { recursive: true });
+    fs.writeFileSync(path.join(fixture.workspaceRoot, 'Cargo.toml'), '[workspace]\nmembers = []\n');
+    fs.writeFileSync(path.join(fixture.workspaceRoot, 'Cargo.lock'), '# fixture\n');
+    fs.writeFileSync(path.join(fixture.workspaceRoot, 'crates', 'brownie-cli', 'Cargo.toml'), '[package]\nname = "brownie-cli"\nversion = "0.0.0"\n');
+    const source = path.join(sourceDirectory, 'lib.rs');
+    fs.writeFileSync(source, 'pub fn fixture() {}\n');
+    const cli = executableFixture(binaryDirectory, 'brownie');
+    const runtime = executableFixture(binaryDirectory, 'brownie-runtime');
+    spawnSync('git', ['init'], { cwd: fixture.workspaceRoot, stdio: 'ignore' });
+    spawnSync('git', ['config', 'user.name', 'test'], { cwd: fixture.workspaceRoot, stdio: 'ignore' });
+    spawnSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: fixture.workspaceRoot, stdio: 'ignore' });
+    spawnSync('git', ['add', '.'], { cwd: fixture.workspaceRoot, stdio: 'ignore' });
+    spawnSync('git', ['commit', '-m', 'fixture'], { cwd: fixture.workspaceRoot, stdio: 'ignore' });
+    const oldTime = new Date(Date.now() - 10_000);
+    const newTime = new Date(Date.now() + 10_000);
+    fs.utimesSync(cli, oldTime, oldTime);
+    fs.utimesSync(runtime, oldTime, oldTime);
+    fs.utimesSync(source, newTime, newTime);
+    const result = spawnSync('bash', [fixture.controller, 'check-binary-freshness'], {
+      cwd: fixture.controllerRoot,
+      env: {
+        ...baseEnvironment(),
+        PHASE_LOOP_WORKSPACE_ROOT: fixture.workspaceRoot,
+        PHASE_LOOP_STATE_DIR: fixture.stateRoot,
+        BROWNIE_BIN: cli,
+        BROWNIE_RUNTIME_PATH: runtime
+      },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stdout, /binary freshness check failed/u);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('uses controller-baseline freshness for an external controller binary', () => {
   const fixture = externalControllerFixture();
   try {

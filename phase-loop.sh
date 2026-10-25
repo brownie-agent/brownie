@@ -505,9 +505,10 @@ check_brownie_binary_freshness() {
   if [ "$PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK" = "1" ]; then
     return 0
   fi
-  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 1 ]; then
-    return 0
-  fi
+  # An explicit binary path is an operator selection, not an exemption from
+  # the admission contract. An older workspace binary can lack the
+  # claim-attestation fields required by a newer controller and turn a valid
+  # execution into a misleading snapshot mismatch.
   # An external controller binary is governed by the approved controller
   # baseline, not by the supervised workspace's Rust source timestamps.
   # Check and rebuild against that controller baseline so a controller source
