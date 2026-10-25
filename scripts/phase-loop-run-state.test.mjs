@@ -504,6 +504,23 @@ test('keeps an original manifest in the archive payload beside the recovery mani
   assert.ok(manifest.files.some((entry) => entry.path === 'manifest.json'));
 });
 
+test('archives durable state without recursively copying run and log history', () => {
+  const { stateDir } = fixture();
+  writeLegacyFixture(stateDir);
+  fs.mkdirSync(path.join(stateDir, 'runs', 'old.delegated-scope'), { recursive: true });
+  fs.mkdirSync(path.join(stateDir, 'logs'), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'runs', 'old.delegated-scope', 'large-source.txt'), 'x'.repeat(1024));
+  fs.writeFileSync(path.join(stateDir, 'logs', 'supervisor.log'), 'y'.repeat(1024));
+  const result = migrateLegacyPhaseLoopState({ stateDir, rootDir: '/repo', processExists: () => false, listAllSupervisors: () => [] });
+  assert.equal(result.ok, true);
+  const manifest = JSON.parse(fs.readFileSync(path.join(result.archive_path, 'manifest.json'), 'utf8'));
+  assert.ok(manifest.excluded.some((entry) => entry.path === 'runs/old.delegated-scope'));
+  assert.ok(manifest.excluded.some((entry) => entry.path === 'logs'));
+  assert.equal(fs.existsSync(path.join(result.archive_path, 'payload', 'runs', 'old.delegated-scope')), false);
+  assert.equal(fs.existsSync(path.join(result.archive_path, 'payload', 'logs')), false);
+  assert.ok(manifest.excluded_bytes >= 0);
+});
+
 test('quiesces a confirmed legacy owner before enforcing archive snapshot stability', () => {
   const { stateDir } = fixture();
   writeLegacyFixture(stateDir);
