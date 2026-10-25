@@ -15210,10 +15210,24 @@ PY
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     export BROWNIE_WORKSPACE_ROOT="${BROWNIE_WORKSPACE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"
-    # A phase-loop claim is valid only for its private runtime store.  Never
-    # inherit an interactive caller's store: it can resume an unrelated,
-    # terminal headless session whose objective does not match this claim.
-    export BROWNIE_STORE_ROOT="$PHASE_LOOP_BROWNIE_STORE_ROOT"
+    # A phase-loop claim is valid only for its own Runtime store.  Sharing a
+    # store across immutable claims lets a terminal/no-eligible headless
+    # session from an earlier objective preempt the currently admitted claim.
+    # The digest avoids exposing the claim id in a filesystem path while
+    # retaining continuity for retries of the same claim.
+    runtime_claim_store="$(python3 - "$PHASE_LOOP_BROWNIE_STORE_ROOT" "$(claim_field claim_id)" <<'PY'
+import hashlib
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+claim_id = sys.argv[2]
+if not claim_id:
+    raise SystemExit(2)
+print(root / "phase-loop-claims" / hashlib.sha256(claim_id.encode("utf-8")).hexdigest())
+PY
+)" || exit 70
+    mkdir -p "$runtime_claim_store" || exit 70
+    export BROWNIE_STORE_ROOT="$runtime_claim_store"
     export PHASE_LOOP_CONTROL_ROOT
     export BROWNIE_PHASE_LOOP_ADMISSION_FILE="$runtime_admission_snapshot"
     export BROWNIE_PHASE_LOOP_CLAIM_ID="$(claim_field claim_id)"

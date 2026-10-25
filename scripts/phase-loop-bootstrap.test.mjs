@@ -76,7 +76,9 @@ test('loads env files only after ROOT_DIR is established', () => {
   assert.ok(bootstrapValidation >= 0);
   assert.ok(bootstrapValidation < source.indexOf('phase_loop_rebaseline_stale_claim "$run_stamp"', runOnce));
   assert.ok(bootstrapValidation < source.indexOf('todo_first_raw_pending_is_recorded_blocked', runOnce));
-  assert.match(source, /export BROWNIE_STORE_ROOT="\$PHASE_LOOP_BROWNIE_STORE_ROOT"/u);
+  assert.match(source, /phase-loop-claims/u);
+  assert.match(source, /hashlib\.sha256\(claim_id\.encode\("utf-8"\)\)\.hexdigest\(\)/u);
+  assert.match(source, /export BROWNIE_STORE_ROOT="\$runtime_claim_store"/u);
 });
 
 test('cleans cached controller artifacts before a freshness-triggered rebuild', () => {
