@@ -9497,6 +9497,19 @@ same_objective_apply_scope = (
     bool(progress_projection["claim_id"])
     and objective_apply_scope == previous_objective_apply_scope
 )
+# Claim/queue identity deliberately bounds authorization inheritance, but it
+# must not reset the retry budget for an unchanged implementation contract.
+# Integrated recovery can replace a failed claim with a fresh claim for the
+# same leaf; without this target-level lineage, each replacement would mint a
+# new three-replay budget even though Runtime is replaying the same proposal.
+objective_apply_target_scope = json.dumps({
+    "selected_todo": progress_projection["selected_todo"],
+}, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+previous_objective_apply_target_scope = text(previous_projection.get("objective_apply_target_scope"))
+same_objective_apply_target_scope = (
+    bool(progress_projection["selected_todo"])
+    and objective_apply_target_scope == previous_objective_apply_target_scope
+)
 
 workspace_changed = workspace_before != workspace_after
 terminal_failed = (
@@ -9589,12 +9602,34 @@ objective_apply_pending = (
     direct_objective_apply_authorization
     or inherited_objective_apply_authorization
 )
+try:
+    previous_objective_apply_target_replay_count = int(
+        previous_projection.get("objective_apply_target_replay_count") or 0
+    )
+except (TypeError, ValueError):
+    previous_objective_apply_target_replay_count = 0
+objective_apply_target_replay_count = (
+    previous_objective_apply_target_replay_count + 1
+    if (
+        objective_apply_pending
+        and same_objective_apply_target_scope
+        and previous_projection.get("objective_apply_pending") is True
+    )
+    else 1
+)
+objective_apply_target_replay_exhausted = (
+    objective_apply_pending
+    and objective_apply_target_replay_count >= threshold
+)
 objective_apply_authorization_lost = (
     progress_projection["next_action"] == "apply_authorized_objective_proposal"
     and progress_projection["candidate_count"] > 0
     and not objective_apply_pending
 )
 progress_projection["objective_apply_authorization_scope"] = objective_apply_scope
+progress_projection["objective_apply_target_scope"] = objective_apply_target_scope
+progress_projection["objective_apply_target_replay_count"] = objective_apply_target_replay_count
+progress_projection["objective_apply_target_replay_exhausted"] = objective_apply_target_replay_exhausted
 progress_projection["objective_apply_authorized"] = objective_apply_pending
 progress_projection["objective_apply_authorization_lost"] = objective_apply_authorization_lost
 progress_projection["objective_apply_pending"] = objective_apply_pending
@@ -9654,7 +9689,7 @@ previous_count = int(previous.get("same_progress_count", 0) or 0)
 same_count = previous_count + 1 if previous_fingerprint == fingerprint else 1
 objective_apply_stalled = (
     objective_apply_pending
-    and same_count >= threshold
+    and (same_count >= threshold or objective_apply_target_replay_exhausted)
     and not workspace_changed
     and not completed
     and not accepted
