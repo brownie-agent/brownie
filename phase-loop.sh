@@ -9696,12 +9696,39 @@ continuation_required = (
 )
 meaningful_progress = exit_code == 0 and (workspace_changed or completed or accepted or finalized or applied)
 
-encoded = json.dumps(progress_projection, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+# Target-level replay lineage is supervisory metadata, not Runtime progress.
+# Including its incrementing counter in the progress fingerprint would reset
+# same-progress detection on every legacy resume and prevent the established
+# same-claim replan recovery from ever reaching its threshold.  Keep it durable
+# for replacement-claim protection, but exclude it from the runtime-progress
+# equivalence relation.
+fingerprint_projection = dict(progress_projection)
+for target_lineage_field in (
+    "objective_apply_target_scope",
+    "objective_apply_target_replay_count",
+    "objective_apply_target_replay_exhausted",
+):
+    fingerprint_projection.pop(target_lineage_field, None)
+encoded = json.dumps(fingerprint_projection, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 fingerprint = "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 previous_fingerprint = previous.get("last_progress_fingerprint")
 previous_count = int(previous.get("same_progress_count", 0) or 0)
 same_count = previous_count + 1 if previous_fingerprint == fingerprint else 1
+# A replacement claim intentionally changes the normal fingerprint, but it
+# must not mint another objective-apply budget for the same immutable TODO.
+# Promote an exhausted cross-claim replay to the supervisor threshold so the
+# existing causeful TODO-contract replan path runs instead of emitting a
+# replacement-free todo.replanned ledger event.
+target_replay_exhausted_after_claim_replacement = (
+    objective_apply_target_replay_exhausted
+    and same_objective_apply_target_scope
+    and bool(progress_projection["claim_id"])
+    and bool(text(previous_projection.get("claim_id")))
+    and progress_projection["claim_id"] != text(previous_projection.get("claim_id"))
+)
+if target_replay_exhausted_after_claim_replacement:
+    same_count = max(same_count, threshold)
 objective_apply_stalled = (
     objective_apply_pending
     and (same_count >= threshold or objective_apply_target_replay_exhausted)
@@ -9718,6 +9745,7 @@ if objective_apply_authorization_lost:
 if objective_apply_stalled:
     continuation_required = False
 progress_projection["objective_apply_stalled"] = objective_apply_stalled
+progress_projection["objective_apply_target_replay_exhausted_after_claim_replacement"] = target_replay_exhausted_after_claim_replacement
 # `stale_progress` with no eligible candidate is not an authorized route.  A
 # continuation can legitimately need one bounded retry while the runtime
 # publishes its durable checkpoint, but retrying the same scoped state again
