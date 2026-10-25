@@ -505,6 +505,13 @@ check_brownie_binary_freshness() {
   if [ "$PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK" = "1" ]; then
     return 0
   fi
+  # Claim-smoke uses a deliberately minimal synthetic CLI.  Its test-only
+  # profile is already rejected outside this exact fixture pairing, so do not
+  # apply production Rust-source freshness semantics to that fake binary.
+  if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" = "claim-smoke-fixture" ] \
+    && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
+    return 0
+  fi
   # An explicit binary path is an operator selection, not an exemption from
   # the admission contract. An older workspace binary can lack the
   # claim-attestation fields required by a newer controller and turn a valid
