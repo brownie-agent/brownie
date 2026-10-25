@@ -395,7 +395,7 @@ test('run-once serializes ownership and installs exit and signal terminalization
   assert.ok(controller.includes("trap 'phase_loop_handle_run_signal TERM' TERM"));
   assert.match(controller, /Unexpected phase-loop run-once exit; terminalized status/u);
   assert.match(controller, /--owner-pid "\$\{PHASE_LOOP_SUPERVISOR_PID:-\}"/u);
-  assert.match(controller, /continuation_required\)\n[\s\S]*write_status "running"[^\n]*"true"/u);
+  assert.match(controller, /continuation_required\)\n[\s\S]*write_status "continuation_required"[^\n]*"true"/u);
   assert.match(controller, /PHASE_LOOP_DEFERRED_SIGNAL_PENDING=1/gu);
   assert.match(controller, /phase_loop_drain_deferred_signal/gu);
   assert.match(controller, /PHASE_LOOP_DEFERRED_SIGNAL_FILE/gu);
