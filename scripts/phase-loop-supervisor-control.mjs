@@ -278,6 +278,26 @@ function maybeRepairTodoContract(repoRoot, diagnostic) {
   }
 }
 
+function maybeRepairCompletedTodoProjection(repoRoot, diagnostic) {
+  const codes = issueCodes(diagnostic);
+  const detail = String(diagnostic.phase_loop?.detail ?? '');
+  if (!codes.has('todo_queue_integrity_invalid') && !detail.includes('TODO queue integrity failed before claim')) {
+    return { attempted: false, reason: 'todo_queue_integrity_valid_or_not_reported' };
+  }
+  try {
+    const result = runJsonCommand(repoRoot, process.execPath, [
+      controlPlaneScript('scripts/phase-loop-todo-completion-reconcile.mjs'),
+      '--repo', repoRoot,
+      '--todo', workspaceTodoPath(repoRoot),
+      '--run-stamp', String(diagnostic.phase_loop?.run_id ?? new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z'))
+    ]);
+    if (result.applied !== true) return { attempted: false, reason: result.reason ?? 'no_completed_todo_projection_drift', result };
+    return { attempted: true, ok: true, result, integrity: runTodoQueueIntegrity(repoRoot) };
+  } catch (error) {
+    return { attempted: true, ok: false, error: error?.message ?? String(error) };
+  }
+}
+
 function maybeRepairTodoQueueIntegrity(repoRoot, diagnostic) {
   const codes = issueCodes(diagnostic);
   const detail = String(diagnostic.phase_loop?.detail ?? '');
@@ -304,6 +324,7 @@ function maybeRepairTodoQueueIntegrity(repoRoot, diagnostic) {
   }
 
   const claimPath = workspaceStatePath(repoRoot, 'todo-claims/current.json');
+
   // A durable dependency graph is the controller's decomposition evidence.
   // When the live queue drifted from one unambiguous graph, reconcile it
   // before asking the broader decomposition recovery to replan the task.
@@ -2991,12 +3012,22 @@ export function controlPhaseLoop(options = {}) {
   const afterResidueRepair = nonLiveTodoResidueRepair.attempted && nonLiveTodoResidueRepair.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterAcknowledgedDelegationReconciliation;
-  const staleActiveClaimRepair = options.repair === false
+  // The ordinary residue repair handles active claims and dependent contract
+  // pruning. If it cannot see a claim, reconcile only the remaining
+  // receipt-backed completed projection; this remains a narrow, auditable
+  // fallback rather than changing the normal cleanup result.
+  const completedTodoProjectionRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : maybeArchiveStaleActiveClaim(repoRoot, afterResidueRepair);
-  const afterClaimRepair = staleActiveClaimRepair.attempted && staleActiveClaimRepair.ok
+    : maybeRepairCompletedTodoProjection(repoRoot, afterResidueRepair);
+  const afterCompletedTodoProjectionRepair = completedTodoProjectionRepair.attempted && completedTodoProjectionRepair.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
     : afterResidueRepair;
+  const staleActiveClaimRepair = options.repair === false
+    ? { attempted: false, reason: 'repair_disabled' }
+    : maybeArchiveStaleActiveClaim(repoRoot, afterCompletedTodoProjectionRepair);
+  const afterClaimRepair = staleActiveClaimRepair.attempted && staleActiveClaimRepair.ok
+    ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
+    : afterCompletedTodoProjectionRepair;
   const rejectedBoundedLeafReplanResidueRepair = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
     : maybeRepairRejectedBoundedLeafReplanResidue(repoRoot, afterClaimRepair);
@@ -3148,6 +3179,7 @@ export function controlPhaseLoop(options = {}) {
     stalled_todo_decomposition: stalledTodoDecomposition,
     post_replan_stale_active_claim: postReplanStaleActiveClaimRepair,
     non_live_todo_residue: nonLiveTodoResidueRepair,
+    completed_todo_projection: completedTodoProjectionRepair,
     rejected_bounded_leaf_replan_residue: rejectedBoundedLeafReplanResidueRepair,
     stale_active_claim: staleActiveClaimRepair,
     terminal_no_eligible_claim: terminalNoEligibleClaimRepair,
