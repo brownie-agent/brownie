@@ -171,6 +171,27 @@ function exactReplanEvents(events, parentEvent, children, parentTaskId, runId) {
   return [parentEvent, ...matchedChildren];
 }
 
+function logicalTaskId(taskId) {
+  return String(taskId ?? '').split('@', 1)[0];
+}
+
+function reusableReplacementChild(events, projection, child, parentTaskId) {
+  const current = projection.get(child?.task_id);
+  // A replacement created for an earlier immutable attempt can be reused by
+  // a later attempt only while it is still queued.  Once claimed or terminal,
+  // a controller must not silently attach a second parent to in-flight or
+  // historical work.
+  if (current?.to_state !== 'queued') return null;
+  const initial = events.find((event) => event?.task_id === child?.task_id && event?.sequence === 1);
+  if (!initial || logicalTaskId(initial.parent_task_id) !== logicalTaskId(parentTaskId)) return null;
+  return semanticEqual(initial?.patch_targets, child?.patch_targets)
+    && semanticEqual(initial?.verification_commands, child?.verification_commands)
+    && semanticEqual(initial?.route, child?.route)
+    && (initial?.task_spec_sha256 ?? null) === (child?.task_spec_sha256 ?? null)
+    ? initial
+    : null;
+}
+
 // Replanning is a single ledger commit: the original task becomes terminal
 // only in the same append that introduces every replacement child.  The TODO
 // markdown remains a compatibility projection during migration; consumers
@@ -210,7 +231,31 @@ export function replanTaskWithChildren(repoRoot, { task_id, reason, children, ru
   for (const child of children) {
     const gate = taskIsExecutable(child);
     if (!gate.ok) return { ok: false, code: 'replan_child_not_executable', task_id: child.task_id, missing: gate.missing };
-    if (projection.has(child.task_id)) return { ok: false, code: 'replan_child_already_exists', task_id: child.task_id };
+  }
+  const existingChildren = children.filter((child) => projection.has(child.task_id));
+  if (existingChildren.length > 0) {
+    // Never create a partial replacement set.  Reusing is permitted only
+    // when every requested child is the still-queued, semantically identical
+    // replacement of the same logical TODO from an earlier attempt.
+    if (existingChildren.length !== children.length) {
+      return { ok: false, code: 'replan_child_collision_mixed_set', task_ids: existingChildren.map((child) => child.task_id) };
+    }
+    const reused = children.map((child) => reusableReplacementChild(events, projection, child, task_id));
+    if (reused.some((child) => !child)) {
+      return { ok: false, code: 'replan_child_collision_not_reusable', task_ids: childIds };
+    }
+    const result = appendTaskTransition(repoRoot, {
+      task_id,
+      to_state: 'replanned',
+      reason,
+      replaces: childIds,
+      run_id,
+      claim_id,
+      task_spec_sha256,
+      at
+    });
+    if (!result.ok) return result;
+    return { ok: true, code: 'replan_reused_children', events: [result.event, ...reused], reused: true };
   }
   const timestamp = at ?? new Date().toISOString();
   const parentEvent = {
