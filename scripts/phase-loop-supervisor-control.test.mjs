@@ -82,10 +82,12 @@ function makeRepo() {
     path.join(__dirname, 'phase-loop-preclaim-recovery.mjs'),
     path.join(repo, 'scripts/phase-loop-preclaim-recovery.mjs')
   );
+  fs.copyFileSync(path.join(__dirname, 'phase-loop-todo-completion-reconcile.mjs'), path.join(repo, 'scripts/phase-loop-todo-completion-reconcile.mjs'));
+  fs.copyFileSync(path.join(__dirname, 'phase-loop-todo-breakdown-reconcile.mjs'), path.join(repo, 'scripts/phase-loop-todo-breakdown-reconcile.mjs'));
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' });
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
   execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
-  execFileSync('git', ['add', 'package.json', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-state.mjs', 'scripts/phase-loop-todo-contract-rebaseline.mjs', 'scripts/guard-todo-decomposition.mjs', 'scripts/repair-todo-decomposition.mjs', 'scripts/phase-loop-preclaim-recovery.mjs'], { cwd: repo });
+  execFileSync('git', ['add', 'package.json', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-state.mjs', 'scripts/phase-loop-todo-contract-rebaseline.mjs', 'scripts/guard-todo-decomposition.mjs', 'scripts/repair-todo-decomposition.mjs', 'scripts/phase-loop-preclaim-recovery.mjs', 'scripts/phase-loop-todo-completion-reconcile.mjs', 'scripts/phase-loop-todo-breakdown-reconcile.mjs'], { cwd: repo });
   execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
   return repo;
 }
