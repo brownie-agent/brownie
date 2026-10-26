@@ -1768,8 +1768,16 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   // directly into the existing auditable delegation gate.  Other feedback
   // kinds (for example semantic verification repair) retain the bounded
   // source-recovery behaviour below.
-  const terminalContractReplan = replanFeedback?.kind === 'phase_loop_todo_contract_replan_feedback'
+  const contractFeedbackBindsSource = replanFeedback?.kind === 'phase_loop_todo_contract_replan_feedback'
     && todoIdFromFirstLine(replanFeedback.selected_todo_first_line) === sourceId;
+  // Terminal-runtime feedback may replace the contract packet before this
+  // recovery runs.  The durable blocked ledger is the independent source
+  // binding in that case; do not let feedback replacement erase causality.
+  const contractBlockBindsSource = readJsonl(blockedPath).some((record) => (
+    record?.block_reason === 'stalled_leaf_contract_replan'
+      && (record?.todo_id === sourceId || todoIdFromFirstLine(record?.selected_todo_first_line) === sourceId)
+  ));
+  const terminalContractReplan = contractFeedbackBindsSource || contractBlockBindsSource;
 
   const removed = removeTodoBlocksById(todoText, new Set([selectedId]));
   fs.writeFileSync(todoPath, removed.text, { encoding: 'utf8', mode: 0o600 });
