@@ -89,6 +89,19 @@ test('controller validates queue integrity before resuming an active claim', () 
   assert.match(controller, /todo-queue-integrity-resume-\$run_stamp/);
 });
 
+test('explicit run-once rebaselines only a stale stop marker after acquiring ownership', () => {
+  const start = controller.indexOf('  run-once)');
+  const end = controller.indexOf('  *)', start);
+  assert(start >= 0 && end > start, 'run-once command handler must exist');
+  const runOnce = controller.slice(start, end);
+  const lock = runOnce.indexOf('if ! acquire_lock; then');
+  const rebaseline = runOnce.indexOf('run_once_stop_file_rebaselined=true');
+  const clear = runOnce.indexOf('rm -f "$STOP_FILE"', rebaseline);
+  const execution = runOnce.indexOf('run_brownie_once');
+  assert(lock >= 0 && rebaseline > lock && clear > rebaseline && execution > clear);
+  assert.match(runOnce, /if \[ -f "\$STOP_FILE" \]; then/);
+});
+
 test('claim snapshot restore validates durable identity before writing current claim', () => {
   const start = controller.indexOf('restore_claim_snapshot_before_runtime()');
   const end = controller.indexOf('\ncompleted_todo_cleanup_pending()', start);
