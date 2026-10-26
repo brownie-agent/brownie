@@ -3334,7 +3334,15 @@ prompt_todo_md_only="$(mktemp)"
 todo_todo_md_only="$(mktemp)"
 workspace_todo_md_only="$(mktemp -d)"
 git -C "$workspace_todo_md_only" init -b main >/dev/null
-git -C "$workspace_todo_md_only" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$workspace_todo_md_only/.brownie"
+# The second invocation deliberately exercises terminal recovery.  Keep this
+# fixture small, but give the recovery path the same package-script contract
+# it uses in a real workspace; otherwise an ENOENT from pnpm masks the
+# terminal classification being tested.
+printf '%s\n' '{"name":"brownie-claim-smoke-todo-md-only-fixture","private":true,"scripts":{"guard:todo-decomposition":"true","phase-loop:todo-queue-integrity":"true"}}' > "$workspace_todo_md_only/package.json"
+printf '# queue fixture breakdown\n' > "$workspace_todo_md_only/.brownie/todo-breakdown.md"
+git -C "$workspace_todo_md_only" add package.json .brownie/todo-breakdown.md
+git -C "$workspace_todo_md_only" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
 printf 'base prompt\n' > "$prompt_todo_md_only"
 printf -- '- [ ] E-08b-next: Finish E-08b after read-budget exhaustion:\n  Source TODO: E-08b: Fail closed on supply-chain scan and network failures.\n' > "$todo_todo_md_only"
 
@@ -3363,12 +3371,17 @@ assert claim["status"] == "in_progress", claim
 assert "E-08b-next" in todo, todo
 PY
 
+set +e
 PHASE_LOOP_STATE_DIR="$state_todo_md_only" \
 PHASE_LOOP_PROMPT="$prompt_todo_md_only" \
 PHASE_LOOP_TODO="$todo_todo_md_only" \
 BROWNIE_BIN="$fake_brownie_no_actionable" \
 PHASE_LOOP_WORKSPACE_ROOT="$workspace_todo_md_only" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+todo_md_only_terminal_exit="$?"
+set -e
+test "$todo_md_only_terminal_exit" = "76"
 
 python3 - "$state_todo_md_only/status.json" "$state_todo_md_only/progress-state.json" "$state_todo_md_only/todo-claims/current.json" "$todo_todo_md_only" <<'PY'
 import json
@@ -3379,8 +3392,10 @@ progress = json.load(open(sys.argv[2], encoding="utf-8"))
 claim = json.load(open(sys.argv[3], encoding="utf-8"))
 todo = open(sys.argv[4], encoding="utf-8").read()
 projection = progress["progress_projection"]
-assert status["status"] == "non_progress_success", status
-assert progress["classification"] == "non_progress_success", progress
+assert status["status"] == "blocked", status
+assert status["exit_code"] == "76", status
+assert "without current-run task execution evidence" in status["detail"], status
+assert progress["classification"] == "terminal_failure", progress
 assert progress["meaningful_progress"] is False, progress
 assert projection["completed_by_no_actionable_after_apply"] is False, projection
 assert claim["status"] == "in_progress", claim
