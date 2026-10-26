@@ -1481,7 +1481,7 @@ Parent TODO: E-22e-release-contract-trace-binding-guard
   assert.match(breakdown, /TODO-repair-E-22e-replan-stalled-leaf-16e2c69e67bb/u);
 });
 
-test('recovers a terminal no-eligible generated replan projected onto its bounded implementation source', () => {
+test('fails closed to implementation delegation when a contract-replan leaf terminalizes', () => {
   const repo = makeRepo();
   writeTodo(repo);
   const sourceTodo = runtimeEvidenceTodo;
@@ -1518,13 +1518,13 @@ test('recovers a terminal no-eligible generated replan projected onto its bounde
   const feedback = JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8'));
 
   assert.equal(result.repair.terminal_stalled_replan_recovery.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.terminal_stalled_replan_recovery.reason, 'terminal_contract_replan_delegated_without_source_restore');
   assert.match(todo, new RegExp(sourceId, 'u'));
   assert.doesNotMatch(todo, new RegExp(replanId, 'u'));
-  assert.equal(feedback.semantic_repair_policy.mode, 'force_bounded_leaf_target_patch');
+  assert.equal(feedback.kind, 'phase_loop_delegation_pending');
+  assert.equal(feedback.reason, 'terminal_generated_contract_replan_requires_implementation_handoff');
+  assert.equal(feedback.delegation.status, 'pending');
   assert.equal(feedback.archived_claim_path, null);
-  assert.deepEqual(feedback.semantic_repair_policy.selected_patch_targets, [
-    'scripts/guard-runtime-operational-evidence.test.mjs'
-  ]);
   assert.equal(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl'), 'utf8'), '');
 });
 
