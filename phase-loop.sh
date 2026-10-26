@@ -16671,7 +16671,22 @@ PY
           set -e
           printf '%s run=%s terminal_execution_evidence_missing_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$terminal_missing_evidence_supervisor_status" "${terminal_missing_evidence_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
           if ! active_todo_claim_exists; then
-            detail="Brownie reported terminal/no-eligible without executing the selected task; archived the verified claim so the next controller run must mint a fresh target snapshot. evidence=$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+            local terminal_missing_evidence_cause="terminal_no_execution_evidence"
+            if python3 - "$PROGRESS_STATE_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    projection = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")).get("progress_projection", {})
+except Exception:
+    projection = {}
+raise SystemExit(0 if isinstance(projection, dict) and projection.get("objective_apply_stalled") is True else 1)
+PY
+            then
+              terminal_missing_evidence_cause="objective_apply_stalled"
+            fi
+            detail="Brownie reported ${terminal_missing_evidence_cause} without executing the selected task; archived the verified claim so the next controller run must mint a fresh target snapshot. evidence=$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
             write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-0}"
           fi
           printf '%s run=%s terminal_execution_evidence_missing=true recovery_state=redelegatable evidence=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"

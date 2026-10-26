@@ -59,6 +59,8 @@ test('objective-apply replay budget follows the selected TODO across replacement
   const terminalFeedbackOffset = controller.indexOf('write_bdk_trajectory_event "$run_stamp" "todo.repair_feedback" \'{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}\'');
   const terminalArchiveOffset = controller.indexOf('run_integrated_supervisor_control "$run_stamp" "terminal_execution_evidence_missing"');
   assert.ok(terminalFeedbackOffset >= 0 && terminalFeedbackOffset < terminalArchiveOffset);
+  assert.match(controller, /terminal_missing_evidence_cause="objective_apply_stalled"/);
+  assert.match(controller, /reported \$\{terminal_missing_evidence_cause\} without executing the selected task/);
   assert.match(controller, /Target-level replay lineage is supervisory metadata, not Runtime progress/);
   assert.match(controller, /fingerprint_projection\.pop\(target_lineage_field, None\)/);
   assert.match(controller, /target_replay_exhausted_after_claim_replacement = \(/);
