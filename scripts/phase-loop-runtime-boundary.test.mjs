@@ -145,3 +145,14 @@ test('terminal todo-decomposition leaves use integrated recovery instead of nest
   assert.match(controller, /"split \.brownie\/todo\.md and \.brownie\/todo-breakdown\.md into nested file-specific leaves"/u);
   assert.match(controller, /retire the generated todo-decomposition leaf through integrated supervisor recovery/u);
 });
+
+test('missing execution evidence preserves a verified terminal-replan recovery', () => {
+  const start = controller.indexOf('terminal_execution_evidence_missing_integrated_supervisor_control=true');
+  const end = controller.indexOf('        if active_todo_claim_exists; then', start);
+  assert(start >= 0 && end > start, 'missing-execution-evidence recovery block must exist');
+  const block = controller.slice(start, end);
+  assert.match(block, /phase_loop_terminal_stalled_replan_recovered/);
+  assert.match(block, /terminal_execution_evidence_stalled_replan_recovery_continued=true/);
+  assert.match(block, /write_status "replanned"/);
+  assert.match(block, /return 0/);
+});

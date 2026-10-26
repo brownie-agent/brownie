@@ -16690,6 +16690,19 @@ PY
           terminal_missing_evidence_supervisor_status=$?
           set -e
           printf '%s run=%s terminal_execution_evidence_missing_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$terminal_missing_evidence_supervisor_status" "${terminal_missing_evidence_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
+          # The supervisor can retire a generated todo-decomposition leaf
+          # during this no-execution path and restore its bounded
+          # implementation successor.  That is an auditable state migration,
+          # not a retry of the unexecuted Runtime task.  Do not overwrite the
+          # recovery with an unconditional blocked result: the next run must
+          # mint a fresh claim for the restored leaf.
+          if phase_loop_terminal_stalled_replan_recovered; then
+            detail="Integrated supervisor retired the terminal todo-decomposition leaf after missing execution evidence and selected its bounded implementation successor; continuing with a fresh claim. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+            write_status "replanned" "$detail" "$run_id" "0" "0"
+            printf '%s run=%s terminal_execution_evidence_stalled_replan_recovery_continued=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+            write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"terminal_execution_evidence_stalled_replan_recovery"}'
+            return 0
+          fi
           if ! active_todo_claim_exists; then
             local terminal_missing_evidence_cause="terminal_no_execution_evidence"
             if python3 - "$PROGRESS_STATE_FILE" <<'PY'
