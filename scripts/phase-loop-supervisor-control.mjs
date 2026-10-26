@@ -1761,6 +1761,15 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   if (!sourceId || !sourceBlock || !/Route:\s*implementation\./u.test(sourceBlock.block) || !/Patch only\s+`[^`]+`/u.test(sourceBlock.block)) {
     return { attempted: true, ok: false, reason: 'replan_source_is_not_a_bounded_implementation_leaf', todo_id: selectedId, source_todo_id: sourceId };
   }
+  // A contract-replan packet means the source already exhausted its declared
+  // target/verification contract.  A terminal generated replan is therefore
+  // evidence against retrying that same source, not a reason to restore it
+  // with a force-patch instruction.  Preserve that causality by transitioning
+  // directly into the existing auditable delegation gate.  Other feedback
+  // kinds (for example semantic verification repair) retain the bounded
+  // source-recovery behaviour below.
+  const terminalContractReplan = replanFeedback?.kind === 'phase_loop_todo_contract_replan_feedback'
+    && todoIdFromFirstLine(replanFeedback.selected_todo_first_line) === sourceId;
 
   const removed = removeTodoBlocksById(todoText, new Set([selectedId]));
   fs.writeFileSync(todoPath, removed.text, { encoding: 'utf8', mode: 0o600 });
@@ -1814,7 +1823,27 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   }
   const patchScope = sourceBlock.first_line ?? sourceBlock.block.split('\n')[0] ?? '';
   const patchTargets = [...patchScope.matchAll(/`([^`]+)`/gu)].map((match) => match[1]);
-  const feedback = {
+  const feedback = terminalContractReplan ? {
+    schema_version: 1,
+    kind: 'phase_loop_delegation_pending',
+    generated_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
+    completed: false,
+    reason: 'terminal_generated_contract_replan_requires_implementation_handoff',
+    claim_id: replanFeedback.claim_id ?? null,
+    selected_todo: sourceBlock.block,
+    selected_todo_first_line: sourceBlock.first_line,
+    superseded_replan_todo_id: selectedId,
+    archived_claim_path: archivedClaimPath,
+    failure_ledger_summary: replanFeedback.failure_ledger_summary ?? null,
+    delegation: {
+      required_actor: 'brownie-agent',
+      acknowledgement_required: true,
+      required_evidence: ['issue_or_pr_url', 'acknowledged_at', 'implementation_commit_or_blocker'],
+      status: 'pending'
+    },
+    repair_hint: 'The generated contract-replan leaf terminated without a workspace.write proposal. Do not recreate the same source target scope or another stalled-leaf replan. Record a brownie-agent acknowledgement and an implementation PR or a concrete blocker before clearing this state.',
+    generated_by: 'phase-loop-supervisor-control'
+  } : {
     schema_version: 1,
     kind: 'phase_loop_terminal_stalled_replan_recovery',
     generated_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
@@ -1840,6 +1869,9 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
     attempted: true,
     ok: true,
     changed: true,
+    reason: terminalContractReplan
+      ? 'terminal_contract_replan_delegated_without_source_restore'
+      : 'terminal_stalled_replan_recovered_to_bounded_leaf',
     source_todo_id: sourceId,
     removed_replan_todo_id: selectedId,
     queue_recovery: queueRecovery,
