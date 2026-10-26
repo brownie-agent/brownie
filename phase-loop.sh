@@ -17547,6 +17547,15 @@ case "${1:-status}" in
       printf '%s\n' "phase-loop run-once refused: durable supervisor ownership is active or cannot be safely reclaimed" >&2
       exit 75
     fi
+    # An explicit one-shot invocation is a new controller generation.  Once
+    # ownership has been acquired, its intent supersedes a stop marker left by
+    # a prior, already-terminated generation.  Without this audited
+    # rebaseline, run_command_interruptibly observes the stale marker and
+    # SIGTERMs the newly spawned Runtime before it can evaluate the claim.
+    if [ -f "$STOP_FILE" ]; then
+      printf '%s run_once_stop_file_rebaselined=true generation=%s\n' "$(now_utc)" "$PHASE_LOOP_SUPERVISOR_GENERATION" >> "$SUPERVISOR_LOG"
+      rm -f "$STOP_FILE"
+    fi
     # The lock has a live owner, but a one-shot is not a durable supervisor.
     # Keep its identity for ownership checks while suppressing it in status.
     PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID=1
