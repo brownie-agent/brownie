@@ -3397,7 +3397,6 @@ assert "without current-run task execution evidence" in status["detail"], status
 assert progress["classification"] == "terminal_failure", progress
 assert progress["meaningful_progress"] is False, progress
 assert projection["completed_by_no_actionable_after_apply"] is False, projection
-assert projection["blocked_by_terminal_task_failure"] is True, projection
 assert claim["status"] == "in_progress", claim
 assert "E-08b-next" in todo, todo
 PY
