@@ -55,6 +55,7 @@ test('objective-apply replay budget follows the selected TODO across replacement
   assert.match(controller, /objective_apply_terminal_failure = objective_apply_stalled/);
   assert.match(controller, /progress_projection\["objective_apply_terminal_failure"\] = objective_apply_terminal_failure/);
   assert.match(controller, /if terminal_non_progress or objective_apply_terminal_failure/);
+  assert.match(controller, /write_bdk_trajectory_event "\$run_stamp" "todo\.blocked" '\{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"\}'/);
   assert.match(controller, /Target-level replay lineage is supervisory metadata, not Runtime progress/);
   assert.match(controller, /fingerprint_projection\.pop\(target_lineage_field, None\)/);
   assert.match(controller, /target_replay_exhausted_after_claim_replacement = \(/);

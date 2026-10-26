@@ -16670,7 +16670,12 @@ PY
             write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-0}"
           fi
           printf '%s run=%s terminal_execution_evidence_missing=true recovery_state=redelegatable evidence=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
-          write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
+          # The claim is archived because the Runtime did not prove that it
+          # executed the selected task.  This is a blocking audit event, not
+          # a replan: advertising `todo.replanned` would authorize the
+          # harness (and a later controller pass) to repeat an unproven
+          # target from stale context.
+          write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
           return 76
         fi
         local terminal_failure_recovery_output terminal_failure_recovery_status
