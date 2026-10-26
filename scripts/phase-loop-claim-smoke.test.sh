@@ -3393,7 +3393,7 @@ todo = open(sys.argv[4], encoding="utf-8").read()
 projection = progress["progress_projection"]
 assert status["status"] == "blocked", status
 assert status["exit_code"] == "76", status
-assert "retry_cap=0" in status["detail"], status
+assert "without current-run task execution evidence" in status["detail"], status
 assert progress["classification"] == "terminal_failure", progress
 assert progress["meaningful_progress"] is False, progress
 assert projection["completed_by_no_actionable_after_apply"] is False, projection
