@@ -9828,6 +9828,13 @@ if objective_apply_authorization_lost:
 if objective_apply_stalled:
     continuation_required = False
 progress_projection["objective_apply_stalled"] = objective_apply_stalled
+# An authorization-loss or an exhausted authorized replay is a causeful
+# controller failure, not ordinary no-progress.  Leaving it in the
+# no-progress path lets the supervisor mint a replacement claim for the same
+# parent TODO, which repeats an apply request that the controller has already
+# proven it cannot safely honor.
+objective_apply_terminal_failure = objective_apply_stalled
+progress_projection["objective_apply_terminal_failure"] = objective_apply_terminal_failure
 progress_projection["objective_apply_target_replay_exhausted_after_claim_replacement"] = target_replay_exhausted_after_claim_replacement
 # `stale_progress` with no eligible candidate is not an authorized route.  A
 # continuation can legitimately need one bounded retry while the runtime
@@ -9851,11 +9858,11 @@ no_progress = exit_code == 0 and not meaningful_progress
 stagnated = no_progress and not continuation_required and same_count >= threshold
 classification = (
     "terminal_failure"
-    if terminal_non_progress
+    if terminal_non_progress or objective_apply_terminal_failure
     else "continuation_required"
     if continuation_required
     else "no_progress"
-    if (stagnated or terminal_non_progress or objective_apply_stalled)
+    if (stagnated or terminal_non_progress)
     else "non_progress_success"
     if no_progress
     else "progress"
@@ -16671,7 +16678,12 @@ PY
           # A terminal/no-eligible result with no executed task must not be
           # retried against the same claim.  The supervisor archives only a
           # target-matching, baseline-verified claim and records its audit
-          # trail; failure leaves this recoverable claim untouched.
+          # trail; failure leaves this recoverable claim untouched.  This is
+          # not a BDK terminal event: the Runtime did not execute the task.
+          # Record repair feedback while the claim still exists so the ledger
+          # binds the incomplete attempt to its selected task rather than
+          # creating an unclaimed trajectory after archival.
+          write_bdk_trajectory_event "$run_stamp" "todo.repair_feedback" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
           local terminal_missing_evidence_supervisor_output terminal_missing_evidence_supervisor_status
           set +e
           terminal_missing_evidence_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "terminal_execution_evidence_missing" 2>&1)"
@@ -16679,11 +16691,25 @@ PY
           set -e
           printf '%s run=%s terminal_execution_evidence_missing_integrated_supervisor_control=true exit=%s result=%s\n' "$(now_utc)" "$run_id" "$terminal_missing_evidence_supervisor_status" "${terminal_missing_evidence_supervisor_output:-<no output>}" >> "$SUPERVISOR_LOG"
           if ! active_todo_claim_exists; then
-            detail="Brownie reported terminal/no-eligible without executing the selected task; archived the verified claim so the next controller run must mint a fresh target snapshot. evidence=$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+            local terminal_missing_evidence_cause="terminal_no_execution_evidence"
+            if python3 - "$PROGRESS_STATE_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    projection = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")).get("progress_projection", {})
+except Exception:
+    projection = {}
+raise SystemExit(0 if isinstance(projection, dict) and projection.get("objective_apply_stalled") is True else 1)
+PY
+            then
+              terminal_missing_evidence_cause="objective_apply_stalled"
+            fi
+            detail="Brownie reported ${terminal_missing_evidence_cause} without executing the selected task; archived the verified claim so the next controller run must mint a fresh target snapshot. evidence=$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
             write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-0}"
           fi
           printf '%s run=%s terminal_execution_evidence_missing=true recovery_state=redelegatable evidence=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
-          write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
           return 76
         fi
         local terminal_failure_recovery_output terminal_failure_recovery_status
