@@ -42,6 +42,18 @@ test('controller stops repeated stale continuation scopes before a third blind r
   assert.match(controller, /"headless_selected_run_id": text\(payload\.get\("headless_selected_run_id"\)\)/);
 });
 
+test('pending claims with zero runtime candidates are terminal even when legacy resume omits blocked', () => {
+  assert.match(controller, /Runtime's legacy resume projection can report zero candidates with\n    # blocked=false even though an immutable pending claim was supplied/);
+  assert.match(controller, /bool\(progress_projection\["claim_id"\]\)/);
+  assert.match(controller, /bool\(progress_projection\["selected_todo"\]\)/);
+  assert.match(controller, /int\(progress_projection\["candidate_count"\] or 0\) == 0/);
+  assert.match(controller, /progress_projection\["cli_status"\] in \("no_eligible_task", "no_actionable_work"\)/);
+  assert.match(controller, /progress_projection\["cli_status"\] == "no_actionable_work"/);
+  assert.match(controller, /progress_projection\["stop_class"\] == "no_actionable_work"/);
+  assert.match(controller, /progress_projection\["controller_action"\] == "stop"/);
+  assert.match(controller, /classification = \(\n    "terminal_failure"\n    if terminal_non_progress/);
+});
+
 test('objective-apply replay budget follows the selected TODO across replacement claims', () => {
   assert.match(controller, /objective_apply_target_scope = json\.dumps/);
   assert.match(controller, /same_objective_apply_target_scope = \(/);
