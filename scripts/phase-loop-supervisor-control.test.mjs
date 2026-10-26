@@ -1481,7 +1481,7 @@ Parent TODO: E-22e-release-contract-trace-binding-guard
   assert.match(breakdown, /TODO-repair-E-22e-replan-stalled-leaf-16e2c69e67bb/u);
 });
 
-test('fails closed to implementation delegation when a contract-replan leaf terminalizes', () => {
+test('fails closed to implementation delegation when terminal feedback replaces a contract-replan packet', () => {
   const repo = makeRepo();
   writeTodo(repo);
   const sourceTodo = runtimeEvidenceTodo;
@@ -1505,7 +1505,7 @@ test('fails closed to implementation delegation when a contract-replan leaf term
     progress_projection: { cli_status: 'no_eligible_task', stop_class: 'terminal_failure', selected_todo: sourceTodo }
   });
   writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
-    kind: 'phase_loop_todo_contract_replan_feedback',
+    kind: 'phase_loop_terminal_failure_redelegation_required',
     selected_todo_first_line: sourceTodo.split('\n')[0]
   });
   fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl'), `${JSON.stringify({
