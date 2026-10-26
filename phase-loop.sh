@@ -16658,7 +16658,11 @@ PY
           # A terminal/no-eligible result with no executed task must not be
           # retried against the same claim.  The supervisor archives only a
           # target-matching, baseline-verified claim and records its audit
-          # trail; failure leaves this recoverable claim untouched.
+          # trail; failure leaves this recoverable claim untouched.  Record
+          # the block while the claim still exists so the ledger binds the
+          # terminal event to its selected task rather than creating an
+          # unclaimed trajectory after archival.
+          write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
           local terminal_missing_evidence_supervisor_output terminal_missing_evidence_supervisor_status
           set +e
           terminal_missing_evidence_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "terminal_execution_evidence_missing" 2>&1)"
@@ -16670,12 +16674,6 @@ PY
             write_status "blocked" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-0}"
           fi
           printf '%s run=%s terminal_execution_evidence_missing=true recovery_state=redelegatable evidence=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
-          # The claim is archived because the Runtime did not prove that it
-          # executed the selected task.  This is a blocking audit event, not
-          # a replan: advertising `todo.replanned` would authorize the
-          # harness (and a later controller pass) to repeat an unproven
-          # target from stale context.
-          write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
           return 76
         fi
         local terminal_failure_recovery_output terminal_failure_recovery_status
