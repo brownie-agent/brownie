@@ -9808,6 +9808,13 @@ if objective_apply_authorization_lost:
 if objective_apply_stalled:
     continuation_required = False
 progress_projection["objective_apply_stalled"] = objective_apply_stalled
+# An authorization-loss or an exhausted authorized replay is a causeful
+# controller failure, not ordinary no-progress.  Leaving it in the
+# no-progress path lets the supervisor mint a replacement claim for the same
+# parent TODO, which repeats an apply request that the controller has already
+# proven it cannot safely honor.
+objective_apply_terminal_failure = objective_apply_stalled
+progress_projection["objective_apply_terminal_failure"] = objective_apply_terminal_failure
 progress_projection["objective_apply_target_replay_exhausted_after_claim_replacement"] = target_replay_exhausted_after_claim_replacement
 # `stale_progress` with no eligible candidate is not an authorized route.  A
 # continuation can legitimately need one bounded retry while the runtime
@@ -9831,11 +9838,11 @@ no_progress = exit_code == 0 and not meaningful_progress
 stagnated = no_progress and not continuation_required and same_count >= threshold
 classification = (
     "terminal_failure"
-    if terminal_non_progress
+    if terminal_non_progress or objective_apply_terminal_failure
     else "continuation_required"
     if continuation_required
     else "no_progress"
-    if (stagnated or terminal_non_progress or objective_apply_stalled)
+    if (stagnated or terminal_non_progress)
     else "non_progress_success"
     if no_progress
     else "progress"

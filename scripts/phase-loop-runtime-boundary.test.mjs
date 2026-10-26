@@ -52,6 +52,9 @@ test('objective-apply replay budget follows the selected TODO across replacement
   assert.match(controller, /objective_apply_target_replay_count >= threshold/);
   assert.match(controller, /same_count >= threshold or objective_apply_target_replay_exhausted/);
   assert.match(controller, /progress_projection\["objective_apply_target_replay_exhausted"\]/);
+  assert.match(controller, /objective_apply_terminal_failure = objective_apply_stalled/);
+  assert.match(controller, /progress_projection\["objective_apply_terminal_failure"\] = objective_apply_terminal_failure/);
+  assert.match(controller, /if terminal_non_progress or objective_apply_terminal_failure/);
   assert.match(controller, /Target-level replay lineage is supervisory metadata, not Runtime progress/);
   assert.match(controller, /fingerprint_projection\.pop\(target_lineage_field, None\)/);
   assert.match(controller, /target_replay_exhausted_after_claim_replacement = \(/);

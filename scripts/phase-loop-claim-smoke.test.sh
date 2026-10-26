@@ -2889,12 +2889,13 @@ archives = sorted(claim_dir.glob("stale-current-*.json"))
 assert len(archives) == 1, archives
 claim = json.load(open(archives[0], encoding="utf-8"))
 projection = progress["progress_projection"]
-assert status["status"] == "no_progress", status
+assert status["status"] == "blocked", status
 assert "objective_apply_stalled" in status["detail"], status
-assert progress["classification"] == "no_progress", progress
+assert progress["classification"] == "terminal_failure", progress
 assert progress["same_progress_count"] == 3, progress
 assert projection["objective_apply_pending"] is True, projection
 assert projection["objective_apply_stalled"] is True, projection
+assert projection["objective_apply_terminal_failure"] is True, projection
 assert projection["objective_apply_authorized"] is True, projection
 assert projection["objective_apply_authorization_lost"] is False, projection
 assert projection["objective_apply_continuation_id"] == "continuation-objective-apply", projection
