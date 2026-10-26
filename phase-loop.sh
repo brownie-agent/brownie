@@ -16658,11 +16658,12 @@ PY
           # A terminal/no-eligible result with no executed task must not be
           # retried against the same claim.  The supervisor archives only a
           # target-matching, baseline-verified claim and records its audit
-          # trail; failure leaves this recoverable claim untouched.  Record
-          # the block while the claim still exists so the ledger binds the
-          # terminal event to its selected task rather than creating an
-          # unclaimed trajectory after archival.
-          write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
+          # trail; failure leaves this recoverable claim untouched.  This is
+          # not a BDK terminal event: the Runtime did not execute the task.
+          # Record repair feedback while the claim still exists so the ledger
+          # binds the incomplete attempt to its selected task rather than
+          # creating an unclaimed trajectory after archival.
+          write_bdk_trajectory_event "$run_stamp" "todo.repair_feedback" '{"reason":"terminal_execution_evidence_missing","recovery_state":"redelegatable"}'
           local terminal_missing_evidence_supervisor_output terminal_missing_evidence_supervisor_status
           set +e
           terminal_missing_evidence_supervisor_output="$(run_integrated_supervisor_control "$run_stamp" "terminal_execution_evidence_missing" 2>&1)"
