@@ -113,4 +113,6 @@ test('phase-loop refuses to enter a Brownie run before the source baseline guard
   assert.doesNotMatch(controller, /local guard_script="\$PHASE_LOOP_WORKSPACE_ROOT\/scripts\/phase-loop-source-baseline-guard/u);
   assert.match(controller, /phase-loop-workspace-control-parity-guard\.mjs/u);
   assert.match(controller, /--control-root "\$ROOT_DIR" --workspace-root "\$PHASE_LOOP_WORKSPACE_ROOT"/u);
+  assert.match(controller, /phase-loop-workspace-baseline-guard\.mjs/u);
+  assert.match(controller, /--workspace-root "\$PHASE_LOOP_WORKSPACE_ROOT" --baseline-ref "\$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE"/u);
 });

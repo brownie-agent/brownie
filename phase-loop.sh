@@ -13393,6 +13393,25 @@ phase_loop_require_approved_controller_baseline() {
     return 78
   fi
   printf '%s controller_workspace_control_parity_guard_passed=true result=%s\n' "$(now_utc)" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+  local workspace_baseline_guard="$ROOT_DIR/scripts/phase-loop-workspace-baseline-guard.mjs"
+  if [ ! -f "$workspace_baseline_guard" ]; then
+    PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT="missing workspace baseline guard script: $workspace_baseline_guard"
+    printf '%s controller_workspace_baseline_guard_failed=true reason=guard_missing path=%s\n' "$(now_utc)" "$workspace_baseline_guard" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  set +e
+  output="$(
+    cd "$ROOT_DIR" || exit 70
+    node "$workspace_baseline_guard" --workspace-root "$PHASE_LOOP_WORKSPACE_ROOT" --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" 2>&1
+  )"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    PHASE_LOOP_SOURCE_BASELINE_GUARD_OUTPUT="$output"
+    printf '%s controller_workspace_baseline_guard_failed=true baseline=%s result=%s\n' "$(now_utc)" "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  printf '%s controller_workspace_baseline_guard_passed=true baseline=%s result=%s\n' "$(now_utc)" "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
   return 0
 }
 
