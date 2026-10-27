@@ -1528,6 +1528,66 @@ test('fails closed to implementation delegation when terminal feedback replaces 
   assert.equal(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl'), 'utf8'), '');
 });
 
+test('recovers a legacy todo-decomposition terminal leaf through the bounded source handoff', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const sourceTodo = runtimeEvidenceTodo;
+  const sourceId = 'E-21c-runtime-operational-evidence-impl-2-target-02';
+  const legacyId = `TODO-decompose-blocked-queue-stalled-${'a'.repeat(12)}`;
+  const legacyTodo = `- [ ] ${legacyId}: Replan the blocked queue leaf.\n  Route: todo-decomposition. Source TODO \`${sourceId}\` was recorded with \`stalled_leaf_contract_replan\`.\n  Depends on: <none>.\n  Completion condition: hand off the bounded implementation leaf.\n  Forbidden changes: do not weaken guards/tests.\n  Verification: run \`pnpm --workspace-root guard:todo-decomposition\`.`;
+  fs.appendFileSync(path.join(repo, '.brownie/todo.md'), `\n${legacyTodo}\n`);
+  fs.appendFileSync(path.join(repo, '.brownie/todo-breakdown.md'), `\n## TODO-repair-${legacyId}\n\nParent TODO: ${sourceId}\n\nDependency graph:\n- ${legacyId}: <none>\n\nVerification ledger:\n- ${legacyId}: run \`pnpm --workspace-root guard:todo-decomposition\`\n\nQuality rubric:\n- ${legacyId}: bounded legacy recovery\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'blocked', run_id: 'legacy-terminal-replan', consecutive_failures: 0,
+    detail: 'runtime terminal task failed without a workspace.write proposal'
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1,
+    selected_todo: { id: sourceId, first_line: sourceTodo.split('\n')[0], route: 'implementation' },
+    progress_projection: { cli_status: 'no_eligible_task', stop_class: 'terminal_failure', selected_todo: sourceTodo }
+  });
+  writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
+    kind: 'phase_loop_terminal_failure_redelegation_required', selected_todo_first_line: sourceTodo.split('\n')[0]
+  });
+  fs.writeFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/blocked.jsonl'), `${JSON.stringify({
+    block_reason: 'stalled_leaf_contract_replan', todo_id: sourceId, selected_todo_first_line: sourceTodo.split('\n')[0]
+  })}\n`);
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+  const feedback = JSON.parse(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json'), 'utf8'));
+
+  assert.equal(result.repair.terminal_stalled_replan_recovery.ok, true, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.terminal_stalled_replan_recovery.reason, 'terminal_contract_replan_delegated_without_source_restore');
+  assert.match(todo, new RegExp(sourceId, 'u'));
+  assert.doesNotMatch(todo, new RegExp(legacyId, 'u'));
+  assert.equal(feedback.kind, 'phase_loop_delegation_pending');
+});
+
+test('fails closed when a legacy todo-decomposition leaf has no bounded source identifier', () => {
+  const repo = makeRepo();
+  writeTodo(repo);
+  const legacyId = `TODO-decompose-blocked-queue-stalled-${'b'.repeat(12)}`;
+  const legacyTodo = `- [ ] ${legacyId}: Replan the blocked queue leaf.\n  Route: todo-decomposition. Source TODO \`not a valid source\` was recorded with \`stalled_leaf_contract_replan\`.\n  Depends on: <none>.\n  Completion condition: hand off the bounded implementation leaf.\n  Forbidden changes: do not weaken guards/tests.\n  Verification: run \`pnpm --workspace-root guard:todo-decomposition\`.`;
+  fs.appendFileSync(path.join(repo, '.brownie/todo.md'), `\n${legacyTodo}\n`);
+  writeJson(repo, '.brownie/private/phase-loop/status.json', {
+    status: 'blocked', run_id: 'legacy-malformed-terminal-replan', consecutive_failures: 0,
+    detail: 'runtime terminal task failed without a workspace.write proposal'
+  });
+  writeJson(repo, '.brownie/private/phase-loop/progress-state.json', {
+    classification: 'no_progress', same_progress_count: 1,
+    selected_todo: { id: legacyId, first_line: legacyTodo.split('\n')[0], route: 'todo-decomposition' },
+    progress_projection: { cli_status: 'no_eligible_task', stop_class: 'terminal_failure', selected_todo: legacyTodo }
+  });
+
+  const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8');
+
+  assert.equal(result.repair.terminal_stalled_replan_recovery.ok, false, JSON.stringify(result, null, 2));
+  assert.equal(result.repair.terminal_stalled_replan_recovery.reason, 'replan_source_is_not_a_bounded_implementation_leaf');
+  assert.match(todo, new RegExp(legacyId, 'u'));
+});
+
 test('recovers a live generated replan after semantic verification feedback replaces its replan feedback', () => {
   const repo = makeRepo();
   writeTodo(repo);
