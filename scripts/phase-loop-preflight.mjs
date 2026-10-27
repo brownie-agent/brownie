@@ -626,7 +626,11 @@ export function validatePhaseLoopPreflight(options = {}) {
     claimPath: options.claim
   });
   validateDirtyTargetPlaceholders(repoRoot, todoText, errors);
-  validateCompletedParentPendingChildren(todoText, errors);
+  // Claim-smoke fixtures intentionally model intermediate controller-owned
+  // completion mutations. Production queues must never carry that shape.
+  if (!fixtureProfile) {
+    validateCompletedParentPendingChildren(todoText, errors);
+  }
   const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors);
 
   return {
