@@ -126,4 +126,4 @@ jobs:
         env:
           BROWNIE_RELEASE_ROUNDTRIP_DOWNLOAD_ROOT: roundtrip-download
           BROWNIE_RELEASE_ROUNDTRIP_TARGET: ${{ matrix.target }}
-        run: node --test scripts/release-artifact-roundtrip-e2e.test.mjs
+        run: corepack pnpm --workspace-root release:artifact-roundtrip:test

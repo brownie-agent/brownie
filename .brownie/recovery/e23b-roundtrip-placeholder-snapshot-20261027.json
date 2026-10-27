@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "kind": "brownie_agent_proxy_snapshot",
+  "captured_at": "2026-10-27T05:30:00Z",
+  "base_commit": "2bee77b9b9cf1a592c071b19e7cfcc6a14272908",
+  "reason": "E-23b rebaseline requires restoration of dirty bounded-proposal placeholders before implementation.",
+  "files": [
+    {
+      "path": "scripts/release-artifact-roundtrip-e2e.mjs",
+      "git_state": "untracked",
+      "sha256": "sha256:e47afee7fa71658475a5dc038c40ad782a54e8df3d51d7eecc1523baaff24576",
+      "content": "// Brownie bounded Create-only proposal."
+    },
+    {
+      "path": "scripts/release-artifact-roundtrip-e2e.test.mjs",
+      "git_state": "modified",
+      "sha256": "sha256:501df9fc56d10b20da18f556037d04f88e123d6a22053174b64e479b41f983eb",
+      "content": "// Brownie bounded Patch-only proposal.",
+      "head_blob": "c5327c6c6da15837e5bfc35f90631fc0f33011c3"
+    }
+  ]
+}
