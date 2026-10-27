@@ -1466,12 +1466,26 @@ function todoIdFromBlock(block) {
 }
 
 function sourceTodoFromBlock(block) {
-  const match = String(block ?? '').match(/^\s*Source TODO:\s*(.+?)\s*$/mu);
-  return match?.[1]?.trim()?.replace(/[.:;,]+$/u, '') ?? null;
+  const text = String(block ?? '');
+  const match = text.match(/^\s*Source TODO:\s*(.+?)\s*$/mu);
+  if (match?.[1]) {
+    return match[1].trim().replace(/[.:;,]+$/u, '');
+  }
+  // Early todo-decomposition leaves recorded their source inline in the
+  // summary rather than in the canonical `Source TODO:` field.  Accept only
+  // that legacy, route-scoped form and a safe TODO identifier; arbitrary
+  // prose must never become a recovery source binding.
+  const legacyMatch = text.match(/Route:\s*todo-decomposition\.[\s\S]*?Source TODO\s+`([A-Za-z0-9][A-Za-z0-9._-]*)`/u);
+  return legacyMatch?.[1] ?? null;
 }
 
 function isStalledLeafReplanId(todoId) {
   return typeof todoId === 'string' && /-replan-stalled-leaf-[a-f0-9]{12}$/u.test(todoId);
+}
+
+function isRecoverableTodoDecompositionId(todoId) {
+  return isStalledLeafReplanId(todoId)
+    || (typeof todoId === 'string' && /^TODO-decompose-blocked-queue-stalled-[a-f0-9]{12}$/u.test(todoId));
 }
 
 function removeTodoBlocksById(todoText, idsToRemove) {
@@ -1734,7 +1748,7 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
   // so derive the association from the live queue as well as from durable
   // feedback.  Require exactly one matching live replan to avoid recovering
   // an unrelated source leaf.
-  if (!isStalledLeafReplanId(selectedId)) {
+  if (!isRecoverableTodoDecompositionId(selectedId)) {
     const feedbackSourceId = replanFeedback?.kind === 'phase_loop_todo_contract_replan_feedback'
       ? todoIdFromFirstLine(replanFeedback.selected_todo_first_line)
       : null;
@@ -1744,14 +1758,14 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
     const sourceId = feedbackSourceId ?? selectedId;
     const matchingReplans = todoBlocks(todoText).filter((block) => {
       const candidateId = todoIdFromBlock(block.block);
-      return isStalledLeafReplanId(candidateId)
+      return isRecoverableTodoDecompositionId(candidateId)
         && sourceTodoFromBlock(block.block) === sourceId;
     });
     if ((feedbackSourceId === null || feedbackSourceId === selectedId) && matchingReplans.length === 1) {
       selectedId = todoIdFromBlock(matchingReplans[0].block) ?? selectedId;
     }
   }
-  if (!terminalNoProposal || !isStalledLeafReplanId(selectedId)) {
+  if (!terminalNoProposal || !isRecoverableTodoDecompositionId(selectedId)) {
     return { attempted: false, reason: 'terminal_stalled_replan_not_reported' };
   }
 
