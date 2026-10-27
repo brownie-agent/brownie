@@ -6494,12 +6494,28 @@ except Exception:
 # leaf. Once the integrated controller has retired it and selected its
 # bounded implementation successor, continuing is safe and is not a blind
 # retry of the terminal runtime task.
-if (
+direct_recovery = (
     feedback.get("kind") == "phase_loop_terminal_stalled_replan_recovery"
     and feedback.get("superseded_replan_todo_id")
     and feedback.get("selected_todo")
     and feedback.get("semantic_repair_policy", {}).get("mode") == "force_bounded_leaf_target_patch"
-):
+)
+# A terminal contract-replan must not be force-patched back into the same
+# target scope.  The supervisor replaces it with this auditable external
+# handoff; treat that replacement as a recovered terminal leaf so this shell
+# does not overwrite it with a stale retry-cap failure status.  A later run
+# will stop at phase_loop_delegation_pending until brownie-agent acknowledges
+# the handoff.
+delegated_recovery = (
+    feedback.get("kind") == "phase_loop_delegation_pending"
+    and feedback.get("reason") == "terminal_generated_contract_replan_requires_implementation_handoff"
+    and feedback.get("superseded_replan_todo_id")
+    and feedback.get("selected_todo")
+    and feedback.get("delegation", {}).get("required_actor") == "brownie-agent"
+    and feedback.get("delegation", {}).get("acknowledgement_required") is True
+    and feedback.get("delegation", {}).get("status") == "pending"
+)
+if direct_recovery or delegated_recovery:
     raise SystemExit(0)
 raise SystemExit(1)
 PY
