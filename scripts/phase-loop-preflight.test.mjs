@@ -60,6 +60,17 @@ test('rejects dirty delivery when only owner blocker remains', () => {
   assert(result.errors.some((error) => error.code === 'dirty_delivery_required'), JSON.stringify(result.errors));
 });
 
+test('rejects a dirty bounded-proposal placeholder before claiming its TODO', () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), '- [ ] E-guard: Patch only `scripts/target.mjs`:\n  Route: implementation.\n  Verification: run `node --test scripts/target.test.mjs`.\n');
+  fs.writeFileSync(path.join(repo, 'scripts/target.mjs'), '// Brownie bounded Patch-only proposal.\n');
+  const result = validatePhaseLoopPreflight({ repo, skipCommands: true });
+  const failure = result.errors.find((error) => error.code === 'contract_unsatisfiable_dirty_scope');
+  assert(failure, JSON.stringify(result.errors));
+  assert.equal(failure.target, 'scripts/target.mjs');
+  assert.match(failure.sha256, /^sha256:[a-f0-9]{64}$/u);
+});
+
 test('accepts Brownie-managed state changes when only an owner blocker remains', () => {
   const repo = makeRepo();
   fs.writeFileSync(path.join(repo, '.brownie/todo.md'), '- [ ] E-owner: Owner must provide release credentials:\n  Route: owner.\n  Verification: external owner handoff.\n');

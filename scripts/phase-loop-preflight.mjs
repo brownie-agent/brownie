@@ -331,7 +331,7 @@ function git(repoRoot, args) {
 }
 
 function gitDirtyFiles(repoRoot) {
-  const output = git(repoRoot, ['status', '--porcelain=v1']);
+  const output = git(repoRoot, ['status', '--porcelain=v1', '--untracked-files=all']);
   return output
     .split('\n')
     .map((line) => line.trimEnd())
@@ -474,6 +474,28 @@ function validateDirtyDelivery(repoRoot, todoText, errors, options = {}) {
   }
 }
 
+function validateDirtyTargetPlaceholders(repoRoot, todoText, errors) {
+  const dirty = new Set(gitDirtyFiles(repoRoot));
+  if (dirty.size === 0) return;
+  for (const block of uncheckedTodoBlocks(todoText)) {
+    const firstLine = block.split('\n')[0] ?? '';
+    const target = /(?:Patch|Create) only `([^`]+)`/u.exec(firstLine)?.[1];
+    if (!target || !dirty.has(target)) continue;
+    const absoluteTarget = path.join(repoRoot, target);
+    let content = '';
+    try { content = fs.readFileSync(absoluteTarget, 'utf8').trim(); } catch { continue; }
+    if (content.length <= 160 && /brownie bounded (?:patch|create)-only proposal\.?/iu.test(content)) {
+      errors.push({
+        code: 'contract_unsatisfiable_dirty_scope',
+        todo: firstLine.trim(),
+        target,
+        sha256: `sha256:${crypto.createHash('sha256').update(content).digest('hex')}`,
+        message: 'Selected TODO targets a dirty bounded-proposal placeholder. Snapshot and rebaseline the target set before any claim or retry.'
+      });
+    }
+  }
+}
+
 function validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors) {
   const controlScripts = path.join(controlPlaneRoot, 'scripts');
   const absoluteTodoPath = path.resolve(repoRoot, todoPath);
@@ -576,6 +598,7 @@ export function validatePhaseLoopPreflight(options = {}) {
     allowPendingCompletionRecovery: fixtureProfile,
     claimPath: options.claim
   });
+  validateDirtyTargetPlaceholders(repoRoot, todoText, errors);
   const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors);
 
   return {
