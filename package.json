@@ -125,6 +125,7 @@
     "release:dependency-security-license-audit:test": "node --test scripts/release-dependency-security-license-audit.test.mjs",
     "release:local-artifact": "node scripts/release-local-artifact.mjs",
     "release:local-artifact:test": "node --test scripts/release-local-artifact.test.mjs",
+    "release:artifact-roundtrip:test": "node scripts/release-artifact-roundtrip-e2e.mjs",
     "release:linux-x64-docker-artifact": "node scripts/release-linux-x64-docker-artifact.mjs",
     "release:local-artifacts:all": "node scripts/release-local-artifacts-all.mjs",
     "release:linux-vm-create": "node scripts/create-linux-release-vm.mjs",
