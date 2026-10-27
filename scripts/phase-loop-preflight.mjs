@@ -358,6 +358,33 @@ function uncheckedTodoBlocks(todoText) {
   });
 }
 
+function completedTodoIds(todoText) {
+  const ids = new Set();
+  const pattern = /^(?:[-*]|\d+[.)])\s+\[x\]\s+([A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*):/gmu;
+  let match;
+  while ((match = pattern.exec(todoText)) !== null) {
+    ids.add(match[1]);
+  }
+  return ids;
+}
+
+function validateCompletedParentPendingChildren(todoText, errors) {
+  const completed = completedTodoIds(todoText);
+  if (completed.size === 0) return;
+  for (const block of uncheckedTodoBlocks(todoText)) {
+    const firstLine = block.split('\n')[0] ?? '';
+    const child = /^(?:[-*]|\d+[.)])\s+\[\s\]\s+([A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*):/u.exec(firstLine)?.[1];
+    const parent = /^\s*Source TODO:\s*([A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*)\.?\s*$/mu.exec(block)?.[1];
+    if (!child || !parent || !completed.has(parent)) continue;
+    errors.push({
+      code: 'completed_parent_pending_child',
+      parent_todo: parent,
+      child_todo: child,
+      message: 'An unchecked child references a completed parent TODO. Record an auditable rebaseline that closes or supersedes the child before the phase loop can claim work.'
+    });
+  }
+}
+
 function hasImplementableTodo(todoText) {
   return uncheckedTodoBlocks(todoText).some((block) => {
     const lower = block.toLowerCase();
@@ -599,6 +626,11 @@ export function validatePhaseLoopPreflight(options = {}) {
     claimPath: options.claim
   });
   validateDirtyTargetPlaceholders(repoRoot, todoText, errors);
+  // Claim-smoke fixtures intentionally model intermediate controller-owned
+  // completion mutations. Production queues must never carry that shape.
+  if (!fixtureProfile) {
+    validateCompletedParentPendingChildren(todoText, errors);
+  }
   const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors);
 
   return {

@@ -71,6 +71,22 @@ test('rejects a dirty bounded-proposal placeholder before claiming its TODO', ()
   assert.match(failure.sha256, /^sha256:[a-f0-9]{64}$/u);
 });
 
+test('rejects an unchecked child whose parent TODO is already complete', () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), [
+    '- [x] E-parent: Completed parent.',
+    '- [ ] E-child: Patch only `scripts/target.mjs`:',
+    '  Route: implementation.',
+    '  Source TODO: E-parent.',
+    '  Verification: run `node --test scripts/target.test.mjs`.'
+  ].join('\n') + '\n');
+  const result = validatePhaseLoopPreflight({ repo, skipCommands: true });
+  const failure = result.errors.find((error) => error.code === 'completed_parent_pending_child');
+  assert(failure, JSON.stringify(result.errors));
+  assert.equal(failure.parent_todo, 'E-parent');
+  assert.equal(failure.child_todo, 'E-child');
+});
+
 test('accepts Brownie-managed state changes when only an owner blocker remains', () => {
   const repo = makeRepo();
   fs.writeFileSync(path.join(repo, '.brownie/todo.md'), '- [ ] E-owner: Owner must provide release credentials:\n  Route: owner.\n  Verification: external owner handoff.\n');
