@@ -6316,31 +6316,6 @@ restore_active_target_baseline() {
   return 1
 }
 
-# Restore the exact pre-dispatch target state for a failed Runtime invocation.
-# A missing target is an explicit baseline state, not an absent backup: without
-# the marker a failed create_file would survive recovery as an untracked file.
-# This function deliberately does not consult known-good state, because
-# admission recovery must restore the snapshot that was current at dispatch.
-restore_pre_runtime_active_target_snapshot() {
-  local target_path="${1:-}" snapshot_path="${2:-}" target_abs
-  if [ -z "$target_path" ] || [ -z "$snapshot_path" ]; then
-    return 0
-  fi
-  target_abs="$PHASE_LOOP_WORKSPACE_ROOT/$target_path"
-  if [ -f "$snapshot_path.absent" ]; then
-    if [ -e "$target_abs" ] || [ -L "$target_abs" ]; then
-      rm -f "$target_abs" || return 1
-    fi
-    return 0
-  fi
-  if [ -f "$snapshot_path" ]; then
-    mkdir -p "$(dirname "$target_abs")" || return 1
-    cp "$snapshot_path" "$target_abs"
-    return $?
-  fi
-  return 1
-}
-
 run_changed_file_quality_gates() {
   local before_status_path="${1:-}"
   python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$before_status_path" <<'PY'
@@ -8479,6 +8454,8 @@ PY
   esac
 }
 
+# The single primary target remains in use by older per-file quality gates.
+# Runtime admission recovery uses the complete manifest below instead.
 active_claim_patch_only_target() {
   if [ ! -f "$TODO_CLAIM_FILE" ]; then
     return 1
@@ -8504,6 +8481,177 @@ path = match.group(1).strip()
 if not path or path.startswith("/") or ".." in pathlib.PurePosixPath(path).parts:
     raise SystemExit(1)
 print(path)
+PY
+}
+
+capture_pre_runtime_active_target_snapshots() {
+  local snapshot_dir="$1"
+  if [ -z "$snapshot_dir" ] || [ ! -f "$TODO_CLAIM_FILE" ]; then
+    return 1
+  fi
+  python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$TODO_CLAIM_FILE" "$snapshot_dir" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import sys
+import tempfile
+
+workspace = pathlib.Path(sys.argv[1]).resolve()
+claim_path = pathlib.Path(sys.argv[2])
+snapshot_dir = pathlib.Path(sys.argv[3])
+
+def safe_relative_path(value):
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        raise ValueError("target must be a non-empty relative path")
+    candidate = pathlib.PurePosixPath(value)
+    if ".." in candidate.parts or candidate == pathlib.PurePosixPath("."):
+        raise ValueError("target escapes workspace")
+    return value
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+try:
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    selected = claim.get("selected_todo")
+    if not isinstance(selected, str):
+        raise ValueError("claim has no selected TODO")
+    first_line = selected.splitlines()[0] if selected.splitlines() else ""
+    markers = list(re.finditer(r"\b(?:Patch|Create)\s+only\b", first_line, flags=re.IGNORECASE))
+    targets = []
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(first_line)
+        for raw_target in re.findall(r"`([^`\n]+)`", first_line[marker.end():end]):
+            target = safe_relative_path(raw_target.strip())
+            if target not in targets:
+                targets.append(target)
+
+    temporary = pathlib.Path(tempfile.mkdtemp(prefix=f".{snapshot_dir.name}.tmp-", dir=snapshot_dir.parent))
+    entries = []
+    for index, target in enumerate(targets):
+        absolute = workspace.joinpath(*pathlib.PurePosixPath(target).parts)
+        resolved = absolute.resolve(strict=False)
+        if os.path.commonpath([str(workspace), str(resolved)]) != str(workspace):
+            raise ValueError("target escapes workspace")
+        if absolute.is_dir():
+            raise ValueError("target is a directory")
+        entry = {"path": target, "slot": index}
+        if absolute.exists():
+            if not absolute.is_file() or absolute.is_symlink():
+                raise ValueError("target is not a regular file")
+            stored = temporary / f"{index}.before"
+            shutil.copyfile(absolute, stored)
+            entry.update({"state": "file", "sha256": sha256(stored)})
+        else:
+            entry["state"] = "absent"
+        entries.append(entry)
+    manifest = {
+        "schema_version": 1,
+        "kind": "phase_loop_pre_runtime_target_snapshots",
+        "targets": entries,
+    }
+    (temporary / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir)
+    os.replace(temporary, snapshot_dir)
+except Exception as error:
+    print(f"pre-runtime target snapshot capture failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+# Restore every declared Patch/Create-only target to its exact pre-dispatch
+# state.  The manifest is intentionally claim-scoped: a multi-target proposal
+# must not silently leave a later Create-only file behind when admission fails.
+# Any discarded post-dispatch bytes are retained next to the snapshot for audit.
+restore_pre_runtime_active_target_snapshots() {
+  local snapshot_dir="$1"
+  if [ -z "$snapshot_dir" ]; then
+    return 0
+  fi
+  python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$snapshot_dir" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import sys
+
+workspace = pathlib.Path(sys.argv[1]).resolve()
+snapshot_dir = pathlib.Path(sys.argv[2])
+manifest_path = snapshot_dir / "manifest.json"
+
+def safe_absolute(value):
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        raise ValueError("invalid target path")
+    relative = pathlib.PurePosixPath(value)
+    if ".." in relative.parts or relative == pathlib.PurePosixPath("."):
+        raise ValueError("target escapes workspace")
+    absolute = workspace.joinpath(*relative.parts)
+    resolved = absolute.resolve(strict=False)
+    if os.path.commonpath([str(workspace), str(resolved)]) != str(workspace):
+        raise ValueError("target escapes workspace")
+    return absolute
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or manifest.get("kind") != "phase_loop_pre_runtime_target_snapshots":
+        raise ValueError("invalid snapshot manifest")
+    targets = manifest.get("targets")
+    if not isinstance(targets, list):
+        raise ValueError("invalid snapshot target list")
+    audit = []
+    discarded = snapshot_dir / "discarded-post-dispatch"
+    for entry in targets:
+        if not isinstance(entry, dict):
+            raise ValueError("invalid snapshot target entry")
+        absolute = safe_absolute(entry.get("path"))
+        state = entry.get("state")
+        slot = entry.get("slot")
+        if not isinstance(slot, int) or slot < 0 or state not in {"file", "absent"}:
+            raise ValueError("invalid snapshot target metadata")
+        if absolute.exists() or absolute.is_symlink():
+            if absolute.is_dir() or (not absolute.is_file() and not absolute.is_symlink()):
+                raise ValueError("refusing to restore over a directory or special file")
+            discarded.mkdir(exist_ok=True)
+            discarded_path = discarded / f"{slot}.after"
+            if absolute.is_symlink():
+                discarded_path.write_text(os.readlink(absolute), encoding="utf-8")
+                post_sha256 = None
+            else:
+                shutil.copyfile(absolute, discarded_path)
+                post_sha256 = sha256(discarded_path)
+            audit.append({"path": entry["path"], "state_before_restore": state, "post_dispatch_sha256": post_sha256, "discarded": str(discarded_path.relative_to(snapshot_dir))})
+        if state == "absent":
+            if absolute.exists() or absolute.is_symlink():
+                absolute.unlink()
+            continue
+        stored = snapshot_dir / f"{slot}.before"
+        expected_sha256 = entry.get("sha256")
+        if not stored.is_file() or not isinstance(expected_sha256, str) or sha256(stored) != expected_sha256:
+            raise ValueError("snapshot bytes are unavailable or corrupt")
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        temporary = absolute.with_name(f".{absolute.name}.phase-loop-restore")
+        shutil.copyfile(stored, temporary)
+        os.replace(temporary, absolute)
+    (snapshot_dir / "restore-audit.json").write_text(json.dumps({"schema_version": 1, "kind": "phase_loop_pre_runtime_target_restore", "targets": audit}, sort_keys=True) + "\n", encoding="utf-8")
+except Exception as error:
+    print(f"pre-runtime target snapshot restore failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
 PY
 }
 
@@ -14619,7 +14767,8 @@ phase_loop_recover_expired_runtime_authorization() {
   local delegated_scope_backup="$4"
   local active_target_path="$5"
   local active_target_snapshot="$6"
-  local claim_snapshot_before_runtime="$7"
+  local active_target_snapshots="$7"
+  local claim_snapshot_before_runtime="$8"
   local mismatch_scope_output mismatch_scope_status=0 mismatch_target_status=0 mismatch_claim_status=0
   local detail authorization_rebaseline_applied
 
@@ -14628,7 +14777,7 @@ phase_loop_recover_expired_runtime_authorization() {
     --backup "$delegated_scope_backup" \
     --objective "$(claim_field selected_todo)" 2>&1)"
   mismatch_scope_status=$?
-  restore_pre_runtime_active_target_snapshot "$active_target_path" "$active_target_snapshot"
+  restore_pre_runtime_active_target_snapshots "$active_target_snapshots"
   mismatch_target_status=$?
   # Do not synthesize a claim from live queue inputs while recovering an
   # interrupted Runtime session; preserve the exact pre-dispatch claim.
@@ -14780,7 +14929,7 @@ _run_brownie_once() {
   local release_contract_before release_contract_repair_output release_contract_repair_status
   local phase_value_manifest_before phase_value_manifest_repair_output phase_value_manifest_repair_status
   local workspace_status_before
-  local active_target_path active_target_snapshot active_target_syntax_output active_target_syntax_status claim_snapshot_before_runtime runtime_admission_snapshot runtime_admission_validation runtime_admission_status delegated_scope_backup delegated_scope_output delegated_scope_status
+  local active_target_path active_target_snapshot active_target_snapshots active_target_syntax_output active_target_syntax_status claim_snapshot_before_runtime runtime_admission_snapshot runtime_admission_validation runtime_admission_status delegated_scope_backup delegated_scope_output delegated_scope_status
   local use_resume=0
   local CLAIM_CREATED_THIS_RUN=0
   local CLAIM_REPLACED_BLOCKED=0
@@ -14894,6 +15043,7 @@ _run_brownie_once() {
   fi
   active_target_path="$(active_claim_patch_only_target 2>/dev/null || true)"
   active_target_snapshot=""
+  active_target_snapshots=""
   if [ -n "$active_target_path" ]; then
     active_target_snapshot="$RUN_DIR/$run_stamp.target.before"
     rm -f "$active_target_snapshot" "$active_target_snapshot.absent"
@@ -15243,6 +15393,13 @@ PY
       : > "$active_target_snapshot.absent"
       chmod 600 "$active_target_snapshot.absent" 2>/dev/null || true
     fi
+  fi
+  active_target_snapshots="$RUN_DIR/$run_stamp.targets.before"
+  if ! capture_pre_runtime_active_target_snapshots "$active_target_snapshots"; then
+    detail="Unable to capture every declared Patch/Create-only target before Runtime dispatch; refusing dispatch. snapshots=$active_target_snapshots"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
   fi
   local deterministic_todo_decomposition_output deterministic_todo_decomposition_status
   if deterministic_todo_decomposition_output="$(try_deterministic_todo_decomposition_repair "$run_stamp" 2>&1)"; then
@@ -15944,7 +16101,7 @@ NODE
   if runtime_stdout_has_expired_authorization "$stdout_log"; then
     phase_loop_recover_expired_runtime_authorization \
       "$run_stamp" "$stdout_log" "$stderr_log" "$delegated_scope_backup" \
-      "$active_target_path" "$active_target_snapshot" "$claim_snapshot_before_runtime"
+      "$active_target_path" "$active_target_snapshot" "$active_target_snapshots" "$claim_snapshot_before_runtime"
     return $?
   fi
   if runtime_admission_validation="$(node "$ROOT_DIR/scripts/phase-loop-runtime-admission.mjs" validate "$runtime_admission_snapshot" "$stdout_log" 2>&1)"; then
@@ -15967,7 +16124,7 @@ NODE
       --backup "$delegated_scope_backup" \
       --objective "$(claim_field selected_todo)" 2>&1)"
     mismatch_scope_status=$?
-    restore_pre_runtime_active_target_snapshot "$active_target_path" "$active_target_snapshot"
+    restore_pre_runtime_active_target_snapshots "$active_target_snapshots"
     mismatch_target_status=$?
     # Do not call write_todo_claim here: if Runtime removed current.json that
     # helper would synthesize a fresh claim from live inputs. Recovery must

@@ -99,39 +99,43 @@ PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS
 PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
 
 run_pre_runtime_target_snapshot_regression() {
-  local fixture helper workspace target snapshot
+  local fixture helper workspace claim snapshot
   fixture="$(mktemp -d)"
-  helper="$fixture/restore-target.sh"
+  helper="$fixture/target-snapshots.sh"
   workspace="$fixture/workspace"
-  target='scripts/generated-target.mjs'
-  snapshot="$fixture/target.before"
+  claim="$fixture/claim.json"
+  snapshot="$fixture/targets.before"
   mkdir -p "$workspace/scripts"
-  sed -n '/^restore_pre_runtime_active_target_snapshot() {/,/^}/p' "$PHASE_LOOP" > "$helper"
+  sed -n '/^capture_pre_runtime_active_target_snapshots() {/,/^}/p' "$PHASE_LOOP" > "$helper"
+  sed -n '/^restore_pre_runtime_active_target_snapshots() {/,/^}/p' "$PHASE_LOOP" >> "$helper"
   if [ ! -s "$helper" ]; then
-    echo "unable to extract pre-runtime target snapshot recovery helper" >&2
+    echo "unable to extract pre-runtime target snapshot helpers" >&2
     rm -rf "$fixture"
     exit 1
   fi
 
-  # A create_file target did not exist at dispatch. Its absent marker must
-  # remove the file if a post-dispatch failure rolls the attempt back.
-  : > "$snapshot.absent"
-  printf '%s\n' '// created during failed runtime invocation' > "$workspace/$target"
+  # Every declared target is part of the dispatch boundary.  Both Create-only
+  # files must be removed on recovery, even when Runtime wrote only the later
+  # target, while an existing Patch-only target gets its exact bytes back.
+  printf '%s\n' '{"selected_todo":"- [ ] fixture: Create only `scripts/first.mjs` and `scripts/second.mjs`, then Patch only `scripts/existing.mjs`."}' > "$claim"
+  printf '%s\n' '// before runtime' > "$workspace/scripts/existing.mjs"
+  PHASE_LOOP_WORKSPACE_ROOT="$workspace" TODO_CLAIM_FILE="$claim" bash -c '
+    source "$1"
+    capture_pre_runtime_active_target_snapshots "$2"
+  ' _ "$helper" "$snapshot"
+  printf '%s\n' '// first created during failed runtime invocation' > "$workspace/scripts/first.mjs"
+  printf '%s\n' '// second created during failed runtime invocation' > "$workspace/scripts/second.mjs"
+  printf '%s\n' '// after runtime' > "$workspace/scripts/existing.mjs"
   PHASE_LOOP_WORKSPACE_ROOT="$workspace" bash -c '
     source "$1"
-    restore_pre_runtime_active_target_snapshot "$2" "$3"
-    test ! -e "$PHASE_LOOP_WORKSPACE_ROOT/$2"
-  ' _ "$helper" "$target" "$snapshot"
-
-  # Existing targets still restore their exact pre-dispatch bytes.
-  rm -f "$snapshot.absent"
-  printf '%s\n' '// before runtime' > "$snapshot"
-  printf '%s\n' '// after runtime' > "$workspace/$target"
-  PHASE_LOOP_WORKSPACE_ROOT="$workspace" bash -c '
-    source "$1"
-    restore_pre_runtime_active_target_snapshot "$2" "$3"
-    test "$(cat "$PHASE_LOOP_WORKSPACE_ROOT/$2")" = "// before runtime"
-  ' _ "$helper" "$target" "$snapshot"
+    restore_pre_runtime_active_target_snapshots "$2"
+    test ! -e "$PHASE_LOOP_WORKSPACE_ROOT/scripts/first.mjs"
+    test ! -e "$PHASE_LOOP_WORKSPACE_ROOT/scripts/second.mjs"
+    test "$(cat "$PHASE_LOOP_WORKSPACE_ROOT/scripts/existing.mjs")" = "// before runtime"
+    test -f "$2/manifest.json"
+    test -f "$2/restore-audit.json"
+    test -f "$2/discarded-post-dispatch/1.after"
+  ' _ "$helper" "$snapshot"
   rm -rf "$fixture"
 }
 
