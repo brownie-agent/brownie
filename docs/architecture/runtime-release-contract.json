@@ -37,7 +37,7 @@
       "fail_closed_reason": "Runtime release readiness is explicitly blocked until executable supply-chain evidence (commit, workflow run, artifact SHA) is bound and verified. No invented placeholders; all pending fields remain null/pending until evidence generation completes."
     },
     "contract_registry_fingerprint": "sha256:4250fb47242f2bdc4ac26ce1d0cf8ecedbd27627eb9e3117acc82e3719eb934d",
-    "readiness_audit_content_sha256": "sha256:888e7e54f061cd879ea2e70ac07ef39e1ba1cdc0747f7116e1c60f5bc083bbf5",
+    "readiness_audit_content_sha256": "sha256:a300040905d9a21444b5f7248fd1f921bbf04df82005879bcc0eee3c48943a72",
     "mode_pack_fingerprint": null,
     "product_dod_fingerprint": null,
     "evidence_alignment_note": "Release trace fields remain pending until executable supply-chain evidence (artifact build, workflow run, tested commit) is generated and bound by guard scripts. Contract maturity at 88% pending P0/P1 evidence closure. Fail-closed: do not replace pending values with invented placeholders."
@@ -707,7 +707,7 @@
       "Missing owner-governance evidence section is a guard failure.",
       "Missing branch protection, status checks, protected tag policy, remote CI provenance, signing or integrity authority, independent reviews, or OSS license/publish decision keeps runtime_release_ready=false.",
       "Runtime automation may collect GitHub and local evidence, but it must not self-approve owner-controlled decisions.",
-      "Normal Brownie Phase Loop PR flow requires brownie-agent to author/push implementation changes and globalpocket to review and merge after required checks pass; same-account exceptions must be explicit, temporary, recorded, and reverted.",
+      "Normal Phase Loop PR flow requires deployment-configured implementation, review, and merge principals; same-account exceptions must be explicit, temporary, recorded, and reverted.",
       "Generated owner-governance evidence stores bounded status fields, counts, hashes, and repository-relative paths only."
     ]
   }

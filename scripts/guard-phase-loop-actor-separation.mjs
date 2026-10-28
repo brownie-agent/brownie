@@ -50,12 +50,14 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   const actorPreflight = options.actorPreflight ?? readText(repoRoot, 'scripts/phase-loop-actor-preflight.mjs', errors);
   const prActorGuard = options.prActorGuard ?? readText(repoRoot, 'scripts/phase-loop-pr-actor-guard.mjs', errors);
   const actorDeployment = options.actorDeployment ?? readText(repoRoot, 'scripts/phase-loop-actor-deployment.mjs', errors);
+  const ciWorkflow = options.ciWorkflow ?? readText(repoRoot, '.github/workflows/ci.yml', errors);
 
-  requireValue(policy.schema_version === 4, errors, `${policyPath} schema_version must be 4.`);
-  requireValue(policy.policy_id === 'phase-loop-actor-separation-v4', errors, `${policyPath} policy_id must match.`);
+  requireValue(policy.schema_version === 5, errors, `${policyPath} schema_version must be 5.`);
+  requireValue(policy.policy_id === 'phase-loop-actor-separation-v5', errors, `${policyPath} policy_id must match.`);
   requireValue(policy.deployment?.actor_configuration_selector === 'PHASE_LOOP_ACTOR_DEPLOYMENT', errors, `${policyPath} must require an explicit actor deployment selector.`);
   requireValue(policy.deployment?.credential_configuration_selector === 'PHASE_LOOP_ACTOR_CREDENTIALS', errors, `${policyPath} must require an explicit credential selector.`);
   requireValue(policy.deployment?.operational_configuration_selector === 'PHASE_LOOP_ENV_FILE', errors, `${policyPath} must define the explicit operational configuration selector.`);
+  requireValue(policy.deployment?.ci_deployment_configuration_selector === 'PHASE_LOOP_ACTOR_DEPLOYMENT', errors, `${policyPath} must define the CI deployment configuration selector.`);
   requireValue(/must not search a repository-relative fallback path/u.test(String(policy.deployment?.selection_rule ?? '')), errors, `${policyPath} must forbid repository-relative deployment fallback discovery.`);
   const roles = policy.roles ?? {};
   const implementationResponsibility = roles.implementation ?? {};
@@ -167,6 +169,11 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   requireValue(!fs.existsSync(path.join(repoRoot, '.brownie/phase-loop-actor-deployment.json')), errors, '.brownie/phase-loop-actor-deployment.json must not ship a concrete deployment.');
   requireValue(!/expectedActor\s*=\s*['"][^'"]+['"]/u.test(prActorGuard), errors, 'phase-loop-pr-actor-guard.mjs must not default implementation PR creation to a fixed actor.');
   requireValue(prActorGuard.includes('validateImplementationPrActor'), errors, 'phase-loop-pr-actor-guard.mjs must validate the authenticated implementation PR actor.');
+  requireValue(ciWorkflow.includes('PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES'), errors, 'CI must receive explicit implementation branch prefixes through deployment configuration.');
+  requireValue(ciWorkflow.includes('PHASE_LOOP_REVIEW_ACTOR') && ciWorkflow.includes('PHASE_LOOP_MERGE_ACTOR'), errors, 'CI must receive explicit review and merge principals through deployment configuration.');
+  requireValue(ciWorkflow.includes("'repository': os.environ['GITHUB_REPOSITORY']"), errors, 'CI must derive the deployment repository from the GitHub event environment.');
+  requireValue(ciWorkflow.includes("printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\\n'"), errors, 'CI must export the explicit ephemeral deployment selector.');
+  requireValue(!/(brownie-agent|globalpocket)/u.test(ciWorkflow), errors, 'CI must not hard-code a deployment actor or repository owner.');
 
   return { errors, policyPath };
 }

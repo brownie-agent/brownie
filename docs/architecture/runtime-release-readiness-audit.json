@@ -201,7 +201,7 @@
     {
       "id": "github_actor_separation",
       "status": "approved",
-      "reason": "Future Brownie Phase Loop implementation PRs use brownie-agent as the pusher/author actor, while Codex uses globalpocket as the reviewer and merger so required review and last-pusher approval can be satisfied without temporary branch-protection relaxation."
+      "reason": "Future Phase Loop implementation PRs use deployment-configured, distinct implementation and review principals so required review and last-pusher approval can be satisfied without temporary branch-protection relaxation."
     }
   ],
   "classifications": [
@@ -498,7 +498,7 @@
     "RRP-8.6 binds pnpm --workspace-root release:gate -- --dry-run into the existing GitHub-CI-invoked brownie-vsix check path and guards that binding without editing .github/workflows/ci.yml.",
     "RRP-8.7 adds machine-checked owner-governance evidence so owner-controlled residuals become precise fail-closed release blockers instead of prose-only blockers.",
     "The repository main branch now has branch protection enabled with required GitHub Actions checks check and index-platform, required pull request review, stale-review dismissal, last-push approval, enforced admins, force-push denial, deletion denial, and required conversation resolution. Owner-governance evidence now records branch_protection, required_status_checks, and remote_ci_workflow_provenance as satisfied.",
-    "Future GitHub actor separation is recorded as: brownie-agent authors and pushes Brownie Phase Loop implementation PRs; globalpocket reviews and merges them through the protected-branch PR flow after required checks pass.",
+    "Future GitHub actor separation is configured per deployment: the implementation principal authors and pushes through the protected-branch PR flow; distinct review and merge principals act only after required checks pass.",
     "E-22f keeps phase-value, Runtime Release Contract, release-readiness audit, and semantic contract guard authority aligned with current executable evidence gates; stale E-17 and 4376c0a authority claims are no longer used as current release evidence."
   ],
   "blockers": [
