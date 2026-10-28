@@ -9,6 +9,7 @@ extensions/*/*.vsix
 
 # Brownie runtime state
 .brownie/private/
+.brownie/phase-loop-actor-deployment.json
 .brownie-archive/
 .brownie-phase-loop/
 phase-loop.env

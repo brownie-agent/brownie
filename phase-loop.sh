@@ -2,36 +2,60 @@
 set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PHASE_LOOP_WORKSPACE_ROOT="${PHASE_LOOP_WORKSPACE_ROOT:-"$ROOT_DIR"}"
+PHASE_LOOP_WORKSPACE_ROOT="${PHASE_LOOP_WORKSPACE_ROOT:-}"
 PHASE_LOOP_STATE_DIR_FROM_PROCESS=0
 if [ -n "${PHASE_LOOP_STATE_DIR+x}" ]; then
   PHASE_LOOP_STATE_DIR_FROM_PROCESS=1
 fi
-STATE_DIR="${PHASE_LOOP_STATE_DIR:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/phase-loop"}"
-RUN_DIR="$STATE_DIR/runs"
-LOG_DIR="$STATE_DIR/logs"
-PID_FILE="$STATE_DIR/phase-loop.pid"
-SUPERVISOR_OWNER_FILE="$STATE_DIR/phase-loop-owner.json"
-LOCK_DIR="$STATE_DIR/phase-loop.lock"
-LEGACY_MIGRATION_LOCK_DIR="$STATE_DIR/phase-loop-legacy-migration.lock"
-STOP_FILE="$STATE_DIR/stop"
-STATUS_FILE="$STATE_DIR/status.json"
-SUPERVISOR_LOG="$LOG_DIR/supervisor.log"
-TODO_CLAIM_DIR="$STATE_DIR/todo-claims"
-TODO_CLAIM_FILE="$TODO_CLAIM_DIR/current.json"
-TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE="$TODO_CLAIM_DIR/terminal-failure-source-transition.pending.json"
-TODO_QUEUE_STATE_FILE="$TODO_CLAIM_DIR/todo-queue-state.json"
-TODO_BLOCKED_FILE="$TODO_CLAIM_DIR/blocked.jsonl"
-TODO_REPAIR_FEEDBACK_FILE="$TODO_CLAIM_DIR/repair-feedback.json"
-PROGRESS_STATE_FILE="$STATE_DIR/progress-state.json"
-BDK_TRAJECTORY_DIR="$STATE_DIR/trajectories"
-KNOWN_GOOD_DIR="$STATE_DIR/known-good-targets"
-BDK_TRAJECTORY_FILE="${PHASE_LOOP_BDK_TRAJECTORY_FILE:-"$STATE_DIR/bdk-trajectory.jsonl"}"
-BDK_HARNESS_FEEDBACK_FILE="$STATE_DIR/bdk-harness-feedback.json"
-PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
-LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
-LAUNCHD_LABEL="${PHASE_LOOP_LAUNCHD_LABEL:-brownie.phase-loop}"
-SCREEN_NAME="${PHASE_LOOP_SCREEN_NAME:-brownie-phase-loop}"
+STATE_DIR="${PHASE_LOOP_STATE_DIR:-}"
+RUN_DIR=""
+LOG_DIR=""
+PID_FILE=""
+SUPERVISOR_OWNER_FILE=""
+LOCK_DIR=""
+LEGACY_MIGRATION_LOCK_DIR=""
+STOP_FILE=""
+STATUS_FILE=""
+SUPERVISOR_LOG=""
+TODO_CLAIM_DIR=""
+TODO_CLAIM_FILE=""
+TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE=""
+TODO_QUEUE_STATE_FILE=""
+TODO_BLOCKED_FILE=""
+TODO_REPAIR_FEEDBACK_FILE=""
+PROGRESS_STATE_FILE=""
+BDK_TRAJECTORY_DIR=""
+KNOWN_GOOD_DIR=""
+BDK_TRAJECTORY_FILE="${PHASE_LOOP_BDK_TRAJECTORY_FILE:-}"
+BDK_HARNESS_FEEDBACK_FILE=""
+PHASE_LOOP_DEFERRED_SIGNAL_FILE=""
+LLM_PROVIDER_FAILURE_MEMORY_FILE=""
+LAUNCHD_LABEL="${PHASE_LOOP_LAUNCHD_LABEL:-}"
+SCREEN_NAME="${PHASE_LOOP_SCREEN_NAME:-}"
+if [ -n "$STATE_DIR" ]; then
+  RUN_DIR="$STATE_DIR/runs"
+  LOG_DIR="$STATE_DIR/logs"
+  PID_FILE="$STATE_DIR/phase-loop.pid"
+  SUPERVISOR_OWNER_FILE="$STATE_DIR/phase-loop-owner.json"
+  LOCK_DIR="$STATE_DIR/phase-loop.lock"
+  LEGACY_MIGRATION_LOCK_DIR="$STATE_DIR/phase-loop-legacy-migration.lock"
+  STOP_FILE="$STATE_DIR/stop"
+  STATUS_FILE="$STATE_DIR/status.json"
+  SUPERVISOR_LOG="$LOG_DIR/supervisor.log"
+  TODO_CLAIM_DIR="$STATE_DIR/todo-claims"
+  TODO_CLAIM_FILE="$TODO_CLAIM_DIR/current.json"
+  TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE="$TODO_CLAIM_DIR/terminal-failure-source-transition.pending.json"
+  TODO_QUEUE_STATE_FILE="$TODO_CLAIM_DIR/todo-queue-state.json"
+  TODO_BLOCKED_FILE="$TODO_CLAIM_DIR/blocked.jsonl"
+  TODO_REPAIR_FEEDBACK_FILE="$TODO_CLAIM_DIR/repair-feedback.json"
+  PROGRESS_STATE_FILE="$STATE_DIR/progress-state.json"
+  BDK_TRAJECTORY_DIR="$STATE_DIR/trajectories"
+  KNOWN_GOOD_DIR="$STATE_DIR/known-good-targets"
+  BDK_TRAJECTORY_FILE="${PHASE_LOOP_BDK_TRAJECTORY_FILE:-$STATE_DIR/bdk-trajectory.jsonl}"
+  BDK_HARNESS_FEEDBACK_FILE="$STATE_DIR/bdk-harness-feedback.json"
+  PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
+  LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
+fi
 PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED=0
 PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL=""
 PHASE_LOOP_TASK_LEDGER_FAILURE=0
@@ -41,7 +65,7 @@ PHASE_LOOP_ACTIVE_RUN_ID=""
 PHASE_LOOP_ACTIVE_STDOUT_LOG=""
 PHASE_LOOP_ACTIVE_STDERR_LOG=""
 PHASE_LOOP_CONTROL_PLANE_FINGERPRINT=""
-PHASE_LOOP_PREFLIGHT_PROFILE="${PHASE_LOOP_PREFLIGHT_PROFILE:-production}"
+PHASE_LOOP_PREFLIGHT_PROFILE="${PHASE_LOOP_PREFLIGHT_PROFILE:-}"
 PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC=""
 PHASE_LOOP_ENV_SOURCES="process environment"
 PHASE_LOOP_RUNTIME_PATH_SOURCE="cli-delegated"
@@ -49,14 +73,14 @@ PHASE_LOOP_RUNTIME_PATH_EXPLICIT=0
 if [ -n "${BROWNIE_RUNTIME_PATH:-}" ]; then
   PHASE_LOOP_RUNTIME_PATH_EXPLICIT=1
 fi
-PHASE_LOOP_BROWNIE_BIN_SOURCE="workspace-default"
+PHASE_LOOP_BROWNIE_BIN_SOURCE="explicit-configuration"
 PHASE_LOOP_STATUS_WRITE_IN_PROGRESS=0
 PHASE_LOOP_SUPERVISOR_PID=""
 PHASE_LOOP_SUPERVISOR_GENERATION=""
-PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS="${PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS:-900}"
+PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS="${PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS:-}"
 # Zero means the first terminal failure is stable/blocked. A positive value is
 # the number of additional executions permitted before the failure is stable.
-PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-0}"
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-}"
 PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
 PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
 PHASE_LOOP_FINALIZING=0
@@ -67,18 +91,18 @@ PHASE_LOOP_REBASELINE_RETRY_ALLOWED=0
 PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE=""
 PHASE_LOOP_RUNTIME_EXECUTION_CONFIRMED=0
 
-PHASE_LOOP_PROMPT="${PHASE_LOOP_PROMPT:-"$PHASE_LOOP_WORKSPACE_ROOT/phase-loop.md"}"
-PHASE_LOOP_TODO="${PHASE_LOOP_TODO:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/todo.md"}"
-PHASE_LOOP_TODO_BREAKDOWN="${PHASE_LOOP_TODO_BREAKDOWN:-"$(dirname "$PHASE_LOOP_TODO")/todo-breakdown.md"}"
+PHASE_LOOP_PROMPT="${PHASE_LOOP_PROMPT:-}"
+PHASE_LOOP_TODO="${PHASE_LOOP_TODO:-}"
+PHASE_LOOP_TODO_BREAKDOWN="${PHASE_LOOP_TODO_BREAKDOWN:-}"
 PHASE_LOOP_TODO_SNAPSHOT_SOURCE="${PHASE_LOOP_TODO_SNAPSHOT_SOURCE:-}"
-PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-"$STATE_DIR/todo-snapshot-audits"}"
-PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-"$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/current.json"}"
+PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-}"
+PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-}"
 PHASE_LOOP_BROWNIE_BIN_EXPLICIT=0
 if [ -n "${BROWNIE_BIN:-}" ]; then
   PHASE_LOOP_BROWNIE_BIN_EXPLICIT=1
 fi
 PHASE_LOOP_DEFAULT_BROWNIE_BIN=""
-PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"$ROOT_DIR"}"
+PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-}"
 PHASE_LOOP_BASE_COMMIT="${PHASE_LOOP_BASE_COMMIT:-}"
 PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-}"
 PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-}"
@@ -97,34 +121,31 @@ esac
 # treating the target checkout as the controller installation.
 export PHASE_LOOP_ACTOR_DEPLOYMENT PHASE_LOOP_ACTOR_CREDENTIALS
 PHASE_LOOP_EXPECTED_ACTOR="${PHASE_LOOP_EXPECTED_ACTOR:-}"
-if [ -z "$PHASE_LOOP_EXPECTED_ACTOR" ] && [ -n "$PHASE_LOOP_ACTOR_DEPLOYMENT" ]; then
-  PHASE_LOOP_EXPECTED_ACTOR="$(node "$ROOT_DIR/scripts/phase-loop-actor-deployment.mjs" --repo-root "$ROOT_DIR" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login 2>/dev/null || true)"
-fi
-PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/runtime-store"}"
-PHASE_LOOP_INTERVAL_SECONDS="${PHASE_LOOP_INTERVAL_SECONDS:-5}"
-PHASE_LOOP_FAILURE_BACKOFF_SECONDS="${PHASE_LOOP_FAILURE_BACKOFF_SECONDS:-60}"
-PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS="${PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS:-900}"
-PHASE_LOOP_BROWNIE_TIMEOUT_SECONDS="${PHASE_LOOP_BROWNIE_TIMEOUT_SECONDS:-14400}"
-PHASE_LOOP_BROWNIE_DECOMPOSE_TIMEOUT_SECONDS="${PHASE_LOOP_BROWNIE_DECOMPOSE_TIMEOUT_SECONDS:-600}"
-PHASE_LOOP_STAGNATION_THRESHOLD="${PHASE_LOOP_STAGNATION_THRESHOLD:-3}"
-PHASE_LOOP_PROMPT_MAX_BYTES="${PHASE_LOOP_PROMPT_MAX_BYTES:-65536}"
-PHASE_LOOP_SELECTED_TODO_MAX_BYTES="${PHASE_LOOP_SELECTED_TODO_MAX_BYTES:-8192}"
-PHASE_LOOP_TODO_SNAPSHOT_LINES="${PHASE_LOOP_TODO_SNAPSHOT_LINES:-80}"
-PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES="${PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES:-80}"
-PHASE_LOOP_PROMPT_RETENTION_COUNT="${PHASE_LOOP_PROMPT_RETENTION_COUNT:-20}"
-PHASE_LOOP_STOP_GRACE_SECONDS="${PHASE_LOOP_STOP_GRACE_SECONDS:-15}"
-PHASE_LOOP_STOP_FORCE_SECONDS="${PHASE_LOOP_STOP_FORCE_SECONDS:-5}"
-PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS="${PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS:-30}"
-PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS="${PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS:-30}"
-PHASE_LOOP_SLEEP_POLL_SECONDS="${PHASE_LOOP_SLEEP_POLL_SECONDS:-1}"
-PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES="${PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES:-3}"
-PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="${PHASE_LOOP_APPROVED_CONTROLLER_BASELINE:-origin/main}"
-PHASE_LOOP_CREATE_PR_AFTER_PROGRESS="${PHASE_LOOP_CREATE_PR_AFTER_PROGRESS:-0}"
-PHASE_LOOP_PR_REMOTE="${PHASE_LOOP_PR_REMOTE:-origin}"
-PHASE_LOOP_PR_BASE="${PHASE_LOOP_PR_BASE:-main}"
-PHASE_LOOP_PR_TITLE_PREFIX="${PHASE_LOOP_PR_TITLE_PREFIX:-Brownie phase-loop}"
-PHASE_LOOP_PR_DRAFT="${PHASE_LOOP_PR_DRAFT:-0}"
-PHASE_LOOP_LLM_ROUTING="${PHASE_LOOP_LLM_ROUTING:-1}"
+PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-}"
+PHASE_LOOP_INTERVAL_SECONDS="${PHASE_LOOP_INTERVAL_SECONDS:-}"
+PHASE_LOOP_FAILURE_BACKOFF_SECONDS="${PHASE_LOOP_FAILURE_BACKOFF_SECONDS:-}"
+PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS="${PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS:-}"
+PHASE_LOOP_BROWNIE_TIMEOUT_SECONDS="${PHASE_LOOP_BROWNIE_TIMEOUT_SECONDS:-}"
+PHASE_LOOP_BROWNIE_DECOMPOSE_TIMEOUT_SECONDS="${PHASE_LOOP_BROWNIE_DECOMPOSE_TIMEOUT_SECONDS:-}"
+PHASE_LOOP_STAGNATION_THRESHOLD="${PHASE_LOOP_STAGNATION_THRESHOLD:-}"
+PHASE_LOOP_PROMPT_MAX_BYTES="${PHASE_LOOP_PROMPT_MAX_BYTES:-}"
+PHASE_LOOP_SELECTED_TODO_MAX_BYTES="${PHASE_LOOP_SELECTED_TODO_MAX_BYTES:-}"
+PHASE_LOOP_TODO_SNAPSHOT_LINES="${PHASE_LOOP_TODO_SNAPSHOT_LINES:-}"
+PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES="${PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES:-}"
+PHASE_LOOP_PROMPT_RETENTION_COUNT="${PHASE_LOOP_PROMPT_RETENTION_COUNT:-}"
+PHASE_LOOP_STOP_GRACE_SECONDS="${PHASE_LOOP_STOP_GRACE_SECONDS:-}"
+PHASE_LOOP_STOP_FORCE_SECONDS="${PHASE_LOOP_STOP_FORCE_SECONDS:-}"
+PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS="${PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS:-}"
+PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS="${PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS:-}"
+PHASE_LOOP_SLEEP_POLL_SECONDS="${PHASE_LOOP_SLEEP_POLL_SECONDS:-}"
+PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES="${PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES:-}"
+PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="${PHASE_LOOP_APPROVED_CONTROLLER_BASELINE:-}"
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS="${PHASE_LOOP_CREATE_PR_AFTER_PROGRESS:-}"
+PHASE_LOOP_PR_REMOTE="${PHASE_LOOP_PR_REMOTE:-}"
+PHASE_LOOP_PR_BASE="${PHASE_LOOP_PR_BASE:-}"
+PHASE_LOOP_PR_TITLE_PREFIX="${PHASE_LOOP_PR_TITLE_PREFIX:-}"
+PHASE_LOOP_PR_DRAFT="${PHASE_LOOP_PR_DRAFT:-}"
+PHASE_LOOP_LLM_ROUTING="${PHASE_LOOP_LLM_ROUTING:-}"
 PHASE_LOOP_LLM_MODEL_FAST="${PHASE_LOOP_LLM_MODEL_FAST:-}"
 PHASE_LOOP_LLM_MODEL_CODE="${PHASE_LOOP_LLM_MODEL_CODE:-}"
 PHASE_LOOP_LLM_MODEL_DEEP="${PHASE_LOOP_LLM_MODEL_DEEP:-}"
@@ -136,10 +157,12 @@ PHASE_LOOP_LLM_TOP_P_FAST="${PHASE_LOOP_LLM_TOP_P_FAST:-}"
 PHASE_LOOP_LLM_TOP_P_CODE="${PHASE_LOOP_LLM_TOP_P_CODE:-}"
 PHASE_LOOP_LLM_TOP_K_FAST="${PHASE_LOOP_LLM_TOP_K_FAST:-}"
 PHASE_LOOP_LLM_TOP_K_CODE="${PHASE_LOOP_LLM_TOP_K_CODE:-}"
-PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES="${PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES:-20000}"
-PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK="${PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK:-0}"
+PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES="${PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES:-}"
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK="${PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK:-}"
 
-mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
+if [ -n "$STATE_DIR" ]; then
+  mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
+fi
 
 json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])'
@@ -541,10 +564,11 @@ check_brownie_binary_freshness() {
   # update cannot silently keep dispatching its older paired binaries.
   local source_root runtime_bin
   source_root="$PHASE_LOOP_WORKSPACE_ROOT"
-  if [ "${PHASE_LOOP_BROWNIE_BIN_SOURCE:-workspace-default}" = "controller-default" ]; then
-    source_root="$ROOT_DIR"
+  runtime_bin="${BROWNIE_RUNTIME_PATH:-}"
+  if [ -z "$runtime_bin" ]; then
+    printf '%s\n' 'PHASE_LOOP_RUNTIME_PATH is required for the binary freshness check.' >&2
+    return 78
   fi
-  runtime_bin="${BROWNIE_RUNTIME_PATH:-"$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie-runtime"}"
   python3 - "$source_root" "$BROWNIE_BIN" "$runtime_bin" <<'PY'
 import pathlib
 import subprocess
@@ -639,9 +663,6 @@ rebuild_brownie_binaries_for_freshness() {
   fi
   local build_root
   build_root="$PHASE_LOOP_WORKSPACE_ROOT"
-  if [ "${PHASE_LOOP_BROWNIE_BIN_SOURCE:-workspace-default}" = "controller-default" ]; then
-    build_root="$ROOT_DIR"
-  fi
   (
     cd "$build_root" || exit 70
     # A controller can move between commits while its target directory remains
@@ -12838,7 +12859,7 @@ apply_phase_loop_llm_route() {
   local meta_path route routed_model base_model fast_model code_model deep_model prompt_bytes provider_recovery
   local fast_max_tokens code_max_tokens deep_max_tokens
   local fast_temperature code_temperature deep_temperature fast_top_p code_top_p deep_top_p fast_top_k code_top_k deep_top_k defaults
-  if [ "${PHASE_LOOP_LLM_ROUTING:-1}" != "1" ]; then
+  if [ "$PHASE_LOOP_LLM_ROUTING" != "1" ]; then
     return 0
   fi
   base_model="${BROWNIE_LLM_MODEL:-}"
@@ -13123,69 +13144,65 @@ stop_if_todo_empty() {
 load_env() {
   local state_dir_before_env="${PHASE_LOOP_STATE_DIR:-$STATE_DIR}"
   PHASE_LOOP_ENV_SOURCES="process environment"
-  set -a
-  if [ -f "$ROOT_DIR/.test/brownie-loop.env" ]; then
-    # Match the local LAN LLM environment used by .test/sample.md smoke runs.
-    # This file is ignored and may contain local credentials.
-    # shellcheck disable=SC1091
-    . "$ROOT_DIR/.test/brownie-loop.env"
-    PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$ROOT_DIR/.test/brownie-loop.env"
-  fi
-  if [ -f "$ROOT_DIR/.brownie/private/llm.env" ]; then
-    # Local LAN LLM credentials and model routing live under .brownie/private.
-    # This file is ignored and must not be logged.
-    # shellcheck disable=SC1091
-    . "$ROOT_DIR/.brownie/private/llm.env"
-    PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$ROOT_DIR/.brownie/private/llm.env"
-  fi
-  if [ -f "$ROOT_DIR/phase-loop.env" ]; then
-    # shellcheck disable=SC1091
-    . "$ROOT_DIR/phase-loop.env"
-    PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$ROOT_DIR/phase-loop.env"
+  # A framework checkout must not discover a deployment by probing fixed
+  # repository-local files.  Operators may inject values directly in the
+  # process environment, or select one trusted environment file explicitly.
+  # The selector is deliberately the only configuration-path convention.
+  if [ -n "${PHASE_LOOP_ENV_FILE:-}" ]; then
+    local env_file="$PHASE_LOOP_ENV_FILE"
+    case "$env_file" in
+      /*) ;;
+      *) env_file="$ROOT_DIR/$env_file" ;;
+    esac
+    if [ ! -f "$env_file" ]; then
+      printf 'PHASE_LOOP_ENV_FILE is not readable: %s\n' "$env_file" >&2
+      return 78
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    . "$env_file"
+    set +a
+    PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$env_file"
   fi
   if [ "$PHASE_LOOP_STATE_DIR_FROM_PROCESS" -eq 0 ] && [ "${PHASE_LOOP_STATE_DIR:-}" != "$state_dir_before_env" ]; then
     PHASE_LOOP_STATE_DIR_FROM_PROCESS=1
   fi
-  if [ "$PHASE_LOOP_STATE_DIR_FROM_PROCESS" -eq 0 ]; then
-    PHASE_LOOP_STATE_DIR="$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/phase-loop"
+  STATE_DIR="${PHASE_LOOP_STATE_DIR:-}"
+  if [ -n "$PHASE_LOOP_TODO" ] && [ -z "$PHASE_LOOP_TODO_BREAKDOWN" ]; then
+    PHASE_LOOP_TODO_BREAKDOWN="$(dirname "$PHASE_LOOP_TODO")/todo-breakdown.md"
   fi
-  STATE_DIR="${PHASE_LOOP_STATE_DIR:-$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/phase-loop}"
-  if [ -f "$STATE_DIR/phase-loop.env" ]; then
-    # shellcheck disable=SC1091
-    . "$STATE_DIR/phase-loop.env"
-    PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$STATE_DIR/phase-loop.env"
-  fi
-  set +a
   if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ] && [ -n "${BROWNIE_BIN:-}" ] && [ "$BROWNIE_BIN" != "$PHASE_LOOP_DEFAULT_BROWNIE_BIN" ]; then
     PHASE_LOOP_BROWNIE_BIN_EXPLICIT=1
   fi
   if [ -n "${BROWNIE_RUNTIME_PATH:-}" ]; then
     PHASE_LOOP_RUNTIME_PATH_EXPLICIT=1
   fi
-  # An external, approved controller can carry a newer CLI admission contract
-  # than the workspace checkout it supervises.  Prefer its paired debug
-  # binaries when both are present, rather than dispatching a stale workspace
-  # binary that cannot attest the runtime-admission snapshot.  Explicit
-  # BROWNIE_BIN/BROWNIE_RUNTIME_PATH overrides remain authoritative.
-  local controller_cli_default="$ROOT_DIR/target/debug/brownie"
-  local controller_runtime_default="$ROOT_DIR/target/debug/brownie-runtime"
-  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ] \
-    && [ "$ROOT_DIR" != "$PHASE_LOOP_WORKSPACE_ROOT" ] \
-    && [ -x "$controller_cli_default" ] \
-    && { [ "$PHASE_LOOP_RUNTIME_PATH_EXPLICIT" -eq 1 ] || [ -x "$controller_runtime_default" ]; }; then
-    BROWNIE_BIN="$controller_cli_default"
-    if [ "$PHASE_LOOP_RUNTIME_PATH_EXPLICIT" -eq 0 ]; then
-      BROWNIE_RUNTIME_PATH="$controller_runtime_default"
-    fi
-    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$controller_cli_default"
-    PHASE_LOOP_BROWNIE_BIN_SOURCE="controller-default"
-  elif [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 0 ]; then
-    BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
-    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
-    PHASE_LOOP_BROWNIE_BIN_SOURCE="workspace-default"
-  else
-    PHASE_LOOP_DEFAULT_BROWNIE_BIN="$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie"
-    PHASE_LOOP_BROWNIE_BIN_SOURCE="explicit"
+  PHASE_LOOP_DEFAULT_BROWNIE_BIN=""
+  PHASE_LOOP_BROWNIE_BIN_SOURCE="explicit-configuration"
+  case "${PHASE_LOOP_ACTOR_DEPLOYMENT:-}" in
+    '') ;;
+    /*) ;;
+    *)
+      if [ -n "$PHASE_LOOP_CONTROL_ROOT" ]; then
+        PHASE_LOOP_ACTOR_DEPLOYMENT="$PHASE_LOOP_CONTROL_ROOT/$PHASE_LOOP_ACTOR_DEPLOYMENT"
+      fi
+      ;;
+  esac
+  case "${PHASE_LOOP_ACTOR_CREDENTIALS:-}" in
+    '') ;;
+    /*) ;;
+    *)
+      if [ -n "$PHASE_LOOP_CONTROL_ROOT" ]; then
+        PHASE_LOOP_ACTOR_CREDENTIALS="$PHASE_LOOP_CONTROL_ROOT/$PHASE_LOOP_ACTOR_CREDENTIALS"
+      fi
+      ;;
+  esac
+  if [ -n "${PHASE_LOOP_ACTOR_DEPLOYMENT:-}" ] && [ -z "$PHASE_LOOP_EXPECTED_ACTOR" ]; then
+    PHASE_LOOP_EXPECTED_ACTOR="$(node "$ROOT_DIR/scripts/phase-loop-actor-deployment.mjs" --repo-root "$ROOT_DIR" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login 2>/dev/null || true)"
+  fi
+  export PHASE_LOOP_ACTOR_DEPLOYMENT PHASE_LOOP_ACTOR_CREDENTIALS PHASE_LOOP_EXPECTED_ACTOR
+  if [ -z "$STATE_DIR" ]; then
+    return 0
   fi
   RUN_DIR="$STATE_DIR/runs"
   LOG_DIR="$STATE_DIR/logs"
@@ -13207,12 +13224,50 @@ load_env() {
   BDK_HARNESS_FEEDBACK_FILE="$STATE_DIR/bdk-harness-feedback.json"
   PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
   LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
-  mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
-  if [ "$PHASE_LOOP_RUNTIME_PATH_EXPLICIT" -eq 1 ]; then
-    PHASE_LOOP_RUNTIME_PATH_SOURCE="explicit"
-  else
-    PHASE_LOOP_RUNTIME_PATH_SOURCE="cli-delegated"
+  if [ -z "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR" ]; then
+    PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="$STATE_DIR/todo-snapshot-audits"
   fi
+  if [ -z "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE" ]; then
+    PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/current.json"
+  fi
+  mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
+  PHASE_LOOP_RUNTIME_PATH_SOURCE="explicit"
+}
+
+phase_loop_require_operational_configuration() {
+  local missing=() name
+  # These are deployment choices, not framework policy constants.  Refuse to
+  # run a task when any is absent instead of reconstructing it from checkout
+  # paths, account names, branch names, or numerical defaults.
+  local required=(
+    PHASE_LOOP_WORKSPACE_ROOT PHASE_LOOP_STATE_DIR PHASE_LOOP_CONTROL_ROOT
+    PHASE_LOOP_PROMPT PHASE_LOOP_TODO PHASE_LOOP_TODO_BREAKDOWN
+    PHASE_LOOP_ACTOR_DEPLOYMENT PHASE_LOOP_ACTOR_CREDENTIALS
+    PHASE_LOOP_PREFLIGHT_PROFILE PHASE_LOOP_BROWNIE_STORE_ROOT
+    PHASE_LOOP_INTERVAL_SECONDS PHASE_LOOP_FAILURE_BACKOFF_SECONDS
+    PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS PHASE_LOOP_BROWNIE_TIMEOUT_SECONDS
+    PHASE_LOOP_BROWNIE_DECOMPOSE_TIMEOUT_SECONDS PHASE_LOOP_STAGNATION_THRESHOLD
+    PHASE_LOOP_PROMPT_MAX_BYTES PHASE_LOOP_SELECTED_TODO_MAX_BYTES
+    PHASE_LOOP_TODO_SNAPSHOT_LINES PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES
+    PHASE_LOOP_PROMPT_RETENTION_COUNT PHASE_LOOP_STOP_GRACE_SECONDS
+    PHASE_LOOP_STOP_FORCE_SECONDS PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS
+    PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS PHASE_LOOP_SLEEP_POLL_SECONDS
+    PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP
+    PHASE_LOOP_APPROVED_CONTROLLER_BASELINE PHASE_LOOP_CREATE_PR_AFTER_PROGRESS
+    PHASE_LOOP_PR_REMOTE PHASE_LOOP_PR_BASE PHASE_LOOP_PR_TITLE_PREFIX
+    PHASE_LOOP_PR_DRAFT PHASE_LOOP_LLM_ROUTING PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES
+    PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK BROWNIE_BIN BROWNIE_RUNTIME_PATH
+  )
+  for name in "${required[@]}"; do
+    if [ -z "${!name:-}" ]; then
+      missing+=("$name")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    printf 'phase-loop operational configuration is incomplete; inject these values through the process environment or PHASE_LOOP_ENV_FILE: %s\n' "${missing[*]}" >&2
+    return 78
+  fi
+  return 0
 }
 
 bind_phase_loop_execution_context() {
@@ -13228,8 +13283,8 @@ bind_phase_loop_execution_context() {
     --workspace "$PHASE_LOOP_WORKSPACE_ROOT" \
     --controller "$PHASE_LOOP_CONTROL_ROOT" \
     --state "$STATE_DIR" \
-    --cli "${BROWNIE_BIN:-$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie}" \
-    --runtime "${BROWNIE_RUNTIME_PATH:-$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie-runtime}" \
+    --cli "$BROWNIE_BIN" \
+    --runtime "${BROWNIE_RUNTIME_PATH:-}" \
     --todo "$PHASE_LOOP_TODO" \
     ${PHASE_LOOP_BASE_COMMIT:+--base-commit "$PHASE_LOOP_BASE_COMMIT"} \
     --actor "$PHASE_LOOP_EXPECTED_ACTOR" \
@@ -13263,8 +13318,10 @@ bind_phase_loop_execution_context() {
   BDK_HARNESS_FEEDBACK_FILE="$STATE_DIR/bdk-harness-feedback.json"
   PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
   LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
-  PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR:-$STATE_DIR/todo-snapshot-audits}"
-  PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE="${PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE:-$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/current.json}"
+  if [ -z "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR" ] || [ -z "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE" ]; then
+    PHASE_LOOP_CONTEXT_DIAGNOSTIC="PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR and PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE must be explicitly configured."
+    return 78
+  fi
   mkdir -p "$RUN_DIR" "$LOG_DIR" "$TODO_CLAIM_DIR" "$BDK_TRAJECTORY_DIR" "$KNOWN_GOOD_DIR"
   return 0
 }
@@ -13288,42 +13345,26 @@ PY
 
 validate_phase_loop_bootstrap() {
   local run_stamp="${1:-bootstrap-check}"
-  local configured_cli="${BROWNIE_BIN:-$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie}"
+  local configured_cli="${BROWNIE_BIN:-}"
   local configured_runtime="${BROWNIE_RUNTIME_PATH:-}"
   local resolved_cli resolved_runtime="" cli_reason="" runtime_reason=""
-  local runtime_path_source="${PHASE_LOOP_RUNTIME_PATH_SOURCE:-cli-delegated}"
-  resolved_cli="$(resolve_phase_loop_binary_path "$configured_cli")"
+  local runtime_path_source="${PHASE_LOOP_RUNTIME_PATH_SOURCE:-explicit}"
+  if [ -z "$configured_cli" ]; then
+    cli_reason="missing_configuration"
+    resolved_cli=""
+  else
+    resolved_cli="$(resolve_phase_loop_binary_path "$configured_cli")"
+  fi
 
-  if [ ! -f "$resolved_cli" ]; then
+  if [ -z "$cli_reason" ] && [ ! -f "$resolved_cli" ]; then
     cli_reason="missing"
-  elif [ ! -x "$resolved_cli" ]; then
+  elif [ -z "$cli_reason" ] && [ ! -x "$resolved_cli" ]; then
     cli_reason="not_executable"
   fi
 
-  if [ -z "$cli_reason" ] && [ "$runtime_path_source" != "explicit" ]; then
-    local adjacent_runtime delegated_runtime
-    adjacent_runtime="$(resolve_phase_loop_binary_path "$(dirname "$resolved_cli")/brownie-runtime")"
-    if [ -f "$adjacent_runtime" ] && [ -x "$adjacent_runtime" ]; then
-      configured_runtime="$adjacent_runtime"
-      resolved_runtime="$adjacent_runtime"
-      runtime_path_source="cli-adjacent-inferred"
-    else
-      delegated_runtime="$(command -v brownie-runtime 2>/dev/null || true)"
-      if [ -n "$delegated_runtime" ]; then
-        delegated_runtime="$(resolve_phase_loop_binary_path "$delegated_runtime")"
-      fi
-      if [ -n "$delegated_runtime" ] && [ -f "$delegated_runtime" ] && [ -x "$delegated_runtime" ]; then
-        configured_runtime="$delegated_runtime"
-        resolved_runtime="$delegated_runtime"
-        runtime_path_source="cli-delegated"
-      elif [ "${resolved_cli##*/}" = "brownie" ] || [ "${resolved_cli##*/}" = "brownie.exe" ]; then
-        configured_runtime="$(dirname "$resolved_cli")/brownie-runtime"
-        resolved_runtime="$adjacent_runtime"
-        runtime_reason="missing_cli_runtime"
-        runtime_path_source="cli-delegated"
-      fi
-    fi
-  elif [ "$runtime_path_source" = "explicit" ]; then
+  if [ -z "$configured_runtime" ]; then
+    runtime_reason="missing_configuration"
+  else
     resolved_runtime="$(resolve_phase_loop_binary_path "$configured_runtime")"
   fi
 
@@ -13339,8 +13380,6 @@ validate_phase_loop_bootstrap() {
     BROWNIE_BIN="$resolved_cli"
     if [ -n "$resolved_runtime" ]; then
       BROWNIE_RUNTIME_PATH="$resolved_runtime"
-    elif [ "$runtime_path_source" = "cli-delegated" ]; then
-      unset BROWNIE_RUNTIME_PATH
     fi
     PHASE_LOOP_RUNTIME_PATH_SOURCE="$runtime_path_source"
     PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC=""
@@ -13374,7 +13413,7 @@ print(json.dumps({
     "configuration_sources": sources,
     "runtime_path_source": runtime_path_source,
     "missing_binaries": missing,
-    "repair": "Set BROWNIE_BIN to an executable absolute path and set BROWNIE_RUNTIME_PATH only when overriding the CLI's runtime resolution. Otherwise place an executable brownie-runtime beside the CLI or on PATH. Do not source phase-loop.env before phase-loop.sh establishes ROOT_DIR.",
+    "repair": "Set BROWNIE_BIN and BROWNIE_RUNTIME_PATH to executable explicit paths through process configuration or PHASE_LOOP_ENV_FILE. The framework never searches a workspace, controller, adjacent directory, or PATH for deployment binaries.",
 }, sort_keys=True))
 PY
 )"
@@ -13382,7 +13421,7 @@ PY
 }
 
 validate_terminal_failure_retry_cap() {
-  local raw_cap="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-0}"
+  local raw_cap="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-}"
   local normalized_cap
   if ! normalized_cap="$(python3 - "$raw_cap" <<'PY'
 import re
@@ -14086,7 +14125,7 @@ run_phase_loop_preflight() {
       --control-plane-root "$ROOT_DIR" \
       --state-root "$STATE_DIR" \
       --cli-root "$BROWNIE_BIN" \
-      --runtime-root "${BROWNIE_RUNTIME_PATH:-$PHASE_LOOP_WORKSPACE_ROOT/target/debug/brownie-runtime}" \
+      --runtime-root "$BROWNIE_RUNTIME_PATH" \
       ${PHASE_LOOP_BASE_COMMIT:+--base-commit "$PHASE_LOOP_BASE_COMMIT"} \
       --expected-actor "$PHASE_LOOP_EXPECTED_ACTOR" \
       --context-audit "$STATE_DIR/execution-context.json" \
@@ -14485,6 +14524,9 @@ PY
 
 _run_brownie_once() {
   load_env
+  if ! phase_loop_require_operational_configuration; then
+    return 78
+  fi
   if ! bind_phase_loop_execution_context; then
     printf '%s execution_context_bind_failed=true result=%s\n' "$(now_utc)" "$PHASE_LOOP_CONTEXT_DIAGNOSTIC" >> "$SUPERVISOR_LOG"
     return 78
@@ -17068,6 +17110,9 @@ run_brownie_once() {
   # any run/claim/status mutation.  An invalid cap must fail closed without
   # creating an unbounded or partially durable retry attempt.
   load_env
+  if ! phase_loop_require_operational_configuration; then
+    return 78
+  fi
   if ! validate_terminal_failure_retry_cap; then
     return 78
   fi
@@ -17489,6 +17534,13 @@ normalize_stale_running_before_start() {
 
 start() {
   load_env
+  if ! phase_loop_require_operational_configuration; then
+    exit 78
+  fi
+  if [ -z "$SCREEN_NAME" ] || [ -z "$LAUNCHD_LABEL" ]; then
+    printf '%s\n' 'PHASE_LOOP_SCREEN_NAME and PHASE_LOOP_LAUNCHD_LABEL must be explicitly configured before start.' >&2
+    exit 78
+  fi
   local migration_status
   if phase_loop_migrate_legacy_state; then
     migration_status=0
@@ -17661,6 +17713,9 @@ case "${1:-status}" in
     # snapshot races start/supervise and can still let this process overwrite
     # durable owner state after the supervisor becomes live.
     load_env
+    if ! phase_loop_require_operational_configuration; then
+      exit 78
+    fi
     PHASE_LOOP_SUPERVISOR_PID="$$"
     PHASE_LOOP_SUPERVISOR_GENERATION="run-once-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
     if ! acquire_lock; then

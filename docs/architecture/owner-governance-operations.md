@@ -10,10 +10,13 @@ authority. It is part of Brownie's fail-closed release governance surface.
 | Phase Loop implementation PR author / pusher | `implementation` |
 | Review, approval, merge, and owner governance operation | `review` / `merge` |
 
-The concrete GitHub principals and repository are deployment data in
-`.brownie/phase-loop-actor-deployment.json`; local credential-profile mappings
-belong in `.brownie/private/phase-loop-actor-credentials.json`. The controller
-resolves and verifies those mappings before any authenticated operation.
+The concrete GitHub principals, repository, branch prefixes, and operating
+paths are deployment data supplied through the explicit
+`PHASE_LOOP_ACTOR_DEPLOYMENT` selector. The framework ships neither a fallback
+deployment file nor account names. Local credential-profile mappings are
+supplied through `PHASE_LOOP_ACTOR_CREDENTIALS` and must be private to the
+selected deployment. The controller resolves and verifies both mappings before
+any authenticated operation.
 
 The implementation actor and review actor must remain distinct for release
 evidence. A review by the implementation actor is not independent review

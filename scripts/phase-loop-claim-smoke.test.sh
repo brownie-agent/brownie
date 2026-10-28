@@ -23,6 +23,18 @@ export PHASE_LOOP_PR_REMOTE="fixture-origin"
 # checkout remains credential-free.
 PHASE_LOOP_TEST_CONTROL_ROOT="$(mktemp -d)"
 mkdir -p "$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/profiles/implementation"
+cat > "$PHASE_LOOP_TEST_CONTROL_ROOT/actor-deployment.json" <<'JSON'
+{
+  "schema_version": 1,
+  "repository": "fixture-owner/fixture-repository",
+  "roles": {
+    "implementation": {"github_login": "fixture-implementation", "branch_prefixes": ["fixture/"]},
+    "review": {"github_login": "fixture-review"},
+    "merge": {"github_login": "fixture-merge"}
+  },
+  "constraints": {"require_independent_review": true}
+}
+JSON
 cat > "$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/phase-loop-actor-credentials.json" <<'JSON'
 {
   "schema_version": 1,
@@ -37,17 +49,48 @@ cat > "$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/phase-loop-actor-credentia
 }
 JSON
 cleanup_phase_loop_test_control_root() {
-  rm -rf "$PHASE_LOOP_TEST_CONTROL_ROOT"
+  rm -rf "$PHASE_LOOP_TEST_CONTROL_ROOT" "${PHASE_LOOP_TEST_RUNTIME:-}"
 }
 trap cleanup_phase_loop_test_control_root EXIT
 export PHASE_LOOP_CONTROL_ROOT="$PHASE_LOOP_TEST_CONTROL_ROOT"
-export PHASE_LOOP_ACTOR_DEPLOYMENT="$REPO_ROOT/.brownie/phase-loop-actor-deployment.json"
+export PHASE_LOOP_ACTOR_DEPLOYMENT="$PHASE_LOOP_TEST_CONTROL_ROOT/actor-deployment.json"
 export PHASE_LOOP_ACTOR_CREDENTIALS="$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/phase-loop-actor-credentials.json"
 PHASE_LOOP_TEST_REPOSITORY="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field repository)"
 PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login)"
 PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field branch-prefix)"
 PHASE_LOOP_TEST_REVIEW_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role review --field github-login)"
 export PHASE_LOOP_TEST_REPOSITORY PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX PHASE_LOOP_TEST_REVIEW_ACTOR
+# Inject every operational value used by a run. The test suite must not rely
+# on a repository-local deployment file or inherited developer configuration.
+PHASE_LOOP_TEST_RUNTIME="$(mktemp)"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$PHASE_LOOP_TEST_RUNTIME"
+chmod +x "$PHASE_LOOP_TEST_RUNTIME"
+export BROWNIE_RUNTIME_PATH="$PHASE_LOOP_TEST_RUNTIME"
+export PHASE_LOOP_INTERVAL_SECONDS=1
+export PHASE_LOOP_FAILURE_BACKOFF_SECONDS=1
+export PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS=1
+export PHASE_LOOP_BROWNIE_TIMEOUT_SECONDS=30
+export PHASE_LOOP_BROWNIE_DECOMPOSE_TIMEOUT_SECONDS=30
+export PHASE_LOOP_STAGNATION_THRESHOLD=3
+export PHASE_LOOP_PROMPT_MAX_BYTES=65536
+export PHASE_LOOP_SELECTED_TODO_MAX_BYTES=8192
+export PHASE_LOOP_TODO_SNAPSHOT_LINES=80
+export PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES=80
+export PHASE_LOOP_PROMPT_RETENTION_COUNT=20
+export PHASE_LOOP_STOP_GRACE_SECONDS=1
+export PHASE_LOOP_STOP_FORCE_SECONDS=1
+export PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS=1
+export PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS=1
+export PHASE_LOOP_SLEEP_POLL_SECONDS=1
+export PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES=3
+export PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0
+export PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=0
+export PHASE_LOOP_PR_BASE=main
+export PHASE_LOOP_PR_TITLE_PREFIX='fixture phase loop'
+export PHASE_LOOP_PR_DRAFT=0
+export PHASE_LOOP_LLM_ROUTING=1
+export PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES=20000
+export PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
 PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
 

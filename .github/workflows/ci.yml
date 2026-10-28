@@ -24,19 +24,32 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.name }}
+          PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN }}
+          PHASE_LOOP_IMPLEMENTATION_PR_ACTOR: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_ACTOR }}
+          PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER }}
+          PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY }}
           PHASE_LOOP_REJECTED_HEAD_SHA: ${{ vars.PHASE_LOOP_REJECTED_HEAD_SHA }}
           PHASE_LOOP_REJECTED_PR_NUMBER: ${{ vars.PHASE_LOOP_REJECTED_PR_NUMBER }}
         run: |
-          case "$PR_HEAD_REF" in
-            brownie-agent/*|phase-loop/*) ;;
-            *) exit 0 ;;
-          esac
-          if [ "$PR_AUTHOR" != "brownie-agent" ]; then
-            echo "Implementation pull-request author guard failed: expected brownie-agent, got $PR_AUTHOR" >&2
+          if [ -z "$PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN" ]; then
+            echo "No phase-loop implementation PR admission selector is configured; skipping role-specific admission."
+            exit 0
+          fi
+          if ! printf '%s\n' "$PR_HEAD_REF" | grep -Eq "^(${PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN})$"; then
+            exit 0
+          fi
+          for required in PHASE_LOOP_IMPLEMENTATION_PR_ACTOR PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY; do
+            if [ -z "${!required}" ]; then
+              echo "Implementation pull-request admission is selected but $required is not configured." >&2
+              exit 1
+            fi
+          done
+          if [ "$PR_AUTHOR" != "$PHASE_LOOP_IMPLEMENTATION_PR_ACTOR" ]; then
+            echo "Implementation pull-request author guard failed: configured=$PHASE_LOOP_IMPLEMENTATION_PR_ACTOR actual=$PR_AUTHOR" >&2
             exit 1
           fi
-          if [ "$PR_HEAD_OWNER" != "brownie-agent" ] || [ "$PR_HEAD_REPO" != "brownie" ]; then
-            echo "Implementation pull-request admission failed: expected head brownie-agent/brownie, got $PR_HEAD_OWNER/$PR_HEAD_REPO" >&2
+          if [ "$PR_HEAD_OWNER" != "$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER" ] || [ "$PR_HEAD_REPO" != "$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY" ]; then
+            echo "Implementation pull-request admission failed: configured=$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER/$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY actual=$PR_HEAD_OWNER/$PR_HEAD_REPO" >&2
             exit 1
           fi
           if [ -n "$PHASE_LOOP_REJECTED_HEAD_SHA" ] || [ -n "$PHASE_LOOP_REJECTED_PR_NUMBER" ]; then

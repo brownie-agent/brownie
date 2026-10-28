@@ -133,6 +133,7 @@ test('accepts an absolute TODO path inside the repository', () => {
   const result = validatePhaseLoopPreflight({
     repo,
     todo: path.join(repo, '.brownie/todo.md'),
+    expectedActor: 'fixture-implementation',
     skipCommands: true
   });
   assert.equal(result.valid, true, JSON.stringify(result.errors));
@@ -174,6 +175,7 @@ test('accepts a workspace TODO snapshot and records source, fingerprint, and que
     todo: snapshotTodo,
     breakdown,
     snapshotSource: sourceTodo,
+    expectedActor: 'fixture-implementation',
     controllerFingerprint: `sha256:${'a'.repeat(64)}`,
     skipCommands: true
   });
@@ -260,7 +262,7 @@ test('runs required preflight commands from the controller root when the workspa
   for (const name of workspaceScriptNames) {
     fs.writeFileSync(path.join(controlPlaneRoot, 'scripts', name), '#!/usr/bin/env node\nprocess.exit(0);\n');
   }
-  const result = validatePhaseLoopPreflight({ repo, controlPlaneRoot });
+  const result = validatePhaseLoopPreflight({ repo, controlPlaneRoot, expectedActor: 'fixture-implementation' });
   assert.equal(result.valid, true, JSON.stringify(result, null, 2));
   assert.deepEqual(result.command_results.map((entry) => entry.exit_code), [0, 0, 0, 0]);
 });
@@ -307,7 +309,8 @@ test('allows an external temporary queue only under the explicit claim-smoke fix
       repo,
       controlPlaneRoot: repositoryRoot,
       profile: 'claim-smoke-fixture',
-      todo: outsideTodo
+      todo: outsideTodo,
+      expectedActor: 'fixture-implementation'
     });
     assert.equal(result.valid, true, JSON.stringify(result, null, 2));
     assert.equal(result.command_results.length, 1);
@@ -373,6 +376,7 @@ test('accepts sequential controller-owned completion mutations for multiple TODO
     breakdown,
     snapshotSource: sourceTodo,
     snapshotAudit: auditPath,
+    expectedActor: 'fixture-implementation',
     skipCommands: true
   });
   assert.equal(result.valid, true, JSON.stringify(result.errors));
@@ -384,6 +388,7 @@ test('accepts sequential controller-owned completion mutations for multiple TODO
     breakdown,
     snapshotSource: sourceTodo,
     snapshotAudit: auditPath,
+    expectedActor: 'fixture-implementation',
     skipCommands: true
   });
   assert.equal(result.valid, true, JSON.stringify(result.errors));
@@ -395,6 +400,7 @@ test('accepts sequential controller-owned completion mutations for multiple TODO
     breakdown,
     snapshotSource: sourceTodo,
     snapshotAudit: auditPath,
+    expectedActor: 'fixture-implementation',
     skipCommands: true
   });
   assert.equal(result.valid, true, JSON.stringify(result.errors));

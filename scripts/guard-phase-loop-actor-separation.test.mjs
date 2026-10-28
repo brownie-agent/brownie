@@ -3,11 +3,12 @@ import test from 'node:test';
 import { runPhaseLoopActorSeparationGuard } from './guard-phase-loop-actor-separation.mjs';
 
 const policy = {
-  schema_version: 3,
-  policy_id: 'phase-loop-actor-separation-v3',
+  schema_version: 4,
+  policy_id: 'phase-loop-actor-separation-v4',
   deployment: {
     actor_configuration_selector: 'PHASE_LOOP_ACTOR_DEPLOYMENT',
     credential_configuration_selector: 'PHASE_LOOP_ACTOR_CREDENTIALS',
+    operational_configuration_selector: 'PHASE_LOOP_ENV_FILE',
     selection_rule: 'Both selectors are required and must not search a repository-relative fallback path.'
   },
   roles: {
@@ -47,7 +48,7 @@ function run(overrides = {}) {
     actorPreflight: 'loadPhaseLoopActorDeployment loadPhaseLoopActorCredentials resolvePhaseLoopGitHubProfile',
     actorDeployment: 'require_independent_review must be supplied explicitly',
     prActorGuard: 'validateImplementationPrActor loadPhaseLoopActorDeployment',
-    phaseLoop: 'PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-}" PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-}" phase-loop-pr-actor-guard.mjs --print-gh-config-dir GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create',
+    phaseLoop: 'PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-}" PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-}" phase_loop_require_operational_configuration phase-loop-pr-actor-guard.mjs --print-gh-config-dir GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create',
     ...overrides
   }).errors;
 }

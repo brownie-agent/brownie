@@ -51,10 +51,11 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   const prActorGuard = options.prActorGuard ?? readText(repoRoot, 'scripts/phase-loop-pr-actor-guard.mjs', errors);
   const actorDeployment = options.actorDeployment ?? readText(repoRoot, 'scripts/phase-loop-actor-deployment.mjs', errors);
 
-  requireValue(policy.schema_version === 3, errors, `${policyPath} schema_version must be 3.`);
-  requireValue(policy.policy_id === 'phase-loop-actor-separation-v3', errors, `${policyPath} policy_id must match.`);
+  requireValue(policy.schema_version === 4, errors, `${policyPath} schema_version must be 4.`);
+  requireValue(policy.policy_id === 'phase-loop-actor-separation-v4', errors, `${policyPath} policy_id must match.`);
   requireValue(policy.deployment?.actor_configuration_selector === 'PHASE_LOOP_ACTOR_DEPLOYMENT', errors, `${policyPath} must require an explicit actor deployment selector.`);
   requireValue(policy.deployment?.credential_configuration_selector === 'PHASE_LOOP_ACTOR_CREDENTIALS', errors, `${policyPath} must require an explicit credential selector.`);
+  requireValue(policy.deployment?.operational_configuration_selector === 'PHASE_LOOP_ENV_FILE', errors, `${policyPath} must define the explicit operational configuration selector.`);
   requireValue(/must not search a repository-relative fallback path/u.test(String(policy.deployment?.selection_rule ?? '')), errors, `${policyPath} must forbid repository-relative deployment fallback discovery.`);
   const roles = policy.roles ?? {};
   const implementationResponsibility = roles.implementation ?? {};
@@ -159,6 +160,11 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   requireValue(actorDeployment.includes('must be supplied explicitly'), errors, 'actor deployment loader must fail closed when deployment configuration is not supplied.');
   requireValue(!/PHASE_LOOP_ACTOR_DEPLOYMENT="\$\{PHASE_LOOP_ACTOR_DEPLOYMENT:-[^}]+\}"/u.test(phaseLoop), errors, 'phase-loop.sh must not supply a fixed actor deployment path.');
   requireValue(!/PHASE_LOOP_ACTOR_CREDENTIALS="\$\{PHASE_LOOP_ACTOR_CREDENTIALS:-[^}]+\}"/u.test(phaseLoop), errors, 'phase-loop.sh must not supply a fixed actor credential path.');
+  requireValue(!/PHASE_LOOP_WORKSPACE_ROOT="\$\{PHASE_LOOP_WORKSPACE_ROOT:-"\$ROOT_DIR"\}"/u.test(phaseLoop), errors, 'phase-loop.sh must not supply a default workspace root.');
+  requireValue(!/BROWNIE_BIN="\$PHASE_LOOP_WORKSPACE_ROOT\/target\/debug\/brownie"/u.test(phaseLoop), errors, 'phase-loop.sh must not discover a default Brownie CLI path.');
+  requireValue(!phaseLoop.includes('$ROOT_DIR/phase-loop.env'), errors, 'phase-loop.sh must not discover a repository-local environment file.');
+  requireValue(phaseLoop.includes('phase_loop_require_operational_configuration'), errors, 'phase-loop.sh must fail closed when operational configuration is incomplete.');
+  requireValue(!fs.existsSync(path.join(repoRoot, '.brownie/phase-loop-actor-deployment.json')), errors, '.brownie/phase-loop-actor-deployment.json must not ship a concrete deployment.');
   requireValue(!/expectedActor\s*=\s*['"][^'"]+['"]/u.test(prActorGuard), errors, 'phase-loop-pr-actor-guard.mjs must not default implementation PR creation to a fixed actor.');
   requireValue(prActorGuard.includes('validateImplementationPrActor'), errors, 'phase-loop-pr-actor-guard.mjs must validate the authenticated implementation PR actor.');
 

@@ -1,10 +1,11 @@
 {
-  "schema_version": 3,
-  "policy_id": "phase-loop-actor-separation-v3",
+  "schema_version": 4,
+  "policy_id": "phase-loop-actor-separation-v4",
   "deployment": {
     "actor_configuration_selector": "PHASE_LOOP_ACTOR_DEPLOYMENT",
     "credential_configuration_selector": "PHASE_LOOP_ACTOR_CREDENTIALS",
-    "selection_rule": "Both selectors are required for an operational deployment; the framework must not search a repository-relative fallback path."
+    "operational_configuration_selector": "PHASE_LOOP_ENV_FILE",
+    "selection_rule": "Operational values may be injected directly through the process environment or through the explicit operational configuration selector. The framework must not search a repository-relative fallback path."
   },
   "roles": {
     "implementation": {
@@ -46,7 +47,7 @@
     }
   },
   "requirements": [
-    "Implementation, review, merge, repository, branch, credential-profile, and controller operating values are supplied by deployment configuration or explicit process configuration, never from source-code defaults.",
+    "Implementation, review, merge, repository, branch, credential-profile, binary, path, timeout, retry, and controller operating values are supplied by deployment configuration or explicit process configuration, never from source-code defaults.",
     "The deployment configuration must bind a repository, a GitHub principal for each role, and implementation branch prefixes.",
     "The implementation credential profile must be repository-private and must not silently fall back to a host-default account.",
     "Runtime preflight must verify gh api user against the deployment role principal before implementation, review, or merge operations.",

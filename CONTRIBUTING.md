@@ -23,6 +23,14 @@ Brownie Phase Loop implementation work is expected to use:
 - review actor: the `review` principal in the configuration selected by `PHASE_LOOP_ACTOR_DEPLOYMENT`
 - merge actor: the `merge` principal in the configuration selected by `PHASE_LOOP_ACTOR_DEPLOYMENT`
 
+The repository does not ship a concrete Phase Loop deployment. Supply every
+operational value (workspace, state, control root, binaries, repository,
+principals, branches, retries, and timeouts) through the process environment or
+an explicitly selected `PHASE_LOOP_ENV_FILE`; supply actor and credential
+mappings with `PHASE_LOOP_ACTOR_DEPLOYMENT` and `PHASE_LOOP_ACTOR_CREDENTIALS`.
+The controller never probes `phase-loop.env`, `.test`, `.brownie/private`, or a
+workspace binary path as a fallback.
+
 Implementation PRs must be authored and pushed by the configured implementation
 principal. Review and merge must use the configured independent review and merge
 principals after required checks pass.

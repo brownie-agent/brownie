@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
+import { roleActor } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,7 +41,7 @@ const requiredOperationalDocuments = [
   {
     path: 'docs/architecture/owner-governance-operations.md',
     requiredSubstrings: [
-      'phase-loop-actor-deployment.json',
+      'PHASE_LOOP_ACTOR_DEPLOYMENT',
       'implementation',
       'review',
       'last-pusher approval',
@@ -206,8 +206,7 @@ function validateEvidence(evidence, options = {}) {
   const repoRoot = options.repoRoot ?? defaultRepoRoot;
   const expectedSourceCommit = options.expectedSourceCommit;
   const errors = [];
-  const deploymentResult = options.deploymentResult ?? loadPhaseLoopActorDeployment({ repoRoot });
-  const deployment = deploymentResult.deployment ?? {
+  const deployment = options.deploymentResult?.deployment ?? {
     repository: evidence.repository,
     roles: {
       implementation: { github_login: null },
