@@ -103,6 +103,11 @@ test('rejects CI deployment values embedded in source', () => {
   assert(errors.some((error) => error.includes('must not hard-code a deployment actor or repository owner')));
 });
 
+test('rejects CI admission coupled to a fixed pull-request head owner', () => {
+  const errors = run({ ciWorkflow: "PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER 'repository': os.environ['GITHUB_REPOSITORY'] phase-loop-actor-deployment.mjs --deployment \"$PHASE_LOOP_DEPLOYMENT_FILE\" --role implementation --field repository" });
+  assert(errors.some((error) => error.includes('must not bind implementation admission to a fixed pull-request head owner or repository')));
+});
+
 test('rejects CI deployment configuration leaked into generic test processes', () => {
   const errors = run({ ciWorkflow: "PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR 'repository': os.environ['GITHUB_REPOSITORY'] phase-loop-actor-deployment.mjs --deployment \"$PHASE_LOOP_DEPLOYMENT_FILE\" --role implementation --field repository printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\\n'" });
   assert(errors.some((error) => error.includes('must not export actor deployment configuration into generic test processes')));

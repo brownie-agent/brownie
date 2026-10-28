@@ -21,12 +21,8 @@ jobs:
         env:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          PR_HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
-          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.name }}
           PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN }}
           PHASE_LOOP_IMPLEMENTATION_PR_ACTOR: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_ACTOR }}
-          PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER }}
-          PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY }}
           PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES: ${{ vars.PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES }}
           PHASE_LOOP_REVIEW_ACTOR: ${{ vars.PHASE_LOOP_REVIEW_ACTOR }}
           PHASE_LOOP_MERGE_ACTOR: ${{ vars.PHASE_LOOP_MERGE_ACTOR }}
@@ -40,7 +36,7 @@ jobs:
           if ! printf '%s\n' "$PR_HEAD_REF" | grep -Eq "^(${PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN})$"; then
             exit 0
           fi
-          for required in PHASE_LOOP_IMPLEMENTATION_PR_ACTOR PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR; do
+          for required in PHASE_LOOP_IMPLEMENTATION_PR_ACTOR PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR; do
             if [ -z "${!required}" ]; then
               echo "Selected phase-loop deployment is incomplete: $required is not configured." >&2
               exit 1
@@ -48,10 +44,6 @@ jobs:
           done
           if [ "$PR_AUTHOR" != "$PHASE_LOOP_IMPLEMENTATION_PR_ACTOR" ]; then
             echo "Implementation pull-request author guard failed: configured=$PHASE_LOOP_IMPLEMENTATION_PR_ACTOR actual=$PR_AUTHOR" >&2
-            exit 1
-          fi
-          if [ "$PR_HEAD_OWNER" != "$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER" ] || [ "$PR_HEAD_REPO" != "$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY" ]; then
-            echo "Implementation pull-request admission failed: configured=$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER/$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY actual=$PR_HEAD_OWNER/$PR_HEAD_REPO" >&2
             exit 1
           fi
           PHASE_LOOP_DEPLOYMENT_FILE="$RUNNER_TEMP/phase-loop-actor-deployment.json"
