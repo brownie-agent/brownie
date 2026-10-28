@@ -819,6 +819,34 @@ chmod +x "$fake_brownie_terminal_no_eligible"
 fake_brownie_terminal_task_executed="$(mktemp)"
 sed 's/"status": "no_eligible_task"/"status": "task_executed"/' "$fake_brownie_terminal_no_eligible" > "$fake_brownie_terminal_task_executed"
 chmod +x "$fake_brownie_terminal_task_executed"
+fake_brownie_runtime_authorization_expired="$(mktemp)"
+cat > "$fake_brownie_runtime_authorization_expired" <<'SH'
+#!/usr/bin/env bash
+set -eu
+claim_id="${BROWNIE_PHASE_LOOP_CLAIM_ID:?missing admitted claim id}"
+claim_digest="$(python3 - "$claim_id" <<'PY'
+import hashlib
+import sys
+print(hashlib.sha256(sys.argv[1].encode('utf-8')).hexdigest())
+PY
+)"
+session_store="$PHASE_LOOP_BROWNIE_STORE_ROOT/phase-loop-claims/$claim_digest"
+mkdir -p "$session_store"
+printf '%s\n' '{"session":"approval-expired"}' > "$session_store/ledger.json"
+cat <<'JSON'
+{
+  "status": "runtime_proposal_apply_approval_expired",
+  "stop_class": "terminal_failure",
+  "terminal_failure": true,
+  "controller_action": "return_to_supervisor",
+  "error": {
+    "code": "runtime_proposal_apply_approval_expired",
+    "message": "controlled proposal authorization expired before apply"
+  }
+}
+JSON
+SH
+chmod +x "$fake_brownie_runtime_authorization_expired"
 fake_brownie_terminal_no_eligible_counted="$(mktemp)"
 cat > "$fake_brownie_terminal_no_eligible_counted" <<SH
 #!/usr/bin/env bash
@@ -1344,6 +1372,63 @@ assert feedback["recovery_state"] == "redelegatable", feedback
 assert feedback["terminal_failure_cause"] == "terminal_task_failed_without_completion_detail", feedback
 assert not blocked, blocked
 assert "terminal_failure_transaction" not in ledger, ledger
+PY
+
+# Proposal approval expiry is a Runtime session recovery, not an admission
+# failure.  The controller must recognise the exact CLI-shaped error before
+# admission validation, restore its pre-dispatch authority, archive only the
+# claim-local store, and require a fresh run without leaving status running.
+state_authorization_expired="$(mktemp -d)"
+prompt_authorization_expired="$(mktemp)"
+todo_authorization_expired="$(mktemp)"
+todo_breakdown_authorization_expired="$(mktemp)"
+authorization_expired_workspace="$(mktemp -d)"
+git -C "$authorization_expired_workspace" init -b main >/dev/null
+git -C "$authorization_expired_workspace" config user.name Brownie
+git -C "$authorization_expired_workspace" config user.email brownie@example.invalid
+mkdir -p "$authorization_expired_workspace/scripts"
+printf 'export const approvalExpiryFixture = true;\n' > "$authorization_expired_workspace/scripts/approval-expiry.mjs"
+git -C "$authorization_expired_workspace" add .
+git -C "$authorization_expired_workspace" commit -m init >/dev/null
+printf 'base prompt\n' > "$prompt_authorization_expired"
+printf -- '- [ ] E-authorization-expired: Patch only `scripts/approval-expiry.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/approval-expiry.mjs`.\n' > "$todo_authorization_expired"
+printf '# Breakdown\n' > "$todo_breakdown_authorization_expired"
+PHASE_LOOP_STATE_DIR="$state_authorization_expired" \
+PHASE_LOOP_PROMPT="$prompt_authorization_expired" \
+PHASE_LOOP_TODO="$todo_authorization_expired" \
+PHASE_LOOP_TODO_BREAKDOWN="$todo_breakdown_authorization_expired" \
+BROWNIE_BIN="$fake_brownie_runtime_authorization_expired" \
+PHASE_LOOP_WORKSPACE_ROOT="$authorization_expired_workspace" \
+PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+authorization_expired_exit="$?"
+test "$authorization_expired_exit" = "0"
+python3 - "$state_authorization_expired" "$PHASE_LOOP_BROWNIE_STORE_ROOT" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+state = pathlib.Path(sys.argv[1])
+store_root = pathlib.Path(sys.argv[2])
+status = json.loads((state / 'status.json').read_text(encoding='utf-8'))
+claim = json.loads((state / 'todo-claims/current.json').read_text(encoding='utf-8'))
+assert status['status'] == 'continuation_required', status
+assert status['exit_code'] == '0', status
+assert 'Runtime proposal authorization expired before apply' in status['detail'], status
+assert claim['runtime_authorization_rebaseline_count'] == 1, claim
+assert claim['runtime_authorization_rebaseline_pending'] is True, claim
+claim_digest = hashlib.sha256(claim['claim_id'].encode('utf-8')).hexdigest()
+active = store_root / 'phase-loop-claims' / claim_digest
+archives = sorted((store_root / 'phase-loop-claim-archives' / claim_digest).glob('*-authorization-expired'))
+assert not active.exists(), active
+assert len(archives) == 1, archives
+assert (archives[0] / 'ledger.json').exists(), archives
+audits = sorted((state / 'recovery-audits').glob('*-runtime-authorization-rebaseline.json'))
+assert len(audits) == 1, audits
+audit = json.loads(audits[0].read_text(encoding='utf-8'))
+assert audit['claim_id'] == claim['claim_id'], audit
+assert audit['cause'] == 'runtime_proposal_apply_approval_expired', audit
 PY
 
 # A stale terminal-looking claim must be isolated before a retry-cap-zero run.
