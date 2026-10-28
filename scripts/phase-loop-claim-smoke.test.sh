@@ -2070,6 +2070,7 @@ set -e
 test "$completion_pr_cleanup_retry_second_exit" = "0"
 python3 - "$completion_pr_cleanup_retry_state/status.json" "$completion_pr_cleanup_retry_state/todo-claims/current.json" "$completion_pr_cleanup_retry_todo" "$completion_pr_cleanup_retry_workspace" "$completion_pr_cleanup_retry_count" "$completion_pr_cleanup_retry_runtime_count" <<'PY'
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -2211,6 +2212,7 @@ set -e
 test "$completion_pr_publish_failure_second_exit" = "0"
 python3 - "$completion_pr_publish_failure_state/status.json" "$completion_pr_publish_failure_state/todo-claims/current.json" "$completion_pr_publish_failure_count" "$completion_pr_publish_failure_runtime_count" "$completion_pr_publish_failure_workspace" <<'PY'
 import json
+import os
 import pathlib
 import subprocess
 import sys
