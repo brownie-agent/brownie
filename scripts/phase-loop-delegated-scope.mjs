@@ -5,15 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { boundedScopes } from './phase-loop-bounded-scope.mjs';
 
 function git(root, args) { return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim(); }
 function digest(file) { return fs.existsSync(file) ? crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null; }
 function targets(objective) {
-  const paths = new Set();
-  for (const match of String(objective ?? '').matchAll(/(?:patch|create)\s+only\s+([^:\n]+)/giu)) {
-    for (const value of match[1].matchAll(/`([^`]+)`|(?:^|,\s*)([^,\s]+(?:\/[^,\s]+)*)/gu)) paths.add(value[1] ?? value[2]);
-  }
-  return [...paths].filter((value) => value && !value.includes('..') && !path.isAbsolute(value));
+  return [...new Set(boundedScopes(String(objective ?? '').split('\n')[0] ?? ''))]
+    .filter((value) => value && !value.includes('..') && !path.isAbsolute(value));
 }
 function tracked(root) { return git(root, ['ls-files', '-z']).split('\0').filter(Boolean); }
 function capture(root, backup, objective) {

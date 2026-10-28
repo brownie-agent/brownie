@@ -28,3 +28,22 @@ test('rejects and rolls back a README replacement outside the declared target se
   assert.equal(fs.readFileSync(path.join(root, 'allowed.txt'), 'utf8'), 'intended\n');
   assert.equal(result.evidence, 'tracked-file-scope-rollback');
 });
+
+test('keeps every target from repeated mixed-case operation clauses in scope', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-multi-scope-'));
+  for (const file of ['one.txt', 'two.txt', 'three.txt', 'README.md']) fs.writeFileSync(path.join(root, file), 'before\n');
+  execFileSync('git', ['init', '-q'], { cwd: root });
+  execFileSync('git', ['config', 'user.name', 'test'], { cwd: root });
+  execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root });
+  execFileSync('git', ['add', '.'], { cwd: root });
+  execFileSync('git', ['commit', '-qm', 'init'], { cwd: root });
+  const backup = path.join(root, '.scope-backup');
+  const objective = 'Patch only `one.txt`, then patch only `two.txt` and `three.txt`:';
+  execFileSync('node', [path.join(path.dirname(new URL(import.meta.url).pathname), 'phase-loop-delegated-scope.mjs'), '--capture', '1', '--workspace', root, '--backup', backup, '--objective', objective], { stdio: 'ignore' });
+  for (const file of ['one.txt', 'two.txt', 'three.txt', 'README.md']) fs.writeFileSync(path.join(root, file), 'after\n');
+  const result = enforceDelegatedScope({ workspaceRoot: root, backupRoot: backup, objective });
+  assert.deepEqual(result.declared_targets, ['one.txt', 'two.txt', 'three.txt']);
+  assert.deepEqual(result.forbidden, ['README.md']);
+  assert.equal(fs.readFileSync(path.join(root, 'README.md'), 'utf8'), 'before\n');
+  for (const file of ['one.txt', 'two.txt', 'three.txt']) assert.equal(fs.readFileSync(path.join(root, file), 'utf8'), 'after\n');
+});

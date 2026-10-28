@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { boundedScopes } from './phase-loop-bounded-scope.mjs';
 import { execFileSync } from 'node:child_process';
 import {
   readAllTodoReplanRecords,
@@ -164,37 +165,6 @@ function breakdownDependencies(text) {
   return dependencies;
 }
 
-function boundedScopeValues(first, keyword) {
-  const start = first.indexOf(keyword);
-  if (start < 0) {
-    return [];
-  }
-  let rest = first.slice(start + keyword.length).trimStart();
-  const scopes = [];
-  while (rest.startsWith('`')) {
-    const end = rest.indexOf('`', 1);
-    if (end < 0) {
-      break;
-    }
-    scopes.push(rest.slice(1, end));
-    rest = rest.slice(end + 1).trimStart();
-    const separator = rest.match(/^(?:,|and\b|&)\s*/u);
-    if (!separator) {
-      break;
-    }
-    rest = rest.slice(separator[0].length).trimStart();
-  }
-  return scopes;
-}
-
-function boundedScopes(block) {
-  const first = firstLine(block);
-  return [
-    ...boundedScopeValues(first, 'Patch only'),
-    ...boundedScopeValues(first, 'Create only')
-  ];
-}
-
 function protectedContract(block) {
   return {
     id: todoId(block),
@@ -204,7 +174,7 @@ function protectedContract(block) {
     completion_condition: lineValue(block, 'Completion condition'),
     forbidden_changes: lineValue(block, 'Forbidden changes'),
     verification: lineValue(block, 'Verification'),
-    bounded_scopes: boundedScopes(block)
+    bounded_scopes: boundedScopes(firstLine(block))
   };
 }
 

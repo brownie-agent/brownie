@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadTodoState } from './phase-loop-todo-state.mjs';
+import { boundedScopeValues, boundedScopes as boundedScopesFromFirstLine } from './phase-loop-bounded-scope.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -235,39 +236,16 @@ function scopeLine(block) {
 
 function patchOnlyScopes(block) {
   const firstLine = scopeLine(block);
-  return boundedScopeValuesAfterKeyword(firstLine, 'Patch only');
+  return boundedScopeValues(firstLine, 'patch');
 }
 
 function createOnlyScopes(block) {
   const firstLine = scopeLine(block);
-  return boundedScopeValuesAfterKeyword(firstLine, 'Create only');
-}
-
-function boundedScopeValuesAfterKeyword(firstLine, keyword) {
-  const start = firstLine.indexOf(keyword);
-  if (start < 0) {
-    return [];
-  }
-  let rest = firstLine.slice(start + keyword.length).trimStart();
-  const scopes = [];
-  while (rest.startsWith('`')) {
-    const end = rest.indexOf('`', 1);
-    if (end < 0) {
-      break;
-    }
-    scopes.push(rest.slice(1, end));
-    rest = rest.slice(end + 1).trimStart();
-    const separator = rest.match(/^(?:,|and\b|&)\s*/);
-    if (!separator) {
-      break;
-    }
-    rest = rest.slice(separator[0].length).trimStart();
-  }
-  return scopes;
+  return boundedScopeValues(firstLine, 'create');
 }
 
 function boundedScopes(block) {
-  return [...patchOnlyScopes(block), ...createOnlyScopes(block)];
+  return boundedScopesFromFirstLine(scopeLine(block));
 }
 
 function parentFromSource(block) {
