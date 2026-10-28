@@ -397,7 +397,19 @@ export function buildIndependentReviewsSection(repoRoot, options = {}) {
   const review = readJsonIfExists(repoRoot, defaultIndependentReviewPath);
   const evidence = ownerFileEvidence(repoRoot, defaultIndependentReviewPath);
   const deploymentResult = options.deploymentResult ?? loadPhaseLoopActorDeployment({ repoRoot });
-  if (!deploymentResult.ok) return { status: 'repository_unknown', release_blocking: true, actor_deployment_errors: deploymentResult.errors };
+  if (!deploymentResult.ok) {
+    return {
+      status: 'repository_unknown',
+      release_blocking: true,
+      owner_evidence: evidence,
+      required_review_ids: requiredReviewIds,
+      approved_review_count: 0,
+      missing_review_ids: requiredReviewIds,
+      github_review_provenance: [],
+      github_review_verification_failures: [],
+      actor_deployment_errors: deploymentResult.errors
+    };
+  }
   const deployment = deploymentResult.deployment;
   const repository = options.repository ?? parseRemoteRepository(gitValue(repoRoot, ['config', '--get', 'remote.origin.url'])) ?? deployment.repository;
   const verifyReviewProvenance = options.verifyReviewProvenance ?? ((entry) => verifyGithubReviewProvenance(repoRoot, repository, entry, deployment));

@@ -104,3 +104,25 @@ test('owner governance release collector accepts only verified GitHub review pro
   assert.equal(section.github_review_provenance.length, requiredReviewIds.length);
   assert.equal(section.github_review_verification_failures.length, 0);
 });
+
+test('owner governance release collector preserves a complete fail-closed section when deployment configuration is unavailable', () => {
+  const repoRoot = tempRepoRoot();
+  writeIndependentReviewEvidence(repoRoot, []);
+
+  const section = buildIndependentReviewsSection(repoRoot, {
+    deploymentResult: {
+      ok: false,
+      deployment: null,
+      errors: ['actor deployment must be supplied explicitly.']
+    }
+  });
+
+  assert.equal(section.status, 'repository_unknown');
+  assert.equal(section.release_blocking, true);
+  assert.equal(section.owner_evidence.exists, true);
+  assert.deepEqual(section.required_review_ids, requiredReviewIds);
+  assert.equal(section.approved_review_count, 0);
+  assert.deepEqual(section.missing_review_ids, requiredReviewIds);
+  assert.deepEqual(section.github_review_provenance, []);
+  assert.deepEqual(section.github_review_verification_failures, []);
+});
