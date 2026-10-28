@@ -259,6 +259,12 @@ fn runtime_error_output(error: RuntimeClientError, json: bool, command: &'static
             "BROWNIE_CLI_RUN_MODE_ID must be a non-empty bounded mode id using only ASCII letters, digits, '-', '_', '.', or ':'",
             None,
         ),
+        RuntimeClientError::ProposalApplyAuthorizationExpired => (
+            ExitCode::InternalCommunication,
+            "runtime_proposal_apply_approval_expired",
+            "controlled proposal authorization expired before apply",
+            None,
+        ),
         RuntimeClientError::InvalidResponse => (
             ExitCode::InternalCommunication,
             "runtime_invalid_response",
@@ -649,6 +655,21 @@ mod tests {
         assert_eq!(payload["automation"]["journey_id"], serde_json::Value::Null);
         assert!(payload["automation"]["next_invocation"].is_null());
         assert_eq!(payload["automation"]["process_admission_state"], "unknown");
+    }
+
+    #[test]
+    fn json_expired_proposal_authorization_is_distinguished_from_invalid_runtime_output() {
+        let output = runtime_error_output(
+            RuntimeClientError::ProposalApplyAuthorizationExpired,
+            true,
+            "resume",
+        );
+        assert_eq!(output.exit_code, ExitCode::InternalCommunication);
+        let payload: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(payload["status"], "runtime_proposal_apply_approval_expired");
+        assert_eq!(payload["retryable"], false);
+        assert_eq!(payload["continuation_required"], false);
+        assert_eq!(payload["controller_action"], "return_to_supervisor");
     }
 
     #[test]

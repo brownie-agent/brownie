@@ -81,6 +81,10 @@ PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS="${PHASE_LOOP_CONTINUATION_WATCHDOG_SEC
 # Zero means the first terminal failure is stable/blocked. A positive value is
 # the number of additional executions permitted before the failure is stable.
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP="${PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP:-}"
+# This is deployment policy, deliberately supplied externally.  It bounds the
+# one-way archive-and-fresh-session recovery used when a Runtime proposal
+# approval expires during an interrupted continuation.
+PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP="${PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP:-}"
 PHASE_LOOP_DEFERRED_SIGNAL_PENDING=0
 PHASE_LOOP_DEFERRED_SIGNAL_CODE=""
 PHASE_LOOP_FINALIZING=0
@@ -9386,6 +9390,23 @@ phase_loop_should_resume_active_claim() {
   if ! active_todo_claim_exists; then
     return 1
   fi
+  # A previous Runtime session can contain an explicit proposal approval that
+  # is no longer current.  Its store is archived by the bounded recovery
+  # below; never issue `resume` against that archived authorization.
+  if python3 - "$TODO_CLAIM_FILE" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        claim = json.load(handle)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if claim.get("runtime_authorization_rebaseline_pending") is True else 1)
+PY
+  then
+    return 1
+  fi
   if [ -f "$BDK_HARNESS_FEEDBACK_FILE" ]; then
     if python3 - "$TODO_CLAIM_FILE" "$BDK_HARNESS_FEEDBACK_FILE" <<'PY'
 import json
@@ -13262,6 +13283,7 @@ phase_loop_require_operational_configuration() {
     PHASE_LOOP_STOP_FORCE_SECONDS PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS
     PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS PHASE_LOOP_SLEEP_POLL_SECONDS
     PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP
+    PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP
     PHASE_LOOP_APPROVED_CONTROLLER_BASELINE PHASE_LOOP_CREATE_PR_AFTER_PROGRESS
     PHASE_LOOP_PR_REMOTE PHASE_LOOP_PR_BASE PHASE_LOOP_PR_TITLE_PREFIX
     PHASE_LOOP_PR_DRAFT PHASE_LOOP_LLM_ROUTING PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES
@@ -13450,6 +13472,30 @@ PY
     return 78
   fi
   PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP="$normalized_cap"
+  return 0
+}
+
+validate_runtime_authorization_rebaseline_cap() {
+  local raw_cap="${PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP:-}"
+  local normalized_cap
+  if ! normalized_cap="$(python3 - "$raw_cap" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1]
+if not re.fullmatch(r"[0-9]+", raw):
+    raise SystemExit(1)
+value = int(raw)
+if value > 9007199254740991:
+    raise SystemExit(1)
+print(value)
+PY
+)"; then
+    PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP_VALIDATION_DETAIL="Invalid PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP=${raw_cap}; expected a finite non-negative integer."
+    printf '%s\n' "$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP_VALIDATION_DETAIL" >&2
+    return 78
+  fi
+  PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP="$normalized_cap"
   return 0
 }
 
@@ -14490,6 +14536,86 @@ acquire_lock() {
   return 1
 }
 
+phase_loop_rebaseline_expired_runtime_authorization() {
+  local run_stamp="$1"
+  local stdout_log="$2"
+  local output status
+  set +e
+  output="$(node "$ROOT_DIR/scripts/phase-loop-runtime-authorization-rebaseline.mjs" rebaseline \
+    --store-root "$PHASE_LOOP_BROWNIE_STORE_ROOT" \
+    --state-dir "$STATE_DIR" \
+    --claim "$TODO_CLAIM_FILE" \
+    --stdout "$stdout_log" \
+    --run-stamp "$run_stamp" \
+    --cap "$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_CAP" 2>&1)"
+  status=$?
+  set -e
+  PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT="$output"
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+  if ! printf '%s' "$output" | python3 -c 'import json,sys; value=json.load(sys.stdin); sys.exit(0 if value.get("ok") is True else 1)'; then
+    return 78
+  fi
+  return 0
+}
+
+clear_runtime_authorization_rebaseline_pending() {
+  local run_stamp="$1"
+  local temporary pending_status
+  set +e
+  python3 - "$TODO_CLAIM_FILE" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        claim = json.load(handle)
+except Exception:
+    sys.exit(2)
+sys.exit(0 if claim.get("runtime_authorization_rebaseline_pending") is True else 1)
+PY
+  pending_status=$?
+  set -e
+  if [ "$pending_status" -eq 1 ]; then
+    return 0
+  fi
+  if [ "$pending_status" -ne 0 ]; then
+    return 1
+  fi
+  temporary="$TODO_CLAIM_FILE.$$.$RANDOM.authorization-rebaseline.tmp"
+  if ! python3 - "$TODO_CLAIM_FILE" "$temporary" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+run_stamp = sys.argv[3]
+timestamp = sys.argv[4]
+try:
+    claim = json.loads(source.read_text(encoding="utf-8"))
+except Exception as error:
+    raise SystemExit(f"claim unreadable: {error}")
+if not isinstance(claim, dict) or not str(claim.get("claim_id") or ""):
+    raise SystemExit("claim lacks durable identity")
+if claim.get("runtime_authorization_rebaseline_pending") is True:
+    claim["runtime_authorization_rebaseline_pending"] = False
+    claim["runtime_authorization_rebaseline_activated_run_stamp"] = run_stamp
+    claim["runtime_authorization_rebaseline_activated_at"] = timestamp
+destination.write_text(json.dumps(claim, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+os.chmod(destination, 0o600)
+PY
+  then
+    rm -f "$temporary"
+    return 1
+  fi
+  mv "$temporary" "$TODO_CLAIM_FILE"
+  chmod 600 "$TODO_CLAIM_FILE"
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
 bind_runtime_stdout_to_active_claim() {
   local stdout_log="$1"
   python3 - "$stdout_log" "$TODO_CLAIM_FILE" <<'PY'
@@ -14541,6 +14667,9 @@ _run_brownie_once() {
     return 78
   fi
   if ! validate_terminal_failure_retry_cap; then
+    return 78
+  fi
+  if ! validate_runtime_authorization_rebaseline_cap; then
     return 78
   fi
   local started_at run_stamp stdout_log stderr_log effective_prompt exit_code run_id detail brownie_timeout_seconds
@@ -15692,9 +15821,28 @@ NODE
     runtime_admission_status=$?
   fi
   if [ "$runtime_admission_status" -ne 0 ]; then
-    local runtime_admission_cause runtime_admission_snapshot_mismatch
+    local runtime_admission_cause runtime_admission_snapshot_mismatch runtime_authorization_expired
     runtime_admission_cause="$(printf '%s' "$runtime_admission_validation" | python3 -c 'import json,sys; value=json.load(sys.stdin); print(value.get("cause") or value.get("reason") or "runtime_admission_validation_failed")' 2>/dev/null || printf '%s' "runtime_admission_validation_failed")"
     runtime_admission_snapshot_mismatch="$(printf '%s' "$runtime_admission_validation" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("snapshot_mismatch") else "0")' 2>/dev/null || printf '%s' "1")"
+    runtime_authorization_expired=0
+    if python3 - "$stdout_log" 2>/dev/null <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    root = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+error = root.get("error") if isinstance(root, dict) else None
+code = root.get("status") if isinstance(root, dict) else None
+if not isinstance(code, str) and isinstance(error, dict):
+    code = error.get("code")
+sys.exit(0 if code == "runtime_proposal_apply_approval_expired" else 1)
+PY
+    then
+      runtime_authorization_expired=1
+    fi
     # Admission failure is a post-execution boundary failure. Roll back both
     # layers of workspace authority before returning: delegated scope restores
     # every out-of-scope tracked file, while the exact pre-runtime target
@@ -15716,6 +15864,32 @@ NODE
     restore_claim_snapshot_before_runtime "$claim_snapshot_before_runtime"
     mismatch_claim_status=$?
     set -e
+    if [ "$runtime_authorization_expired" = "1" ] \
+      && [ "$mismatch_scope_status" -eq 0 ] \
+      && [ "$mismatch_target_status" -eq 0 ] \
+      && [ "$mismatch_claim_status" -eq 0 ]; then
+      if ! phase_loop_rebaseline_expired_runtime_authorization "$run_stamp" "$stdout_log"; then
+        detail="Runtime proposal authorization expired, but its prior session could not be safely archived and rebaselined; refusing a stale resume. result=${PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT:-<no output>} stdout=$stdout_log stderr=$stderr_log"
+        printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+        write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+        write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_rebaseline_failed","owner_blocked":true}'
+        return 78
+      fi
+      local authorization_rebaseline_applied
+      authorization_rebaseline_applied="$(printf '%s' "$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("rebaselined") is True else "0")' 2>/dev/null || printf '%s' "0")"
+      if [ "$authorization_rebaseline_applied" = "1" ]; then
+        detail="Runtime proposal authorization expired before apply. The claim-local Runtime session was archived with audit evidence and the next invocation is forced to create a fresh session. recovery=$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT stdout=$stdout_log stderr=$stderr_log"
+        printf '%s run=%s runtime_authorization_rebaselined=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT" >> "$SUPERVISOR_LOG"
+        write_status "continuation_required" "$detail" "$run_stamp" "0" "0" "" "true"
+        write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"runtime_proposal_apply_approval_expired","recovery_scope":"claim_runtime_store","fresh_run_required":true}'
+        return 0
+      fi
+      detail="Runtime proposal authorization expired and the configured rebaseline cap forbids another fresh Runtime session. recovery=$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT stdout=$stdout_log stderr=$stderr_log"
+      printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+      write_status "blocked" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
+      write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_rebaseline_cap_exhausted","owner_blocked":true}'
+      return 76
+    fi
     write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
     if [ "$runtime_admission_cause" = "claimed_task_not_admitted" ] && [ "$runtime_admission_snapshot_mismatch" = "0" ]; then
       detail="Runtime attested the admitted claim snapshot but produced no task execution evidence; classified as execution_not_started and restored the pre-runtime delegated scope, target, and claim snapshots before bounded recovery. admission=$runtime_admission_validation scope_status=$mismatch_scope_status target_status=$mismatch_target_status claim_status=$mismatch_claim_status scope=$mismatch_scope_output stdout=$stdout_log stderr=$stderr_log"
@@ -15729,6 +15903,13 @@ NODE
     printf '%s run=%s runtime_admission_recovery_required=true runtime_admission_cause=%s snapshot_mismatch=%s admission=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_stamp" "$runtime_admission_cause" "$runtime_admission_snapshot_mismatch" "$runtime_admission_validation" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
     write_bdk_trajectory_event "$run_stamp" "todo.replanned" "{\"reason\":\"$runtime_admission_cause\",\"snapshot_mismatch\":$([ "$runtime_admission_snapshot_mismatch" = "1" ] && printf true || printf false),\"continuation_required\":true,\"recovery_scope\":\"selected_claim\",\"owner_blocked\":false}"
     return 76
+  fi
+  if [ "$use_resume" -ne 1 ] && ! clear_runtime_authorization_rebaseline_pending "$run_stamp"; then
+    detail="Runtime returned an admitted fresh session, but the expired-authorization rebaseline marker could not be cleared atomically; refusing to continue with ambiguous resume state. stdout=$stdout_log stderr=$stderr_log"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_rebaseline_marker_clear_failed","owner_blocked":true}'
+    return 78
   fi
   bind_runtime_stdout_to_active_claim "$stdout_log"
   set +e
@@ -17123,6 +17304,9 @@ run_brownie_once() {
     return 78
   fi
   if ! validate_terminal_failure_retry_cap; then
+    return 78
+  fi
+  if ! validate_runtime_authorization_rebaseline_cap; then
     return 78
   fi
   PHASE_LOOP_TASK_LEDGER_FAILURE=0

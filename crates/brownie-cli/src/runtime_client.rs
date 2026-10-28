@@ -102,6 +102,7 @@ pub enum RuntimeClientError {
     RunCommunicationFailedAdmissionUnknown(RunRecoveryIdentity),
     RunTimedOutAdmissionUnknown(RunRecoveryIdentity),
     InvalidRunModeConfig,
+    ProposalApplyAuthorizationExpired,
     InvalidResponse,
     RuntimeError,
 }
@@ -3950,6 +3951,22 @@ fn validate_direct_proposal_apply_result(result: &Value) -> Result<(), RuntimeCl
         .as_object()
         .ok_or(RuntimeClientError::InvalidResponse)?;
     let apply = object_field_from_value(object, "apply_result")?;
+    if display_string(apply, "apply_status")? == "Denied"
+        && !display_bool(apply, "applied")?
+        && !display_bool(apply, "authorization_consumed")?
+        && apply
+            .get("failed_checks")
+            .and_then(Value::as_array)
+            .is_some_and(|checks| {
+                checks.iter().any(|check| {
+                    check
+                        .as_str()
+                        .is_some_and(|value| value == "approval_not_expired")
+                })
+            })
+    {
+        return Err(RuntimeClientError::ProposalApplyAuthorizationExpired);
+    }
     if !matches!(
         display_string(apply, "operation")?.as_str(),
         "replace_file" | "create_file" | "patch_file"
@@ -5639,6 +5656,25 @@ mod tests {
         });
 
         validate_direct_proposal_apply_result(&apply_result).expect("valid create apply");
+    }
+
+    #[test]
+    fn direct_proposal_apply_reports_expired_authorization_without_collapsing_it_to_invalid_response(
+    ) {
+        let apply_result = json!({
+            "apply_result": {
+                "operation": "create_file",
+                "apply_status": "Denied",
+                "applied": false,
+                "authorization_consumed": false,
+                "failed_checks": ["approval_not_expired"]
+            }
+        });
+
+        assert_eq!(
+            validate_direct_proposal_apply_result(&apply_result),
+            Err(RuntimeClientError::ProposalApplyAuthorizationExpired)
+        );
     }
 
     #[test]
