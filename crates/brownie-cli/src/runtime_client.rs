@@ -2821,6 +2821,22 @@ fn automation_outcome_from_legacy_payload(
                     payload_string(payload, "stop_reason")
                         .unwrap_or_else(|| "bounded_progress".to_string()),
                 ),
+                // `proposal.apply` is an acknowledged, durable workspace
+                // mutation.  It is intentionally followed by a separate
+                // verification/acceptance turn, so it is neither a terminal
+                // completion nor an invalid Runtime response.  Project it as
+                // resumable progress; otherwise a successful apply is
+                // collapsed into `runtime_invalid_response` and a supervisor
+                // can roll the mutation back without ever running its
+                // verification route.
+                "objective_proposal_applied" => (
+                    "continuation_required",
+                    "resume",
+                    true,
+                    true,
+                    payload_string(payload, "stop_reason")
+                        .unwrap_or_else(|| "objective_proposal_applied".to_string()),
+                ),
                 _ => return Err(RuntimeClientError::InvalidResponse),
             }
         };
@@ -6490,6 +6506,28 @@ mod tests {
             payload["automation"]["next_invocation"]["params"]["product_loop_stop_recovery_target"]
                 ["recovery_mode_id"],
             "implementer"
+        );
+    }
+
+    #[test]
+    fn legacy_projection_treats_applied_objective_proposal_as_resumable_progress() {
+        let payload = json!({
+            "status": "objective_proposal_applied",
+            "stop_reason": "objective_proposal_applied"
+        });
+        let outcome = automation_outcome_from_legacy_payload(payload.as_object().unwrap())
+            .expect("an acknowledged proposal apply is a resumable outcome");
+
+        assert_eq!(outcome.status, "continuation_required");
+        assert_eq!(outcome.class_name, "continuation_required");
+        assert_eq!(outcome.controller_action, "resume");
+        assert!(outcome.continuation_required);
+        assert!(outcome.retryable);
+        assert!(!outcome.completed);
+        assert!(!outcome.terminal_failure);
+        assert_eq!(
+            outcome.next_invocation,
+            Some(json!({ "command": "resume", "arguments": [] }))
         );
     }
 

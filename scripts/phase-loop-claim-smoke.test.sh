@@ -98,6 +98,45 @@ export PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
 PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
 
+run_pre_runtime_target_snapshot_regression() {
+  local fixture helper workspace target snapshot
+  fixture="$(mktemp -d)"
+  helper="$fixture/restore-target.sh"
+  workspace="$fixture/workspace"
+  target='scripts/generated-target.mjs'
+  snapshot="$fixture/target.before"
+  mkdir -p "$workspace/scripts"
+  sed -n '/^restore_pre_runtime_active_target_snapshot() {/,/^}/p' "$PHASE_LOOP" > "$helper"
+  if [ ! -s "$helper" ]; then
+    echo "unable to extract pre-runtime target snapshot recovery helper" >&2
+    rm -rf "$fixture"
+    exit 1
+  fi
+
+  # A create_file target did not exist at dispatch. Its absent marker must
+  # remove the file if a post-dispatch failure rolls the attempt back.
+  : > "$snapshot.absent"
+  printf '%s\n' '// created during failed runtime invocation' > "$workspace/$target"
+  PHASE_LOOP_WORKSPACE_ROOT="$workspace" bash -c '
+    source "$1"
+    restore_pre_runtime_active_target_snapshot "$2" "$3"
+    test ! -e "$PHASE_LOOP_WORKSPACE_ROOT/$2"
+  ' _ "$helper" "$target" "$snapshot"
+
+  # Existing targets still restore their exact pre-dispatch bytes.
+  rm -f "$snapshot.absent"
+  printf '%s\n' '// before runtime' > "$snapshot"
+  printf '%s\n' '// after runtime' > "$workspace/$target"
+  PHASE_LOOP_WORKSPACE_ROOT="$workspace" bash -c '
+    source "$1"
+    restore_pre_runtime_active_target_snapshot "$2" "$3"
+    test "$(cat "$PHASE_LOOP_WORKSPACE_ROOT/$2")" = "// before runtime"
+  ' _ "$helper" "$target" "$snapshot"
+  rm -rf "$fixture"
+}
+
+run_pre_runtime_target_snapshot_regression
+
 phase_loop_smoke_cpu_count() {
   local detected=""
   if command -v getconf >/dev/null 2>&1; then
