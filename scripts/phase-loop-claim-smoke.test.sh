@@ -3539,6 +3539,7 @@ preclaim_dirty_output="$(PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 node "$REPO_ROOT/scr
   --todo "$preclaim_delivery_todo" \
   --breakdown "$preclaim_delivery_breakdown" \
   --control-plane-root "$REPO_ROOT" \
+  --expected-actor "$PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR" \
   --profile claim-smoke-fixture \
   --stage pre-claim-boundary 2>&1)"
 preclaim_dirty_status="$?"
@@ -3561,6 +3562,7 @@ PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 node "$REPO_ROOT/scripts/phase-loop-preflight
   --todo "$preclaim_delivery_todo" \
   --breakdown "$preclaim_delivery_breakdown" \
   --control-plane-root "$REPO_ROOT" \
+  --expected-actor "$PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR" \
   --profile claim-smoke-fixture \
   --stage pre-claim-boundary >/dev/null
 
@@ -3636,7 +3638,7 @@ head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], te
 remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", f"fixture-origin/{os.environ['PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX']}smoke-pr"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
-assert message.startswith("Brownie phase-loop:"), message
+assert message.startswith(f"{os.environ['PHASE_LOOP_PR_TITLE_PREFIX']}:"), message
 assert "B-01:" in message, message
 assert "README.md" in message, message
 assert "B-01:" in todo, todo
@@ -3696,7 +3698,7 @@ head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], te
 remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", f"fixture-origin/{os.environ['PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX']}smoke-pr-completed"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
-assert message.startswith("Brownie phase-loop:"), message
+assert message.startswith(f"{os.environ['PHASE_LOOP_PR_TITLE_PREFIX']}:"), message
 assert "B-01:" in message, message
 assert "README.md" in message, message
 assert "B-01:" in todo, todo
@@ -3831,6 +3833,22 @@ test "$actor_guard_invalid_exit" = "1"
 fi
 
 if claim_smoke_section_enabled lifecycle; then
+# The lifecycle shard is selected independently by CI.  It therefore cannot
+# borrow the bare workspace created for the core shard: phase-loop preflight
+# reads the workspace package-script contract even for stop/recovery paths.
+# Keep this deployment-neutral fixture complete and restore the shared
+# variable afterwards so other selected shards cannot inherit it.
+lifecycle_original_workspace="$test_workspace"
+lifecycle_workspace="$(mktemp -d)"
+git -C "$lifecycle_workspace" init -b main >/dev/null
+mkdir -p "$lifecycle_workspace/.brownie" "$lifecycle_workspace/scripts"
+printf '%s\n' '{"name":"brownie-claim-smoke-lifecycle-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$lifecycle_workspace/package.json"
+printf '# lifecycle fixture breakdown\n' > "$lifecycle_workspace/.brownie/todo-breakdown.md"
+printf 'export const evidence = {};\n' > "$lifecycle_workspace/scripts/release-supply-chain-artifact-evidence.mjs"
+git -C "$lifecycle_workspace" add package.json .brownie/todo-breakdown.md scripts/release-supply-chain-artifact-evidence.mjs
+git -C "$lifecycle_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+test_workspace="$lifecycle_workspace"
+
 state_truncated="$(mktemp -d)"
 prompt_truncated="$(mktemp)"
 todo_truncated="$(mktemp)"
@@ -4201,14 +4219,15 @@ PHASE_LOOP_STOP_FORCE_SECONDS=3 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" supervise >/dev/null 2>/dev/null &
 child_supervisor_pid="$!"
 
-for _ in 1 2 3 4 5; do
-  if [ -s "$child_pid_file" ]; then
+child_start_deadline=$((SECONDS + PHASE_LOOP_COMMAND_TIMEOUT_SECONDS))
+while [ ! -s "$child_pid_file" ] && [ "$SECONDS" -lt "$child_start_deadline" ]; do
+  if ! kill -0 "$child_supervisor_pid" 2>/dev/null; then
     break
   fi
-  sleep 1
+  sleep "$PHASE_LOOP_SLEEP_POLL_SECONDS"
 done
 if [ ! -s "$child_pid_file" ]; then
-  echo "expected fake Brownie child pid file" >&2
+  echo "expected fake Brownie child pid file before configured command timeout" >&2
   kill "$child_supervisor_pid" 2>/dev/null || true
   exit 1
 fi
@@ -4225,6 +4244,7 @@ if kill -0 "$child_pid" 2>/dev/null && ! ps -o stat= -p "$child_pid" 2>/dev/null
   kill -KILL "$child_pid" 2>/dev/null || true
   exit 1
 fi
+test_workspace="$lifecycle_original_workspace"
 fi
 
 if claim_smoke_section_enabled guards; then
