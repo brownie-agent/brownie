@@ -382,7 +382,7 @@
       "release_blocking": false,
       "evidence": [
         "docs/architecture/owner-independent-review-evidence.json records all six owner-designated independent review scopes as approved by globalpocket.",
-        ".brownie/release-evidence/owner-governance-evidence.json verifies PR #458 GitHub review provenance for reviewer globalpocket, implementation actor brownie-agent, and approved_review_count=6."
+        ".brownie/release-evidence/owner-governance-evidence.json verifies the recorded PR review provenance against the deployment-configured principals and records approved_review_count=6."
       ],
       "next_action": "Closed for owner-governance independent review evidence. Runtime Release Ready remains false until release evidence executable bindings are complete."
     },
