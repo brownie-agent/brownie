@@ -269,4 +269,6 @@ test('wires recovery into pre-claim boundary and pre-completion failures, deferr
   assert(controller.includes('preclaim_recovery_preflight_diagnostic_replay=true'));
   assert(controller.includes('node "$ROOT_DIR/scripts/guard-todo-decomposition.mjs"'));
   assert(controller.includes('recovery_diagnostic="guard-todo-decomposition.mjs: $recovery_diagnostic"'));
+  assert.match(controller, /\$\{snapshot_args\[@\]\+"\$\{snapshot_args\[@\]\}"\} 2>&1/u);
+  assert.doesNotMatch(controller, /\$\{snapshot_args\[@\]\+"\$\{snapshot_args\[@\]\}"\}\n\s+2>&1/u);
 });
