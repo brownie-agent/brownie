@@ -14361,8 +14361,7 @@ run_phase_loop_preflight() {
       --controller-fingerprint "$PHASE_LOOP_CONTROL_PLANE_FINGERPRINT" \
       --claim "$TODO_CLAIM_FILE" \
       --stage "$stage" \
-      ${snapshot_args[@]+"${snapshot_args[@]}"}
-  2>&1)"
+      ${snapshot_args[@]+"${snapshot_args[@]}"} 2>&1)"
   status=$?
   set -e
   if [ "$status" -eq 0 ] && ! printf '%s' "$output" | python3 -c 'import json,sys
@@ -14403,8 +14402,7 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
             --controller-fingerprint "$PHASE_LOOP_CONTROL_PLANE_FINGERPRINT" \
             --claim "$TODO_CLAIM_FILE" \
             --stage "$stage" \
-            ${snapshot_args[@]+"${snapshot_args[@]}"}
-          2>&1
+            ${snapshot_args[@]+"${snapshot_args[@]}"} 2>&1
         )"
         recovery_replay_status=$?
         set -e
