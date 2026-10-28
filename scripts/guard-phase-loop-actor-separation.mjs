@@ -171,6 +171,7 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   requireValue(prActorGuard.includes('validateImplementationPrActor'), errors, 'phase-loop-pr-actor-guard.mjs must validate the authenticated implementation PR actor.');
   requireValue(ciWorkflow.includes('PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES'), errors, 'CI must receive explicit implementation branch prefixes through deployment configuration.');
   requireValue(ciWorkflow.includes('PHASE_LOOP_REVIEW_ACTOR') && ciWorkflow.includes('PHASE_LOOP_MERGE_ACTOR'), errors, 'CI must receive explicit review and merge principals through deployment configuration.');
+  requireValue(!ciWorkflow.includes('PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER') && !ciWorkflow.includes('PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY'), errors, 'CI must not bind implementation admission to a fixed pull-request head owner or repository.');
   requireValue(ciWorkflow.includes("'repository': os.environ['GITHUB_REPOSITORY']"), errors, 'CI must derive the deployment repository from the GitHub event environment.');
   requireValue(ciWorkflow.includes('phase-loop-actor-deployment.mjs --deployment "$PHASE_LOOP_DEPLOYMENT_FILE" --role implementation --field repository'), errors, 'CI must validate the explicit ephemeral deployment in a scoped command.');
   requireValue(!ciWorkflow.includes("printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\\n'"), errors, 'CI must not export actor deployment configuration into generic test processes.');
