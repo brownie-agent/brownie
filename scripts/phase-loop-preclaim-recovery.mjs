@@ -155,7 +155,12 @@ function migrateLegacyTargetCapture({ repo, stateDir, todoPath, breakdownPath, t
       const change = sourceReceipt.contract_changes?.find((entry) => entry?.todo_id === id && entry?.after_contract?.first_line === firstLine);
       if (!change) continue;
       for (const scope of targetScopes(firstLine).filter((entry) => entry.operation === 'Patch')) {
-        const beforeCreatedTarget = String(change.before_contract?.first_line ?? '').includes(`Create only \`${scope.path}\``);
+        // A legacy contract can group multiple targets under one operation
+        // ("Create only A and B").  Match the parsed operation/path pairs,
+        // rather than searching for a phrase that only exists for the first
+        // target in that clause.
+        const beforeCreatedTarget = targetScopes(change.before_contract?.first_line)
+          .some((candidate) => candidate.operation === 'Create' && candidate.path === scope.path);
         if (!beforeCreatedTarget) continue;
         const targetPath = path.join(repo, scope.path);
         let targetContent = '';
