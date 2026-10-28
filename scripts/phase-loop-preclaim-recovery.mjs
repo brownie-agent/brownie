@@ -170,7 +170,10 @@ function migrateLegacyTargetCapture({ repo, stateDir, todoPath, breakdownPath, t
         const alreadyCaptured = existingReceipts.some((candidate) => candidate.target_capture?.mode === 'legacy_pre_capture_materialization'
           && candidate.target_capture?.source_recovery_record === safeRelativePath(repo, recordPath)
           && candidate.target_snapshots?.some((snapshot) => snapshot.path === scope.path && snapshot.sha256_after === targetSha256));
-        if (alreadyCaptured) return true;
+        // The capture receipt is only one half of recovery.  Do not report
+        // success here: the normal repair below must still rewrite any
+        // remaining Create-only scopes for materialized siblings to Patch-only.
+        if (alreadyCaptured) continue;
         const beforeTodoText = fs.readFileSync(beforePath, 'utf8');
         const beforeBreakdownPath = record.rollback_snapshot?.breakdown;
         const beforeBreakdownText = beforeBreakdownPath && fs.existsSync(beforeBreakdownPath)

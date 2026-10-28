@@ -173,10 +173,27 @@ test('migrates a legacy single-target recovery into an audited hash-bound target
   // Historical receipts can group several Create-only targets.  The second
   // target must still be eligible for the hash-bound materialization capture.
   sourceReceipt.contract_changes[0].before_contract.first_line = '- [ ] E-23b-release-artifact-download-roundtrip-target-01: Create only `scripts/a.mjs` and `scripts/a.test.mjs` for the downloaded roundtrip:';
+  const target02Change = sourceReceipt.contract_changes.find((entry) => entry.todo_id === 'E-23b-release-artifact-download-roundtrip-target-02');
+  assert.ok(target02Change, 'fixture must retain the target-02 rebaseline entry');
+  const target02Before = target02Change.before_contract.first_line;
+  const target02After = target02Change.after_contract.first_line;
+  const target02WithPendingSibling = target02After.replace(
+    'Patch only `scripts/a.test.mjs`',
+    'Patch only `scripts/a.test.mjs` and Create only `scripts/c.mjs`'
+  );
+  target02Change.before_contract.first_line = target02Before.replace(
+    'Create only `scripts/a.test.mjs`',
+    'Create only `scripts/a.test.mjs` and `scripts/c.mjs`'
+  );
+  target02Change.after_contract.first_line = target02WithPendingSibling;
   fs.writeFileSync(sourceReceiptPath, `${JSON.stringify(sourceReceipt, null, 2)}\n`);
   record.target_snapshot = record.target_snapshot.filter((target) => target.path !== 'scripts/a.test.mjs');
   fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
   fs.writeFileSync(path.join(root, 'scripts/a.test.mjs'), '// Brownie bounded Create-only proposal.\n');
+  fs.writeFileSync(path.join(root, 'scripts/c.mjs'), '// Brownie bounded Create-only proposal.\n');
+  const todoWithPendingSibling = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8')
+    .replace(target02After, target02WithPendingSibling);
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), todoWithPendingSibling);
 
   const migrated = runRecovery(root, 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope');
   assert.equal(migrated.status, 0, `${migrated.stdout}\n${migrated.stderr}`);
@@ -192,6 +209,11 @@ test('migrates a legacy single-target recovery into an audited hash-bound target
     exists_after: true,
     sha256_after: migrationReceipt.target_capture.target_sha256
   }]);
+  const resumed = runRecovery(root, 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope; Create only target already exists');
+  assert.equal(resumed.status, 0, `${resumed.stdout}\n${resumed.stderr}`);
+  const resumedTodo = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8');
+  assert.match(resumedTodo, /Patch only `scripts\/a\.test\.mjs` and `scripts\/c\.mjs`/u);
+  assert.doesNotMatch(resumedTodo, /Create only `scripts\/c\.mjs`/u);
 });
 
 test('parses every joined bounded target before migrating a legacy materialization', () => {
