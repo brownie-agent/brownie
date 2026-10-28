@@ -7062,6 +7062,77 @@ validate_phase_loop_progress_integrity_after_runtime_apply() {
   )
 }
 
+# A Runtime continuation can durably update its private session while leaving
+# the claimed source files unchanged until its next `resume`. The ordinary
+# active-claim integrity guard correctly rejects arbitrary off-scope writes,
+# but it must not convert this explicitly attested hand-off into no-progress.
+# Keep the exception deliberately narrow: it accepts only the single
+# selected-target error, and only a non-terminal Runtime response that has
+# requested an actual `resume` continuation. Every other integrity error
+# remains fail-closed.
+phase_loop_can_defer_selected_target_change_for_continuation() {
+  local validation_json="$1"
+  local runtime_stdout="$2"
+  python3 - "$validation_json" "$runtime_stdout" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    validation = json.loads(sys.argv[1])
+    errors = validation.get("errors") if isinstance(validation, dict) else None
+    if not isinstance(errors, list) or not errors:
+        raise ValueError("missing integrity errors")
+    if any(not isinstance(error, dict) or error.get("code") != "selected_target_not_changed" for error in errors):
+        raise ValueError("integrity error is not solely selected_target_not_changed")
+    # The integrity tool ignores .brownie/private/, so a deferred error must
+    # be explained by one of the Runtime-managed public session artifacts.
+    # Never treat an arbitrary untracked workspace file as a checkpoint.
+    session_artifact_prefixes = (
+        ".brownie/headless-continuations/",
+        ".brownie/headless-journeys/",
+        ".brownie/headless-objective-admissions/",
+        ".brownie/headless-run-sessions/",
+    )
+    for error in errors:
+        changed_files = error.get("changed_files")
+        if not isinstance(changed_files, list) or not changed_files:
+            raise ValueError("missing changed-file evidence for continuation")
+        if any(not isinstance(path, str) or not path.startswith(session_artifact_prefixes) for path in changed_files):
+            raise ValueError("continuation changed files are not Runtime session artifacts")
+
+    root = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+    payload = root.get("run") if isinstance(root, dict) and isinstance(root.get("run"), dict) else root.get("resume") if isinstance(root, dict) and isinstance(root.get("resume"), dict) else root
+    if not isinstance(payload, dict):
+        raise ValueError("missing runtime payload")
+    automation = payload.get("automation")
+    if not isinstance(automation, dict):
+        raise ValueError("missing runtime automation")
+    invocation = payload.get("next_invocation")
+    if not isinstance(invocation, dict):
+        invocation = automation.get("next_invocation")
+    valid = (
+        payload.get("continuation_required") is True
+        and automation.get("continuation_required") is True
+        and payload.get("controller_action") == "resume"
+        and automation.get("controller_action") == "resume"
+        and payload.get("completed") is False
+        and payload.get("blocked") is False
+        and payload.get("terminal_failure") is False
+        and payload.get("retryable") is True
+        and payload.get("stop_class") == "continuation_required"
+        and automation.get("stop_class") == "continuation_required"
+        and isinstance(invocation, dict)
+        and invocation.get("command") == "resume"
+    )
+    if not valid:
+        raise ValueError("runtime response is not a verified resume continuation")
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
 try_reconstruct_missing_todo_replan_records() {
   local run_stamp="$1"
   local validation_json="$2"
@@ -16535,6 +16606,19 @@ PY
 
     local progress_integrity_validation
     if ! progress_integrity_validation="$(validate_phase_loop_progress_integrity_after_runtime_apply "$run_stamp" 2>&1)"; then
+      if phase_loop_can_defer_selected_target_change_for_continuation "$progress_integrity_validation" "$stdout_log"; then
+        # The Runtime has attested a bounded resume route, while the sole
+        # integrity finding says that no claimed source target changed yet.
+        # Preserve the strict guard for every other finding, but record this
+        # hand-off as continuation instead of creating repair feedback for a
+        # legitimate private-session checkpoint.
+        write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+        detail="Brownie recorded a verified Runtime resume continuation before changing a selected target; deferred the sole selected_target_not_changed integrity finding to the bounded resume. validation=$progress_integrity_validation stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+        write_status "continuation_required" "$detail" "$run_id" "$exit_code" "0" "" "true"
+        printf '%s run=%s progress_integrity_selected_target_change_deferred_for_continuation=true validation=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$progress_integrity_validation" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+        write_bdk_trajectory_event "$run_stamp" "workflow.routed" '{"source":"runtime","bdk_state":"continuation_required","llm_route":"resume","integrity_deferred":"selected_target_not_changed"}'
+        return 0
+      fi
       write_repair_feedback "$run_stamp" "$progress_integrity_validation" "$stdout_log" "$stderr_log" || true
       write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
       detail="Brownie workspace/TODO progress failed active-claim integrity validation; recorded repair feedback and kept the TODO in progress. validation=$progress_integrity_validation stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
