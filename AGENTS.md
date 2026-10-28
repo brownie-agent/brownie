@@ -35,6 +35,37 @@ The Phase 0 constraints below are historical bootstrap constraints. Do not apply
 them as current blockers to accepted M/R phases such as M9 runtime codebase
 indexing work.
 
+## Operational roles and delegated execution
+
+The implementation, review, merge, and exceptional delegated-executor roles
+are deployment-time roles. Resolve their identities from the active deployment
+and GitHub evidence for each run; never encode account, organization, or agent
+names as a default, allowlist, or completion condition.
+
+For every implementation PR, record and independently verify the observed PR
+author, CI result, reviewer, and merge actor. CI success is not completion.
+When the active operator holds the review role, they must inspect, approve, and
+merge a green PR rather than report a fictitious external-review wait.
+
+Exceptional delegated execution is valid only for one explicitly identified
+TODO. Its durable receipt must state the grant reason and evidence, TODO ID,
+allowed scope, prohibited scope, required verification, and issuance time. It
+remains valid only until both of these are evidenced for that same TODO:
+
+1. The implementation PR is merged.
+2. The TODO is consumed in the live queue with its completion evidence.
+
+Do not reuse, transfer, or broaden a delegation to another TODO. A new TODO
+requires a new explicit grant and receipt. Treat a missing receipt, an expired
+receipt, a mismatched TODO, or a missing PR/TODO completion half as a blocked
+state, not as permission to continue.
+
+Keep implementation, PR creation, CI, review, merge, TODO consumption, and
+post-merge runtime verification as separate audit states. Do not close a task
+or resume a loop until every applicable state has evidence. Recovery work must
+identify the causal failure and add a generalized guard and regression test;
+restarting the same failed state is not a recovery.
+
 ## Historical Phase 0 constraints
 
 Phase 0 is limited to repository bootstrap:
