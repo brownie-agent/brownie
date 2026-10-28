@@ -13164,6 +13164,11 @@ load_env() {
     set +a
     PHASE_LOOP_ENV_SOURCES="$PHASE_LOOP_ENV_SOURCES,$env_file"
   fi
+  # These aliases are consumed by lifecycle commands, so rebind them after an
+  # explicitly selected environment file is loaded.  Otherwise an env-file
+  # deployment would incorrectly behave as though these values were absent.
+  LAUNCHD_LABEL="${PHASE_LOOP_LAUNCHD_LABEL:-}"
+  SCREEN_NAME="${PHASE_LOOP_SCREEN_NAME:-}"
   if [ "$PHASE_LOOP_STATE_DIR_FROM_PROCESS" -eq 0 ] && [ "${PHASE_LOOP_STATE_DIR:-}" != "$state_dir_before_env" ]; then
     PHASE_LOOP_STATE_DIR_FROM_PROCESS=1
   fi
@@ -13241,6 +13246,8 @@ phase_loop_require_operational_configuration() {
   # paths, account names, branch names, or numerical defaults.
   local required=(
     PHASE_LOOP_WORKSPACE_ROOT PHASE_LOOP_STATE_DIR PHASE_LOOP_CONTROL_ROOT
+    PHASE_LOOP_SCREEN_NAME PHASE_LOOP_LAUNCHD_LABEL
+    PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS
     PHASE_LOOP_PROMPT PHASE_LOOP_TODO PHASE_LOOP_TODO_BREAKDOWN
     PHASE_LOOP_ACTOR_DEPLOYMENT PHASE_LOOP_ACTOR_CREDENTIALS
     PHASE_LOOP_PREFLIGHT_PROFILE PHASE_LOOP_BROWNIE_STORE_ROOT

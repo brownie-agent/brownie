@@ -55,6 +55,8 @@ trap cleanup_phase_loop_test_control_root EXIT
 export PHASE_LOOP_CONTROL_ROOT="$PHASE_LOOP_TEST_CONTROL_ROOT"
 export PHASE_LOOP_ACTOR_DEPLOYMENT="$PHASE_LOOP_TEST_CONTROL_ROOT/actor-deployment.json"
 export PHASE_LOOP_ACTOR_CREDENTIALS="$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/phase-loop-actor-credentials.json"
+export PHASE_LOOP_SCREEN_NAME='fixture-phase-loop-screen'
+export PHASE_LOOP_LAUNCHD_LABEL='fixture.phase-loop'
 PHASE_LOOP_TEST_REPOSITORY="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field repository)"
 PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login)"
 PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field branch-prefix)"
@@ -82,6 +84,7 @@ export PHASE_LOOP_STOP_FORCE_SECONDS=1
 export PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS=1
 export PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS=1
 export PHASE_LOOP_SLEEP_POLL_SECONDS=1
+export PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS=60
 export PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES=3
 export PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0
 export PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=0

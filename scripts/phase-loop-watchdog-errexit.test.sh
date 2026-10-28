@@ -3,6 +3,88 @@ set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Every controller invocation, including function-level watchdog fixtures,
+# must receive a deployment explicitly.  Keep this synthetic deployment
+# outside the repository and inject it through the process environment so the
+# test never restores an implicit checkout-local fallback.
+watchdog_fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-deployment.XXXXXX")"
+watchdog_fixture_workspace="$watchdog_fixture_root/workspace"
+watchdog_fixture_control="$watchdog_fixture_root/control"
+mkdir -p "$watchdog_fixture_workspace/.brownie" "$watchdog_fixture_control/.brownie/private/profiles/implementation"
+printf '%s\n' 'fixture prompt' > "$watchdog_fixture_workspace/prompt.md"
+printf '%s\n' '- [ ] fixture watchdog task' > "$watchdog_fixture_workspace/todo.md"
+printf '%s\n' '# fixture watchdog breakdown' > "$watchdog_fixture_workspace/todo-breakdown.md"
+cat > "$watchdog_fixture_control/actor-deployment.json" <<'JSON'
+{
+  "schema_version": 1,
+  "repository": "fixture-owner/fixture-repository",
+  "roles": {
+    "implementation": {"github_login": "fixture-implementation", "branch_prefixes": ["fixture/"]},
+    "review": {"github_login": "fixture-review"},
+    "merge": {"github_login": "fixture-merge"}
+  },
+  "constraints": {"require_independent_review": true}
+}
+JSON
+cat > "$watchdog_fixture_control/.brownie/private/phase-loop-actor-credentials.json" <<'JSON'
+{
+  "schema_version": 1,
+  "roles": {
+    "implementation": {"kind": "repository-private", "github_config_dir": "profiles/implementation"},
+    "review": {"kind": "host-default"},
+    "merge": {"kind": "host-default"}
+  }
+}
+JSON
+watchdog_fixture_binary="$watchdog_fixture_root/fixture-brownie"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$watchdog_fixture_binary"
+chmod +x "$watchdog_fixture_binary"
+watchdog_fixture_env="$watchdog_fixture_root/deployment.env"
+cat > "$watchdog_fixture_env" <<'ENV'
+PHASE_LOOP_SCREEN_NAME='fixture-phase-loop-screen'
+PHASE_LOOP_LAUNCHD_LABEL='fixture.phase-loop'
+ENV
+export PHASE_LOOP_ENV_FILE="$watchdog_fixture_env"
+export PHASE_LOOP_WORKSPACE_ROOT="$watchdog_fixture_workspace"
+export PHASE_LOOP_CONTROL_ROOT="$watchdog_fixture_control"
+export PHASE_LOOP_PROMPT="$watchdog_fixture_workspace/prompt.md"
+export PHASE_LOOP_TODO="$watchdog_fixture_workspace/todo.md"
+export PHASE_LOOP_TODO_BREAKDOWN="$watchdog_fixture_workspace/todo-breakdown.md"
+export PHASE_LOOP_ACTOR_DEPLOYMENT="$watchdog_fixture_control/actor-deployment.json"
+export PHASE_LOOP_ACTOR_CREDENTIALS="$watchdog_fixture_control/.brownie/private/phase-loop-actor-credentials.json"
+export PHASE_LOOP_PREFLIGHT_PROFILE='watchdog-fixture'
+export PHASE_LOOP_BROWNIE_STORE_ROOT="$watchdog_fixture_workspace/.brownie"
+export PHASE_LOOP_INTERVAL_SECONDS=1
+export PHASE_LOOP_FAILURE_BACKOFF_SECONDS=1
+export PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS=1
+export PHASE_LOOP_BROWNIE_TIMEOUT_SECONDS=30
+export PHASE_LOOP_BROWNIE_DECOMPOSE_TIMEOUT_SECONDS=30
+export PHASE_LOOP_STAGNATION_THRESHOLD=3
+export PHASE_LOOP_PROMPT_MAX_BYTES=65536
+export PHASE_LOOP_SELECTED_TODO_MAX_BYTES=8192
+export PHASE_LOOP_TODO_SNAPSHOT_LINES=80
+export PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES=80
+export PHASE_LOOP_PROMPT_RETENTION_COUNT=20
+export PHASE_LOOP_STOP_GRACE_SECONDS=1
+export PHASE_LOOP_STOP_FORCE_SECONDS=1
+export PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS=1
+export PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS=1
+export PHASE_LOOP_SLEEP_POLL_SECONDS=1
+export PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS=60
+export PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES=3
+export PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0
+export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE='HEAD'
+export PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=0
+export PHASE_LOOP_PR_REMOTE='fixture-origin'
+export PHASE_LOOP_PR_BASE='fixture-base'
+export PHASE_LOOP_PR_TITLE_PREFIX='fixture phase loop'
+export PHASE_LOOP_PR_DRAFT=0
+export PHASE_LOOP_LLM_ROUTING=1
+export PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES=20000
+export PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1
+export BROWNIE_BIN="$watchdog_fixture_binary"
+export BROWNIE_RUNTIME_PATH="$watchdog_fixture_binary"
+
 run_case() {
   local mode="$1"
   local state_dir
