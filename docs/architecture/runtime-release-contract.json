@@ -37,7 +37,7 @@
       "fail_closed_reason": "Runtime release readiness is explicitly blocked until executable supply-chain evidence (commit, workflow run, artifact SHA) is bound and verified. No invented placeholders; all pending fields remain null/pending until evidence generation completes."
     },
     "contract_registry_fingerprint": "sha256:4250fb47242f2bdc4ac26ce1d0cf8ecedbd27627eb9e3117acc82e3719eb934d",
-    "readiness_audit_content_sha256": "sha256:7977d8948446a1e75af22a7aa753639b48d115f174388abbcd776ddee9cd5e30",
+    "readiness_audit_content_sha256": "sha256:490e8a959cc65f227110a36cf4f52d0af788036ba3c2ec8ebe65383503695fca",
     "mode_pack_fingerprint": null,
     "product_dod_fingerprint": null,
     "evidence_alignment_note": "Release trace fields remain pending until executable supply-chain evidence (artifact build, workflow run, tested commit) is generated and bound by guard scripts. Contract maturity at 88% pending P0/P1 evidence closure. Fail-closed: do not replace pending values with invented placeholders."
@@ -205,7 +205,7 @@
         "independent human review for Release Ready判定ロジック"
       ],
       "evidence": [
-        "docs/architecture/owner-independent-review-evidence.json records all six required review scopes as approved by globalpocket.",
+        "docs/architecture/owner-independent-review-evidence.json records all six required review scopes with GitHub-verifiable historical provenance; current principals are loaded from deployment configuration.",
         "GitHub review provenance for PR #458 is verified against the live GitHub pull request review API.",
         ".brownie/release-evidence/owner-governance-evidence.json records independent_reviews.status=satisfied and approved_review_count=6."
       ]
@@ -618,7 +618,7 @@
     "Decide OSS license and publish posture.",
     "Provide GitHub workflow scope or approve an equivalent CI-hardening path.",
     "Keep main branch protection and required status checks enforced for the release gate.",
-    "Use brownie-agent as the Brownie Phase Loop implementation actor and globalpocket as the Codex review/merge actor so last-pusher approval remains satisfiable without weakening branch protection.",
+    "Use deployment-configured, distinct implementation, review, and merge principals so last-pusher approval remains satisfiable without weakening branch protection.",
     "Keep protected tag policy enforced for release tag patterns.",
     "Keep owner-approved integrity authority evidence current, or replace it with stronger artifact signing.",
     "Arrange independent human reviews for Release workflow, permission model, Ledger Contract, Mode Pack trust boundary, signing/provenance, and Release Ready判定ロジック."
@@ -707,7 +707,7 @@
       "Missing owner-governance evidence section is a guard failure.",
       "Missing branch protection, status checks, protected tag policy, remote CI provenance, signing or integrity authority, independent reviews, or OSS license/publish decision keeps runtime_release_ready=false.",
       "Runtime automation may collect GitHub and local evidence, but it must not self-approve owner-controlled decisions.",
-      "Normal Brownie Phase Loop PR flow requires brownie-agent to author/push implementation changes and globalpocket to review and merge after required checks pass; same-account exceptions must be explicit, temporary, recorded, and reverted.",
+      "Normal Phase Loop PR flow requires deployment-configured implementation, review, and merge principals; same-account exceptions must be explicit, temporary, recorded, and reverted.",
       "Generated owner-governance evidence stores bounded status fields, counts, hashes, and repository-relative paths only."
     ]
   }

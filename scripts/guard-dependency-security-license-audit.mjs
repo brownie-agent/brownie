@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { requiredReleaseGateCommands } from './release-gate.mjs';
+import { loadPhaseLoopActorDeployment } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -119,10 +120,12 @@ export function validateDependencySecurityLicenseAuditContract(contract, package
 export function validateDependencySecurityLicenseAuditEvidence(evidence, options = {}) {
   const repoRoot = options.repoRoot ?? defaultRepoRoot;
   const errors = [];
+  const deploymentResult = options.deploymentResult ?? loadPhaseLoopActorDeployment({ repoRoot });
+  const expectedRepository = options.repository ?? deploymentResult.deployment?.repository ?? evidence.repository;
   requireValue(evidence.schema_version === 1, errors, 'dependency audit evidence schema_version must be 1.');
   requireValue(evidence.evidence_id === 'brownie-dependency-security-license-audit-v1', errors, 'dependency audit evidence_id must match.');
   requireValue(evidence.phase === 'RRP-8.5', errors, 'dependency audit evidence phase must be RRP-8.5.');
-  requireValue(evidence.repository === 'globalpocket/brownie', errors, 'dependency audit evidence repository must be globalpocket/brownie.');
+  requireValue(evidence.repository === expectedRepository, errors, 'dependency audit evidence repository must match the configured deployment repository.');
   requireValue(evidence.release_ready === false, errors, 'dependency audit evidence must not declare release_ready true.');
   requireValue(evidence.runtime_release_ready === false, errors, 'dependency audit evidence must not declare runtime_release_ready true.');
   requireValue(Array.isArray(evidence.fail_closed_reasons), errors, 'dependency audit evidence must include fail_closed_reasons.');

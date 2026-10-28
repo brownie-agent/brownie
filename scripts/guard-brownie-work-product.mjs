@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,7 +48,7 @@ function forbiddenTargets(todo) {
     .flatMap(backtickedValues);
 }
 
-export function validateBrownieWorkProduct(evidence) {
+export function validateBrownieWorkProduct(evidence, options = {}) {
   const errors = [];
   const todo = evidence?.selected_todo ?? '';
   const id = todoId(todo);
@@ -61,8 +62,9 @@ export function validateBrownieWorkProduct(evidence) {
   if (!id) {
     errors.push('selected_todo must include a concrete TODO id.');
   }
-  if (actor && actor !== 'brownie-agent') {
-    errors.push('Brownie-generated work product evidence must be produced by actor brownie-agent.');
+  const expectedActor = options.expectedActor;
+  if (expectedActor && actor && actor !== expectedActor) {
+    errors.push(`Brownie-generated work product evidence must be produced by configured implementation actor ${expectedActor}.`);
   }
   if (allowedTargets.size > 0) {
     for (const file of changedFiles) {
@@ -96,7 +98,10 @@ export function runBrownieWorkProductGuard(repoRoot = defaultRepoRoot, evidenceP
     return { status: 'skipped', reason: 'no work product evidence present', errors: [] };
   }
   const evidence = JSON.parse(fs.readFileSync(absolute, 'utf8'));
-  const errors = validateBrownieWorkProduct(evidence);
+  const deployment = loadPhaseLoopActorDeployment({ repoRoot });
+  const errors = deployment.ok
+    ? validateBrownieWorkProduct(evidence, { expectedActor: roleActor(deployment.deployment, 'implementation') })
+    : deployment.errors;
   return { status: errors.length === 0 ? 'passed' : 'failed', evidencePath, errors };
 }
 

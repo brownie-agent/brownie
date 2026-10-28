@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { roleActor } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,8 +41,9 @@ const requiredOperationalDocuments = [
   {
     path: 'docs/architecture/owner-governance-operations.md',
     requiredSubstrings: [
-      'brownie-agent',
-      'globalpocket',
+      'PHASE_LOOP_ACTOR_DEPLOYMENT',
+      'implementation',
+      'review',
       'last-pusher approval',
       'Protected tag policy',
       'Independent review evidence'
@@ -182,7 +184,7 @@ function validateOwnerFile(repoRoot, fileEvidence, errors, owner) {
   }
 }
 
-function validateGithubReviewProvenance(entry, errors, owner) {
+function validateGithubReviewProvenance(entry, errors, owner, deployment) {
   requireValue(entry && typeof entry === 'object' && !Array.isArray(entry), errors, `${owner} must be an object.`);
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
     return;
@@ -191,8 +193,10 @@ function validateGithubReviewProvenance(entry, errors, owner) {
   requireValue(Number.isInteger(entry.pull_request_number) && entry.pull_request_number > 0, errors, `${owner}.pull_request_number must be a positive integer.`);
   requireValue(isNonEmptyString(entry.review_id), errors, `${owner}.review_id must be non-empty.`);
   requireValue(entry.state === 'APPROVED', errors, `${owner}.state must be APPROVED.`);
-  requireValue(entry.reviewer === 'globalpocket', errors, `${owner}.reviewer must be globalpocket.`);
-  requireValue(entry.pull_request_author === 'brownie-agent', errors, `${owner}.pull_request_author must be brownie-agent.`);
+  const reviewActor = roleActor(deployment, 'review');
+  const implementationActor = roleActor(deployment, 'implementation');
+  if (reviewActor) requireValue(entry.reviewer === reviewActor, errors, `${owner}.reviewer must match the configured review actor.`);
+  if (implementationActor) requireValue(entry.pull_request_author === implementationActor, errors, `${owner}.pull_request_author must match the configured implementation actor.`);
   requireValue(entry.reviewer !== entry.pull_request_author, errors, `${owner}.reviewer must differ from pull_request_author.`);
   requireValue(gitCommitPattern.test(entry.commit_sha), errors, `${owner}.commit_sha must be a 40-character lowercase git commit SHA.`);
   requireValue(isNonEmptyString(entry.submitted_at), errors, `${owner}.submitted_at must be non-empty.`);
@@ -202,9 +206,16 @@ function validateEvidence(evidence, options = {}) {
   const repoRoot = options.repoRoot ?? defaultRepoRoot;
   const expectedSourceCommit = options.expectedSourceCommit;
   const errors = [];
+  const deployment = options.deploymentResult?.deployment ?? {
+    repository: evidence.repository,
+    roles: {
+      implementation: { github_login: null },
+      review: { github_login: null }
+    }
+  };
   requireValue(evidence.schema_version === 1, errors, 'owner governance evidence schema_version must be 1.');
   requireValue(evidence.evidence_id === 'brownie-owner-governance-evidence-v1', errors, 'owner governance evidence_id must match.');
-  requireValue(evidence.repository === 'globalpocket/brownie', errors, 'owner governance evidence repository must be globalpocket/brownie.');
+  requireValue(evidence.repository === deployment.repository, errors, 'owner governance evidence repository must match the configured deployment repository.');
   requireValue(gitCommitPattern.test(evidence.source_commit), errors, 'owner governance evidence source_commit must be a 40-character lowercase git commit SHA.');
   if (expectedSourceCommit) {
     requireValue(evidence.source_commit === expectedSourceCommit, errors, `owner governance evidence source_commit must match current HEAD ${expectedSourceCommit}.`);
@@ -282,7 +293,7 @@ function validateEvidence(evidence, options = {}) {
     requireValue(Array.isArray(reviews.github_review_provenance), errors, 'independent_reviews.github_review_provenance must be an array.');
     const provenanceIds = new Set();
     for (const [index, entry] of (Array.isArray(reviews.github_review_provenance) ? reviews.github_review_provenance : []).entries()) {
-      validateGithubReviewProvenance(entry, errors, `independent_reviews.github_review_provenance[${index}]`);
+      validateGithubReviewProvenance(entry, errors, `independent_reviews.github_review_provenance[${index}]`, deployment);
       requireValue(
         canonicalRequiredReviewIds.includes(entry?.required_review_id),
         errors,
@@ -361,7 +372,11 @@ export function runOwnerGovernanceEvidenceGuard(options = {}) {
   if (shouldValidateEvidence) {
     const evidence = options.evidence ?? readJson(repoRoot, resolvedEvidencePath, errors);
     const expectedSourceCommit = options.expectedSourceCommit ?? (options.evidence === undefined ? currentGitHead(repoRoot) : undefined);
-    errors.push(...validateEvidence(evidence, { repoRoot, expectedSourceCommit }));
+    errors.push(...validateEvidence(evidence, {
+      repoRoot,
+      expectedSourceCommit,
+      deploymentResult: options.deploymentResult
+    }));
   }
   return { errors, contractPath, evidencePath: resolvedEvidencePath, validatedEvidence: shouldValidateEvidence };
 }

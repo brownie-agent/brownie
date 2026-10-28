@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment, roleActor, roleBranchPrefixes } from './phase-loop-actor-deployment.mjs';
 
-export const implementationBranchPrefixes = Object.freeze(['brownie-agent/', 'phase-loop/']);
+export const implementationBranchPrefixes = Object.freeze([]);
 
 export function validateImplementationPullRequestRemediation({
   headSha,
@@ -36,11 +37,13 @@ export function validateImplementationPullRequest({
   headRepoName,
   rejectedHeadSha,
   rejectedPullRequestNumber,
-  expectedActor = 'brownie-agent',
+  expectedActor,
   branchPrefixes = implementationBranchPrefixes,
-  expectedRepoName = 'brownie'
+  expectedRepoName,
+  requireForkOwnerMatch = false
 } = {}) {
   const normalizedHeadRef = typeof headRef === 'string' ? headRef.trim() : '';
+  if (!expectedActor) return ['implementation pull request validation requires a configured implementation GitHub actor.'];
   if (!branchPrefixes.some((prefix) => normalizedHeadRef.startsWith(prefix))) return [];
 
   const normalizedAuthor = typeof author === 'string' ? author.trim() : '';
@@ -51,11 +54,11 @@ export function validateImplementationPullRequest({
     return [`implementation pull requests on ${normalizedHeadRef} require author ${expectedActor}; got ${normalizedAuthor}.`];
   }
   const normalizedOwner = typeof headRepoOwner === 'string' ? headRepoOwner.trim() : '';
-  if (normalizedOwner !== expectedActor) {
+  if (requireForkOwnerMatch && normalizedOwner !== expectedActor) {
     return [`implementation pull requests on ${normalizedHeadRef} must originate from the ${expectedActor} fork; head repository owner was ${normalizedOwner || '(unknown)'}.`];
   }
   const normalizedRepo = typeof headRepoName === 'string' ? headRepoName.trim().replace(/\.git$/u, '') : '';
-  if (normalizedRepo !== expectedRepoName) {
+  if (expectedRepoName && normalizedRepo !== expectedRepoName) {
     return [`implementation pull requests on ${normalizedHeadRef} must originate from ${expectedActor}/${expectedRepoName}; head repository was ${normalizedOwner || '(unknown)'}/${normalizedRepo || '(unknown)'}.`];
   }
   return validateImplementationPullRequestRemediation({ headSha, rejectedHeadSha, rejectedPullRequestNumber });
@@ -93,10 +96,24 @@ if (isMainModule()) {
     console.error('Implementation pull-request author guard failed: GITHUB_EVENT_PATH is required.');
     process.exit(1);
   }
+  const deploymentResult = loadPhaseLoopActorDeployment({
+    repoRoot: process.env.GITHUB_WORKSPACE ? path.resolve(process.env.GITHUB_WORKSPACE) : process.cwd()
+  });
+  if (!deploymentResult.ok) {
+    console.error(`Implementation pull-request author guard failed: ${deploymentResult.errors.join(' ')}`);
+    process.exit(1);
+  }
+  const implementation = deploymentResult.deployment.roles.implementation;
   const event = readPullRequestEvent(eventPath);
   const errors = event.error
     ? [`implementation pull-request event could not be read: ${event.error}`]
-    : validateImplementationPullRequest(event);
+    : validateImplementationPullRequest({
+      ...event,
+      expectedActor: roleActor(deploymentResult.deployment, 'implementation'),
+      branchPrefixes: roleBranchPrefixes(deploymentResult.deployment, 'implementation'),
+      expectedRepoName: deploymentResult.deployment.repository.split('/')[1],
+      requireForkOwnerMatch: implementation.require_fork_owner_match === true
+    });
   if (errors.length > 0) {
     console.error('Implementation pull-request author guard failed:');
     for (const error of errors) console.error(`- ${error}`);

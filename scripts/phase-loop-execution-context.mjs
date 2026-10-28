@@ -46,7 +46,7 @@ export function resolveExecutionContext(options = {}) {
   const runtimeRoot = absolute(options.runtimeRoot ?? env.BROWNIE_RUNTIME_PATH ?? path.join(workspaceRoot, 'target/debug/brownie-runtime'));
   const todoPath = absolute(options.todoPath ?? env.PHASE_LOOP_TODO ?? path.join(workspaceRoot, '.brownie/todo.md'));
   const baseCommit = options.baseCommit ?? env.PHASE_LOOP_BASE_COMMIT ?? (git(workspaceRoot, ['rev-parse', env.PHASE_LOOP_APPROVED_CONTROLLER_BASELINE ?? 'origin/main']) || git(workspaceRoot, ['rev-parse', 'HEAD']));
-  const expectedActor = String(options.expectedActor ?? env.PHASE_LOOP_EXPECTED_ACTOR ?? 'brownie-agent').trim();
+  const expectedActor = String(options.expectedActor ?? env.PHASE_LOOP_EXPECTED_ACTOR ?? '').trim();
   return {
     schema_version: 1,
     workspace_root: workspaceRoot,
@@ -87,8 +87,8 @@ export function validateExecutionContext(context, options = {}) {
   } else if (!gitExists(context.workspace_root, ['cat-file', '-e', `${context.git_base_commit}^{commit}`])) {
     errors.push({ code: 'git_base_commit_missing', actual: context.git_base_commit, message: 'Git base commit is not present in the selected workspace repository.' });
   }
-  if (context.expected_actor !== 'brownie-agent') {
-    errors.push({ code: 'expected_actor_invalid', actual: context.expected_actor, message: 'Implementation dispatch must bind expected actor brownie-agent.' });
+  if (!context.expected_actor) {
+    errors.push({ code: 'expected_actor_missing', actual: context.expected_actor, message: 'Implementation dispatch must bind a configured implementation actor.' });
   }
   return errors;
 }

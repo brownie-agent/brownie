@@ -3,7 +3,10 @@ import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-export function validateImplementationPrActor(actor, expectedActor = 'brownie-agent') {
+export function validateImplementationPrActor(actor, expectedActor) {
+  if (!String(expectedActor ?? '').trim()) {
+    return ['implementation PR creation requires a configured implementation GitHub actor.'];
+  }
   const normalized = typeof actor === 'string' ? actor.trim() : '';
   if (!normalized) {
     return [`implementation PR creation requires authenticated GitHub actor ${expectedActor}; no actor was detected.`];
@@ -35,10 +38,12 @@ const invokedDirectly = (() => {
 })();
 
 if (invokedDirectly) {
+  const expectedIndex = process.argv.indexOf('--expected-actor');
+  const expectedActor = expectedIndex >= 0 ? process.argv[expectedIndex + 1] : '';
   const detected = readAuthenticatedActor();
   const errors = detected.error
     ? [`implementation PR creation could not verify GitHub actor: ${detected.error}`]
-    : validateImplementationPrActor(detected.actor);
+    : validateImplementationPrActor(detected.actor, expectedActor);
   if (errors.length > 0) {
     console.error('Implementation PR actor guard failed:');
     for (const error of errors) console.error(`- ${error}`);

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -85,6 +86,7 @@ export function buildIntegrityVerificationEvidence(options = {}) {
   const entries = fs.existsSync(checksumFullPath)
     ? parseChecksumLines(fs.readFileSync(checksumFullPath, 'utf8'))
     : [];
+  const deploymentResult = loadPhaseLoopActorDeployment({ repoRoot });
 
   const verified_entries = entries.map((entry) => {
     if (entry.malformed) {
@@ -125,7 +127,7 @@ export function buildIntegrityVerificationEvidence(options = {}) {
     schema_version: 1,
     evidence_id: 'brownie-release-integrity-verification-v1',
     generated_at: generatedAt,
-    repository: 'globalpocket/brownie',
+    repository: deploymentResult.deployment?.repository ?? null,
     checksum_path: checksumPath,
     checksum_file_sha256: fs.existsSync(checksumFullPath) ? sha256File(checksumFullPath) : null,
     verified_entries,

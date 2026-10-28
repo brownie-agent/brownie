@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -161,19 +162,19 @@ function ghApiJson(repoRoot, repository, endpoint) {
   }
 }
 
-function reviewMatchesStaticProvenance(entry, review) {
+function reviewMatchesStaticProvenance(entry, review, reviewActor) {
   return (
     review &&
     (String(review.id) === String(entry.review_id) || review.node_id === entry.review_id) &&
     review.state === 'APPROVED' &&
-    review.user?.login === 'globalpocket' &&
+    review.user?.login === reviewActor &&
     review.commit_id === entry.commit_sha &&
     typeof review.submitted_at === 'string' &&
     review.submitted_at === entry.submitted_at
   );
 }
 
-function verifyGithubReviewProvenance(repoRoot, repository, entry) {
+function verifyGithubReviewProvenance(repoRoot, repository, entry, deployment) {
   if (!repository) {
     return { verified: false, status: 'repository_unknown' };
   }
@@ -182,8 +183,8 @@ function verifyGithubReviewProvenance(repoRoot, repository, entry) {
   }
   const staticFieldsValid =
     entry.state === 'APPROVED' &&
-    entry.reviewer === 'globalpocket' &&
-    entry.pull_request_author === 'brownie-agent' &&
+    entry.reviewer === roleActor(deployment, 'review') &&
+    entry.pull_request_author === roleActor(deployment, 'implementation') &&
     entry.reviewer !== entry.pull_request_author &&
     Number.isInteger(entry.pull_request_number) &&
     entry.pull_request_number > 0 &&
@@ -201,7 +202,7 @@ function verifyGithubReviewProvenance(repoRoot, repository, entry) {
   if (pull.status !== 'satisfied') {
     return { verified: false, status: pull.status };
   }
-  if (pull.json?.user?.login !== 'brownie-agent') {
+  if (pull.json?.user?.login !== roleActor(deployment, 'implementation')) {
     return { verified: false, status: 'pull_request_author_mismatch' };
   }
 
@@ -209,7 +210,7 @@ function verifyGithubReviewProvenance(repoRoot, repository, entry) {
   if (reviews.status !== 'satisfied') {
     return { verified: false, status: reviews.status };
   }
-  const matchingReview = (Array.isArray(reviews.json) ? reviews.json : []).find((review) => reviewMatchesStaticProvenance(entry, review));
+  const matchingReview = (Array.isArray(reviews.json) ? reviews.json : []).find((review) => reviewMatchesStaticProvenance(entry, review, roleActor(deployment, 'review')));
   if (!matchingReview) {
     return { verified: false, status: 'github_review_not_verified' };
   }
@@ -395,8 +396,23 @@ function buildIntegrityAuthoritySection(repoRoot) {
 export function buildIndependentReviewsSection(repoRoot, options = {}) {
   const review = readJsonIfExists(repoRoot, defaultIndependentReviewPath);
   const evidence = ownerFileEvidence(repoRoot, defaultIndependentReviewPath);
-  const repository = options.repository ?? parseRemoteRepository(gitValue(repoRoot, ['config', '--get', 'remote.origin.url'])) ?? 'globalpocket/brownie';
-  const verifyReviewProvenance = options.verifyReviewProvenance ?? ((entry) => verifyGithubReviewProvenance(repoRoot, repository, entry));
+  const deploymentResult = options.deploymentResult ?? loadPhaseLoopActorDeployment({ repoRoot });
+  if (!deploymentResult.ok) {
+    return {
+      status: 'repository_unknown',
+      release_blocking: true,
+      owner_evidence: evidence,
+      required_review_ids: requiredReviewIds,
+      approved_review_count: 0,
+      missing_review_ids: requiredReviewIds,
+      github_review_provenance: [],
+      github_review_verification_failures: [],
+      actor_deployment_errors: deploymentResult.errors
+    };
+  }
+  const deployment = deploymentResult.deployment;
+  const repository = options.repository ?? parseRemoteRepository(gitValue(repoRoot, ['config', '--get', 'remote.origin.url'])) ?? deployment.repository;
+  const verifyReviewProvenance = options.verifyReviewProvenance ?? ((entry) => verifyGithubReviewProvenance(repoRoot, repository, entry, deployment));
   const reviews = Array.isArray(review?.reviews) ? review.reviews : [];
   const provenanceEntries = Array.isArray(review?.github_review_provenance) ? review.github_review_provenance : [];
   const verificationResults = provenanceEntries.map((entry) => ({ entry, result: verifyReviewProvenance(entry) }));
@@ -460,14 +476,15 @@ export function buildOwnerGovernanceEvidence(options = {}) {
   const repoRoot = options.repoRoot ?? defaultRepoRoot;
   const generatedAt = options.generatedAt ?? new Date().toISOString();
   const remoteUrl = gitValue(repoRoot, ['config', '--get', 'remote.origin.url']);
-  const repository = parseRemoteRepository(remoteUrl) ?? 'globalpocket/brownie';
+  const deploymentResult = options.deploymentResult ?? loadPhaseLoopActorDeployment({ repoRoot });
+  const repository = parseRemoteRepository(remoteUrl) ?? deploymentResult.deployment?.repository ?? null;
   const sections = {
     branch_protection: buildBranchProtectionSection(repoRoot, repository),
     required_status_checks: buildRequiredStatusChecksSection(repoRoot, repository),
     protected_tag_policy: buildProtectedTagPolicySection(repoRoot, repository),
     remote_ci_workflow_provenance: buildRemoteCiWorkflowProvenanceSection(repoRoot, repository, options.env ?? process.env),
     signature_or_integrity_authority: buildIntegrityAuthoritySection(repoRoot),
-    independent_reviews: buildIndependentReviewsSection(repoRoot, { repository, verifyReviewProvenance: options.verifyReviewProvenance }),
+    independent_reviews: buildIndependentReviewsSection(repoRoot, { repository, deploymentResult, verifyReviewProvenance: options.verifyReviewProvenance }),
     oss_license_publish_posture: buildOssLicensePublishPostureSection(repoRoot)
   };
   const failClosedReasons = requiredSections

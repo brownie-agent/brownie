@@ -21,7 +21,7 @@ test('generates exact function replacement from target JSON shape', () => {
       JSON.stringify({
         schema_version: 1,
         phase: 'RRP-test',
-        repository: 'globalpocket/brownie',
+        repository: 'example-org/validator-fixture',
         runtime_release_ready: false,
         release_ready_blocked_by: ['evidence'],
         ledger_event_kind: { values: ['RuntimeStarted', 'RuntimeStopped'] },

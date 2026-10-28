@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment } from './phase-loop-actor-deployment.mjs';
 import { runtimeOperationalEvidenceRequiredSections } from './guard-runtime-operational-evidence.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1004,7 +1005,7 @@ function buildShortcutRuntimeOperationalEvidence(options, repoRoot, generatedAt)
     schema_version: 1,
     evidence_id: 'brownie-runtime-operational-evidence-v1',
     generated_at: generatedAt,
-    repository: 'globalpocket/brownie',
+    repository: loadPhaseLoopActorDeployment({ repoRoot }).deployment?.repository ?? null,
     release_ready: false,
     runtime_release_ready: false,
     fail_closed: artifactFailClosed,
@@ -1049,7 +1050,7 @@ export function buildRuntimeOperationalEvidence(options = {}) {
     schema_version: 1,
     evidence_id: 'brownie-runtime-operational-evidence-v1',
     generated_at: generatedAt,
-    repository: 'globalpocket/brownie',
+    repository: loadPhaseLoopActorDeployment({ repoRoot }).deployment?.repository ?? null,
     release_ready: false,
     runtime_release_ready: false,
     required_sections: requiredSections,

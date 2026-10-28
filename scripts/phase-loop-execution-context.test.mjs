@@ -20,7 +20,7 @@ function repo() {
 
 test('binds workspace-derived defaults and writes bounded audit', () => {
   const workspace = repo();
-  const result = bindExecutionContext({ workspaceRoot: workspace, controllerRoot: workspace });
+  const result = bindExecutionContext({ workspaceRoot: workspace, controllerRoot: workspace, expectedActor: 'implementation-bot' });
   assert.equal(result.valid, true, JSON.stringify(result.errors));
   assert.equal(result.context.state_root, path.join(workspace, '.brownie/private/phase-loop'));
   assert.equal(result.context.cli_root, path.join(workspace, 'target/debug/brownie'));
@@ -30,7 +30,7 @@ test('binds workspace-derived defaults and writes bounded audit', () => {
 
 test('rejects stale controller and cross-workspace state before dispatch', () => {
   const workspace = repo();
-  const result = bindExecutionContext({ workspaceRoot: workspace, controllerRoot: path.join(workspace, 'deleted-controller'), stateRoot: path.join(os.tmpdir(), 'foreign-state') });
+  const result = bindExecutionContext({ workspaceRoot: workspace, controllerRoot: path.join(workspace, 'deleted-controller'), stateRoot: path.join(os.tmpdir(), 'foreign-state'), expectedActor: 'implementation-bot' });
   assert.equal(result.valid, false);
   assert(result.errors.some((entry) => entry.code === 'controller_root_stale'));
   assert(result.errors.some((entry) => entry.code === 'state_controller_root_mismatch'));

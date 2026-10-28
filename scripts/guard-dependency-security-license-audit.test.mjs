@@ -52,7 +52,7 @@ function validEvidence(repoRoot = tempRepo(), overrides = {}) {
     schema_version: 1,
     evidence_id: 'brownie-dependency-security-license-audit-v1',
     phase: 'RRP-8.5',
-    repository: 'globalpocket/brownie',
+    repository: 'example-org/evidence-fixture',
     release_ready: false,
     runtime_release_ready: false,
     mandatory_gate_passed: false,

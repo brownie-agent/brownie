@@ -16,33 +16,80 @@ jobs:
       - name: Fetch approved phase-loop controller baseline
         run: git fetch --no-tags origin main:refs/remotes/origin/main
 
-      - name: Fail closed on implementation pull-request author
+      - name: Materialize and verify selected phase-loop deployment
         if: github.event_name == 'pull_request'
         env:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.name }}
+          PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN }}
+          PHASE_LOOP_IMPLEMENTATION_PR_ACTOR: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_ACTOR }}
+          PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER }}
+          PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY: ${{ vars.PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY }}
+          PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES: ${{ vars.PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES }}
+          PHASE_LOOP_REVIEW_ACTOR: ${{ vars.PHASE_LOOP_REVIEW_ACTOR }}
+          PHASE_LOOP_MERGE_ACTOR: ${{ vars.PHASE_LOOP_MERGE_ACTOR }}
           PHASE_LOOP_REJECTED_HEAD_SHA: ${{ vars.PHASE_LOOP_REJECTED_HEAD_SHA }}
           PHASE_LOOP_REJECTED_PR_NUMBER: ${{ vars.PHASE_LOOP_REJECTED_PR_NUMBER }}
         run: |
-          case "$PR_HEAD_REF" in
-            brownie-agent/*|phase-loop/*) ;;
-            *) exit 0 ;;
-          esac
-          if [ "$PR_AUTHOR" != "brownie-agent" ]; then
-            echo "Implementation pull-request author guard failed: expected brownie-agent, got $PR_AUTHOR" >&2
+          if [ -z "$PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN" ]; then
+            echo "No phase-loop implementation PR admission selector is configured; skipping role-specific admission."
+            exit 0
+          fi
+          if ! printf '%s\n' "$PR_HEAD_REF" | grep -Eq "^(${PHASE_LOOP_IMPLEMENTATION_PR_BRANCH_PATTERN})$"; then
+            exit 0
+          fi
+          for required in PHASE_LOOP_IMPLEMENTATION_PR_ACTOR PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR; do
+            if [ -z "${!required}" ]; then
+              echo "Selected phase-loop deployment is incomplete: $required is not configured." >&2
+              exit 1
+            fi
+          done
+          if [ "$PR_AUTHOR" != "$PHASE_LOOP_IMPLEMENTATION_PR_ACTOR" ]; then
+            echo "Implementation pull-request author guard failed: configured=$PHASE_LOOP_IMPLEMENTATION_PR_ACTOR actual=$PR_AUTHOR" >&2
             exit 1
           fi
-          if [ "$PR_HEAD_OWNER" != "brownie-agent" ] || [ "$PR_HEAD_REPO" != "brownie" ]; then
-            echo "Implementation pull-request admission failed: expected head brownie-agent/brownie, got $PR_HEAD_OWNER/$PR_HEAD_REPO" >&2
+          if [ "$PR_HEAD_OWNER" != "$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER" ] || [ "$PR_HEAD_REPO" != "$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY" ]; then
+            echo "Implementation pull-request admission failed: configured=$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_OWNER/$PHASE_LOOP_IMPLEMENTATION_PR_HEAD_REPOSITORY actual=$PR_HEAD_OWNER/$PR_HEAD_REPO" >&2
             exit 1
           fi
+          PHASE_LOOP_DEPLOYMENT_FILE="$RUNNER_TEMP/phase-loop-actor-deployment.json"
+          export PHASE_LOOP_DEPLOYMENT_FILE
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          try:
+              prefixes = json.loads(os.environ['PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES'])
+          except json.JSONDecodeError as error:
+              raise SystemExit(f'PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES must be a JSON array: {error}')
+          if not isinstance(prefixes, list) or not prefixes or any(not isinstance(value, str) or not value.strip() for value in prefixes):
+              raise SystemExit('PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES must be a non-empty JSON array of non-empty strings.')
+          deployment = {
+              'schema_version': 1,
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'roles': {
+                  'implementation': {
+                      'github_login': os.environ['PHASE_LOOP_IMPLEMENTATION_PR_ACTOR'],
+                      'branch_prefixes': prefixes,
+                  },
+                  'review': {'github_login': os.environ['PHASE_LOOP_REVIEW_ACTOR']},
+                  'merge': {'github_login': os.environ['PHASE_LOOP_MERGE_ACTOR']},
+              },
+              'constraints': {'require_independent_review': True},
+          }
+          with open(os.environ['PHASE_LOOP_DEPLOYMENT_FILE'], 'w', encoding='utf-8') as output:
+              json.dump(deployment, output)
+              output.write('\n')
+          PY
+          chmod 600 "$PHASE_LOOP_DEPLOYMENT_FILE"
+          node scripts/phase-loop-actor-deployment.mjs --deployment "$PHASE_LOOP_DEPLOYMENT_FILE" --role implementation --field repository >/dev/null
           if [ -n "$PHASE_LOOP_REJECTED_HEAD_SHA" ] || [ -n "$PHASE_LOOP_REJECTED_PR_NUMBER" ]; then
             node scripts/phase-loop-pr-author-guard.mjs --event-path "$GITHUB_EVENT_PATH"
           fi
-          echo "Implementation pull-request author guard passed for $PR_HEAD_REF."
+          echo "Selected phase-loop deployment and implementation pull-request author guard passed for $PR_HEAD_REF."
 
       - name: Fail closed on stale phase-loop controller source
         run: |

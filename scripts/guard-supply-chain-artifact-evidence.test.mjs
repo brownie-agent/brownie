@@ -199,7 +199,7 @@ function validEvidence(repoRoot = tempRepo()) {
     schema_version: 1,
     evidence_id: 'brownie-supply-chain-artifact-evidence-v1',
     phase: 'RRP-8.4',
-    repository: 'globalpocket/brownie',
+    repository: 'example-org/evidence-fixture',
     release_ready: false,
     runtime_release_ready: false,
     sourceCheckoutState: 'clean',

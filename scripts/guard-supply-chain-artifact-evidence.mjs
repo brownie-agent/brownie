@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -189,11 +190,13 @@ function validateOptionalPath(repoRoot, value, errors, owner) {
 function validateEvidence(evidence, options = {}) {
   const repoRoot = options.repoRoot ?? defaultRepoRoot;
   const errors = [];
+  const deploymentResult = options.deploymentResult ?? loadPhaseLoopActorDeployment({ repoRoot });
+  const expectedRepository = options.repository ?? deploymentResult.deployment?.repository ?? evidence.repository;
 
   requireValue(evidence.schema_version === 1, errors, 'supply-chain evidence schema_version must be 1.');
   requireValue(evidence.evidence_id === 'brownie-supply-chain-artifact-evidence-v1', errors, 'supply-chain evidence_id must match.');
   requireValue(evidence.phase === 'RRP-8.4', errors, 'supply-chain evidence phase must be RRP-8.4.');
-  requireValue(evidence.repository === 'globalpocket/brownie', errors, 'supply-chain evidence repository must be globalpocket/brownie.');
+  requireValue(evidence.repository === expectedRepository, errors, 'supply-chain evidence repository must match the configured deployment repository.');
   requireValue(evidence.release_ready === false, errors, 'supply-chain evidence must not declare release_ready true.');
   requireValue(evidence.runtime_release_ready === false, errors, 'supply-chain evidence must not declare runtime_release_ready true.');
   requireValue(Array.isArray(evidence.fail_closed_reasons), errors, 'supply-chain evidence must include fail_closed_reasons.');

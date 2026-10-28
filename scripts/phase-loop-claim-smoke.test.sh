@@ -16,6 +16,84 @@ export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="HEAD"
 export PHASE_LOOP_PREFLIGHT_PROFILE="claim-smoke-fixture"
 export PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY="1"
 export PHASE_LOOP_PR_REMOTE="fixture-origin"
+# A fixture must inject the same role-to-credential mapping that production
+# receives from its deployment control plane.  Never borrow a developer's
+# private profile or rely on a particular GitHub account being available in
+# CI.  The controller receives this root explicitly; the temporary worker
+# checkout remains credential-free.
+PHASE_LOOP_TEST_CONTROL_ROOT="$(mktemp -d)"
+mkdir -p "$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/profiles/implementation"
+cat > "$PHASE_LOOP_TEST_CONTROL_ROOT/actor-deployment.json" <<'JSON'
+{
+  "schema_version": 1,
+  "repository": "fixture-owner/fixture-repository",
+  "roles": {
+    "implementation": {"github_login": "fixture-implementation", "branch_prefixes": ["fixture/"]},
+    "review": {"github_login": "fixture-review"},
+    "merge": {"github_login": "fixture-merge"}
+  },
+  "constraints": {"require_independent_review": true}
+}
+JSON
+cat > "$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/phase-loop-actor-credentials.json" <<'JSON'
+{
+  "schema_version": 1,
+  "roles": {
+    "implementation": {
+      "kind": "repository-private",
+      "github_config_dir": "profiles/implementation"
+    },
+    "review": { "kind": "host-default" },
+    "merge": { "kind": "host-default" }
+  }
+}
+JSON
+cleanup_phase_loop_test_control_root() {
+  rm -rf "$PHASE_LOOP_TEST_CONTROL_ROOT" "${PHASE_LOOP_TEST_RUNTIME:-}"
+}
+trap cleanup_phase_loop_test_control_root EXIT
+export PHASE_LOOP_CONTROL_ROOT="$PHASE_LOOP_TEST_CONTROL_ROOT"
+export PHASE_LOOP_ACTOR_DEPLOYMENT="$PHASE_LOOP_TEST_CONTROL_ROOT/actor-deployment.json"
+export PHASE_LOOP_ACTOR_CREDENTIALS="$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/phase-loop-actor-credentials.json"
+export PHASE_LOOP_SCREEN_NAME='fixture-phase-loop-screen'
+export PHASE_LOOP_LAUNCHD_LABEL='fixture.phase-loop'
+PHASE_LOOP_TEST_REPOSITORY="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field repository)"
+PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login)"
+PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field branch-prefix)"
+PHASE_LOOP_TEST_REVIEW_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role review --field github-login)"
+export PHASE_LOOP_TEST_REPOSITORY PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX PHASE_LOOP_TEST_REVIEW_ACTOR
+# Inject every operational value used by a run. The test suite must not rely
+# on a repository-local deployment file or inherited developer configuration.
+PHASE_LOOP_TEST_RUNTIME="$(mktemp)"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$PHASE_LOOP_TEST_RUNTIME"
+chmod +x "$PHASE_LOOP_TEST_RUNTIME"
+export BROWNIE_RUNTIME_PATH="$PHASE_LOOP_TEST_RUNTIME"
+export PHASE_LOOP_INTERVAL_SECONDS=1
+export PHASE_LOOP_FAILURE_BACKOFF_SECONDS=1
+export PHASE_LOOP_MAX_FAILURE_BACKOFF_SECONDS=1
+export PHASE_LOOP_BROWNIE_TIMEOUT_SECONDS=30
+export PHASE_LOOP_BROWNIE_DECOMPOSE_TIMEOUT_SECONDS=30
+export PHASE_LOOP_STAGNATION_THRESHOLD=3
+export PHASE_LOOP_PROMPT_MAX_BYTES=65536
+export PHASE_LOOP_SELECTED_TODO_MAX_BYTES=8192
+export PHASE_LOOP_TODO_SNAPSHOT_LINES=80
+export PHASE_LOOP_BASE_PROMPT_SNAPSHOT_LINES=80
+export PHASE_LOOP_PROMPT_RETENTION_COUNT=20
+export PHASE_LOOP_STOP_GRACE_SECONDS=1
+export PHASE_LOOP_STOP_FORCE_SECONDS=1
+export PHASE_LOOP_SUPERVISOR_OWNER_GRACE_SECONDS=1
+export PHASE_LOOP_LEGACY_MIGRATION_OWNERLESS_GRACE_SECONDS=1
+export PHASE_LOOP_SLEEP_POLL_SECONDS=1
+export PHASE_LOOP_CONTINUATION_WATCHDOG_SECONDS=60
+export PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES=3
+export PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0
+export PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=0
+export PHASE_LOOP_PR_BASE=main
+export PHASE_LOOP_PR_TITLE_PREFIX='fixture phase loop'
+export PHASE_LOOP_PR_DRAFT=0
+export PHASE_LOOP_LLM_ROUTING=1
+export PHASE_LOOP_LLM_FAST_MAX_PROMPT_BYTES=20000
+export PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
 PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"
 
@@ -105,7 +183,7 @@ phase_loop_prepare_pr_fixture_workspace() {
   mkdir -p "$workspace/docs/architecture"
   cp "$REPO_ROOT/docs/architecture/phase-loop-actor-separation-policy.json" \
     "$workspace/docs/architecture/phase-loop-actor-separation-policy.json"
-  git -C "$workspace" remote set-url origin https://github.com/globalpocket/brownie.git
+  git -C "$workspace" remote set-url origin "https://github.com/${PHASE_LOOP_TEST_REPOSITORY}.git"
   git -C "$workspace" remote add fixture-origin "$remote"
   git -C "$workspace" add \
     docs/architecture/phase-loop-actor-separation-policy.json \
@@ -380,13 +458,35 @@ assert_contains "${BASH_SOURCE[0]}" "phase_loop_smoke_cpu_count"
 assert_contains "${BASH_SOURCE[0]}" "PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE"
 assert_contains "$CLAIM_SMOKE_SCHEDULER" 'local batch_size="\$3"'
 
-claim_smoke_private_state_sha256() {
+claim_smoke_live_private_state_sha256() {
   local state_root="$REPO_ROOT/.brownie/private/phase-loop"
   if [ ! -d "$state_root" ]; then
     printf '%s\n' absent
     return 0
   fi
-  find "$state_root" -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum | shasum | awk '{print $1}'
+  # Historical run archives can be large and are deliberately not live control
+  # state. Hash only the bounded files that a fixture could accidentally use as
+  # its active controller store. Isolation is enforced by explicit state-root
+  # injection below, so recursively hashing all retained evidence would turn a
+  # non-mutating smoke test into an unbounded operation.
+  local relative_path
+  local -a live_paths=(
+    'current.json'
+    'progress-state.json'
+    'run-state.json'
+    'status.json'
+    'worker-launch-receipt.json'
+    'todo-claims/current.json'
+    'todo-claims/repair-feedback.json'
+    'todo-claims/failure-ledger.jsonl'
+  )
+  {
+    for relative_path in "${live_paths[@]}"; do
+      if [ -f "$state_root/$relative_path" ]; then
+        shasum "$state_root/$relative_path" | sed "s#  $state_root/#  #"
+      fi
+    done
+  } | LC_ALL=C sort | shasum | awk '{print $1}'
 }
 
 # Every scenario below must confine queue mutations to its own TODO/breakdown
@@ -394,7 +494,7 @@ claim_smoke_private_state_sha256() {
 # validates, even when the scenario exits through a replan or repair path.
 CLAIM_SMOKE_REPO_TODO_SHA256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
 CLAIM_SMOKE_REPO_BREAKDOWN_SHA256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
-CLAIM_SMOKE_REPO_PRIVATE_STATE_SHA256="$(claim_smoke_private_state_sha256)"
+CLAIM_SMOKE_REPO_PRIVATE_STATE_SHA256="$(claim_smoke_live_private_state_sha256)"
 # Test invocations always use temporary queue/state paths; their durable
 # controller store must be isolated as well.  Otherwise phase-loop's default
 # store rooted at this repository can leave replan records that alter later
@@ -408,34 +508,12 @@ assert_repository_state_unchanged() {
   current_todo_sha256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
   current_breakdown_sha256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
   local current_private_state_sha256
-  current_private_state_sha256="$(claim_smoke_private_state_sha256)"
+  current_private_state_sha256="$(claim_smoke_live_private_state_sha256)"
   if [ "$current_todo_sha256" != "$CLAIM_SMOKE_REPO_TODO_SHA256" ] || [ "$current_breakdown_sha256" != "$CLAIM_SMOKE_REPO_BREAKDOWN_SHA256" ] || [ "$current_private_state_sha256" != "$CLAIM_SMOKE_REPO_PRIVATE_STATE_SHA256" ]; then
     echo "phase-loop claim smoke leaked temporary controller state into the repository: todo=${PHASE_LOOP_TODO:-<default>} breakdown=${PHASE_LOOP_TODO_BREAKDOWN:-<default>} workspace=${PHASE_LOOP_WORKSPACE_ROOT:-<default>} state=${PHASE_LOOP_STATE_DIR:-<default>}" >&2
     return 97
   fi
 }
-
-claim_smoke_private_state_sha256() {
-  local state_root="$REPO_ROOT/.brownie/private/phase-loop"
-  if [ ! -d "$state_root" ]; then
-    printf '%s\n' absent
-    return 0
-  fi
-  find "$state_root" -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum | shasum | awk '{print $1}'
-}
-
-# Every scenario below must confine queue mutations to its own TODO/breakdown
-# paths.  A smoke fixture must never mutate the repository queue that CI later
-# validates, even when the scenario exits through a replan or repair path.
-CLAIM_SMOKE_REPO_TODO_SHA256="$(shasum "$REPO_ROOT/.brownie/todo.md" | awk '{print $1}')"
-CLAIM_SMOKE_REPO_BREAKDOWN_SHA256="$(shasum "$REPO_ROOT/.brownie/todo-breakdown.md" | awk '{print $1}')"
-CLAIM_SMOKE_REPO_PRIVATE_STATE_SHA256="$(claim_smoke_private_state_sha256)"
-# Test invocations always use temporary queue/state paths; their durable
-# controller store must be isolated as well.  Otherwise phase-loop's default
-# store rooted at this repository can leave replan records that alter later
-# repository guards despite an unchanged fixture TODO.
-CLAIM_SMOKE_BROWNIE_STORE_ROOT="$(mktemp -d)"
-export PHASE_LOOP_BROWNIE_STORE_ROOT="$CLAIM_SMOKE_BROWNIE_STORE_ROOT"
 
 test_workspace="$(mktemp -d)"
 git -C "$test_workspace" init -b main >/dev/null
@@ -1911,7 +1989,7 @@ git -C "$completion_pr_cleanup_retry_workspace" -c user.name=Brownie -c user.ema
 git -C "$completion_pr_cleanup_retry_remote" init --bare >/dev/null
 git -C "$completion_pr_cleanup_retry_workspace" remote add origin "$completion_pr_cleanup_retry_remote"
 git -C "$completion_pr_cleanup_retry_workspace" push -u origin main >/dev/null
-git -C "$completion_pr_cleanup_retry_workspace" switch -c brownie-agent/smoke-completion-cleanup-pr >/dev/null
+git -C "$completion_pr_cleanup_retry_workspace" switch -c "${PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX}smoke-completion-cleanup-pr" >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$completion_pr_cleanup_retry_workspace" "$completion_pr_cleanup_retry_remote"
 printf 'base prompt\n' > "$completion_pr_cleanup_retry_prompt"
 printf -- '- [ ] E-completion-cleanup-pr: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_cleanup_retry_todo"
@@ -1925,7 +2003,7 @@ cat > "$completion_pr_cleanup_retry_bin/gh" <<'SH'
 set -eu
 case "${1:-} ${2:-}" in
   "api user")
-    printf 'brownie-agent\n'
+    printf '%s\n' "${PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR:?}"
     ;;
   "auth token")
     printf 'fake-token\n'
@@ -1935,7 +2013,7 @@ case "${1:-} ${2:-}" in
     ;;
   "pr create")
     printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
-    printf 'https://github.com/globalpocket/brownie/pull/10001\n'
+    printf 'https://github.com/%s/pull/10001\n' "${PHASE_LOOP_TEST_REPOSITORY:?}"
     ;;
   *)
     exit 0
@@ -1967,6 +2045,7 @@ set -e
 test "$completion_pr_cleanup_retry_first_exit" = "78"
 python3 - "$completion_pr_cleanup_retry_state/todo-claims/current.json" "$completion_pr_cleanup_retry_todo" <<'PY'
 import json
+import os
 import pathlib
 import sys
 
@@ -1994,6 +2073,7 @@ set -e
 test "$completion_pr_cleanup_retry_second_exit" = "0"
 python3 - "$completion_pr_cleanup_retry_state/status.json" "$completion_pr_cleanup_retry_state/todo-claims/current.json" "$completion_pr_cleanup_retry_todo" "$completion_pr_cleanup_retry_workspace" "$completion_pr_cleanup_retry_count" "$completion_pr_cleanup_retry_runtime_count" <<'PY'
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -2014,7 +2094,7 @@ assert '- [ ] E-completion-cleanup-pr:' not in todo, todo
 assert pr_count.read_text(encoding='utf-8').splitlines() == ['1'], pr_count
 assert not runtime_count.exists(), runtime_count
 head = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'HEAD'], text=True).strip()
-remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'fixture-origin/brownie-agent/smoke-completion-cleanup-pr'], text=True).strip()
+remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', f"fixture-origin/{os.environ['PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX']}smoke-completion-cleanup-pr"], text=True).strip()
 assert head == remote, (head, remote)
 supervisor = pathlib.Path(pathlib.Path(sys.argv[1]).parent / 'logs' / 'supervisor.log').read_text(encoding='utf-8')
 assert 'completed_todo_pr_publish_retry_succeeded=true' in supervisor, supervisor
@@ -2040,7 +2120,7 @@ git -C "$completion_pr_publish_failure_workspace" -c user.name=Brownie -c user.e
 git -C "$completion_pr_publish_failure_remote" init --bare >/dev/null
 git -C "$completion_pr_publish_failure_workspace" remote add origin "$completion_pr_publish_failure_remote"
 git -C "$completion_pr_publish_failure_workspace" push -u origin main >/dev/null
-git -C "$completion_pr_publish_failure_workspace" switch -c brownie-agent/smoke-completion-pr-retry >/dev/null
+git -C "$completion_pr_publish_failure_workspace" switch -c "${PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX}smoke-completion-pr-retry" >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$completion_pr_publish_failure_workspace" "$completion_pr_publish_failure_remote"
 printf 'base prompt\n' > "$completion_pr_publish_failure_prompt"
 printf -- '- [ ] E-completion-pr-retry: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_publish_failure_todo"
@@ -2054,7 +2134,7 @@ cat > "$completion_pr_publish_failure_bin/gh" <<'SH'
 set -eu
 case "${1:-} ${2:-}" in
   "api user")
-    printf 'brownie-agent\n'
+    printf '%s\n' "${PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR:?}"
     ;;
   "auth token")
     printf 'fake-token\n'
@@ -2071,7 +2151,7 @@ case "${1:-} ${2:-}" in
     if [ "$attempts" -eq 0 ]; then
       exit 1
     fi
-    printf 'https://github.com/globalpocket/brownie/pull/10002\n'
+    printf 'https://github.com/%s/pull/10002\n' "${PHASE_LOOP_TEST_REPOSITORY:?}"
     ;;
   *)
     exit 0
@@ -2102,6 +2182,7 @@ set -e
 test "$completion_pr_publish_failure_first_exit" = "78"
 python3 - "$completion_pr_publish_failure_state/status.json" "$completion_pr_publish_failure_state/todo-claims/current.json" "$completion_pr_publish_failure_todo" "$completion_pr_publish_failure_count" "$completion_pr_publish_failure_runtime_count" <<'PY'
 import json
+import os
 import pathlib
 import sys
 
@@ -2134,6 +2215,7 @@ set -e
 test "$completion_pr_publish_failure_second_exit" = "0"
 python3 - "$completion_pr_publish_failure_state/status.json" "$completion_pr_publish_failure_state/todo-claims/current.json" "$completion_pr_publish_failure_count" "$completion_pr_publish_failure_runtime_count" "$completion_pr_publish_failure_workspace" <<'PY'
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -2150,7 +2232,7 @@ assert claim['completion_pr_pending'] is False, claim
 assert attempts.read_text(encoding='utf-8').splitlines() == ['attempt', 'attempt'], attempts
 assert not runtime_count.exists(), runtime_count
 head = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'HEAD'], text=True).strip()
-remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', 'fixture-origin/brownie-agent/smoke-completion-pr-retry'], text=True).strip()
+remote = subprocess.check_output(['git', '-C', workspace, 'rev-parse', f"fixture-origin/{os.environ['PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX']}smoke-completion-pr-retry"], text=True).strip()
 assert head == remote, (head, remote)
 PY
 
@@ -2174,7 +2256,7 @@ git -C "$completion_pr_marker_preservation_workspace" -c user.name=Brownie -c us
 git -C "$completion_pr_marker_preservation_remote" init --bare >/dev/null
 git -C "$completion_pr_marker_preservation_workspace" remote add origin "$completion_pr_marker_preservation_remote"
 git -C "$completion_pr_marker_preservation_workspace" push -u origin main >/dev/null
-git -C "$completion_pr_marker_preservation_workspace" switch -c brownie-agent/smoke-completion-pr-marker-preservation >/dev/null
+git -C "$completion_pr_marker_preservation_workspace" switch -c "${PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX}smoke-completion-pr-marker-preservation" >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$completion_pr_marker_preservation_workspace" "$completion_pr_marker_preservation_remote"
 printf 'base prompt\n' > "$completion_pr_marker_preservation_prompt"
 printf -- '- [ ] E-completion-pr-marker-preservation: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_pr_marker_preservation_todo"
@@ -2187,12 +2269,12 @@ cat > "$completion_pr_marker_preservation_bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -eu
 case "${1:-} ${2:-}" in
-  "api user") printf 'brownie-agent\n' ;;
+  "api user") printf '%s\n' "${PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR:?}" ;;
   "auth token") printf 'fake-token\n' ;;
   "pr view") exit 1 ;;
   "pr create")
     printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
-    printf 'https://github.com/globalpocket/brownie/pull/10003\n'
+    printf 'https://github.com/%s/pull/10003\n' "${PHASE_LOOP_TEST_REPOSITORY:?}"
     ;;
   *) exit 0 ;;
 esac
@@ -2317,7 +2399,7 @@ git -C "$completion_cleanup_interrupt_workspace" -c user.name=Brownie -c user.em
 git -C "$completion_cleanup_interrupt_remote" init --bare >/dev/null
 git -C "$completion_cleanup_interrupt_workspace" remote add origin "$completion_cleanup_interrupt_remote"
 git -C "$completion_cleanup_interrupt_workspace" push -u origin main >/dev/null
-git -C "$completion_cleanup_interrupt_workspace" switch -c brownie-agent/smoke-completion-cleanup-interrupt >/dev/null
+git -C "$completion_cleanup_interrupt_workspace" switch -c "${PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX}smoke-completion-cleanup-interrupt" >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$completion_cleanup_interrupt_workspace" "$completion_cleanup_interrupt_remote"
 printf 'base prompt\n' > "$completion_cleanup_interrupt_prompt"
 printf -- '- [ ] E-completion-cleanup-interrupt: Patch only `README.md`:\n  Route: implementation.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$completion_cleanup_interrupt_todo"
@@ -2330,12 +2412,12 @@ cat > "$completion_cleanup_interrupt_bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -eu
 case "${1:-} ${2:-}" in
-  "api user") printf 'brownie-agent\n' ;;
+  "api user") printf '%s\n' "${PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR:?}" ;;
   "auth token") printf 'fake-token\n' ;;
   "pr view") exit 1 ;;
   "pr create")
     printf '1\n' >> "${FAKE_GH_PR_CREATE_COUNT:?}"
-    printf 'https://github.com/globalpocket/brownie/pull/10004\n'
+    printf 'https://github.com/%s/pull/10004\n' "${PHASE_LOOP_TEST_REPOSITORY:?}"
     ;;
   *) exit 0 ;;
 esac
@@ -3460,6 +3542,7 @@ preclaim_dirty_output="$(PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 node "$REPO_ROOT/scr
   --todo "$preclaim_delivery_todo" \
   --breakdown "$preclaim_delivery_breakdown" \
   --control-plane-root "$REPO_ROOT" \
+  --expected-actor "$PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR" \
   --profile claim-smoke-fixture \
   --stage pre-claim-boundary 2>&1)"
 preclaim_dirty_status="$?"
@@ -3482,6 +3565,7 @@ PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY=1 node "$REPO_ROOT/scripts/phase-loop-preflight
   --todo "$preclaim_delivery_todo" \
   --breakdown "$preclaim_delivery_breakdown" \
   --control-plane-root "$REPO_ROOT" \
+  --expected-actor "$PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR" \
   --profile claim-smoke-fixture \
   --stage pre-claim-boundary >/dev/null
 
@@ -3500,7 +3584,7 @@ git -C "$workspace_pr_progress" -c user.name=Brownie -c user.email=brownie@examp
 git -C "$remote_pr_progress" init --bare >/dev/null
 git -C "$workspace_pr_progress" remote add origin "$remote_pr_progress"
 git -C "$workspace_pr_progress" push -u origin main >/dev/null
-git -C "$workspace_pr_progress" switch -c brownie-agent/smoke-pr >/dev/null
+git -C "$workspace_pr_progress" switch -c "${PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX}smoke-pr" >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$workspace_pr_progress" "$remote_pr_progress"
 test -z "$(git -C "$workspace_pr_progress" status --porcelain)"
 printf 'base prompt\n' > "$prompt_pr_progress"
@@ -3515,7 +3599,7 @@ cat > "$fake_bin_dir/gh" <<'SH'
 set -eu
 case "${1:-} ${2:-}" in
   "api user")
-    printf 'brownie-agent\n'
+    printf '%s\n' "${PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR:?}"
     ;;
   "auth token")
     printf 'fake-token\n'
@@ -3524,7 +3608,7 @@ case "${1:-} ${2:-}" in
     exit 1
     ;;
   "pr create")
-    printf 'https://github.com/globalpocket/brownie/pull/9999\n'
+    printf 'https://github.com/%s/pull/9999\n' "${PHASE_LOOP_TEST_REPOSITORY:?}"
     ;;
   *)
     exit 0
@@ -3544,6 +3628,7 @@ run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/
 
 python3 - "$state_pr_progress/status.json" "$workspace_pr_progress" "$todo_pr_progress" <<'PY'
 import json
+import os
 import subprocess
 import sys
 
@@ -3553,10 +3638,10 @@ todo = open(sys.argv[3], encoding="utf-8").read()
 assert status["status"] == "pr_created", status
 assert "pull/9999" in status["detail"], status
 head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
-remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr"], text=True).strip()
+remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", f"fixture-origin/{os.environ['PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX']}smoke-pr"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
-assert message.startswith("Brownie phase-loop:"), message
+assert message.startswith(f"{os.environ['PHASE_LOOP_PR_TITLE_PREFIX']}:"), message
 assert "B-01:" in message, message
 assert "README.md" in message, message
 assert "B-01:" in todo, todo
@@ -3585,7 +3670,7 @@ git -C "$workspace_pr_completed_progress" -c user.name=Brownie -c user.email=bro
 git -C "$remote_pr_completed_progress" init --bare >/dev/null
 git -C "$workspace_pr_completed_progress" remote add origin "$remote_pr_completed_progress"
 git -C "$workspace_pr_completed_progress" push -u origin main >/dev/null
-git -C "$workspace_pr_completed_progress" switch -c brownie-agent/smoke-pr-completed >/dev/null
+git -C "$workspace_pr_completed_progress" switch -c "${PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX}smoke-pr-completed" >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$workspace_pr_completed_progress" "$remote_pr_completed_progress"
 test -z "$(git -C "$workspace_pr_completed_progress" status --porcelain)"
 printf 'base prompt\n' > "$prompt_pr_completed_progress"
@@ -3603,6 +3688,7 @@ run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/
 
 python3 - "$state_pr_completed_progress/status.json" "$workspace_pr_completed_progress" "$todo_pr_completed_progress_contract" <<'PY'
 import json
+import os
 import subprocess
 import sys
 
@@ -3612,10 +3698,10 @@ todo = open(sys.argv[3], encoding="utf-8").read()
 assert status["status"] == "pr_created", status
 assert "pull/9999" in status["detail"], status
 head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
-remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr-completed"], text=True).strip()
+remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", f"fixture-origin/{os.environ['PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX']}smoke-pr-completed"], text=True).strip()
 assert head == remote, (head, remote)
 message = subprocess.check_output(["git", "-C", workspace, "log", "-1", "--format=%s"], text=True).strip()
-assert message.startswith("Brownie phase-loop:"), message
+assert message.startswith(f"{os.environ['PHASE_LOOP_PR_TITLE_PREFIX']}:"), message
 assert "B-01:" in message, message
 assert "README.md" in message, message
 assert "B-01:" in todo, todo
@@ -3641,7 +3727,7 @@ git -C "$workspace_pr_supervise" -c user.name=Brownie -c user.email=brownie@exam
 git -C "$remote_pr_supervise" init --bare >/dev/null
 git -C "$workspace_pr_supervise" remote add origin "$remote_pr_supervise"
 git -C "$workspace_pr_supervise" push -u origin main >/dev/null
-git -C "$workspace_pr_supervise" switch -c brownie-agent/smoke-pr-supervise >/dev/null
+git -C "$workspace_pr_supervise" switch -c "${PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX}smoke-pr-supervise" >/dev/null
 phase_loop_prepare_pr_fixture_workspace "$workspace_pr_supervise" "$remote_pr_supervise"
 test -z "$(git -C "$workspace_pr_supervise" status --porcelain)"
 printf 'base prompt\n' > "$prompt_pr_supervise"
@@ -3656,7 +3742,7 @@ cat > "$fake_supervise_bin_dir/gh" <<'SH'
 set -eu
 case "${1:-} ${2:-}" in
   "api user")
-    printf 'brownie-agent\n'
+    printf '%s\n' "${PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR:?}"
     ;;
   "auth token")
     printf 'fake-token\n'
@@ -3665,7 +3751,7 @@ case "${1:-} ${2:-}" in
     exit 1
     ;;
   "pr create")
-    printf 'https://github.com/globalpocket/brownie/pull/9998\n'
+    printf 'https://github.com/%s/pull/9998\n' "${PHASE_LOOP_TEST_REPOSITORY:?}"
     ;;
   *)
     exit 0
@@ -3695,6 +3781,7 @@ run_with_timeout 20 env \
 
 python3 - "$state_pr_supervise/status.json" "$state_pr_supervise/logs/supervisor.log" "$workspace_pr_supervise" <<'PY'
 import json
+import os
 import subprocess
 import sys
 
@@ -3705,7 +3792,7 @@ assert status["status"] == "pr_created", status
 assert "pull/9998" in status["detail"], status
 assert "pr_created observed; stopping supervisor for review" in supervisor_log, supervisor_log
 head = subprocess.check_output(["git", "-C", workspace, "rev-parse", "HEAD"], text=True).strip()
-remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", "fixture-origin/brownie-agent/smoke-pr-supervise"], text=True).strip()
+remote = subprocess.check_output(["git", "-C", workspace, "rev-parse", f"fixture-origin/{os.environ['PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX']}smoke-pr-supervise"], text=True).strip()
 assert head == remote, (head, remote)
 PY
 
@@ -3732,7 +3819,7 @@ cat > "$actor_guard_invalid_bin_dir/gh" <<'SH'
 #!/usr/bin/env bash
 set -eu
 if [ "${1:-} ${2:-}" = "api user" ]; then
-  printf 'globalpocket\n'
+  printf '%s\n' "${PHASE_LOOP_TEST_REVIEW_ACTOR:?}"
   exit 0
 fi
 exit 1
@@ -3749,6 +3836,22 @@ test "$actor_guard_invalid_exit" = "1"
 fi
 
 if claim_smoke_section_enabled lifecycle; then
+# The lifecycle shard is selected independently by CI.  It therefore cannot
+# borrow the bare workspace created for the core shard: phase-loop preflight
+# reads the workspace package-script contract even for stop/recovery paths.
+# Keep this deployment-neutral fixture complete and restore the shared
+# variable afterwards so other selected shards cannot inherit it.
+lifecycle_original_workspace="$test_workspace"
+lifecycle_workspace="$(mktemp -d)"
+git -C "$lifecycle_workspace" init -b main >/dev/null
+mkdir -p "$lifecycle_workspace/.brownie" "$lifecycle_workspace/scripts"
+printf '%s\n' '{"name":"brownie-claim-smoke-lifecycle-fixture","private":true,"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","phase-loop:todo-queue-integrity":"node scripts/phase-loop-todo-queue-integrity.mjs"}}' > "$lifecycle_workspace/package.json"
+printf '# lifecycle fixture breakdown\n' > "$lifecycle_workspace/.brownie/todo-breakdown.md"
+printf 'export const evidence = {};\n' > "$lifecycle_workspace/scripts/release-supply-chain-artifact-evidence.mjs"
+git -C "$lifecycle_workspace" add package.json .brownie/todo-breakdown.md scripts/release-supply-chain-artifact-evidence.mjs
+git -C "$lifecycle_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+test_workspace="$lifecycle_workspace"
+
 state_truncated="$(mktemp -d)"
 prompt_truncated="$(mktemp)"
 todo_truncated="$(mktemp)"
@@ -4119,14 +4222,15 @@ PHASE_LOOP_STOP_FORCE_SECONDS=3 \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" supervise >/dev/null 2>/dev/null &
 child_supervisor_pid="$!"
 
-for _ in 1 2 3 4 5; do
-  if [ -s "$child_pid_file" ]; then
+child_start_deadline=$((SECONDS + PHASE_LOOP_COMMAND_TIMEOUT_SECONDS))
+while [ ! -s "$child_pid_file" ] && [ "$SECONDS" -lt "$child_start_deadline" ]; do
+  if ! kill -0 "$child_supervisor_pid" 2>/dev/null; then
     break
   fi
-  sleep 1
+  sleep "$PHASE_LOOP_SLEEP_POLL_SECONDS"
 done
 if [ ! -s "$child_pid_file" ]; then
-  echo "expected fake Brownie child pid file" >&2
+  echo "expected fake Brownie child pid file before configured command timeout" >&2
   kill "$child_supervisor_pid" 2>/dev/null || true
   exit 1
 fi
@@ -4143,6 +4247,7 @@ if kill -0 "$child_pid" 2>/dev/null && ! ps -o stat= -p "$child_pid" 2>/dev/null
   kill -KILL "$child_pid" 2>/dev/null || true
   exit 1
 fi
+test_workspace="$lifecycle_original_workspace"
 fi
 
 if claim_smoke_section_enabled guards; then

@@ -19,12 +19,21 @@ gates.
 
 Brownie Phase Loop implementation work is expected to use:
 
-- implementation actor: `brownie-agent`
-- review actor: `globalpocket`
-- merge actor: `globalpocket`
+- implementation actor: the `implementation` principal in the configuration selected by `PHASE_LOOP_ACTOR_DEPLOYMENT`
+- review actor: the `review` principal in the configuration selected by `PHASE_LOOP_ACTOR_DEPLOYMENT`
+- merge actor: the `merge` principal in the configuration selected by `PHASE_LOOP_ACTOR_DEPLOYMENT`
 
-Implementation PRs should be authored and pushed by `brownie-agent`. Review and
-merge should be performed by `globalpocket` after required checks pass.
+The repository does not ship a concrete Phase Loop deployment. Supply every
+operational value (workspace, state, control root, binaries, repository,
+principals, branches, retries, and timeouts) through the process environment or
+an explicitly selected `PHASE_LOOP_ENV_FILE`; supply actor and credential
+mappings with `PHASE_LOOP_ACTOR_DEPLOYMENT` and `PHASE_LOOP_ACTOR_CREDENTIALS`.
+The controller never probes `phase-loop.env`, `.test`, `.brownie/private`, or a
+workspace binary path as a fallback.
+
+Implementation PRs must be authored and pushed by the configured implementation
+principal. Review and merge must use the configured independent review and merge
+principals after required checks pass.
 
 Before implementation pushes, run:
 
@@ -62,4 +71,3 @@ Do not claim Release Ready from static documentation alone. Release evidence mus
 come from executable checks, guarded evidence files, verified GitHub review
 provenance, protected ref/tag policy, and owner-approved integrity authority or
 stronger artifact signing.
-

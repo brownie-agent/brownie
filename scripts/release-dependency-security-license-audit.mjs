@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -178,7 +179,7 @@ export function buildDependencySecurityLicenseAudit(options = {}) {
     schema_version: 1,
     evidence_id: 'brownie-dependency-security-license-audit-v1',
     phase: 'RRP-8.5',
-    repository: 'globalpocket/brownie',
+    repository: loadPhaseLoopActorDeployment({ repoRoot }).deployment?.repository ?? null,
     generated_at: generatedAt,
     source_commit: sourceCommit,
     release_ready: false,

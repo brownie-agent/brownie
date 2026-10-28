@@ -113,7 +113,7 @@ function buildAuditValidatorReplacement(target) {
   for (const field of required) if (!(field in doc)) errors.push(\`missing field: \${field}\`);
   if (doc.schema_version !== 1) errors.push('schema_version must be 1');
   if (typeof doc.phase !== 'string' || !doc.phase) errors.push('phase must be string');
-  if (doc.repository !== 'globalpocket/brownie') errors.push('repository mismatch');
+  if (typeof doc.repository !== 'string' || !/^[^/\\s]+\\/[^/\\s]+$/u.test(doc.repository)) errors.push('repository must be an owner/name GitHub slug');
   if (doc.runtime_release_ready !== false) errors.push('runtime_release_ready must be false');
   if (!Array.isArray(doc.release_ready_blocked_by)) errors.push('release_ready_blocked_by must be array');
   if (!object(doc.ledger_event_kind)) errors.push('ledger_event_kind must be object');
