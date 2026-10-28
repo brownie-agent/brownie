@@ -85,6 +85,27 @@ export PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1
 export BROWNIE_BIN="$watchdog_fixture_binary"
 export BROWNIE_RUNTIME_PATH="$watchdog_fixture_binary"
 
+# An explicitly selected env file is allowed to own the state root.  Every
+# state-derived lifecycle path must be rebound after that file is loaded;
+# otherwise startup mistakes an empty legacy-migration path for lock
+# contention and cannot resume a recoverable controller.
+env_file_state_case_dir="$(mktemp -d "${TMPDIR:-/tmp}/brownie-watchdog-env-state.XXXXXX")"
+trap 'rm -rf "$env_file_state_case_dir"' EXIT
+env_file_state_case_env="$env_file_state_case_dir/deployment.env"
+cat > "$env_file_state_case_env" <<ENV
+PHASE_LOOP_STATE_DIR='$env_file_state_case_dir/state'
+PHASE_LOOP_SCREEN_NAME='fixture-env-state-screen'
+PHASE_LOOP_LAUNCHD_LABEL='fixture.env-state'
+ENV
+env -u PHASE_LOOP_STATE_DIR PHASE_LOOP_ENV_FILE="$env_file_state_case_env" ROOT_DIR="$ROOT_DIR" bash -c '
+  set -u
+  source "$ROOT_DIR/phase-loop.sh" status >/dev/null 2>&1
+  load_env
+  [ "$LEGACY_MIGRATION_LOCK_DIR" = "$STATE_DIR/phase-loop-legacy-migration.lock" ]
+  [ "$TERMINAL_FAILURE_SOURCE_TRANSITION_PENDING_FILE" = "$STATE_DIR/todo-claims/terminal-failure-source-transition.pending.json" ]
+'
+printf '%s\n' 'phase-loop rebinds all lifecycle paths after an explicit env-file state root'
+
 run_case() {
   local mode="$1"
   local state_dir
