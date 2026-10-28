@@ -15904,7 +15904,14 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.replanned" "{\"reason\":\"$runtime_admission_cause\",\"snapshot_mismatch\":$([ "$runtime_admission_snapshot_mismatch" = "1" ] && printf true || printf false),\"continuation_required\":true,\"recovery_scope\":\"selected_claim\",\"owner_blocked\":false}"
     return 76
   fi
-  if [ "$use_resume" -ne 1 ] && ! clear_runtime_authorization_rebaseline_pending "$run_stamp"; then
+  # A fresh Runtime admission can legitimately retire the current claim before
+  # its terminal result is projected (for example, during deterministic
+  # terminal-failure recovery).  In that case no durable rebaseline marker can
+  # exist: the marker lives on the claim itself.  Do not reinterpret an absent
+  # claim as a failed marker clear; there is no session that a later resume can
+  # accidentally reuse.  A present claim still has to clear its marker
+  # atomically before continuing.
+  if [ "$use_resume" -ne 1 ] && [ -f "$TODO_CLAIM_FILE" ] && ! clear_runtime_authorization_rebaseline_pending "$run_stamp"; then
     detail="Runtime returned an admitted fresh session, but the expired-authorization rebaseline marker could not be cleared atomically; refusing to continue with ambiguous resume state. stdout=$stdout_log stderr=$stderr_log"
     printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
     write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
