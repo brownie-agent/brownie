@@ -37,7 +37,7 @@
       "fail_closed_reason": "Runtime release readiness is explicitly blocked until executable supply-chain evidence (commit, workflow run, artifact SHA) is bound and verified. No invented placeholders; all pending fields remain null/pending until evidence generation completes."
     },
     "contract_registry_fingerprint": "sha256:4250fb47242f2bdc4ac26ce1d0cf8ecedbd27627eb9e3117acc82e3719eb934d",
-    "readiness_audit_content_sha256": "sha256:7977d8948446a1e75af22a7aa753639b48d115f174388abbcd776ddee9cd5e30",
+    "readiness_audit_content_sha256": "sha256:888e7e54f061cd879ea2e70ac07ef39e1ba1cdc0747f7116e1c60f5bc083bbf5",
     "mode_pack_fingerprint": null,
     "product_dod_fingerprint": null,
     "evidence_alignment_note": "Release trace fields remain pending until executable supply-chain evidence (artifact build, workflow run, tested commit) is generated and bound by guard scripts. Contract maturity at 88% pending P0/P1 evidence closure. Fail-closed: do not replace pending values with invented placeholders."
