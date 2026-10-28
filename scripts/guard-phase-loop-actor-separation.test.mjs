@@ -3,11 +3,12 @@ import test from 'node:test';
 import { runPhaseLoopActorSeparationGuard } from './guard-phase-loop-actor-separation.mjs';
 
 const policy = {
-  schema_version: 2,
-  policy_id: 'phase-loop-actor-separation-v2',
+  schema_version: 3,
+  policy_id: 'phase-loop-actor-separation-v3',
   deployment: {
-    default_path: '.brownie/phase-loop-actor-deployment.json',
-    credential_default_path: '.brownie/private/phase-loop-actor-credentials.json'
+    actor_configuration_selector: 'PHASE_LOOP_ACTOR_DEPLOYMENT',
+    credential_configuration_selector: 'PHASE_LOOP_ACTOR_CREDENTIALS',
+    selection_rule: 'Both selectors are required and must not search a repository-relative fallback path.'
   },
   roles: {
     implementation: {
@@ -44,9 +45,9 @@ function run(overrides = {}) {
     manageVmImages: "const p = '.brownie/private/vm-images';",
     bootstrapVms: "const p = '.brownie/private/';",
     actorPreflight: 'loadPhaseLoopActorDeployment loadPhaseLoopActorCredentials resolvePhaseLoopGitHubProfile',
-    actorDeployment: 'require_independent_review',
+    actorDeployment: 'require_independent_review must be supplied explicitly',
     prActorGuard: 'validateImplementationPrActor loadPhaseLoopActorDeployment',
-    phaseLoop: 'phase-loop-pr-actor-guard.mjs --print-gh-config-dir GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create',
+    phaseLoop: 'PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-}" PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-}" phase-loop-pr-actor-guard.mjs --print-gh-config-dir GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create',
     ...overrides
   }).errors;
 }
@@ -76,6 +77,17 @@ test('rejects missing deployment loader wiring', () => {
 test('rejects any fixed implementation actor fallback', () => {
   const errors = run({ prActorGuard: "validateImplementationPrActor expectedActor = 'another-implementation-bot'" });
   assert(errors.some((error) => error.includes('must not default implementation PR creation to a fixed actor')));
+});
+
+test('rejects fixed deployment-path fallbacks', () => {
+  const errors = run({
+    actorDeployment: "require_independent_review must be supplied explicitly '.brownie/phase-loop-actor-deployment.json' '.brownie/private/phase-loop-actor-credentials.json'",
+    phaseLoop: 'PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-$ROOT_DIR/.brownie/phase-loop-actor-deployment.json}" PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-$ROOT_DIR/.brownie/private/phase-loop-actor-credentials.json}" phase-loop-pr-actor-guard.mjs --print-gh-config-dir GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create'
+  });
+  assert(errors.some((error) => error.includes('must not contain a fixed deployment file path')));
+  assert(errors.some((error) => error.includes('must not contain a fixed credential file path')));
+  assert(errors.some((error) => error.includes('must not supply a fixed actor deployment path')));
+  assert(errors.some((error) => error.includes('must not supply a fixed actor credential path')));
 });
 
 test('rejects ignoring all Brownie state', () => {

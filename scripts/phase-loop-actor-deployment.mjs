@@ -6,8 +6,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const defaultRepoRoot = path.resolve(__dirname, '..');
-export const defaultDeploymentPath = '.brownie/phase-loop-actor-deployment.json';
-export const defaultCredentialsPath = '.brownie/private/phase-loop-actor-credentials.json';
 
 function isMainModule() {
   return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
@@ -22,9 +20,9 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function resolvePath(repoRoot, requested, fallback) {
-  const value = typeof requested === 'string' && requested.trim() ? requested.trim() : fallback;
-  return path.resolve(repoRoot, value);
+function resolveConfiguredPath(repoRoot, requested) {
+  const value = typeof requested === 'string' && requested.trim() ? requested.trim() : null;
+  return value ? path.resolve(repoRoot, value) : null;
 }
 
 export function validateActorDeployment(deployment = {}) {
@@ -56,7 +54,19 @@ export function loadPhaseLoopActorDeployment(options = {}) {
   const repoRoot = path.resolve(options.repoRoot ?? defaultRepoRoot);
   const env = options.env ?? process.env;
   const requested = options.deploymentPath ?? env.PHASE_LOOP_ACTOR_DEPLOYMENT;
-  const deploymentPath = resolvePath(repoRoot, requested, defaultDeploymentPath);
+  const deploymentPath = resolveConfiguredPath(repoRoot, requested);
+  if (!deploymentPath) {
+    if (options.deployment) {
+      const errors = validateActorDeployment(options.deployment);
+      return { ok: errors.length === 0, deploymentPath: null, deployment: options.deployment, errors };
+    }
+    return {
+      ok: false,
+      deploymentPath: null,
+      deployment: null,
+      errors: ['actor deployment must be supplied explicitly with --deployment or PHASE_LOOP_ACTOR_DEPLOYMENT.']
+    };
+  }
   try {
     const deployment = options.deployment ?? readJson(deploymentPath);
     const errors = validateActorDeployment(deployment);
@@ -80,7 +90,21 @@ export function loadPhaseLoopActorCredentials(options = {}) {
   const env = options.env ?? process.env;
   const privateRoot = path.resolve(credentialsRoot, '.brownie/private');
   const requested = options.credentialsPath ?? env.PHASE_LOOP_ACTOR_CREDENTIALS;
-  const credentialsPath = resolvePath(credentialsRoot, requested, defaultCredentialsPath);
+  const credentialsPath = resolveConfiguredPath(credentialsRoot, requested);
+  if (!credentialsPath) {
+    if (options.credentials) {
+      if (options.credentials.schema_version !== 1 || !options.credentials.roles || typeof options.credentials.roles !== 'object') {
+        return { ok: false, credentialsPath: null, credentials: null, errors: ['actor credential configuration must define schema_version 1 and roles.'] };
+      }
+      return { ok: true, credentialsPath: null, credentials: options.credentials, errors: [] };
+    }
+    return {
+      ok: false,
+      credentialsPath: null,
+      credentials: null,
+      errors: ['actor credentials must be supplied explicitly with --credentials or PHASE_LOOP_ACTOR_CREDENTIALS.']
+    };
+  }
   if (!inside(privateRoot, credentialsPath)) {
     return { ok: false, credentialsPath, credentials: null, errors: ['actor credential configuration must remain under .brownie/private/.'] };
   }

@@ -80,13 +80,15 @@ fi
 PHASE_LOOP_DEFAULT_BROWNIE_BIN=""
 PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"$ROOT_DIR"}"
 PHASE_LOOP_BASE_COMMIT="${PHASE_LOOP_BASE_COMMIT:-}"
-PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-$ROOT_DIR/.brownie/phase-loop-actor-deployment.json}"
-PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-$ROOT_DIR/.brownie/private/phase-loop-actor-credentials.json}"
+PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-}"
+PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-}"
 case "$PHASE_LOOP_ACTOR_DEPLOYMENT" in
+  '') ;;
   /*) ;;
   *) PHASE_LOOP_ACTOR_DEPLOYMENT="$ROOT_DIR/$PHASE_LOOP_ACTOR_DEPLOYMENT" ;;
 esac
 case "$PHASE_LOOP_ACTOR_CREDENTIALS" in
+  '') ;;
   /*) ;;
   *) PHASE_LOOP_ACTOR_CREDENTIALS="$ROOT_DIR/$PHASE_LOOP_ACTOR_CREDENTIALS" ;;
 esac
@@ -95,7 +97,7 @@ esac
 # treating the target checkout as the controller installation.
 export PHASE_LOOP_ACTOR_DEPLOYMENT PHASE_LOOP_ACTOR_CREDENTIALS
 PHASE_LOOP_EXPECTED_ACTOR="${PHASE_LOOP_EXPECTED_ACTOR:-}"
-if [ -z "$PHASE_LOOP_EXPECTED_ACTOR" ]; then
+if [ -z "$PHASE_LOOP_EXPECTED_ACTOR" ] && [ -n "$PHASE_LOOP_ACTOR_DEPLOYMENT" ]; then
   PHASE_LOOP_EXPECTED_ACTOR="$(node "$ROOT_DIR/scripts/phase-loop-actor-deployment.mjs" --repo-root "$ROOT_DIR" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login 2>/dev/null || true)"
 fi
 PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/runtime-store"}"
@@ -10098,7 +10100,7 @@ phase_loop_create_pr_for_progress() {
       --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" \
       --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" \
       --credentials "$PHASE_LOOP_ACTOR_CREDENTIALS" \
-      --credentials-root "$ROOT_DIR" \
+      --credentials-root "$PHASE_LOOP_CONTROL_ROOT" \
       --print-gh-config-dir 2>>"$SUPERVISOR_LOG"
   )" || {
     printf '%s pr_create_skipped reason=implementation_profile_preflight_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
@@ -10115,7 +10117,7 @@ phase_loop_create_pr_for_progress() {
       --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" \
       --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" \
       --credentials "$PHASE_LOOP_ACTOR_CREDENTIALS" \
-      --credentials-root "$ROOT_DIR" >/dev/null
+      --credentials-root "$PHASE_LOOP_CONTROL_ROOT" >/dev/null
   ) || {
     printf '%s pr_create_skipped reason=implementation_preflight_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 1

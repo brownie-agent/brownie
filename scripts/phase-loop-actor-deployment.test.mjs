@@ -16,16 +16,30 @@ const deployment = {
   constraints: { require_independent_review: true }
 };
 
-test('loads an alternate deployment from a project-local path', () => {
+test('loads an alternate deployment only when its path is explicitly supplied', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'actor-deployment-'));
+  try {
+    const file = path.join(repo, '.brownie/phase-loop-actor-deployment.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(deployment));
+    const loaded = loadPhaseLoopActorDeployment({ repoRoot: repo, deploymentPath: file });
+    assert.equal(loaded.ok, true, loaded.errors.join('\n'));
+    assert.equal(loaded.deployment.roles.implementation.github_login, 'ci-writer');
+    assert.deepEqual(roleBranchPrefixes(loaded.deployment, 'implementation'), ['delivery/']);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('rejects implicit repository-relative deployment discovery', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'actor-deployment-'));
   try {
     const file = path.join(repo, '.brownie/phase-loop-actor-deployment.json');
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(deployment));
     const loaded = loadPhaseLoopActorDeployment({ repoRoot: repo });
-    assert.equal(loaded.ok, true, loaded.errors.join('\n'));
-    assert.equal(loaded.deployment.roles.implementation.github_login, 'ci-writer');
-    assert.deepEqual(roleBranchPrefixes(loaded.deployment, 'implementation'), ['delivery/']);
+    assert.equal(loaded.ok, false);
+    assert.match(loaded.errors.join('\n'), /must be supplied explicitly/u);
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }

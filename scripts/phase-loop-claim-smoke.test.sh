@@ -16,10 +16,37 @@ export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE="HEAD"
 export PHASE_LOOP_PREFLIGHT_PROFILE="claim-smoke-fixture"
 export PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY="1"
 export PHASE_LOOP_PR_REMOTE="fixture-origin"
-PHASE_LOOP_TEST_REPOSITORY="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --role implementation --field repository)"
-PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --role implementation --field github-login)"
-PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --role implementation --field branch-prefix)"
-PHASE_LOOP_TEST_REVIEW_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --role review --field github-login)"
+# A fixture must inject the same role-to-credential mapping that production
+# receives from its deployment control plane.  Never borrow a developer's
+# private profile or rely on a particular GitHub account being available in
+# CI.  The controller receives this root explicitly; the temporary worker
+# checkout remains credential-free.
+PHASE_LOOP_TEST_CONTROL_ROOT="$(mktemp -d)"
+mkdir -p "$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/profiles/implementation"
+cat > "$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/phase-loop-actor-credentials.json" <<'JSON'
+{
+  "schema_version": 1,
+  "roles": {
+    "implementation": {
+      "kind": "repository-private",
+      "github_config_dir": "profiles/implementation"
+    },
+    "review": { "kind": "host-default" },
+    "merge": { "kind": "host-default" }
+  }
+}
+JSON
+cleanup_phase_loop_test_control_root() {
+  rm -rf "$PHASE_LOOP_TEST_CONTROL_ROOT"
+}
+trap cleanup_phase_loop_test_control_root EXIT
+export PHASE_LOOP_CONTROL_ROOT="$PHASE_LOOP_TEST_CONTROL_ROOT"
+export PHASE_LOOP_ACTOR_DEPLOYMENT="$REPO_ROOT/.brownie/phase-loop-actor-deployment.json"
+export PHASE_LOOP_ACTOR_CREDENTIALS="$PHASE_LOOP_TEST_CONTROL_ROOT/.brownie/private/phase-loop-actor-credentials.json"
+PHASE_LOOP_TEST_REPOSITORY="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field repository)"
+PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login)"
+PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field branch-prefix)"
+PHASE_LOOP_TEST_REVIEW_ACTOR="$(node "$REPO_ROOT/scripts/phase-loop-actor-deployment.mjs" --repo-root "$REPO_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role review --field github-login)"
 export PHASE_LOOP_TEST_REPOSITORY PHASE_LOOP_TEST_IMPLEMENTATION_ACTOR PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX PHASE_LOOP_TEST_REVIEW_ACTOR
 PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS="${PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS:-360}"
 PHASE_LOOP_CLAIM_SMOKE_SECTION="${PHASE_LOOP_CLAIM_SMOKE_SECTION:-all}"

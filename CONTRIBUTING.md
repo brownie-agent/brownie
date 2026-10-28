@@ -19,9 +19,9 @@ gates.
 
 Brownie Phase Loop implementation work is expected to use:
 
-- implementation actor: the `implementation` principal in `.brownie/phase-loop-actor-deployment.json`
-- review actor: the `review` principal in `.brownie/phase-loop-actor-deployment.json`
-- merge actor: the `merge` principal in `.brownie/phase-loop-actor-deployment.json`
+- implementation actor: the `implementation` principal in the configuration selected by `PHASE_LOOP_ACTOR_DEPLOYMENT`
+- review actor: the `review` principal in the configuration selected by `PHASE_LOOP_ACTOR_DEPLOYMENT`
+- merge actor: the `merge` principal in the configuration selected by `PHASE_LOOP_ACTOR_DEPLOYMENT`
 
 Implementation PRs must be authored and pushed by the configured implementation
 principal. Review and merge must use the configured independent review and merge
