@@ -329,8 +329,8 @@ export function matchesMaterializedTargetRebaseline(record, {
   if (!change || JSON.stringify(change.after_contract) !== JSON.stringify(currentContract)) return false;
   const snapshot = record.target_snapshots?.find((entry) => entry?.path === targetPath);
   if (!snapshot || snapshot.operation !== 'Create' || snapshot.exists_after !== true || snapshot.sha256_after !== targetSha256) return false;
-  const beforeCreatesTarget = String(change.before_contract?.first_line ?? '').includes(`Create only \`${targetPath}\``);
-  const afterPatchesTarget = String(change.after_contract?.first_line ?? '').includes(`Patch only \`${targetPath}\``);
+  const beforeCreatesTarget = boundedScopeValues(String(change.before_contract?.first_line ?? ''), 'Create only').includes(targetPath);
+  const afterPatchesTarget = boundedScopeValues(String(change.after_contract?.first_line ?? ''), 'Patch only').includes(targetPath);
   const capturedBeforeAbsence = snapshot.exists_before === false && snapshot.sha256_before === null;
   const legacyCapture = snapshot.exists_before === null
     && snapshot.sha256_before === null

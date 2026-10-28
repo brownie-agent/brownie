@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { targetScopes } from './phase-loop-preclaim-recovery.mjs';
 
 const repositoryRoot = path.resolve(new URL('..', import.meta.url).pathname);
 const recoveryScript = path.join(repositoryRoot, 'scripts/phase-loop-preclaim-recovery.mjs');
@@ -190,6 +191,17 @@ test('migrates a legacy single-target recovery into an audited hash-bound target
   }]);
 });
 
+test('parses every joined bounded target before migrating a legacy materialization', () => {
+  assert.deepEqual(targetScopes('Create only `scripts/runtime.mjs` and `scripts/runtime.test.mjs`, then patch only `package.json`.'), [
+    { operation: 'Create', path: 'scripts/runtime.mjs' },
+    { operation: 'Create', path: 'scripts/runtime.test.mjs' }
+  ]);
+  assert.deepEqual(targetScopes('Patch only `scripts/runtime.test.mjs` and Create only `scripts/runtime.mjs`, then patch only `package.json`.'), [
+    { operation: 'Patch', path: 'scripts/runtime.test.mjs' },
+    { operation: 'Create', path: 'scripts/runtime.mjs' }
+  ]);
+});
+
 test('fails closed and records a terminal audit when an interrupted recovery snapshot is missing', () => {
   const root = makeFixture();
   const diagnostic = 'node scripts/guard-todo-decomposition.mjs: Create only target already exists; TODO dependencies must not contain cycles; dependency E-23b-release-artifact-download-roundtrip is present only in the breakdown ledger';
@@ -254,6 +266,7 @@ test('wires recovery into pre-claim boundary and pre-completion failures, deferr
   assert(controller.includes('precompletion_create_only_replan_deferred_completion=true'));
   assert(controller.includes('create_only_target_materialized_before_semantic_completion'));
   assert(controller.includes('preclaim_recovery_diagnostic_fallback=true'));
+  assert(controller.includes('preclaim_recovery_preflight_diagnostic_replay=true'));
   assert(controller.includes('node "$ROOT_DIR/scripts/guard-todo-decomposition.mjs"'));
   assert(controller.includes('recovery_diagnostic="guard-todo-decomposition.mjs: $recovery_diagnostic"'));
 });
