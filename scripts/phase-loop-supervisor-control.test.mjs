@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-  controlPhaseLoop,
+  controlPhaseLoop as controlPhaseLoopImplementation,
   inspectDelegationFeedback,
   inspectWorkerLaunchReceipt,
   registerWorkerLaunchReceipt
@@ -61,20 +61,34 @@ const ownerBlockerTodo = `- [ ] E-20i-runtime-release-ops-blocker: Blocker: Owne
 const fixtureRepository = 'example-org/supervisor-fixture';
 const implementationActor = 'implementation-bot';
 const reviewActor = 'independent-reviewer';
+const fixtureActorDeployment = Object.freeze({
+  schema_version: 1,
+  repository: fixtureRepository,
+  roles: {
+    implementation: { github_login: implementationActor, branch_prefixes: ['implementation/'] },
+    review: { github_login: reviewActor },
+    merge: { github_login: reviewActor }
+  },
+  constraints: { require_independent_review: true }
+});
+const fixtureRepoRoots = new Set();
+
+// Production control requires an explicitly injected deployment.  Keep each
+// isolated fixture on that same path instead of relying on a repository file.
+function controlPhaseLoop(options = {}) {
+  const actorDeployment = options.actorDeployment
+    ?? (fixtureRepoRoots.has(options.repoRoot) ? fixtureActorDeployment : undefined);
+  return controlPhaseLoopImplementation({ ...options, actorDeployment });
+}
+
+function inspectFixtureWorkerLaunchReceipt(repo, options = {}) {
+  return inspectWorkerLaunchReceipt(repo, { ...options, actorDeployment: fixtureActorDeployment });
+}
 
 function makeRepo() {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-supervisor-control-'));
+  fixtureRepoRoots.add(repo);
   fs.mkdirSync(path.join(repo, '.brownie/private/phase-loop/todo-claims'), { recursive: true });
-  fs.writeFileSync(path.join(repo, '.brownie/phase-loop-actor-deployment.json'), JSON.stringify({
-    schema_version: 1,
-    repository: fixtureRepository,
-    roles: {
-      implementation: { github_login: implementationActor, branch_prefixes: ['implementation/'] },
-      review: { github_login: reviewActor },
-      merge: { github_login: reviewActor }
-    },
-    constraints: { require_independent_review: true }
-  }, null, 2));
   fs.mkdirSync(path.join(repo, 'scripts'), { recursive: true });
   fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({
     scripts: {
@@ -113,7 +127,7 @@ function makeRepo() {
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' });
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
   execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
-  execFileSync('git', ['add', 'package.json', '.brownie/phase-loop-actor-deployment.json', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-state.mjs', 'scripts/phase-loop-todo-contract-rebaseline.mjs', 'scripts/guard-todo-decomposition.mjs', 'scripts/repair-todo-decomposition.mjs', 'scripts/phase-loop-preclaim-recovery.mjs', 'scripts/phase-loop-todo-completion-reconcile.mjs', 'scripts/phase-loop-todo-breakdown-reconcile.mjs'], { cwd: repo });
+  execFileSync('git', ['add', 'package.json', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-state.mjs', 'scripts/phase-loop-todo-contract-rebaseline.mjs', 'scripts/guard-todo-decomposition.mjs', 'scripts/repair-todo-decomposition.mjs', 'scripts/phase-loop-preclaim-recovery.mjs', 'scripts/phase-loop-todo-completion-reconcile.mjs', 'scripts/phase-loop-todo-breakdown-reconcile.mjs'], { cwd: repo });
   execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
   return repo;
 }
@@ -159,24 +173,24 @@ function workerReceipt(overrides = {}) {
 test('requires a live worker-launch receipt and rejects missing, expired, mismatched, and duplicate launches', () => {
   const repo = makeRepo();
   const now = new Date('2026-10-18T00:20:10.000Z');
-  assert.equal(inspectWorkerLaunchReceipt(repo, { now }).reason, 'dispatch_not_started');
+  assert.equal(inspectFixtureWorkerLaunchReceipt(repo, { now }).reason, 'dispatch_not_started');
 
   const receipt = workerReceipt();
   assert.equal(registerWorkerLaunchReceipt(repo, receipt).ok, true);
-  assert.equal(inspectWorkerLaunchReceipt(repo, { now }).ok, true);
+  assert.equal(inspectFixtureWorkerLaunchReceipt(repo, { now }).ok, true);
   assert.equal(registerWorkerLaunchReceipt(repo, receipt).replayed, true);
 
   writeJson(repo, '.brownie/private/phase-loop/worker-launch-receipt.json', workerReceipt({
     launch_id: 'launch-expired',
     expires_at: '2026-10-18T00:20:00.000Z'
   }));
-  assert.equal(inspectWorkerLaunchReceipt(repo, { now }).reason, 'worker_liveness_missing');
+  assert.equal(inspectFixtureWorkerLaunchReceipt(repo, { now }).reason, 'worker_liveness_missing');
 
   writeJson(repo, '.brownie/private/phase-loop/worker-launch-receipt.json', workerReceipt({
     launch_id: 'launch-actor-mismatch',
     actor: reviewActor
   }));
-  assert.equal(inspectWorkerLaunchReceipt(repo, { now }).reason, 'dispatch_not_started');
+  assert.equal(inspectFixtureWorkerLaunchReceipt(repo, { now }).reason, 'dispatch_not_started');
 
   const duplicate = workerReceipt({
     launch_id: 'launch-duplicate',

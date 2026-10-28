@@ -50,7 +50,7 @@ function run(overrides = {}) {
     actorDeployment: 'require_independent_review must be supplied explicitly',
     prActorGuard: 'validateImplementationPrActor loadPhaseLoopActorDeployment',
     phaseLoop: 'PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-}" PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-}" phase_loop_require_operational_configuration phase-loop-pr-actor-guard.mjs --print-gh-config-dir GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create',
-    ciWorkflow: "PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR 'repository': os.environ['GITHUB_REPOSITORY'] printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\\n'",
+    ciWorkflow: "PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR 'repository': os.environ['GITHUB_REPOSITORY'] phase-loop-actor-deployment.mjs --deployment \"$PHASE_LOOP_DEPLOYMENT_FILE\" --role implementation --field repository",
     ...overrides
   }).errors;
 }
@@ -99,6 +99,11 @@ test('rejects ignoring all Brownie state', () => {
 });
 
 test('rejects CI deployment values embedded in source', () => {
-  const errors = run({ ciWorkflow: "PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR 'repository': os.environ['GITHUB_REPOSITORY'] printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\\n' brownie-agent" });
+  const errors = run({ ciWorkflow: "PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR 'repository': os.environ['GITHUB_REPOSITORY'] phase-loop-actor-deployment.mjs --deployment \"$PHASE_LOOP_DEPLOYMENT_FILE\" --role implementation --field repository brownie-agent" });
   assert(errors.some((error) => error.includes('must not hard-code a deployment actor or repository owner')));
+});
+
+test('rejects CI deployment configuration leaked into generic test processes', () => {
+  const errors = run({ ciWorkflow: "PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES PHASE_LOOP_REVIEW_ACTOR PHASE_LOOP_MERGE_ACTOR 'repository': os.environ['GITHUB_REPOSITORY'] phase-loop-actor-deployment.mjs --deployment \"$PHASE_LOOP_DEPLOYMENT_FILE\" --role implementation --field repository printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\\n'" });
+  assert(errors.some((error) => error.includes('must not export actor deployment configuration into generic test processes')));
 });

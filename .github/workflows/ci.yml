@@ -85,7 +85,7 @@ jobs:
               output.write('\n')
           PY
           chmod 600 "$PHASE_LOOP_DEPLOYMENT_FILE"
-          printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\n' "$PHASE_LOOP_DEPLOYMENT_FILE" >> "$GITHUB_ENV"
+          node scripts/phase-loop-actor-deployment.mjs --deployment "$PHASE_LOOP_DEPLOYMENT_FILE" --role implementation --field repository >/dev/null
           if [ -n "$PHASE_LOOP_REJECTED_HEAD_SHA" ] || [ -n "$PHASE_LOOP_REJECTED_PR_NUMBER" ]; then
             node scripts/phase-loop-pr-author-guard.mjs --event-path "$GITHUB_EVENT_PATH"
           fi

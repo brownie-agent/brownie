@@ -50,7 +50,7 @@
   "requirements": [
     "Implementation, review, merge, repository, branch, credential-profile, binary, path, timeout, retry, and controller operating values are supplied by deployment configuration or explicit process configuration, never from source-code defaults.",
     "The deployment configuration must bind a repository, a GitHub principal for each role, and implementation branch prefixes.",
-    "When CI selects an implementation pull request, it must materialize an ephemeral deployment from explicit repository configuration and export PHASE_LOOP_ACTOR_DEPLOYMENT; missing selected values must fail closed.",
+    "When CI selects an implementation pull request, it must materialize and validate an ephemeral deployment from explicit repository configuration in a scoped command; it must not export the deployment selector into generic test processes, and missing selected values must fail closed.",
     "The implementation credential profile must be repository-private and must not silently fall back to a host-default account.",
     "Runtime preflight must verify gh api user against the deployment role principal before implementation, review, or merge operations.",
     "Private local state, VM disks, VM images, credentials, screenshots, and machine-local scratch files must live under .brownie/private/ so shared Brownie evidence under .brownie/release-evidence/ remains trackable."

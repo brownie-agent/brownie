@@ -172,7 +172,8 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   requireValue(ciWorkflow.includes('PHASE_LOOP_IMPLEMENTATION_BRANCH_PREFIXES'), errors, 'CI must receive explicit implementation branch prefixes through deployment configuration.');
   requireValue(ciWorkflow.includes('PHASE_LOOP_REVIEW_ACTOR') && ciWorkflow.includes('PHASE_LOOP_MERGE_ACTOR'), errors, 'CI must receive explicit review and merge principals through deployment configuration.');
   requireValue(ciWorkflow.includes("'repository': os.environ['GITHUB_REPOSITORY']"), errors, 'CI must derive the deployment repository from the GitHub event environment.');
-  requireValue(ciWorkflow.includes("printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\\n'"), errors, 'CI must export the explicit ephemeral deployment selector.');
+  requireValue(ciWorkflow.includes('phase-loop-actor-deployment.mjs --deployment "$PHASE_LOOP_DEPLOYMENT_FILE" --role implementation --field repository'), errors, 'CI must validate the explicit ephemeral deployment in a scoped command.');
+  requireValue(!ciWorkflow.includes("printf 'PHASE_LOOP_ACTOR_DEPLOYMENT=%s\\n'"), errors, 'CI must not export actor deployment configuration into generic test processes.');
   requireValue(!/(brownie-agent|globalpocket)/u.test(ciWorkflow), errors, 'CI must not hard-code a deployment actor or repository owner.');
 
   return { errors, policyPath };
