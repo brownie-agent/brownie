@@ -15831,6 +15831,14 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_admission_snapshot_mismatch","owner_blocked":true}'
     return 78
   fi
+  # Runtime uses its process status to distinguish a failed apply from a
+  # successful continuation. Capture it explicitly: helper functions invoked
+  # earlier may have enabled errexit, and otherwise bash exits before the
+  # structured JSON recovery below can run.
+  local runtime_command_errexit_enabled=0
+  case "$-" in
+    *e*) runtime_command_errexit_enabled=1; set +e ;;
+  esac
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     export BROWNIE_WORKSPACE_ROOT="${BROWNIE_WORKSPACE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"
@@ -15870,6 +15878,9 @@ PY
     fi
   ) > "$stdout_log" 2> "$stderr_log"
   exit_code=$?
+  if [ "$runtime_command_errexit_enabled" -eq 1 ]; then
+    set -e
+  fi
   if [ "$PHASE_LOOP_PREFLIGHT_PROFILE" = "claim-smoke-fixture" ] && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
     node --input-type=module - "$stdout_log" "$runtime_admission_snapshot" "$(claim_field claim_id)" <<'NODE'
 import fs from 'node:fs';
