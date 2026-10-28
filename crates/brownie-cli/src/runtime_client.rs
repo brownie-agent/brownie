@@ -744,6 +744,10 @@ impl RuntimeClient {
             Some(params),
             RuntimeRequestClass::ObjectiveExecution,
         )?;
+        let apply_result =
+            canonicalize_direct_proposal_apply_result(apply_result).map_err(|error| {
+                debug_invalid_response("canonicalize_direct_proposal_apply_result", error)
+            })?;
         validate_direct_proposal_apply_result(&apply_result).map_err(|error| {
             debug_invalid_response("validate_direct_proposal_apply_result", error)
         })?;
@@ -3980,6 +3984,40 @@ fn validate_direct_proposal_apply_result(result: &Value) -> Result<(), RuntimeCl
     Ok(())
 }
 
+/// Normalizes the two documented `proposal.apply` result envelopes used by
+/// Runtime versions into the wrapper consumed by the objective route.
+///
+/// Runtime may return either `{ "apply_result": { ... } }` or the apply
+/// result object directly. The latter is not an arbitrary fallback: it must
+/// contain every field required to classify an apply outcome before it is
+/// wrapped. This keeps malformed responses fail-closed while allowing expiry
+/// recovery to see the same canonical result as a successful apply.
+fn canonicalize_direct_proposal_apply_result(result: Value) -> Result<Value, RuntimeClientError> {
+    let object = result
+        .as_object()
+        .ok_or(RuntimeClientError::InvalidResponse)?;
+    if object
+        .get("apply_result")
+        .and_then(Value::as_object)
+        .is_some()
+    {
+        return Ok(result);
+    }
+    if [
+        "operation",
+        "apply_status",
+        "applied",
+        "authorization_consumed",
+        "failed_checks",
+    ]
+    .into_iter()
+    .all(|field| object.contains_key(field))
+    {
+        return Ok(json!({ "apply_result": result }));
+    }
+    Err(RuntimeClientError::InvalidResponse)
+}
+
 fn merge_direct_proposal_apply_result(
     original: Value,
     proposal_apply: Value,
@@ -5674,6 +5712,56 @@ mod tests {
         assert_eq!(
             validate_direct_proposal_apply_result(&apply_result),
             Err(RuntimeClientError::ProposalApplyAuthorizationExpired)
+        );
+    }
+
+    #[test]
+    fn direct_proposal_apply_normalizes_flat_expired_authorization_result() {
+        let apply_result = json!({
+            "operation": "create_file",
+            "apply_status": "Denied",
+            "applied": false,
+            "authorization_consumed": false,
+            "failed_checks": ["approval_not_expired"]
+        });
+
+        let canonical = canonicalize_direct_proposal_apply_result(apply_result)
+            .expect("flat apply result is canonicalized");
+        assert!(canonical["apply_result"].is_object());
+        assert_eq!(
+            validate_direct_proposal_apply_result(&canonical),
+            Err(RuntimeClientError::ProposalApplyAuthorizationExpired)
+        );
+    }
+
+    #[test]
+    fn direct_proposal_apply_normalizes_flat_applied_result() {
+        let apply_result = json!({
+            "operation": "create_file",
+            "apply_status": "Applied",
+            "applied": true,
+            "authorization_consumed": true,
+            "failed_checks": [],
+            "post_write_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+        });
+
+        let canonical = canonicalize_direct_proposal_apply_result(apply_result)
+            .expect("flat apply result is canonicalized");
+        validate_direct_proposal_apply_result(&canonical).expect("valid flat apply result");
+    }
+
+    #[test]
+    fn direct_proposal_apply_rejects_flat_result_without_required_outcome_fields() {
+        let apply_result = json!({
+            "operation": "create_file",
+            "apply_status": "Denied",
+            "applied": false,
+            "authorization_consumed": false
+        });
+
+        assert_eq!(
+            canonicalize_direct_proposal_apply_result(apply_result),
+            Err(RuntimeClientError::InvalidResponse)
         );
     }
 
