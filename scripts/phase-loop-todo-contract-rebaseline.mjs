@@ -373,3 +373,23 @@ export function matchesMaterializedTargetRebaseline(record, {
     && record.target_capture?.mode === 'legacy_pre_capture_materialization';
   return beforeCreatesTarget && afterPatchesTarget && (capturedBeforeAbsence || legacyCapture);
 }
+
+export function matchesMaterializedTargetRebaselineChain(records, details) {
+  for (const record of records) {
+    const change = record?.contract_changes?.find((entry) => entry.todo_id === details.todoId);
+    if (!change) continue;
+    const captured = matchesMaterializedTargetRebaseline(record, {
+      ...details,
+      currentContract: change.after_contract
+    });
+    if (!captured) continue;
+    if (JSON.stringify(change.after_contract) === JSON.stringify(details.currentContract)) return record;
+    const terminal = matchesContractRebaselineChain(records, {
+      todoId: details.todoId,
+      beforeContract: change.after_contract,
+      afterContract: details.currentContract
+    });
+    if (terminal) return terminal;
+  }
+  return null;
+}

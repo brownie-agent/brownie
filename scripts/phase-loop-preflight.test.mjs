@@ -114,6 +114,25 @@ test('admits an audited Create-to-Patch placeholder only when its exact target h
   });
 });
 
+test('admits a hash-bound materialization through a contiguous approved rebaseline chain', () => {
+  const repo = makeRepo();
+  const before = '- [ ] E-chain: Create only `scripts/target.mjs` and `scripts/other.mjs`:\n  Route: implementation.\n  Verification: run `node --test scripts/target.test.mjs`.\n';
+  const middle = before.replace('Create only `scripts/target.mjs` and `scripts/other.mjs`', 'Patch only `scripts/target.mjs` and Create only `scripts/other.mjs`');
+  const after = middle.replace('Create only `scripts/other.mjs`', 'Patch only `scripts/other.mjs`');
+  const placeholder = '// Brownie bounded Create-only proposal.\n';
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), before);
+  execFileSync('git', ['add', '.brownie/todo.md'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'create chain contract'], { cwd: repo, stdio: 'ignore' });
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), after);
+  fs.writeFileSync(path.join(repo, 'scripts/target.mjs'), placeholder);
+  const verification = { repair_command: 'node scripts/phase-loop-preclaim-recovery.mjs', guard_command: 'node scripts/guard-todo-decomposition.mjs', integrity_command: 'pnpm -s phase-loop:todo-queue-integrity' };
+  writeContractRebaselineReceipt(repo, buildContractRebaselineReceipt({ repoRoot: repo, beforeTodoText: before, afterTodoText: middle, runStamp: 'chain-capture', eventKey: 'chain-capture-event', diagnostic: 'contract_unsatisfiable_dirty_scope', verification, targetSnapshots: [{ operation: 'Create', path: 'scripts/target.mjs', exists_before: false, sha256_before: null, exists_after: true, sha256_after: createHash('sha256').update(placeholder.trim()).digest('hex') }] }));
+  writeContractRebaselineReceipt(repo, buildContractRebaselineReceipt({ repoRoot: repo, beforeTodoText: middle, afterTodoText: after, runStamp: 'chain-terminal', eventKey: 'chain-terminal-event', diagnostic: 'contract_unsatisfiable_dirty_scope', verification }));
+  const result = validatePhaseLoopPreflight({ repo, expectedActor: 'fixture-implementation', skipCommands: true });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.equal(result.warnings.find((warning) => warning.code === 'rebaselined_dirty_target_placeholder')?.contract_rebaseline_run_stamp, 'chain-terminal');
+});
+
 test('rejects an unchecked child whose parent TODO is already complete', () => {
   const repo = makeRepo();
   fs.writeFileSync(path.join(repo, '.brownie/todo.md'), [
