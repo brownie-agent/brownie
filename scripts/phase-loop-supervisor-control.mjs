@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { diagnosePhaseLoop as runDiagnosis } from './phase-loop-supervisor-diagnose.mjs';
 import { dispatchSelfUpdate } from './phase-loop-self-update.mjs';
 import { loadTodoState } from './phase-loop-todo-state.mjs';
+import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +16,11 @@ let activeControlPlaneRoot = defaultRepoRoot;
 let activeTodoPath = null;
 let activeBreakdownPath = null;
 let activeStateRoot = null;
+let activeActorDeployment = null;
+
+function configuredActor(role) {
+  return roleActor(activeActorDeployment, role);
+}
 
 function controlPlaneScript(relativePath) {
   return path.join(activeControlPlaneRoot, relativePath);
@@ -58,7 +64,8 @@ function parseArgs(argv) {
     repair: true,
     start: false,
     selfUpdateRequest: null,
-    workerLaunchReceiptPath: null
+    workerLaunchReceiptPath: null,
+    actorDeploymentPath: null
   };
   for (let index = 2; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -90,6 +97,8 @@ function parseArgs(argv) {
       args.selfUpdateRequest = argv[++index];
     } else if (arg === '--worker-launch-receipt') {
       args.workerLaunchReceiptPath = argv[++index];
+    } else if (arg === '--actor-deployment') {
+      args.actorDeploymentPath = argv[++index] ?? null;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -519,15 +528,17 @@ function hasMergedCommit(repoRoot, commit) {
   }
 }
 
-function verifyDelegationPullRequestProvenance(repoRoot, pullRequestUrl, implementationCommit) {
-  const match = /^https:\/\/github\.com\/globalpocket\/brownie\/pull\/(\d+)$/u.exec(pullRequestUrl);
+function verifyDelegationPullRequestProvenance(repoRoot, pullRequestUrl, implementationCommit, deployment) {
+  const repository = String(deployment?.repository ?? '');
+  const escapedRepository = repository.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const match = new RegExp(`^https://github\\.com/${escapedRepository}/pull/(\\d+)$`, 'u').exec(pullRequestUrl);
   if (!match) {
     return { ok: false, reason: 'delegation_pull_request_url_not_trusted' };
   }
   try {
     const pullRequest = runJsonCommand(repoRoot, 'gh', [
       'pr', 'view', match[1],
-      '--repo', 'globalpocket/brownie',
+      '--repo', repository,
       '--json', 'author,state,mergedAt,mergeCommit,commits,reviews,statusCheckRollup'
     ]);
     const commitIds = new Set([
@@ -536,7 +547,7 @@ function verifyDelegationPullRequestProvenance(repoRoot, pullRequestUrl, impleme
     ].filter((oid) => typeof oid === 'string'));
     const hasIndependentApproval = (pullRequest?.reviews ?? []).some((review) => (
       review?.state === 'APPROVED'
-      && review?.author?.login === 'globalpocket'
+      && review?.author?.login === roleActor(deployment, 'review')
       && commitIds.has(review?.commit?.oid)
     ));
     const checks = Array.isArray(pullRequest?.statusCheckRollup) ? pullRequest.statusCheckRollup : [];
@@ -544,7 +555,7 @@ function verifyDelegationPullRequestProvenance(repoRoot, pullRequestUrl, impleme
       check?.status === 'COMPLETED' && check?.conclusion === 'SUCCESS'
     ));
     const valid = (
-      pullRequest?.author?.login === 'brownie-agent'
+      pullRequest?.author?.login === roleActor(deployment, 'implementation')
       && pullRequest?.state === 'MERGED'
       && typeof pullRequest?.mergedAt === 'string'
       && commitIds.has(implementationCommit)
@@ -560,11 +571,11 @@ function verifyDelegationPullRequestProvenance(repoRoot, pullRequestUrl, impleme
 }
 
 // An acknowledged handoff is not itself a completion: it must name a merged
-// brownie-agent delivery and globalpocket review. Once those durable facts are
+// configured implementation delivery and independent configured review. Once those durable facts are
 // present, materialize a completion receipt before pruning the matching queue
 // item. This prevents a merged fix from being selected again merely because a
 // stale controller claim still refers to the old TODO.
-function maybeReconcileAcknowledgedDelegation(repoRoot, provenanceVerifier) {
+function maybeReconcileAcknowledgedDelegation(repoRoot, provenanceVerifier, deployment) {
   const feedbackPath = workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json');
   const inspected = inspectDelegationFeedback(feedbackPath);
   if (inspected.state === 'missing') return { attempted: false, reason: 'delegation_feedback_missing' };
@@ -583,10 +594,10 @@ function maybeReconcileAcknowledgedDelegation(repoRoot, provenanceVerifier) {
     ? delegation.implementation_commit_or_blocker.trim()
     : '';
   const evidenceValid = (
-    delegation.required_actor === 'brownie-agent'
-    && /^https:\/\/github\.com\/globalpocket\/brownie\/pull\/\d+$/u.test(pullRequestUrl)
+    delegation.required_actor === roleActor(deployment, 'implementation')
+    && new RegExp(`^https://github\\.com/${String(deployment.repository).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}/pull/\\d+$`, 'u').test(pullRequestUrl)
     && !Number.isNaN(Date.parse(acknowledgedAt))
-    && verification.reviewed_by === 'globalpocket'
+    && verification.reviewed_by === roleActor(deployment, 'review')
     && verification.all_ci_checks_passed === true
     && selectedTodoId
     && hasMergedCommit(repoRoot, implementationCommit)
@@ -1858,12 +1869,12 @@ function maybeRecoverTerminalStalledReplan(repoRoot, diagnostic) {
     archived_claim_path: archivedClaimPath,
     failure_ledger_summary: replanFeedback.failure_ledger_summary ?? null,
     delegation: {
-      required_actor: 'brownie-agent',
+      required_actor: configuredActor('implementation'),
       acknowledgement_required: true,
       required_evidence: ['issue_or_pr_url', 'acknowledged_at', 'implementation_commit_or_blocker'],
       status: 'pending'
     },
-    repair_hint: 'The generated contract-replan leaf terminated without a workspace.write proposal. Do not recreate the same source target scope or another stalled-leaf replan. Record a brownie-agent acknowledgement and an implementation PR or a concrete blocker before clearing this state.',
+    repair_hint: 'The generated contract-replan leaf terminated without a workspace.write proposal. Do not recreate the same source target scope or another stalled-leaf replan. Record the configured implementation actor acknowledgement and an implementation PR or a concrete blocker before clearing this state.',
     generated_by: 'phase-loop-supervisor-control'
   } : {
     schema_version: 1,
@@ -2595,12 +2606,12 @@ function maybeWriteDelegationPendingFeedback(repoRoot, diagnostic, ledgerSummary
     selected_todo_first_line: todoFirstLine(selectedTodo),
     failure_ledger_summary: ledgerSummary,
     delegation: {
-      required_actor: 'brownie-agent',
+      required_actor: configuredActor('implementation'),
       acknowledgement_required: true,
       required_evidence: ['issue_or_pr_url', 'acknowledged_at', 'implementation_commit_or_blocker'],
       status: 'pending'
     },
-    repair_hint: 'Do not create another TODO leaf with the same target scope and verification command. Record brownie-agent acknowledgement and implementation evidence before clearing this state.',
+    repair_hint: 'Do not create another TODO leaf with the same target scope and verification command. Record configured implementation actor acknowledgement and implementation evidence before clearing this state.',
     generated_by: 'phase-loop-supervisor-control'
   };
   try {
@@ -2906,6 +2917,19 @@ function workerLaunchReceiptPath(repoRoot, receiptPath = defaultWorkerLaunchRece
 
 export function inspectWorkerLaunchReceipt(repoRoot, options = {}) {
   const receiptPath = workerLaunchReceiptPath(repoRoot, options.receiptPath);
+  const actorDeploymentResult = options.actorDeployment
+    ? { ok: true, deployment: options.actorDeployment, errors: [] }
+    : loadPhaseLoopActorDeployment({ repoRoot });
+  if (!actorDeploymentResult.ok) {
+    return {
+      ok: false,
+      reason: 'dispatch_not_started',
+      detail: 'worker_launch_actor_deployment_unavailable',
+      actor_deployment_errors: actorDeploymentResult.errors,
+      receipt_path: path.relative(repoRoot, receiptPath)
+    };
+  }
+  const implementationActor = roleActor(actorDeploymentResult.deployment, 'implementation');
   const now = options.now instanceof Date ? options.now : new Date(options.now ?? Date.now());
   const claim = readJsonOrNull(workspaceStatePath(repoRoot, 'todo-claims/current.json')) ?? {};
   const feedback = readJsonOrNull(workspaceStatePath(repoRoot, 'todo-claims/repair-feedback.json')) ?? {};
@@ -2921,7 +2945,7 @@ export function inspectWorkerLaunchReceipt(repoRoot, options = {}) {
   if (required.some((key) => !receipt[key])) {
     return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_receipt_missing_required_field', receipt_path: path.relative(repoRoot, receiptPath) };
   }
-  if (receipt.actor !== 'brownie-agent') {
+  if (receipt.actor !== implementationActor) {
     return { ok: false, reason: 'dispatch_not_started', detail: 'worker_launch_actor_mismatch', actor: receipt.actor };
   }
   if (receipt.status && receipt.status !== 'active') {
@@ -3034,7 +3058,8 @@ function maybeStartPhaseLoop(repoRoot, enabled, diagnostic, options = {}) {
   }
   const workerLaunch = inspectWorkerLaunchReceipt(repoRoot, {
     receiptPath: options.workerLaunchReceiptPath,
-    now: options.now
+    now: options.now,
+    actorDeployment: options.actorDeployment
   });
   if (!workerLaunch.ok) {
     return {
@@ -3063,11 +3088,23 @@ export function controlPhaseLoop(options = {}) {
   activeTodoPath = path.resolve(options.todoPath ?? path.join(repoRoot, '.brownie/todo.md'));
   activeBreakdownPath = path.resolve(options.breakdownPath ?? path.join(repoRoot, '.brownie/todo-breakdown.md'));
   activeStateRoot = path.resolve(options.stateRoot ?? path.join(repoRoot, '.brownie/private/phase-loop'));
+  const actorDeploymentResult = options.actorDeployment
+    ? { ok: true, deployment: options.actorDeployment, errors: [] }
+    : loadPhaseLoopActorDeployment({ repoRoot });
+  if (!actorDeploymentResult.ok) {
+    return {
+      status: 'blocked',
+      reason: 'actor_deployment_invalid',
+      errors: actorDeploymentResult.errors
+    };
+  }
+  activeActorDeployment = actorDeploymentResult.deployment;
   const delegationProvenanceVerifier = options.delegationProvenanceVerifier
     ?? ((_, pullRequestUrl, implementationCommit) => verifyDelegationPullRequestProvenance(
       repoRoot,
       pullRequestUrl,
-      implementationCommit
+      implementationCommit,
+      activeActorDeployment
     ));
   const initial = diagnosePhaseLoop({ repoRoot, write: options.write !== false });
   const failureLedger = options.repair === false
@@ -3106,7 +3143,7 @@ export function controlPhaseLoop(options = {}) {
     : afterMissingDerivedBreakdownLedgerRepair;
   const acknowledgedDelegationReconciliation = options.repair === false
     ? { attempted: false, reason: 'repair_disabled' }
-    : maybeReconcileAcknowledgedDelegation(repoRoot, delegationProvenanceVerifier);
+    : maybeReconcileAcknowledgedDelegation(repoRoot, delegationProvenanceVerifier, activeActorDeployment);
   const afterAcknowledgedDelegationReconciliation = acknowledgedDelegationReconciliation.attempted
     && acknowledgedDelegationReconciliation.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
@@ -3367,7 +3404,8 @@ export function controlPhaseLoop(options = {}) {
         }
     : maybeStartPhaseLoop(repoRoot, Boolean(options.start), afterResolvedRepairFeedback, {
       workerLaunchReceiptPath: options.workerLaunchReceiptPath,
-      now: options.now
+      now: options.now,
+      actorDeployment: activeActorDeployment
     });
   const final = start.attempted && start.ok
     ? diagnosePhaseLoop({ repoRoot, write: options.write !== false })
@@ -3417,6 +3455,10 @@ export function controlPhaseLoop(options = {}) {
 
 if (process.argv[1] === __filename) {
   const args = parseArgs(process.argv);
+  const actorDeploymentResult = loadPhaseLoopActorDeployment({
+    repoRoot: args.controlPlaneRoot,
+    deploymentPath: args.actorDeploymentPath
+  });
   const result = controlPhaseLoop({
     repoRoot: args.repo,
     controlPlaneRoot: args.controlPlaneRoot,
@@ -3427,8 +3469,12 @@ if (process.argv[1] === __filename) {
     repair: args.repair,
     start: args.start,
     selfUpdateRequest: args.selfUpdateRequest,
-    workerLaunchReceiptPath: args.workerLaunchReceiptPath
+    workerLaunchReceiptPath: args.workerLaunchReceiptPath,
+    actorDeployment: actorDeploymentResult.ok ? actorDeploymentResult.deployment : undefined
   });
+  if (!actorDeploymentResult.ok && result.reason !== 'actor_deployment_invalid') {
+    result.actor_deployment_errors = actorDeploymentResult.errors;
+  }
   console.log(JSON.stringify(result, null, 2));
-  process.exit(result.final_summary.healthy ? 0 : 1);
+  process.exit(result.final_summary?.healthy === true ? 0 : 1);
 }

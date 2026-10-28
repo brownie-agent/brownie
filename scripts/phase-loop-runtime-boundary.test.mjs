@@ -145,7 +145,7 @@ test('terminal todo-decomposition leaves use integrated recovery instead of nest
   assert.match(controller, /"split \.brownie\/todo\.md and \.brownie\/todo-breakdown\.md into nested file-specific leaves"/u);
   assert.match(controller, /retire the generated todo-decomposition leaf through integrated supervisor recovery/u);
   assert.match(controller, /terminal_generated_contract_replan_requires_implementation_handoff/u);
-  assert.match(controller, /feedback\.get\("delegation", \{\}\)\.get\("required_actor"\) == "brownie-agent"/u);
+  assert.match(controller, /feedback\.get\("delegation", \{\}\)\.get\("required_actor"\) == sys\.argv\[3\]/u);
   assert.match(controller, /feedback\.get\("delegation", \{\}\)\.get\("status"\) == "pending"/u);
 });
 

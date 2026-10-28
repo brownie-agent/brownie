@@ -17,6 +17,19 @@ const requiredSections = [
   'independent_reviews',
   'oss_license_publish_posture'
 ];
+const fixtureRepository = 'example-org/evidence-fixture';
+const implementationActor = 'implementation-bot';
+const reviewActor = 'independent-reviewer';
+const fixtureDeploymentResult = {
+  ok: true,
+  deployment: {
+    repository: fixtureRepository,
+    roles: {
+      implementation: { github_login: implementationActor },
+      review: { github_login: reviewActor }
+    }
+  }
+};
 
 const commitSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const requiredReviewIds = [
@@ -112,7 +125,7 @@ function validEvidence(overrides = {}) {
   return {
     schema_version: 1,
     evidence_id: 'brownie-owner-governance-evidence-v1',
-    repository: 'globalpocket/brownie',
+    repository: fixtureRepository,
     source_commit: commitSha,
     release_ready: false,
     runtime_release_ready: false,
@@ -132,9 +145,9 @@ function githubReviewProvenance(requiredReviewId, overrides = {}) {
   return {
     required_review_id: requiredReviewId,
     pull_request_number: 413,
-    pull_request_author: 'brownie-agent',
+    pull_request_author: implementationActor,
     review_id: `PRR_${requiredReviewId}`,
-    reviewer: 'globalpocket',
+    reviewer: reviewActor,
     state: 'APPROVED',
     commit_sha: commitSha,
     submitted_at: '2026-09-08T17:19:58Z',
@@ -148,6 +161,7 @@ function validate(evidence = validEvidence(), contract = validContract()) {
     repoRoot,
     contract,
     evidence,
+    deploymentResult: fixtureDeploymentResult,
     validateOperationalDocuments: false
   }).errors;
 }
@@ -292,8 +306,8 @@ test('rejects GitHub review provenance from the implementation actor', () => {
         missing_review_ids: [],
         github_review_provenance: [
           githubReviewProvenance('release_workflow', {
-            reviewer: 'brownie-agent',
-            pull_request_author: 'brownie-agent'
+            reviewer: implementationActor,
+            pull_request_author: implementationActor
           })
         ]
       })
@@ -305,7 +319,7 @@ test('rejects GitHub review provenance from the implementation actor', () => {
     ]
   });
   const errors = validate(evidence);
-  assert(errors.some((error) => error.includes('reviewer must be globalpocket')));
+  assert(errors.some((error) => error.includes('reviewer must match the configured review actor')));
   assert(errors.some((error) => error.includes('reviewer must differ from pull_request_author')));
 });
 

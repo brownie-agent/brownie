@@ -197,7 +197,7 @@ function validEvidence(overrides = {}) {
   return {
     schema_version: 1,
     evidence_id: 'brownie-runtime-operational-evidence-v1',
-    repository: 'globalpocket/brownie',
+    repository: 'example-org/evidence-fixture',
     release_ready: false,
     runtime_release_ready: false,
     required_sections: requiredSections,

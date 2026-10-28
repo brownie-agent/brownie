@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
@@ -9,115 +9,113 @@ import {
   validatePhaseLoopActorPreflight
 } from './phase-loop-actor-preflight.mjs';
 
-const policy = {
-  repository: 'globalpocket/brownie',
-  implementation_actor: 'brownie-agent',
-  review_actor: 'globalpocket',
-  merge_actor: 'globalpocket',
-  implementation_branch_prefixes: ['brownie-agent/', 'phase-loop/'],
-  review_branch_prefixes: ['codex/']
+const deployment = {
+  schema_version: 1,
+  repository: 'example-org/example-repo',
+  roles: {
+    implementation: { github_login: 'implementation-bot', branch_prefixes: ['automation/'] },
+    review: { github_login: 'reviewer-a' },
+    merge: { github_login: 'release-manager' }
+  },
+  constraints: { require_independent_review: true }
 };
 
-test('controller passes the implementation workspace to actor preflight', () => {
-  const controller = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'phase-loop.sh'), 'utf8');
-  assert.match(controller, /phase-loop-actor-preflight\.mjs" --role implementation --repo-root "\$PHASE_LOOP_WORKSPACE_ROOT"/u);
-  assert.match(controller, /--print-gh-config-dir/u);
-  assert.match(controller, /GH_CONFIG_DIR="\$implementation_gh_config_dir" gh pr create/u);
-});
+const credentials = {
+  schema_version: 1,
+  roles: {
+    implementation: { kind: 'repository-private', github_config_dir: 'profiles/implementation' },
+    review: { kind: 'host-default' },
+    merge: { kind: 'host-default' }
+  }
+};
 
-test('implementation resolves only the repository-private brownie-agent profile', () => {
-  const repo = fs.mkdtempSync(path.join(process.cwd(), '.test-actor-profile-'));
+test('implementation resolves the configured repository-private profile, not a login-derived default', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'actor-profile-'));
   try {
-    fs.mkdirSync(path.join(repo, '.brownie/private/gh-brownie-agent'), { recursive: true });
-    const profile = resolvePhaseLoopGitHubProfile({
-      repoRoot: repo,
-      role: 'implementation',
-      actor: 'brownie-agent',
-      env: { GH_CONFIG_DIR: '/must-not-be-used' }
-    });
+    fs.mkdirSync(path.join(repo, '.brownie/private/profiles/implementation'), { recursive: true });
+    const profile = resolvePhaseLoopGitHubProfile({ repoRoot: repo, role: 'implementation', credentials });
     assert.equal(profile.ok, true);
-    assert.equal(profile.profile_id, 'private-brownie-agent');
-    assert.equal(profile.github_config_dir, path.join(repo, '.brownie/private/gh-brownie-agent'));
-    assert.equal(profile.env.GH_CONFIG_DIR, profile.github_config_dir);
+    assert.equal(profile.profile_id, 'private-implementation');
+    assert.equal(profile.github_config_dir, path.join(repo, '.brownie/private/profiles/implementation'));
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
 });
 
-test('implementation rejects a credential profile outside repository private state', () => {
-  const repo = fs.mkdtempSync(path.join(process.cwd(), '.test-actor-profile-'));
+test('implementation rejects credentials outside repository private state', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'actor-profile-'));
   try {
     const profile = resolvePhaseLoopGitHubProfile({
       repoRoot: repo,
       role: 'implementation',
-      actor: 'brownie-agent',
-      env: { PHASE_LOOP_IMPLEMENTATION_GH_CONFIG_DIR: '/tmp/not-brownie-private' }
+      credentials: {
+        ...credentials,
+        roles: { ...credentials.roles, implementation: { kind: 'repository-private', github_config_dir: '../../outside' } }
+      }
     });
     assert.equal(profile.ok, false);
-    assert.equal(profile.code, 'implementation_github_profile_outside_private_root');
+    assert.equal(profile.code, 'github_profile_outside_private_root');
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
 });
 
-test('accepts brownie-agent implementation actor on implementation branch', () => {
+test('implementation can use a control-plane private profile while validating an isolated workspace', () => {
+  const control = fs.mkdtempSync(path.join(os.tmpdir(), 'actor-control-'));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'actor-workspace-'));
+  try {
+    const configuredProfile = path.join(control, '.brownie/private/profiles/implementation');
+    fs.mkdirSync(configuredProfile, { recursive: true });
+    const profile = resolvePhaseLoopGitHubProfile({
+      repoRoot: workspace,
+      credentialsRoot: control,
+      role: 'implementation',
+      credentials
+    });
+    assert.equal(profile.ok, true);
+    assert.equal(profile.github_config_dir, configuredProfile);
+  } finally {
+    fs.rmSync(control, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('accepts configured implementation identity and branch', () => {
   const errors = validatePhaseLoopActorPreflight({
-    repository: 'globalpocket/brownie',
-    githubActor: 'brownie-agent',
-    branch: 'brownie-agent/fix-release-evidence'
-  }, { role: 'implementation', policy });
+    repository: 'example-org/example-repo', githubActor: 'implementation-bot', branch: 'automation/fix'
+  }, { role: 'implementation', deployment });
   assert.deepEqual(errors, []);
 });
 
-test('rejects globalpocket implementation actor', () => {
+test('rejects a configured review actor from implementation', () => {
   const errors = validatePhaseLoopActorPreflight({
-    repository: 'globalpocket/brownie',
-    githubActor: 'globalpocket',
-    branch: 'brownie-agent/fix-release-evidence'
-  }, { role: 'implementation', policy });
-  assert(errors.some((error) => error.includes('must use GitHub actor brownie-agent')));
-  assert(errors.some((error) => error.includes('forbidden actor globalpocket')));
+    repository: 'example-org/example-repo', githubActor: 'reviewer-a', branch: 'automation/fix'
+  }, { role: 'implementation', deployment });
+  assert(errors.some((error) => error.includes('must use GitHub actor implementation-bot')));
+  assert(errors.some((error) => error.includes('forbidden actor reviewer-a')));
 });
 
-test('rejects implementation from main or codex review branch', () => {
+test('rejects implementation from main or a branch outside configured prefixes', () => {
   const mainErrors = validatePhaseLoopActorPreflight({
-    repository: 'globalpocket/brownie',
-    githubActor: 'brownie-agent',
-    branch: 'main'
-  }, { role: 'implementation', policy });
+    repository: 'example-org/example-repo', githubActor: 'implementation-bot', branch: 'main'
+  }, { role: 'implementation', deployment });
   assert(mainErrors.some((error) => error.includes('non-main implementation branch')));
 
-  const codexErrors = validatePhaseLoopActorPreflight({
-    repository: 'globalpocket/brownie',
-    githubActor: 'brownie-agent',
-    branch: 'codex/review-only'
-  }, { role: 'implementation', policy });
-  assert(codexErrors.some((error) => error.includes('must start with one of')));
+  const prefixErrors = validatePhaseLoopActorPreflight({
+    repository: 'example-org/example-repo', githubActor: 'implementation-bot', branch: 'review/fix'
+  }, { role: 'implementation', deployment });
+  assert(prefixErrors.some((error) => error.includes('must start with one of')));
 });
 
-test('accepts globalpocket review actor and rejects brownie-agent review actor', () => {
+test('accepts configured review identity and rejects implementation identity', () => {
   const accepted = validatePhaseLoopActorPreflight({
-    repository: 'globalpocket/brownie',
-    githubActor: 'globalpocket',
-    branch: 'codex/review'
-  }, { role: 'review', policy });
+    repository: 'example-org/example-repo', githubActor: 'reviewer-a', branch: 'review/fix'
+  }, { role: 'review', deployment });
   assert.deepEqual(accepted, []);
 
   const rejected = validatePhaseLoopActorPreflight({
-    repository: 'globalpocket/brownie',
-    githubActor: 'brownie-agent',
-    branch: 'brownie-agent/fix'
-  }, { role: 'review', policy });
-  assert(rejected.some((error) => error.includes('must use GitHub actor globalpocket')));
-  assert(rejected.some((error) => error.includes('forbidden actor brownie-agent')));
-});
-
-test('rejects unknown repository and missing GitHub actor', () => {
-  const errors = validatePhaseLoopActorPreflight({
-    repository: 'someone/else',
-    githubActor: null,
-    branch: 'brownie-agent/fix'
-  }, { role: 'implementation', policy });
-  assert(errors.some((error) => error.includes('remote origin must resolve')));
-  assert(errors.some((error) => error.includes('authenticated GitHub actor must be available')));
+    repository: 'example-org/example-repo', githubActor: 'implementation-bot', branch: 'automation/fix'
+  }, { role: 'review', deployment });
+  assert(rejected.some((error) => error.includes('must use GitHub actor reviewer-a')));
+  assert(rejected.some((error) => error.includes('forbidden actor implementation-bot')));
 });

@@ -2,6 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+  loadPhaseLoopActorCredentials,
+  loadPhaseLoopActorDeployment,
+  roleActor,
+  roleBranchPrefixes,
+  roleCredentialProfile
+} from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,6 +24,9 @@ function parseArgs(argv) {
     role: null,
     repoRoot: defaultRepoRoot,
     policyPath: defaultPolicyPath,
+    deploymentPath: null,
+    credentialsPath: null,
+    credentialsRoot: null,
     printGhConfigDir: false
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -29,6 +39,12 @@ function parseArgs(argv) {
       options.repoRoot = path.resolve(argv[++index] ?? '');
     } else if (arg === '--policy') {
       options.policyPath = argv[++index] ?? '';
+    } else if (arg === '--deployment') {
+      options.deploymentPath = argv[++index] ?? null;
+    } else if (arg === '--credentials') {
+      options.credentialsPath = argv[++index] ?? null;
+    } else if (arg === '--credentials-root') {
+      options.credentialsRoot = path.resolve(argv[++index] ?? '');
     } else if (arg === '--print-gh-config-dir') {
       options.printGhConfigDir = true;
     } else {
@@ -88,99 +104,42 @@ function commandStdout(repoRoot, command, args, env) {
   return result.passed ? result.stdout.trim() : null;
 }
 
-function expectedActorForRole(policy, role) {
-  if (role === 'implementation') {
-    return policy.implementation_actor;
-  }
-  if (role === 'review' || role === 'merge') {
-    return role === 'review' ? policy.review_actor : policy.merge_actor;
-  }
-  return null;
-}
-
-function branchPrefixesForRole(policy, role) {
-  if (role === 'implementation') {
-    return Array.isArray(policy.implementation_branch_prefixes) ? policy.implementation_branch_prefixes : [];
-  }
-  if (role === 'review' || role === 'merge') {
-    return Array.isArray(policy.review_branch_prefixes) ? policy.review_branch_prefixes : [];
-  }
-  return [];
-}
-
-function isInside(root, candidate) {
-  const relative = path.relative(root, candidate);
-  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
-}
-
-function profileEnvironmentVariable(role) {
-  if (role === 'implementation') return 'PHASE_LOOP_IMPLEMENTATION_GH_CONFIG_DIR';
-  if (role === 'review') return 'PHASE_LOOP_REVIEW_GH_CONFIG_DIR';
-  if (role === 'merge') return 'PHASE_LOOP_MERGE_GH_CONFIG_DIR';
-  return null;
-}
-
-// Resolve an account profile without ever reading its token file.  Implementation
-// credentials are repository-private and must not silently fall back to the
-// owner/default gh account.  Review and merge may use an explicitly selected
-// profile or the host default, but still have to pass the actor check below.
+// Resolve an account profile without ever reading its token file. The deployment
+// names principals by role; local credentials only map that role to a profile.
+// No GitHub login or credential directory is inferred from source-code defaults.
 export function resolvePhaseLoopGitHubProfile(options = {}) {
   const repoRoot = path.resolve(options.repoRoot ?? defaultRepoRoot);
   const role = options.role;
-  const actor = String(options.actor ?? '').trim();
   const env = options.env ?? process.env;
-  const envName = profileEnvironmentVariable(role);
-  const privateRoot = path.resolve(repoRoot, '.brownie/private');
-  const implementationDefault = path.join(privateRoot, `gh-${actor}`);
-  const requested = envName && typeof env[envName] === 'string' && env[envName].trim()
-    ? env[envName].trim()
-    : role === 'implementation'
-      ? implementationDefault
-      : (typeof env.GH_CONFIG_DIR === 'string' && env.GH_CONFIG_DIR.trim() ? env.GH_CONFIG_DIR.trim() : null);
-
-  if (!requested) {
-    return {
-      ok: true,
-      profile_id: 'host-default',
-      github_config_dir: null,
-      env: { ...env }
-    };
+  const credentialsResult = options.credentialsResult ?? loadPhaseLoopActorCredentials({
+    repoRoot,
+    env,
+    credentials: options.credentials,
+    credentialsPath: options.credentialsPath,
+    credentialsRoot: options.credentialsRoot
+  });
+  if (!credentialsResult.ok) {
+    return { ok: false, code: 'actor_credentials_unavailable', message: credentialsResult.errors.join(' ') };
   }
-
-  const configDir = path.resolve(repoRoot, requested);
-  if (role === 'implementation' && !isInside(privateRoot, configDir)) {
-    return {
-      ok: false,
-      code: 'implementation_github_profile_outside_private_root',
-      message: 'Implementation GitHub profile must remain under .brownie/private/.'
-    };
-  }
-  try {
-    if (!fs.statSync(configDir).isDirectory()) throw new Error('not a directory');
-  } catch {
-    return {
-      ok: false,
-      code: 'github_profile_missing',
-      message: `GitHub profile for ${role} is unavailable; configure ${envName ?? 'GH_CONFIG_DIR'} before dispatch.`
-    };
-  }
+  const selected = roleCredentialProfile(options.credentialsRoot ?? repoRoot, credentialsResult.credentials, role);
+  if (!selected.ok) return selected;
   return {
     ok: true,
-    profile_id: role === 'implementation' ? `private-${actor}` : 'explicit-or-host-default',
-    github_config_dir: configDir,
-    env: { ...env, GH_CONFIG_DIR: configDir }
+    profile_id: selected.profileId,
+    github_config_dir: selected.githubConfigDir,
+    env: selected.githubConfigDir ? { ...env, GH_CONFIG_DIR: selected.githubConfigDir } : { ...env }
   };
 }
 
 export function validatePhaseLoopActorPreflight(state, options = {}) {
   const errors = [];
   const role = options.role;
-  const policy = options.policy ?? {};
-  const expectedActor = expectedActorForRole(policy, role);
+  const deployment = options.deployment ?? {};
+  const expectedActor = roleActor(deployment, role);
   const forbiddenActors = new Set(
     role === 'implementation'
-      ? [policy.review_actor, policy.merge_actor].filter(Boolean)
-      : [policy.implementation_actor].filter(Boolean)
+      ? [roleActor(deployment, 'review'), roleActor(deployment, 'merge')].filter(Boolean)
+      : [roleActor(deployment, 'implementation')].filter(Boolean)
   );
 
   if (!['implementation', 'review', 'merge'].includes(role)) {
@@ -189,8 +148,8 @@ export function validatePhaseLoopActorPreflight(state, options = {}) {
   if (!expectedActor) {
     errors.push(`policy must define an expected actor for role ${role ?? '(missing)'}.`);
   }
-  if (state.repository !== policy.repository) {
-    errors.push(`remote origin must resolve to ${policy.repository}; got ${state.repository ?? '(unknown)'}.`);
+  if (state.repository !== deployment.repository) {
+    errors.push(`remote origin must resolve to ${deployment.repository ?? '(configured repository missing)'}; got ${state.repository ?? '(unknown)'}.`);
   }
   if (!state.githubActor) {
     errors.push('authenticated GitHub actor must be available via gh api user.');
@@ -205,7 +164,7 @@ export function validatePhaseLoopActorPreflight(state, options = {}) {
     if (!state.branch || state.branch === 'main') {
       errors.push('implementation role must run from a non-main implementation branch.');
     }
-    const prefixes = branchPrefixesForRole(policy, role);
+    const prefixes = roleBranchPrefixes(deployment, role);
     if (state.branch && prefixes.length > 0 && !prefixes.some((prefix) => state.branch.startsWith(prefix))) {
       errors.push(`implementation branch ${state.branch} must start with one of: ${prefixes.join(', ')}.`);
     }
@@ -234,17 +193,26 @@ export function runPhaseLoopActorPreflight(options = {}) {
   const policyPath = options.policyPath ?? defaultPolicyPath;
   const errors = [];
   const policy = options.policy ?? readJson(repoRoot, policyPath, errors);
-  const expectedActor = expectedActorForRole(policy, options.role);
+  const deploymentResult = options.deploymentResult ?? loadPhaseLoopActorDeployment({
+    repoRoot,
+    env: options.env,
+    deployment: options.deployment,
+    deploymentPath: options.deploymentPath
+  });
+  if (!deploymentResult.ok) errors.push(...deploymentResult.errors);
+  const deployment = deploymentResult.deployment ?? {};
   const profile = options.profile ?? resolvePhaseLoopGitHubProfile({
     repoRoot,
     role: options.role,
-    actor: expectedActor,
-    env: options.env
+    env: options.env,
+    credentials: options.credentials,
+    credentialsPath: options.credentialsPath,
+    credentialsRoot: options.credentialsRoot
   });
   if (profile.ok === false) errors.push(profile.message);
   const state = options.state ?? collectPhaseLoopActorState({ repoRoot, profile, env: options.env });
-  errors.push(...validatePhaseLoopActorPreflight(state, { role: options.role, policy }));
-  return { errors, policyPath, role: options.role, state, profile };
+  errors.push(...validatePhaseLoopActorPreflight(state, { role: options.role, deployment }));
+  return { errors, policyPath, role: options.role, state, profile, deployment: deploymentResult };
 }
 
 if (isMainModule()) {

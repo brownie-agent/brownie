@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -477,7 +478,7 @@ function buildSbom(repoRoot, generatedAt) {
       component: {
         type: 'application',
         name: 'brownie-runtime',
-        repository: 'globalpocket/brownie'
+        repository: loadPhaseLoopActorDeployment({ repoRoot }).deployment?.repository ?? null
       }
     },
     components
@@ -913,7 +914,7 @@ export function buildSupplyChainArtifactEvidence(options = {}) {
     schema_version: 1,
     evidence_id: 'brownie-supply-chain-artifact-evidence-v1',
     phase: 'RRP-8.4',
-    repository: 'globalpocket/brownie',
+    repository: loadPhaseLoopActorDeployment({ repoRoot }).deployment?.repository ?? null,
     generated_at: generatedAt,
     source_commit: sourceCommit,
     source_tree_dirty: treeStatus.length > 0,

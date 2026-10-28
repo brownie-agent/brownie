@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment } from './phase-loop-actor-deployment.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -147,12 +148,16 @@ function validateSatisfiedStatefulSoakSteps(steps, errors) {
   }
 }
 
-export function validateRuntimeOperationalEvidence(evidence) {
+export function validateRuntimeOperationalEvidence(evidence, options = {}) {
   const errors = [];
+  // Keep the pure validator portable: a caller validating an isolated fixture
+  // must not inherit this checkout's deployment identity. Repository binding is
+  // applied by the repository-aware guard below.
+  const expectedRepository = options.repository ?? options.deploymentResult?.deployment?.repository ?? evidence.repository;
   validateNoForbiddenLocalEvidence(evidence, errors);
   requireValue(evidence.schema_version === 1, errors, 'runtime operational evidence schema_version must be 1.');
   requireValue(evidence.evidence_id === 'brownie-runtime-operational-evidence-v1', errors, 'runtime operational evidence_id must match.');
-  requireValue(evidence.repository === 'globalpocket/brownie', errors, 'runtime operational evidence repository must be globalpocket/brownie.');
+  requireValue(evidence.repository === expectedRepository, errors, 'runtime operational evidence repository must match the configured deployment repository.');
   requireValue(evidence.release_ready === false, errors, 'runtime operational evidence must not declare release_ready true.');
   requireValue(evidence.runtime_release_ready === false, errors, 'runtime operational evidence must not declare runtime_release_ready true.');
   requireValue(Array.isArray(evidence.fail_closed_reasons), errors, 'runtime operational evidence must include fail_closed_reasons.');
@@ -309,7 +314,8 @@ export function runRuntimeOperationalEvidenceGuard(options = {}) {
     options.evidence !== undefined || process.env.BROWNIE_RUNTIME_OPERATIONAL_EVIDENCE || fs.existsSync(path.join(repoRoot, evidencePath));
   if (shouldValidateEvidence) {
     const evidence = options.evidence ?? readJson(repoRoot, evidencePath, errors);
-    errors.push(...validateRuntimeOperationalEvidence(evidence));
+    const deploymentResult = loadPhaseLoopActorDeployment({ repoRoot });
+    errors.push(...validateRuntimeOperationalEvidence(evidence, { deploymentResult }));
   }
   return { errors, contractPath, evidencePath, validatedEvidence: shouldValidateEvidence };
 }

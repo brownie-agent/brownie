@@ -13,8 +13,8 @@ function git(repo, args) {
 function fixture() {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-delivery-reconcile-'));
   git(repo, ['init', '-b', 'main']);
-  git(repo, ['config', 'user.name', 'brownie-agent']);
-  git(repo, ['config', 'user.email', 'brownie-agent@local']);
+  git(repo, ['config', 'user.name', 'Fixture Implementation']);
+  git(repo, ['config', 'user.email', 'implementation@example.invalid']);
   fs.writeFileSync(path.join(repo, '.gitignore'), '.brownie/private/\n');
   fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base\n');
   fs.writeFileSync(path.join(repo, 'clean-target-change.txt'), 'base\n');
@@ -143,8 +143,8 @@ test('refuses a squash-equivalent delivery when the workspace is not clean', () 
 test('cleans the index for a tree-equal fast-forward instead of treating it as squash-equivalent', () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-delivery-reconcile-'));
   git(repo, ['init', '-b', 'main']);
-  git(repo, ['config', 'user.name', 'brownie-agent']);
-  git(repo, ['config', 'user.email', 'brownie-agent@local']);
+  git(repo, ['config', 'user.name', 'Fixture Implementation']);
+  git(repo, ['config', 'user.email', 'implementation@example.invalid']);
   fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base\n');
   git(repo, ['add', '.']);
   git(repo, ['commit', '-m', 'base']);

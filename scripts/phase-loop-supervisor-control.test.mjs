@@ -22,12 +22,25 @@ test('nested supervisor repair uses the explicit controller source root', () => 
   assert.match(source, /--todo/u);
   assert.match(source, /--breakdown/u);
   assert.match(source, /--state-dir/u);
+  assert.match(source, /--actor-deployment/u);
   assert.match(source, /workspaceTodoPath\(repoRoot\)/u);
   assert.match(source, /workspaceStateRoot\(repoRoot\)/u);
   assert.match(source, /controlPlaneScript\('scripts\/phase-loop-todo-queue-integrity\.mjs'\)/u);
   assert.match(source, /controlPlaneScript\('scripts\/repair-todo-decomposition\.mjs'\)/u);
   assert.match(source, /controlPlaneScript\('scripts\/phase-loop-preclaim-recovery\.mjs'\)/u);
   assert.doesNotMatch(source, /runJsonCommand\(repoRoot, process\.execPath, \[\s*'scripts\/(?:phase-loop-todo-queue-integrity|repair-todo-decomposition|phase-loop-preclaim-recovery)\.mjs'/u);
+});
+
+test('supervisor returns a controlled nonzero result when actor deployment is unavailable', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-supervisor-missing-deployment-'));
+  try {
+    const result = controlPhaseLoop({ repoRoot: repo, write: false, repair: true, start: false });
+    assert.equal(result.status, 'blocked');
+    assert.equal(result.reason, 'actor_deployment_invalid');
+    assert.equal(result.final_summary, undefined);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 const runtimeEvidenceTodo = `- [ ] E-21c-runtime-operational-evidence-impl-2-target-02: Patch only \`scripts/guard-runtime-operational-evidence.test.mjs\` to require runtime operational evidence to model release operation as executable fail-closed evidence:
@@ -45,10 +58,23 @@ const ownerBlockerTodo = `- [ ] E-20i-runtime-release-ops-blocker: Blocker: Owne
   Completion condition: release engineering owner provides or documents the Runtime Release Ops authority needed for clean CI builds, artifact upload/provenance binding, and GitHub Release publication. Customer or Enterprise production deployment credentials are explicitly out of Runtime Product Ready scope and must not block the OSS Runtime release.
   Forbidden changes: do not attempt to configure external CI/CD, create credentials, publish a GitHub Release, or request customer/Enterprise production deployment credentials.
   Verification: inspect/blocker/fail-closed.`;
+const fixtureRepository = 'example-org/supervisor-fixture';
+const implementationActor = 'implementation-bot';
+const reviewActor = 'independent-reviewer';
 
 function makeRepo() {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-supervisor-control-'));
   fs.mkdirSync(path.join(repo, '.brownie/private/phase-loop/todo-claims'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.brownie/phase-loop-actor-deployment.json'), JSON.stringify({
+    schema_version: 1,
+    repository: fixtureRepository,
+    roles: {
+      implementation: { github_login: implementationActor, branch_prefixes: ['implementation/'] },
+      review: { github_login: reviewActor },
+      merge: { github_login: reviewActor }
+    },
+    constraints: { require_independent_review: true }
+  }, null, 2));
   fs.mkdirSync(path.join(repo, 'scripts'), { recursive: true });
   fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({
     scripts: {
@@ -87,7 +113,7 @@ function makeRepo() {
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' });
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
   execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
-  execFileSync('git', ['add', 'package.json', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-state.mjs', 'scripts/phase-loop-todo-contract-rebaseline.mjs', 'scripts/guard-todo-decomposition.mjs', 'scripts/repair-todo-decomposition.mjs', 'scripts/phase-loop-preclaim-recovery.mjs', 'scripts/phase-loop-todo-completion-reconcile.mjs', 'scripts/phase-loop-todo-breakdown-reconcile.mjs'], { cwd: repo });
+  execFileSync('git', ['add', 'package.json', '.brownie/phase-loop-actor-deployment.json', 'scripts/guard-runtime-operational-evidence.test.mjs', 'scripts/phase-loop-todo-queue-integrity.mjs', 'scripts/phase-loop-todo-state.mjs', 'scripts/phase-loop-todo-contract-rebaseline.mjs', 'scripts/guard-todo-decomposition.mjs', 'scripts/repair-todo-decomposition.mjs', 'scripts/phase-loop-preclaim-recovery.mjs', 'scripts/phase-loop-todo-completion-reconcile.mjs', 'scripts/phase-loop-todo-breakdown-reconcile.mjs'], { cwd: repo });
   execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
   return repo;
 }
@@ -107,7 +133,7 @@ test('delegation feedback parsing preserves acknowledgements and fails closed on
   writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', {
     kind: 'phase_loop_delegation_pending',
     completed: false,
-    delegation: { status: 'acknowledged', required_actor: 'brownie-agent' }
+    delegation: { status: 'acknowledged', required_actor: implementationActor }
   });
   assert.equal(inspectDelegationFeedback(feedbackPath).state, 'acknowledged');
 });
@@ -118,9 +144,9 @@ function workerReceipt(overrides = {}) {
     kind: 'phase_loop_worker_launch_receipt',
     status: 'active',
     launch_id: 'launch-01',
-    actor: 'brownie-agent',
+    actor: implementationActor,
     claim_id: 'claim-worker',
-    target_pr_url: 'https://github.com/globalpocket/brownie/pull/643',
+    target_pr_url: `https://github.com/${fixtureRepository}/pull/643`,
     started_at: '2026-10-18T00:00:00.000Z',
     expires_at: '2026-10-18T01:00:00.000Z',
     last_heartbeat_at: '2026-10-18T00:20:00.000Z',
@@ -148,7 +174,7 @@ test('requires a live worker-launch receipt and rejects missing, expired, mismat
 
   writeJson(repo, '.brownie/private/phase-loop/worker-launch-receipt.json', workerReceipt({
     launch_id: 'launch-actor-mismatch',
-    actor: 'globalpocket'
+    actor: reviewActor
   }));
   assert.equal(inspectWorkerLaunchReceipt(repo, { now }).reason, 'dispatch_not_started');
 
@@ -203,14 +229,14 @@ test('reconciles an acknowledged reviewed merged delegation into a durable compl
     completed: false,
     selected_todo: runtimeEvidenceTodo,
     delegation: {
-      required_actor: 'brownie-agent',
+      required_actor: implementationActor,
       status: 'acknowledged',
-      issue_or_pr_url: 'https://github.com/globalpocket/brownie/pull/999',
+      issue_or_pr_url: `https://github.com/${fixtureRepository}/pull/999`,
       acknowledged_at: '2026-10-15T00:00:00Z',
       implementation_commit_or_blocker: mergedCommit
     },
     verification: {
-      reviewed_by: 'globalpocket',
+      reviewed_by: reviewActor,
       all_ci_checks_passed: true
     }
   });
@@ -221,7 +247,7 @@ test('reconciles an acknowledged reviewed merged delegation into a durable compl
     repair: true,
     start: false,
     delegationProvenanceVerifier(_repoRoot, pullRequestUrl, commit) {
-      assert.equal(pullRequestUrl, 'https://github.com/globalpocket/brownie/pull/999');
+      assert.equal(pullRequestUrl, `https://github.com/${fixtureRepository}/pull/999`);
       assert.equal(commit, mergedCommit);
       return { ok: true };
     }
@@ -248,14 +274,14 @@ test('fails closed when acknowledged delegation lacks independently reviewable m
     completed: false,
     selected_todo: runtimeEvidenceTodo,
     delegation: {
-      required_actor: 'brownie-agent',
+      required_actor: implementationActor,
       status: 'acknowledged',
-      issue_or_pr_url: 'https://github.com/globalpocket/brownie/pull/999',
+      issue_or_pr_url: `https://github.com/${fixtureRepository}/pull/999`,
       acknowledged_at: '2026-10-15T00:00:00Z',
       implementation_commit_or_blocker: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim()
     },
     verification: {
-      reviewed_by: 'globalpocket',
+      reviewed_by: reviewActor,
       all_ci_checks_passed: true
     }
   });
@@ -546,7 +572,7 @@ test('escalates repeated target-and-verification contracts across replan leaf id
   assert.equal(result.repair.delegation_pending.ok, true, JSON.stringify(result, null, 2));
   assert.equal(result.repair.todo_contract_replan.reason, 'delegation_pending_blocks_same_scope_replan');
   assert.equal(feedback.kind, 'phase_loop_delegation_pending');
-  assert.equal(feedback.delegation.required_actor, 'brownie-agent');
+  assert.equal(feedback.delegation.required_actor, implementationActor);
 
   feedback.delegation.status = 'acknowledged';
   writeJson(repo, '.brownie/private/phase-loop/todo-claims/repair-feedback.json', feedback);

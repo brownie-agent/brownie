@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/brownie/phase-loop-actor-deployment.schema.json",
+  "title": "Phase Loop actor deployment",
+  "type": "object",
+  "required": ["schema_version", "repository", "roles", "constraints"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "repository": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$" },
+    "roles": {
+      "type": "object",
+      "required": ["implementation", "review", "merge"],
+      "properties": {
+        "implementation": {
+          "type": "object",
+          "required": ["github_login", "branch_prefixes"],
+          "properties": {
+            "github_login": { "type": "string", "minLength": 1 },
+            "branch_prefixes": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+            "require_fork_owner_match": { "type": "boolean" }
+          }
+        },
+        "review": { "type": "object", "required": ["github_login"], "properties": { "github_login": { "type": "string", "minLength": 1 } } },
+        "merge": { "type": "object", "required": ["github_login"], "properties": { "github_login": { "type": "string", "minLength": 1 } } }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "required": ["require_independent_review"],
+      "properties": { "require_independent_review": { "type": "boolean" } }
+    }
+  }
+}

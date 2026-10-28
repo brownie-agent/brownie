@@ -49,19 +49,16 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   const phaseLoop = options.phaseLoop ?? readText(repoRoot, 'phase-loop.sh', errors);
   const actorPreflight = options.actorPreflight ?? readText(repoRoot, 'scripts/phase-loop-actor-preflight.mjs', errors);
   const prActorGuard = options.prActorGuard ?? readText(repoRoot, 'scripts/phase-loop-pr-actor-guard.mjs', errors);
+  const actorDeployment = options.actorDeployment ?? readText(repoRoot, 'scripts/phase-loop-actor-deployment.mjs', errors);
 
-  requireValue(policy.schema_version === 1, errors, `${policyPath} schema_version must be 1.`);
-  requireValue(policy.policy_id === 'brownie-phase-loop-actor-separation-v1', errors, `${policyPath} policy_id must match.`);
-  requireValue(policy.repository === 'globalpocket/brownie', errors, `${policyPath} repository must be globalpocket/brownie.`);
-  requireValue(policy.implementation_actor === 'brownie-agent', errors, `${policyPath} implementation_actor must be brownie-agent.`);
-  requireValue(policy.review_actor === 'globalpocket', errors, `${policyPath} review_actor must be globalpocket.`);
-  requireValue(policy.merge_actor === 'globalpocket', errors, `${policyPath} merge_actor must be globalpocket.`);
-  requireValue(policy.implementation_actor !== policy.review_actor, errors, `${policyPath} implementation_actor and review_actor must differ.`);
-  const responsibility = policy.workflow_responsibility ?? {};
-  const brownieResponsibility = responsibility.brownie_phase_loop ?? {};
-  const codexResponsibility = responsibility.codex_globalpocket ?? {};
-  requireValue(brownieResponsibility.actor === 'brownie-agent', errors, `${policyPath} workflow_responsibility.brownie_phase_loop.actor must be brownie-agent.`);
-  requireValue(codexResponsibility.actor === 'globalpocket', errors, `${policyPath} workflow_responsibility.codex_globalpocket.actor must be globalpocket.`);
+  requireValue(policy.schema_version === 2, errors, `${policyPath} schema_version must be 2.`);
+  requireValue(policy.policy_id === 'phase-loop-actor-separation-v2', errors, `${policyPath} policy_id must match.`);
+  requireValue(policy.deployment?.default_path === '.brownie/phase-loop-actor-deployment.json', errors, `${policyPath} must name the deployment configuration path.`);
+  requireValue(policy.deployment?.credential_default_path === '.brownie/private/phase-loop-actor-credentials.json', errors, `${policyPath} must name the private credential configuration path.`);
+  const roles = policy.roles ?? {};
+  const implementationResponsibility = roles.implementation ?? {};
+  const reviewResponsibility = roles.review ?? {};
+  const mergeResponsibility = roles.merge ?? {};
   for (const owner of [
     'select and claim one TODO',
     'decompose broad TODOs into implementation leaves when needed',
@@ -72,52 +69,41 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
     'create the pull request'
   ]) {
     requireValue(
-      Array.isArray(brownieResponsibility.owns) && brownieResponsibility.owns.includes(owner),
+      Array.isArray(implementationResponsibility.owns) && implementationResponsibility.owns.includes(owner),
       errors,
-      `${policyPath} brownie_phase_loop must own ${owner}.`
+      `${policyPath} implementation role must own ${owner}.`
     );
   }
   requireValue(
-    brownieResponsibility.must_stop_after === 'pull_request_created',
+    implementationResponsibility.must_stop_after === 'pull_request_created',
     errors,
-    `${policyPath} brownie_phase_loop.must_stop_after must be pull_request_created.`
+    `${policyPath} implementation role must stop after pull_request_created.`
   );
   for (const forbidden of [
     'review its own pull request',
     'approve its own pull request',
     'merge pull requests',
-    'relax branch protection',
-    'use the globalpocket account for implementation, commit, push, or pull request creation'
+    'relax branch protection'
   ]) {
     requireValue(
-      Array.isArray(brownieResponsibility.must_not) && brownieResponsibility.must_not.includes(forbidden),
+      Array.isArray(implementationResponsibility.must_not) && implementationResponsibility.must_not.includes(forbidden),
       errors,
-      `${policyPath} brownie_phase_loop.must_not must include ${forbidden}.`
+      `${policyPath} implementation role must_not must include ${forbidden}.`
     );
   }
   for (const owner of [
-    'review Brownie-created pull requests',
+    'review implementation pull requests',
     'request changes when CI, evidence, policy, or implementation is insufficient',
-    'approve pull requests when the review is satisfied and the repository policy allows approval',
-    'merge pull requests after required checks and review policy are satisfied'
+    'approve pull requests when the review is satisfied and the repository policy allows approval'
   ]) {
     requireValue(
-      Array.isArray(codexResponsibility.owns) && codexResponsibility.owns.includes(owner),
+      Array.isArray(reviewResponsibility.owns) && reviewResponsibility.owns.includes(owner),
       errors,
-      `${policyPath} codex_globalpocket must own ${owner}.`
+      `${policyPath} review role must own ${owner}.`
     );
   }
-  for (const forbidden of [
-    'perform Brownie TODO implementation work through the globalpocket account',
-    'create Brownie implementation branches, commits, pushes, or pull requests for ordinary TODO execution',
-    'count a globalpocket-authored implementation pull request as a brownie-agent implementation pull request'
-  ]) {
-    requireValue(
-      Array.isArray(codexResponsibility.must_not) && codexResponsibility.must_not.includes(forbidden),
-      errors,
-      `${policyPath} codex_globalpocket.must_not must include ${forbidden}.`
-    );
-  }
+  requireValue(Array.isArray(reviewResponsibility.must_not) && reviewResponsibility.must_not.length > 0, errors, `${policyPath} review role must prohibit implementation work.`);
+  requireValue(Array.isArray(mergeResponsibility.owns) && mergeResponsibility.owns.includes('merge pull requests after required checks and review policy are satisfied'), errors, `${policyPath} merge role must own guarded merge.`);
   requireValue(
     Array.isArray(policy.forbidden_success_claims) &&
       policy.forbidden_success_claims.some((claim) => /static review JSON/i.test(claim)),
@@ -126,9 +112,9 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   );
   requireValue(
     Array.isArray(policy.forbidden_success_claims) &&
-      policy.forbidden_success_claims.some((claim) => /Codex\/globalpocket commit, push, or pull request/i.test(claim)),
+      policy.forbidden_success_claims.some((claim) => /configured implementation and review principals are the same/i.test(claim)),
     errors,
-    `${policyPath} must forbid treating Codex/globalpocket implementation work as Brownie phase-loop implementation work.`
+    `${policyPath} must forbid actor-collapse success claims.`
   );
   requireValue(
     Array.isArray(policy.requirements) &&
@@ -138,9 +124,9 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   );
   requireValue(
     Array.isArray(policy.requirements) &&
-      policy.requirements.some((requirement) => /repository-private brownie-agent GitHub profile/u.test(requirement)),
+      policy.requirements.some((requirement) => /repository-private/u.test(requirement) && /host-default/u.test(requirement)),
     errors,
-    `${policyPath} must require a repository-private brownie-agent GitHub profile for implementation publishing.`
+    `${policyPath} must require a repository-private implementation profile with no host-default fallback.`
   );
 
   requireValue(gitignore.includes('.brownie/private/'), errors, '.gitignore must ignore .brownie/private/.');
@@ -164,9 +150,10 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   requireValue(phaseLoop.includes('phase-loop-pr-actor-guard.mjs'), errors, 'phase-loop.sh must invoke the implementation PR actor guard before commit/push/PR creation.');
   requireValue(phaseLoop.includes('--print-gh-config-dir'), errors, 'phase-loop.sh must resolve a dedicated implementation GitHub profile before publish.');
   requireValue(phaseLoop.includes('GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create'), errors, 'phase-loop.sh must use the dedicated implementation GitHub profile for PR creation.');
-  requireValue(actorPreflight.includes('resolvePhaseLoopGitHubProfile'), errors, 'actor preflight must resolve a role-specific GitHub profile.');
-  requireValue(actorPreflight.includes('implementation_github_profile_outside_private_root'), errors, 'actor preflight must reject implementation profiles outside .brownie/private/.');
-  requireValue(prActorGuard.includes("expectedActor = 'brownie-agent'"), errors, 'phase-loop-pr-actor-guard.mjs must default implementation PR creation to actor brownie-agent.');
+  requireValue(actorPreflight.includes('loadPhaseLoopActorDeployment'), errors, 'actor preflight must load project actor deployment configuration.');
+  requireValue(actorPreflight.includes('loadPhaseLoopActorCredentials'), errors, 'actor preflight must load local actor credential configuration.');
+  requireValue(actorDeployment.includes('require_independent_review'), errors, 'actor deployment loader must enforce independent review when configured.');
+  requireValue(!/expectedActor\s*=\s*['"][^'"]+['"]/u.test(prActorGuard), errors, 'phase-loop-pr-actor-guard.mjs must not default implementation PR creation to a fixed actor.');
   requireValue(prActorGuard.includes('validateImplementationPrActor'), errors, 'phase-loop-pr-actor-guard.mjs must validate the authenticated implementation PR actor.');
 
   return { errors, policyPath };

@@ -30,7 +30,7 @@ BDK_TRAJECTORY_FILE="${PHASE_LOOP_BDK_TRAJECTORY_FILE:-"$STATE_DIR/bdk-trajector
 BDK_HARNESS_FEEDBACK_FILE="$STATE_DIR/bdk-harness-feedback.json"
 PHASE_LOOP_DEFERRED_SIGNAL_FILE="$STATE_DIR/deferred-signal"
 LLM_PROVIDER_FAILURE_MEMORY_FILE="$STATE_DIR/llm-provider-failures.jsonl"
-LAUNCHD_LABEL="${PHASE_LOOP_LAUNCHD_LABEL:-globalpocket.brownie.phase-loop}"
+LAUNCHD_LABEL="${PHASE_LOOP_LAUNCHD_LABEL:-brownie.phase-loop}"
 SCREEN_NAME="${PHASE_LOOP_SCREEN_NAME:-brownie-phase-loop}"
 PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED=0
 PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL=""
@@ -78,9 +78,26 @@ if [ -n "${BROWNIE_BIN:-}" ]; then
   PHASE_LOOP_BROWNIE_BIN_EXPLICIT=1
 fi
 PHASE_LOOP_DEFAULT_BROWNIE_BIN=""
-PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT"}"
+PHASE_LOOP_CONTROL_ROOT="${PHASE_LOOP_CONTROL_ROOT:-"$ROOT_DIR"}"
 PHASE_LOOP_BASE_COMMIT="${PHASE_LOOP_BASE_COMMIT:-}"
-PHASE_LOOP_EXPECTED_ACTOR="${PHASE_LOOP_EXPECTED_ACTOR:-brownie-agent}"
+PHASE_LOOP_ACTOR_DEPLOYMENT="${PHASE_LOOP_ACTOR_DEPLOYMENT:-$ROOT_DIR/.brownie/phase-loop-actor-deployment.json}"
+PHASE_LOOP_ACTOR_CREDENTIALS="${PHASE_LOOP_ACTOR_CREDENTIALS:-$ROOT_DIR/.brownie/private/phase-loop-actor-credentials.json}"
+case "$PHASE_LOOP_ACTOR_DEPLOYMENT" in
+  /*) ;;
+  *) PHASE_LOOP_ACTOR_DEPLOYMENT="$ROOT_DIR/$PHASE_LOOP_ACTOR_DEPLOYMENT" ;;
+esac
+case "$PHASE_LOOP_ACTOR_CREDENTIALS" in
+  /*) ;;
+  *) PHASE_LOOP_ACTOR_CREDENTIALS="$ROOT_DIR/$PHASE_LOOP_ACTOR_CREDENTIALS" ;;
+esac
+# Child processes may operate on an isolated target workspace.  Preserve the
+# control-plane deployment and credential locations explicitly rather than
+# treating the target checkout as the controller installation.
+export PHASE_LOOP_ACTOR_DEPLOYMENT PHASE_LOOP_ACTOR_CREDENTIALS
+PHASE_LOOP_EXPECTED_ACTOR="${PHASE_LOOP_EXPECTED_ACTOR:-}"
+if [ -z "$PHASE_LOOP_EXPECTED_ACTOR" ]; then
+  PHASE_LOOP_EXPECTED_ACTOR="$(node "$ROOT_DIR/scripts/phase-loop-actor-deployment.mjs" --repo-root "$ROOT_DIR" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login 2>/dev/null || true)"
+fi
 PHASE_LOOP_BROWNIE_STORE_ROOT="${PHASE_LOOP_BROWNIE_STORE_ROOT:-"$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/runtime-store"}"
 PHASE_LOOP_INTERVAL_SECONDS="${PHASE_LOOP_INTERVAL_SECONDS:-5}"
 PHASE_LOOP_FAILURE_BACKOFF_SECONDS="${PHASE_LOOP_FAILURE_BACKOFF_SECONDS:-60}"
@@ -651,7 +668,7 @@ todo_first_pending_item() {
   fi
   if phase_loop_delegation_pending; then
     # Fail closed: repeated identical contracts require a separately auditable
-    # brownie-agent acknowledgement, not another generated replan leaf.
+    # configured implementation-actor acknowledgement, not another generated replan leaf.
     return 0
   fi
   local contract_replan_item
@@ -700,12 +717,12 @@ phase_loop_delegation_pending() {
     return 1
   fi
   local delegation_admission_output
-  if delegation_admission_output="$(node "$ROOT_DIR/scripts/phase-loop-delegation-admission.mjs" record --feedback "$TODO_REPAIR_FEEDBACK_FILE" --audit "$TODO_CLAIM_DIR/delegation-admission.jsonl" 2>&1)"; then
+  if delegation_admission_output="$(node "$ROOT_DIR/scripts/phase-loop-delegation-admission.mjs" record --feedback "$TODO_REPAIR_FEEDBACK_FILE" --audit "$TODO_CLAIM_DIR/delegation-admission.jsonl" --actor "$PHASE_LOOP_EXPECTED_ACTOR" 2>&1)"; then
     printf '%s delegation_admission=%s\n' "$(now_utc)" "$delegation_admission_output" >> "$SUPERVISOR_LOG"
   else
     printf '%s delegation_admission_failed=%s\n' "$(now_utc)" "${delegation_admission_output:-<no output>}" >> "$SUPERVISOR_LOG"
   fi
-  python3 - "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
+  python3 - "$TODO_REPAIR_FEEDBACK_FILE" "$PHASE_LOOP_EXPECTED_ACTOR" <<'PY'
 import json
 import pathlib
 import sys
@@ -719,7 +736,7 @@ delegation = feedback.get("delegation") if isinstance(feedback.get("delegation")
 pending = (
     feedback.get("completed") is not True
     and feedback.get("kind") == "phase_loop_delegation_pending"
-    and delegation.get("required_actor") == "brownie-agent"
+    and delegation.get("required_actor") == sys.argv[2]
     and delegation.get("acknowledgement_required") is True
     and delegation.get("status") == "pending"
 )
@@ -729,26 +746,26 @@ PY
 
 phase_loop_delegation_blocker_detail() {
   local delegation_status
-  if ! delegation_status="$(node "$ROOT_DIR/scripts/phase-loop-delegation-admission.mjs" status --feedback "$TODO_REPAIR_FEEDBACK_FILE" --audit "$TODO_CLAIM_DIR/delegation-admission.jsonl" 2>&1)"; then
-    printf 'brownie-agent delegation state is unreadable; fail closed until its admission record is repaired. detail=%s' "${delegation_status:-<no output>}"
+  if ! delegation_status="$(node "$ROOT_DIR/scripts/phase-loop-delegation-admission.mjs" status --feedback "$TODO_REPAIR_FEEDBACK_FILE" --audit "$TODO_CLAIM_DIR/delegation-admission.jsonl" --actor "$PHASE_LOOP_EXPECTED_ACTOR" 2>&1)"; then
+    printf '%s delegation state is unreadable; fail closed until its admission record is repaired. detail=%s' "$PHASE_LOOP_EXPECTED_ACTOR" "${delegation_status:-<no output>}"
     return 0
   fi
-  python3 - "$delegation_status" <<'PY'
+  python3 - "$delegation_status" "$PHASE_LOOP_EXPECTED_ACTOR" <<'PY'
 import json
 import sys
 
 try:
     state = json.loads(sys.argv[1])
 except Exception:
-    print("brownie-agent delegation state is malformed; fail closed until its admission record is repaired.")
+    print(f"{sys.argv[2]} delegation state is malformed; fail closed until its admission record is repaired.")
     raise SystemExit(0)
 
 if state.get("ok") and state.get("pending"):
     phase = state.get("state", "awaiting_acknowledgement")
     due = state.get("acknowledgement_due_at", "unknown")
-    print(f"brownie-agent implementation delegation is {phase}; acknowledgement with implementation PR URL or concrete blocker is required by {due}. Phase-loop will not retry this TODO.")
+    print(f"{sys.argv[2]} implementation delegation is {phase}; acknowledgement with implementation PR URL or concrete blocker is required by {due}. Phase-loop will not retry this TODO.")
 else:
-    print("brownie-agent delegation is pending but its admission state is unavailable; fail closed until repaired.")
+    print(f"{sys.argv[2]} delegation is pending but its admission state is unavailable; fail closed until repaired.")
 PY
 }
 
@@ -756,7 +773,7 @@ todo_contract_replan_feedback_pending_item() {
   if [ ! -f "$PHASE_LOOP_TODO" ] || [ ! -f "$TODO_REPAIR_FEEDBACK_FILE" ]; then
     return 0
   fi
-  python3 - "$PHASE_LOOP_TODO" "$TODO_REPAIR_FEEDBACK_FILE" <<'PY'
+  python3 - "$PHASE_LOOP_TODO" "$TODO_REPAIR_FEEDBACK_FILE" "$PHASE_LOOP_EXPECTED_ACTOR" <<'PY'
 import json
 import pathlib
 import re
@@ -6492,6 +6509,7 @@ run_integrated_supervisor_control() {
       node "$ROOT_DIR/scripts/phase-loop-supervisor-control.mjs" \
         --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
         --control-plane-root "$ROOT_DIR" \
+        --actor-deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" \
         --todo "$PHASE_LOOP_TODO" \
         --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" \
         --state-dir "$STATE_DIR" \
@@ -6529,14 +6547,14 @@ direct_recovery = (
 # target scope.  The supervisor replaces it with this auditable external
 # handoff; treat that replacement as a recovered terminal leaf so this shell
 # does not overwrite it with a stale retry-cap failure status.  A later run
-# will stop at phase_loop_delegation_pending until brownie-agent acknowledges
+# will stop at phase_loop_delegation_pending until the configured implementation actor acknowledges
 # the handoff.
 delegated_recovery = (
     feedback.get("kind") == "phase_loop_delegation_pending"
     and feedback.get("reason") == "terminal_generated_contract_replan_requires_implementation_handoff"
     and feedback.get("superseded_replan_todo_id")
     and feedback.get("selected_todo")
-    and feedback.get("delegation", {}).get("required_actor") == "brownie-agent"
+    and feedback.get("delegation", {}).get("required_actor") == sys.argv[3]
     and feedback.get("delegation", {}).get("acknowledgement_required") is True
     and feedback.get("delegation", {}).get("status") == "pending"
 )
@@ -10054,7 +10072,7 @@ phase_loop_require_implementation_pr_actor() {
     printf '%s implementation_pr_actor_guard_missing=true path=%s\n' "$(now_utc)" "$guard_script" >> "$SUPERVISOR_LOG"
     return 1
   fi
-  node "$guard_script"
+  node "$guard_script" --expected-actor "$PHASE_LOOP_EXPECTED_ACTOR"
 }
 
 phase_loop_create_pr_for_progress() {
@@ -10078,6 +10096,9 @@ phase_loop_create_pr_for_progress() {
     node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" \
       --role implementation \
       --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" \
+      --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" \
+      --credentials "$PHASE_LOOP_ACTOR_CREDENTIALS" \
+      --credentials-root "$ROOT_DIR" \
       --print-gh-config-dir 2>>"$SUPERVISOR_LOG"
   )" || {
     printf '%s pr_create_skipped reason=implementation_profile_preflight_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
@@ -10089,7 +10110,12 @@ phase_loop_create_pr_for_progress() {
   fi
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    GH_CONFIG_DIR="$implementation_gh_config_dir" node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" --role implementation --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" >/dev/null
+    GH_CONFIG_DIR="$implementation_gh_config_dir" node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" \
+      --role implementation \
+      --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" \
+      --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" \
+      --credentials "$PHASE_LOOP_ACTOR_CREDENTIALS" \
+      --credentials-root "$ROOT_DIR" >/dev/null
   ) || {
     printf '%s pr_create_skipped reason=implementation_preflight_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 1
@@ -10116,10 +10142,10 @@ This PR was created by the external phase-loop controller after Brownie produced
       if git diff --cached --quiet --exit-code; then
         exit 1
       fi
-      GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Brownie}" \
-        GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-brownie-agent@users.noreply.github.com}" \
-        GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-Brownie}" \
-        GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-brownie-agent@users.noreply.github.com}" \
+      GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-$PHASE_LOOP_EXPECTED_ACTOR}" \
+        GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-$PHASE_LOOP_EXPECTED_ACTOR@users.noreply.github.com}" \
+        GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$PHASE_LOOP_EXPECTED_ACTOR}" \
+        GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$PHASE_LOOP_EXPECTED_ACTOR@users.noreply.github.com}" \
         git commit -m "$title" >/dev/null
     elif [ "$pending_publish" != "1" ]; then
       exit 1
@@ -14799,8 +14825,8 @@ PY
     elif phase_loop_delegation_pending; then
       detail="$(phase_loop_delegation_blocker_detail)"
       printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
-      write_status "blocked" "$detail" "brownie-agent-delegation-$run_stamp" "0" "${CONSECUTIVE_FAILURES:-0}"
-      write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"brownie_agent_delegation_pending"}'
+      write_status "blocked" "$detail" "implementation-delegation-$run_stamp" "0" "${CONSECUTIVE_FAILURES:-0}"
+      write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"implementation_delegation_pending"}'
       return 65
     elif todo_queue_only_explicit_blockers; then
       detail="No implementable TODO remains; pending queue contains only explicit owner-controlled blocker TODOs. Phase-loop is stopped until owner/review evidence changes."

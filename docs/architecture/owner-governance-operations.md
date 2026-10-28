@@ -5,10 +5,15 @@ authority. It is part of Brownie's fail-closed release governance surface.
 
 ## Actor model
 
-| Responsibility | GitHub actor |
+| Responsibility | Configured GitHub role |
 | --- | --- |
-| Brownie Phase Loop implementation PR author / pusher | `brownie-agent` |
-| Codex review, approval, merge, and owner governance operation | `globalpocket` |
+| Phase Loop implementation PR author / pusher | `implementation` |
+| Review, approval, merge, and owner governance operation | `review` / `merge` |
+
+The concrete GitHub principals and repository are deployment data in
+`.brownie/phase-loop-actor-deployment.json`; local credential-profile mappings
+belong in `.brownie/private/phase-loop-actor-credentials.json`. The controller
+resolves and verifies those mappings before any authenticated operation.
 
 The implementation actor and review actor must remain distinct for release
 evidence. A review by the implementation actor is not independent review
@@ -98,4 +103,3 @@ guidance, and contribution rules are documented separately:
 
 Public publication remains owner-gated until release artifacts, smoke tests,
 integrity evidence, and independent reviews are complete.
-

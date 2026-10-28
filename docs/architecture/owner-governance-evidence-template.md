@@ -46,13 +46,13 @@ approval.
 {
   "schema_version": 1,
   "evidence_id": "brownie-owner-independent-review-evidence-v1",
-  "review_authority": "globalpocket",
+  "review_authority": "<configured review principal>",
   "review_policy": "Owner-designated review and merge authority for Brownie Runtime Release Readiness governance.",
   "github_actor_separation_policy": {
-    "implementation_actor": "brownie-agent",
-    "review_actor": "globalpocket",
-    "merge_actor": "globalpocket",
-    "policy": "Brownie Phase Loop implementation PRs are authored and pushed by brownie-agent. Codex uses the owner account globalpocket to review and merge those PRs after required status checks pass.",
+    "implementation_actor": "<configured implementation principal>",
+    "review_actor": "<configured review principal>",
+    "merge_actor": "<configured merge principal>",
+    "policy": "Phase Loop implementation PRs are authored and pushed by the configured implementation principal. The configured review and merge principals review and merge only after required status checks pass.",
     "branch_protection_expectation": "main keeps required pull request reviews, last-pusher approval, required status checks, enforced admins, force-push denial, deletion denial, and required conversation resolution enabled.",
     "temporary_exception_policy": "If the implementation and review actors collapse to the same GitHub account, any branch-protection relaxation must be explicit, temporary, recorded, and restored immediately after the bounded operation."
   },
@@ -104,9 +104,9 @@ approval.
     {
       "required_review_id": "release_workflow",
       "pull_request_number": 413,
-      "pull_request_author": "brownie-agent",
+      "pull_request_author": "<configured implementation principal>",
       "review_id": "PRR_kwDOTGOop88AAAABMqjWww",
-      "reviewer": "globalpocket",
+      "reviewer": "<configured review principal>",
       "state": "APPROVED",
       "commit_sha": "1bd07b11671592e984cd821e060a2dd5b1921cb7",
       "submitted_at": "2026-09-08T17:19:58Z"
@@ -121,8 +121,8 @@ release evidence by themselves. The collector verifies each
 before counting it. A satisfied independent-review section must include verified
 GitHub review provenance for every required review id, including the pull
 request number, review id, reviewer, implementation PR author, reviewed commit
-SHA, and submission timestamp. The reviewer must be `globalpocket`, the
-implementation PR author must be `brownie-agent`, and those actors must differ.
+SHA, and submission timestamp. The reviewer and implementation PR author must
+match the configured deployment principals, and those actors must differ.
 
 ### `docs/architecture/owner-oss-publication-decision.json`
 
@@ -148,7 +148,7 @@ actions have been completed.
 ## Phase Loop actor preflight
 
 Brownie Phase Loop replacement work must run implementation push and pull-request
-creation under `brownie-agent`, while Codex/globalpocket remains the review and
+creation under the configured implementation principal, while the configured review authority remains the review and
 merge authority. Run the implementation preflight immediately before pushing or
 opening an implementation pull request:
 
@@ -156,8 +156,8 @@ opening an implementation pull request:
 pnpm --workspace-root phase-loop:implementation-preflight
 ```
 
-The command fails closed when the authenticated GitHub actor is `globalpocket`,
-missing, or any actor other than `brownie-agent`. Review and merge automation
+The command fails closed when the authenticated GitHub actor is missing or does
+not match the configured role principal. Review and merge automation
 should run:
 
 ```sh

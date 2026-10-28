@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPhaseLoopActorDeployment } from './phase-loop-actor-deployment.mjs';
 
 import { validateLocalReleaseTargetsManifest } from './guard-local-release-targets.mjs';
 
@@ -377,7 +378,8 @@ export function bootstrapReleaseVms(options = {}) {
   if (errors.length > 0) {
     throw new Error(errors.join('\n'));
   }
-  const repoUrl = options.repoUrl ?? gitValue(repoRoot, ['config', '--get', 'remote.origin.url']) ?? 'https://github.com/globalpocket/brownie.git';
+  const deployment = loadPhaseLoopActorDeployment({ repoRoot }).deployment;
+  const repoUrl = options.repoUrl ?? gitValue(repoRoot, ['config', '--get', 'remote.origin.url']) ?? (deployment?.repository ? `https://github.com/${deployment.repository}.git` : null);
   const ref = options.ref ?? gitValue(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']) ?? 'main';
   const selectedTargets = manifest.targets.filter((target) => target.kind === 'ssh' && (!options.target || target.id === options.target));
   if (selectedTargets.length === 0) {

@@ -16,6 +16,19 @@ const requiredReviewIds = [
   'signing_provenance',
   'release_ready_judgment'
 ];
+const fixtureRepository = 'example-org/evidence-fixture';
+const implementationActor = 'implementation-bot';
+const reviewActor = 'independent-reviewer';
+const fixtureDeploymentResult = {
+  ok: true,
+  deployment: {
+    repository: fixtureRepository,
+    roles: {
+      implementation: { github_login: implementationActor },
+      review: { github_login: reviewActor }
+    }
+  }
+};
 
 function tempRepoRoot() {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-owner-governance-release-'));
@@ -30,11 +43,11 @@ function writeIndependentReviewEvidence(repoRoot, githubReviewProvenance) {
       {
         schema_version: 1,
         evidence_id: 'brownie-owner-independent-review-evidence-v1',
-        review_authority: 'globalpocket',
+        review_authority: reviewActor,
         reviews: requiredReviewIds.map((reviewId) => ({
           id: reviewId,
           status: 'approved',
-          reviewer: 'globalpocket',
+          reviewer: reviewActor,
           self_approval: false
         })),
         github_review_provenance: githubReviewProvenance
@@ -49,9 +62,9 @@ function provenance(requiredReviewId) {
   return {
     required_review_id: requiredReviewId,
     pull_request_number: 414,
-    pull_request_author: 'brownie-agent',
+    pull_request_author: implementationActor,
     review_id: `review-${requiredReviewId}`,
-    reviewer: 'globalpocket',
+    reviewer: reviewActor,
     state: 'APPROVED',
     commit_sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     submitted_at: '2026-09-08T17:30:42Z'
@@ -63,7 +76,8 @@ test('owner governance release collector does not trust static GitHub review pro
   writeIndependentReviewEvidence(repoRoot, requiredReviewIds.map((reviewId) => provenance(reviewId)));
 
   const section = buildIndependentReviewsSection(repoRoot, {
-    repository: 'globalpocket/brownie',
+    repository: fixtureRepository,
+    deploymentResult: fixtureDeploymentResult,
     verifyReviewProvenance: () => ({ verified: false, status: 'github_review_not_verified' })
   });
 
@@ -79,7 +93,8 @@ test('owner governance release collector accepts only verified GitHub review pro
   writeIndependentReviewEvidence(repoRoot, requiredReviewIds.map((reviewId) => provenance(reviewId)));
 
   const section = buildIndependentReviewsSection(repoRoot, {
-    repository: 'globalpocket/brownie',
+    repository: fixtureRepository,
+    deploymentResult: fixtureDeploymentResult,
     verifyReviewProvenance: () => ({ verified: true, status: 'satisfied' })
   });
 

@@ -8,13 +8,13 @@ import {
   validateImplementationPrActor
 } from './phase-loop-pr-actor-guard.mjs';
 
-test('accepts brownie-agent as the implementation PR actor', () => {
-  assert.deepEqual(validateImplementationPrActor('brownie-agent'), []);
+test('accepts the configured implementation PR actor', () => {
+  assert.deepEqual(validateImplementationPrActor('implementation-bot', 'implementation-bot'), []);
 });
 
-test('rejects globalpocket before implementation PR creation', () => {
-  const errors = validateImplementationPrActor('globalpocket');
-  assert.deepEqual(errors, ['implementation PR creation requires GitHub actor brownie-agent; got globalpocket.']);
+test('rejects a review actor before implementation PR creation', () => {
+  const errors = validateImplementationPrActor('reviewer-a', 'implementation-bot');
+  assert.deepEqual(errors, ['implementation PR creation requires GitHub actor implementation-bot; got reviewer-a.']);
 });
 
 test('fails closed when GitHub actor lookup fails', () => {

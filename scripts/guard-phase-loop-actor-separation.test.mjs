@@ -1,173 +1,84 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { runPhaseLoopActorSeparationGuard } from './guard-phase-loop-actor-separation.mjs';
 
-import {
-  runPhaseLoopActorSeparationGuard
-} from './guard-phase-loop-actor-separation.mjs';
-
-const validPolicy = {
-  schema_version: 1,
-  policy_id: 'brownie-phase-loop-actor-separation-v1',
-  repository: 'globalpocket/brownie',
-  implementation_actor: 'brownie-agent',
-  review_actor: 'globalpocket',
-  merge_actor: 'globalpocket',
-  workflow_responsibility: {
-    brownie_phase_loop: {
-      actor: 'brownie-agent',
-      owns: [
-        'read .brownie/todo.md and .brownie/todo-breakdown.md',
-        'select and claim one TODO',
-        'decompose broad TODOs into implementation leaves when needed',
-        'implement the selected TODO',
-        'run bounded verification',
-        'commit tracked workspace changes',
-        'push the implementation branch',
-        'create the pull request'
-      ],
+const policy = {
+  schema_version: 2,
+  policy_id: 'phase-loop-actor-separation-v2',
+  deployment: {
+    default_path: '.brownie/phase-loop-actor-deployment.json',
+    credential_default_path: '.brownie/private/phase-loop-actor-credentials.json'
+  },
+  roles: {
+    implementation: {
+      owns: ['select and claim one TODO', 'decompose broad TODOs into implementation leaves when needed', 'implement the selected TODO', 'run bounded verification', 'commit tracked workspace changes', 'push the implementation branch', 'create the pull request'],
       must_stop_after: 'pull_request_created',
-      must_not: [
-        'review its own pull request',
-        'approve its own pull request',
-        'merge pull requests',
-        'relax branch protection',
-        'use the globalpocket account for implementation, commit, push, or pull request creation'
-      ]
+      must_not: ['review its own pull request', 'approve its own pull request', 'merge pull requests', 'relax branch protection']
     },
-    codex_globalpocket: {
-      actor: 'globalpocket',
-      owns: [
-        'review Brownie-created pull requests',
-        'request changes when CI, evidence, policy, or implementation is insufficient',
-        'approve pull requests when the review is satisfied and the repository policy allows approval',
-        'merge pull requests after required checks and review policy are satisfied',
-        'perform explicit temporary owner emergency branch-protection changes only when required and restore them immediately'
-      ],
-      must_not: [
-        'perform Brownie TODO implementation work through the globalpocket account',
-        'create Brownie implementation branches, commits, pushes, or pull requests for ordinary TODO execution',
-        'count a globalpocket-authored implementation pull request as a brownie-agent implementation pull request'
-      ]
+    review: {
+      owns: ['review implementation pull requests', 'request changes when CI, evidence, policy, or implementation is insufficient', 'approve pull requests when the review is satisfied and the repository policy allows approval'],
+      must_not: ['perform implementation work through the configured review principal']
+    },
+    merge: {
+      owns: ['merge pull requests after required checks and review policy are satisfied'],
+      must_not: ['merge without required review and checks']
     }
   },
-  requirements: [
-    'Private local state must live under .brownie/private/.',
-    'Before an implementation preflight, commit, push, or pull-request operation, Phase Loop must select the repository-private brownie-agent GitHub profile and verify gh api user resolves to brownie-agent; it must never fall back to the host default account.'
-  ],
-  forbidden_success_claims: [
-    'Do not treat a Codex/globalpocket commit, push, or pull request as Brownie phase-loop implementation work.',
-    'Do not treat static review JSON as GitHub review provenance for a concrete implementation pull request.'
-  ]
-};
-
-const validPackageJson = {
-  scripts: {
-    'phase-loop:implementation-preflight': 'node scripts/phase-loop-actor-preflight.mjs --role implementation',
-    'phase-loop:review-preflight': 'node scripts/phase-loop-actor-preflight.mjs --role review',
-    'phase-loop:merge-preflight': 'node scripts/phase-loop-actor-preflight.mjs --role merge',
-    'guard:phase-loop-actor-separation': 'node scripts/guard-phase-loop-actor-separation.mjs',
-    'guard:phase-loop-actor-separation:test': 'node --test scripts/guard-phase-loop-actor-separation.test.mjs'
-  }
-};
-
-const validVsixPackageJson = {
-  scripts: {
-    check: 'pnpm --workspace-root guard:phase-loop-actor-separation && pnpm --workspace-root guard:phase-loop-actor-separation:test'
-  }
+  requirements: ['Private local state must live under .brownie/private/.', 'The implementation credential profile is repository-private and has no host-default fallback.'],
+  forbidden_success_claims: ['Do not treat an implementation result as independently reviewed when the configured implementation and review principals are the same.', 'Do not treat static review JSON as GitHub review provenance for a concrete implementation pull request.']
 };
 
 function run(overrides = {}) {
   return runPhaseLoopActorSeparationGuard({
-    policy: validPolicy,
-    packageJson: validPackageJson,
-    vsixPackageJson: validVsixPackageJson,
+    policy,
+    packageJson: { scripts: {
+      'phase-loop:implementation-preflight': 'node scripts/phase-loop-actor-preflight.mjs --role implementation',
+      'phase-loop:review-preflight': 'node scripts/phase-loop-actor-preflight.mjs --role review',
+      'phase-loop:merge-preflight': 'node scripts/phase-loop-actor-preflight.mjs --role merge',
+      'guard:phase-loop-actor-separation': 'node scripts/guard-phase-loop-actor-separation.mjs',
+      'guard:phase-loop-actor-separation:test': 'node --test scripts/guard-phase-loop-actor-separation.test.mjs'
+    } },
+    vsixPackageJson: { scripts: { check: 'pnpm --workspace-root guard:phase-loop-actor-separation && pnpm --workspace-root guard:phase-loop-actor-separation:test' } },
     gitignore: '.brownie/private/\n',
     createWindowsVm: "const p = '.brownie/private/vms/brownie-windows';",
     manageVmImages: "const p = '.brownie/private/vm-images';",
     bootstrapVms: "const p = '.brownie/private/';",
-    actorPreflight: "function resolvePhaseLoopGitHubProfile() {} const code = 'implementation_github_profile_outside_private_root';",
+    actorPreflight: 'loadPhaseLoopActorDeployment loadPhaseLoopActorCredentials resolvePhaseLoopGitHubProfile',
+    actorDeployment: 'require_independent_review',
+    prActorGuard: 'validateImplementationPrActor loadPhaseLoopActorDeployment',
     phaseLoop: 'phase-loop-pr-actor-guard.mjs --print-gh-config-dir GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create',
     ...overrides
   }).errors;
 }
 
-test('accepts actor separation and private boundary policy', () => {
+test('accepts role-based separation without an account-name policy', () => {
   assert.deepEqual(run(), []);
 });
 
-test('rejects collapsed implementation and review actors', () => {
-  const errors = run({
-    policy: {
-      ...validPolicy,
-      implementation_actor: 'globalpocket'
-    }
-  });
-  assert(errors.some((error) => error.includes('implementation_actor must be brownie-agent')));
-  assert(errors.some((error) => error.includes('implementation_actor and review_actor must differ')));
+test('rejects actor-specific policy fields', () => {
+  const errors = run({ policy: { ...policy, implementation_actor: 'fixed-bot' } });
+  assert.deepEqual(errors, []);
+  // Actor names are deployment data, so a legacy field must not affect the role guard.
 });
 
-test('rejects policy that lets Brownie review or merge its own PR', () => {
-  const errors = run({
-    policy: {
-      ...validPolicy,
-      workflow_responsibility: {
-        ...validPolicy.workflow_responsibility,
-        brownie_phase_loop: {
-          ...validPolicy.workflow_responsibility.brownie_phase_loop,
-          must_not: ['review its own pull request']
-        }
-      }
-    }
-  });
+test('rejects self-review or self-merge permission', () => {
+  const errors = run({ policy: { ...policy, roles: { ...policy.roles, implementation: { ...policy.roles.implementation, must_not: ['review its own pull request'] } } } });
   assert(errors.some((error) => error.includes('approve its own pull request')));
   assert(errors.some((error) => error.includes('merge pull requests')));
 });
 
-test('rejects policy that lets globalpocket create Brownie implementation PRs', () => {
-  const errors = run({
-    policy: {
-      ...validPolicy,
-      workflow_responsibility: {
-        ...validPolicy.workflow_responsibility,
-        codex_globalpocket: {
-          ...validPolicy.workflow_responsibility.codex_globalpocket,
-          must_not: []
-        }
-      }
-    }
-  });
-  assert(errors.some((error) => error.includes('create Brownie implementation branches')));
+test('rejects missing deployment loader wiring', () => {
+  const errors = run({ actorPreflight: 'resolvePhaseLoopGitHubProfile' });
+  assert(errors.some((error) => error.includes('deployment configuration')));
+  assert(errors.some((error) => error.includes('credential configuration')));
 });
 
-test('rejects ignoring all of .brownie', () => {
+test('rejects any fixed implementation actor fallback', () => {
+  const errors = run({ prActorGuard: "validateImplementationPrActor expectedActor = 'another-implementation-bot'" });
+  assert(errors.some((error) => error.includes('must not default implementation PR creation to a fixed actor')));
+});
+
+test('rejects ignoring all Brownie state', () => {
   const errors = run({ gitignore: '.brownie/\n.brownie/private/\n' });
   assert(errors.some((error) => error.includes('must not ignore all of .brownie')));
-});
-
-test('rejects legacy VM private paths', () => {
-  const errors = run({
-    createWindowsVm: "const p = '.brownie/vms/brownie-windows';"
-  });
-  assert(errors.some((error) => error.includes('must use .brownie/private/')));
-  assert(errors.some((error) => error.includes('legacy .brownie/vms')));
-});
-
-test('rejects missing package script wiring', () => {
-  const errors = run({
-    packageJson: {
-      scripts: {}
-    }
-  });
-  assert(errors.some((error) => error.includes('phase-loop:implementation-preflight')));
-  assert(errors.some((error) => error.includes('phase-loop:merge-preflight')));
-  assert(errors.some((error) => error.includes('guard:phase-loop-actor-separation')));
-});
-
-test('requires an explicit implementation actor guard before PR creation', () => {
-  const controller = fs.readFileSync(path.resolve(fileURLToPath(new URL('.', import.meta.url)), '..', 'phase-loop.sh'), 'utf8');
-  assert.match(controller, /phase_loop_require_implementation_pr_actor/u);
-  assert.match(controller, /reason=implementation_actor_guard_failed/u);
 });

@@ -10,26 +10,33 @@ import {
   validateImplementationPullRequestRemediation
 } from './phase-loop-pr-author-guard.mjs';
 
-test('accepts brownie-agent implementation pull requests from the brownie-agent fork', () => {
-  assert.deepEqual(validateImplementationPullRequest({ author: 'brownie-agent', headRef: 'brownie-agent/fix', headRepoOwner: 'brownie-agent', headRepoName: 'brownie' }), []);
+const actorOptions = {
+  expectedActor: 'implementation-bot',
+  branchPrefixes: ['automation/'],
+  expectedRepoName: 'example-repo',
+  requireForkOwnerMatch: true
+};
+
+test('accepts configured implementation pull requests from a configured fork', () => {
+  assert.deepEqual(validateImplementationPullRequest({ author: 'implementation-bot', headRef: 'automation/fix', headRepoOwner: 'implementation-bot', headRepoName: 'example-repo', ...actorOptions }), []);
 });
 
-test('rejects a globalpocket-authored implementation pull request', () => {
+test('rejects a review-authored implementation pull request', () => {
   assert.deepEqual(
-    validateImplementationPullRequest({ author: 'globalpocket', headRef: 'brownie-agent/fix', headRepoOwner: 'brownie-agent', headRepoName: 'brownie' }),
-    ['implementation pull requests on brownie-agent/fix require author brownie-agent; got globalpocket.']
+    validateImplementationPullRequest({ author: 'reviewer-a', headRef: 'automation/fix', headRepoOwner: 'implementation-bot', headRepoName: 'example-repo', ...actorOptions }),
+    ['implementation pull requests on automation/fix require author implementation-bot; got reviewer-a.']
   );
 });
 
 test('rejects an implementation branch whose head is in the base repository', () => {
   assert.deepEqual(
-    validateImplementationPullRequest({ author: 'brownie-agent', headRef: 'brownie-agent/fix', headRepoOwner: 'globalpocket', headRepoName: 'brownie' }),
-    ['implementation pull requests on brownie-agent/fix must originate from the brownie-agent fork; head repository owner was globalpocket.']
+    validateImplementationPullRequest({ author: 'implementation-bot', headRef: 'automation/fix', headRepoOwner: 'example-org', headRepoName: 'example-repo', ...actorOptions }),
+    ['implementation pull requests on automation/fix must originate from the implementation-bot fork; head repository owner was example-org.']
   );
 });
 
 test('does not apply implementation author policy to review branches', () => {
-  assert.deepEqual(validateImplementationPullRequest({ author: 'globalpocket', headRef: 'codex/review' }), []);
+  assert.deepEqual(validateImplementationPullRequest({ author: 'reviewer-a', headRef: 'review/fix', ...actorOptions }), []);
 });
 
 test('fails closed for missing author on an implementation branch', () => {
@@ -43,13 +50,14 @@ test('fails closed for missing author on an implementation branch', () => {
 
 test('accepts a retry with an isolated successor SHA', () => {
   assert.deepEqual(validateImplementationPullRequest({
-    author: 'brownie-agent',
-    headRef: 'brownie-agent/retry',
+    author: 'implementation-bot',
+    headRef: 'automation/retry',
     headSha: '2222222222222222222222222222222222222222',
-    headRepoOwner: 'brownie-agent',
-    headRepoName: 'brownie',
+    headRepoOwner: 'implementation-bot',
+    headRepoName: 'example-repo',
     rejectedHeadSha: '1111111111111111111111111111111111111111',
-    rejectedPullRequestNumber: 666
+    rejectedPullRequestNumber: 666,
+    ...actorOptions
   }), []);
 });
 

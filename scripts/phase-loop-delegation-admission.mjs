@@ -34,12 +34,12 @@ function readJsonLines(file) {
 
 const DEFAULT_ACKNOWLEDGEMENT_TIMEOUT_MS = 30 * 60 * 1000;
 
-function pendingBrownieAgentDelegation(feedback) {
+function pendingImplementationDelegation(feedback, requiredActor) {
   const delegation = feedback?.delegation && typeof feedback.delegation === 'object' ? feedback.delegation : {};
   return (
     feedback?.kind === 'phase_loop_delegation_pending'
     && feedback?.completed !== true
-    && delegation.required_actor === 'brownie-agent'
+    && delegation.required_actor === requiredActor
     && delegation.acknowledgement_required === true
     && delegation.status === 'pending'
   );
@@ -49,11 +49,12 @@ function delegationFingerprint(feedback) {
   return crypto.createHash('sha256').update(JSON.stringify(feedback)).digest('hex');
 }
 
-export function recordDelegationAdmission({ feedbackPath, auditPath, now = new Date().toISOString() }) {
+export function recordDelegationAdmission({ feedbackPath, auditPath, requiredActor, now = new Date().toISOString() }) {
   const feedback = readJson(feedbackPath);
   if (!feedback) return { ok: true, recorded: false, reason: 'feedback_missing' };
   if (feedback.__read_error) return { ok: false, code: 'feedback_unreadable', error: feedback.__read_error };
-  if (!pendingBrownieAgentDelegation(feedback)) return { ok: true, recorded: false, reason: 'not_pending_brownie_agent_handoff' };
+  if (!requiredActor) return { ok: false, code: 'delegation_actor_missing' };
+  if (!pendingImplementationDelegation(feedback, requiredActor)) return { ok: true, recorded: false, reason: 'not_pending_implementation_handoff' };
 
   const fingerprint = delegationFingerprint(feedback);
   const existing = readJsonLines(auditPath).find((record) => record?.feedback_sha256 === fingerprint && record?.phase === 'received');
@@ -67,9 +68,9 @@ export function recordDelegationAdmission({ feedbackPath, auditPath, now = new D
     admission_id: crypto.randomUUID(),
     feedback_sha256: fingerprint,
     selected_todo_first_line: String(feedback.selected_todo ?? '').split('\n')[0],
-    required_actor: 'brownie-agent',
+    required_actor: requiredActor,
     authority: 'existing_controller_maintenance_implementation_policy',
-    required_authority: 'brownie-agent implementation actor and authenticated implementation credentials',
+    required_authority: 'configured implementation actor and authenticated implementation credentials',
     alternative_unavailable: true,
     reason: 'controller_maintenance_delegation_received_without_requiring_a_second_user_approval',
     at: now,
@@ -83,11 +84,12 @@ export function recordDelegationAdmission({ feedbackPath, auditPath, now = new D
   }
 }
 
-export function delegationAdmissionStatus({ feedbackPath, auditPath, now = new Date().toISOString() }) {
+export function delegationAdmissionStatus({ feedbackPath, auditPath, requiredActor, now = new Date().toISOString() }) {
   const feedback = readJson(feedbackPath);
   if (!feedback) return { ok: true, pending: false, reason: 'feedback_missing' };
   if (feedback.__read_error) return { ok: false, code: 'feedback_unreadable', error: feedback.__read_error };
-  if (!pendingBrownieAgentDelegation(feedback)) return { ok: true, pending: false, reason: 'not_pending_brownie_agent_handoff' };
+  if (!requiredActor) return { ok: false, code: 'delegation_actor_missing', pending: true };
+  if (!pendingImplementationDelegation(feedback, requiredActor)) return { ok: true, pending: false, reason: 'not_pending_implementation_handoff' };
   const record = readJsonLines(auditPath).find((entry) => (
     entry?.phase === 'received' && entry?.feedback_sha256 === delegationFingerprint(feedback)
   ));
@@ -109,7 +111,7 @@ export function delegationAdmissionStatus({ feedbackPath, auditPath, now = new D
     ok: true,
     pending: true,
     state: observedAt >= dueAt ? 'overdue' : 'awaiting_acknowledgement',
-    required_actor: 'brownie-agent',
+    required_actor: requiredActor,
     acknowledgement_due_at: new Date(dueAt).toISOString(),
     admission_id: record.admission_id
   };
@@ -121,10 +123,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   ), []));
   const feedbackPath = args.get('feedback');
   const auditPath = args.get('audit');
-  if (!feedbackPath || !auditPath) process.exit(2);
+  const requiredActor = args.get('actor') || process.env.PHASE_LOOP_EXPECTED_ACTOR;
+  if (!feedbackPath || !auditPath || !requiredActor) process.exit(2);
   const result = process.argv[2] === 'record'
-    ? recordDelegationAdmission({ feedbackPath, auditPath })
-    : delegationAdmissionStatus({ feedbackPath, auditPath });
+    ? recordDelegationAdmission({ feedbackPath, auditPath, requiredActor })
+    : delegationAdmissionStatus({ feedbackPath, auditPath, requiredActor });
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (!result.ok) process.exit(78);
 }
