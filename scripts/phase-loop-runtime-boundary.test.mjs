@@ -17,8 +17,8 @@ function mismatchRecoveryBlock() {
 test('runtime mismatch recovery restores delegated scope, target, and pre-runtime claim snapshots', () => {
   const block = mismatchRecoveryBlock();
   assert.match(block, /phase-loop-delegated-scope\.mjs/);
-  assert.match(block, /active_target_snapshot/);
-  assert.match(block, /cp \"\$active_target_snapshot\"/);
+  assert.match(block, /active_target_snapshots/);
+  assert.match(block, /restore_pre_runtime_active_target_snapshots \"\$active_target_snapshots\"/);
   assert.match(block, /restore_claim_snapshot_before_runtime \"\$claim_snapshot_before_runtime\"/);
   assert.doesNotMatch(block, /\n\s+write_todo_claim\b/);
 });
@@ -87,6 +87,38 @@ test('controller validates queue integrity before resuming an active claim', () 
   assert.match(controller, /write_status "continuation_required" "\$detail" "\$run_id" "\$exit_code" "0" "" "true"/);
   assert.doesNotMatch(controller, /continuation_required\)[\s\S]{0,500}write_status "running"/);
   assert.match(controller, /todo-queue-integrity-resume-\$run_stamp/);
+});
+
+test('controller defers only the selected-target integrity finding for a verified Runtime resume continuation', () => {
+  const helperStart = controller.indexOf('phase_loop_can_defer_selected_target_change_for_continuation()');
+  const helperEnd = controller.indexOf('\ntry_reconstruct_missing_todo_replan_records()', helperStart);
+  assert(helperStart >= 0 && helperEnd > helperStart, 'narrow continuation integrity helper must exist');
+  const helper = controller.slice(helperStart, helperEnd);
+  assert.match(helper, /error\.get\("code"\) != "selected_target_not_changed"/);
+  assert.match(helper, /session_artifact_prefixes = \(/);
+  assert.match(helper, /\.brownie\/headless-continuations\//);
+  assert.match(helper, /\.brownie\/headless-journeys\//);
+  assert.match(helper, /\.brownie\/headless-objective-admissions\//);
+  assert.match(helper, /\.brownie\/headless-run-sessions\//);
+  assert.match(helper, /missing changed-file evidence for continuation/);
+  assert.match(helper, /continuation changed files are not Runtime session artifacts/);
+  assert.match(helper, /payload\.get\("continuation_required"\) is True/);
+  assert.match(helper, /automation\.get\("continuation_required"\) is True/);
+  assert.match(helper, /payload\.get\("controller_action"\) == "resume"/);
+  assert.match(helper, /invocation\.get\("command"\) == "resume"/);
+  assert.match(helper, /payload\.get\("completed"\) is False/);
+  assert.match(helper, /payload\.get\("blocked"\) is False/);
+  assert.match(helper, /payload\.get\("terminal_failure"\) is False/);
+
+  const integrityStart = controller.indexOf('if ! progress_integrity_validation=');
+  const integrityEnd = controller.indexOf('    write_bdk_trajectory_event "$run_stamp" "verification.run"', integrityStart);
+  assert(integrityStart >= 0 && integrityEnd > integrityStart, 'post-runtime integrity block must exist');
+  const integrity = controller.slice(integrityStart, integrityEnd);
+  const defer = integrity.indexOf('phase_loop_can_defer_selected_target_change_for_continuation');
+  const repair = integrity.indexOf('write_repair_feedback');
+  assert(defer >= 0 && repair > defer, 'verified continuation must be considered before repair feedback');
+  assert.match(integrity, /write_status "continuation_required"/);
+  assert.match(integrity, /integrity_deferred":"selected_target_not_changed/);
 });
 
 test('explicit run-once rebaselines only a stale stop marker after acquiring ownership', () => {
