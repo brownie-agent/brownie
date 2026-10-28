@@ -6316,6 +6316,31 @@ restore_active_target_baseline() {
   return 1
 }
 
+# Restore the exact pre-dispatch target state for a failed Runtime invocation.
+# A missing target is an explicit baseline state, not an absent backup: without
+# the marker a failed create_file would survive recovery as an untracked file.
+# This function deliberately does not consult known-good state, because
+# admission recovery must restore the snapshot that was current at dispatch.
+restore_pre_runtime_active_target_snapshot() {
+  local target_path="${1:-}" snapshot_path="${2:-}" target_abs
+  if [ -z "$target_path" ] || [ -z "$snapshot_path" ]; then
+    return 0
+  fi
+  target_abs="$PHASE_LOOP_WORKSPACE_ROOT/$target_path"
+  if [ -f "$snapshot_path.absent" ]; then
+    if [ -e "$target_abs" ] || [ -L "$target_abs" ]; then
+      rm -f "$target_abs" || return 1
+    fi
+    return 0
+  fi
+  if [ -f "$snapshot_path" ]; then
+    mkdir -p "$(dirname "$target_abs")" || return 1
+    cp "$snapshot_path" "$target_abs"
+    return $?
+  fi
+  return 1
+}
+
 run_changed_file_quality_gates() {
   local before_status_path="${1:-}"
   python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$before_status_path" <<'PY'
@@ -14603,10 +14628,8 @@ phase_loop_recover_expired_runtime_authorization() {
     --backup "$delegated_scope_backup" \
     --objective "$(claim_field selected_todo)" 2>&1)"
   mismatch_scope_status=$?
-  if [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$active_target_snapshot" ]; then
-    cp "$active_target_snapshot" "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path"
-    mismatch_target_status=$?
-  fi
+  restore_pre_runtime_active_target_snapshot "$active_target_path" "$active_target_snapshot"
+  mismatch_target_status=$?
   # Do not synthesize a claim from live queue inputs while recovering an
   # interrupted Runtime session; preserve the exact pre-dispatch claim.
   restore_claim_snapshot_before_runtime "$claim_snapshot_before_runtime"
@@ -14871,10 +14894,16 @@ _run_brownie_once() {
   fi
   active_target_path="$(active_claim_patch_only_target 2>/dev/null || true)"
   active_target_snapshot=""
-  if [ -n "$active_target_path" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
+  if [ -n "$active_target_path" ]; then
     active_target_snapshot="$RUN_DIR/$run_stamp.target.before"
-    cp "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" "$active_target_snapshot"
-    chmod 600 "$active_target_snapshot" 2>/dev/null || true
+    rm -f "$active_target_snapshot" "$active_target_snapshot.absent"
+    if [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
+      cp "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" "$active_target_snapshot"
+      chmod 600 "$active_target_snapshot" 2>/dev/null || true
+    else
+      : > "$active_target_snapshot.absent"
+      chmod 600 "$active_target_snapshot.absent" 2>/dev/null || true
+    fi
   fi
   if [ ! -x "$BROWNIE_BIN" ]; then
     detail="Brownie binary is not executable: $BROWNIE_BIN"
@@ -15204,10 +15233,16 @@ PY
   # are bound to the live claim, TODO contract, and target selected for this
   # runtime invocation.
   active_target_snapshot=""
-  if [ -n "$active_target_path" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
+  if [ -n "$active_target_path" ]; then
     active_target_snapshot="$RUN_DIR/$run_stamp.target.before"
-    cp "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" "$active_target_snapshot"
-    chmod 600 "$active_target_snapshot" 2>/dev/null || true
+    rm -f "$active_target_snapshot" "$active_target_snapshot.absent"
+    if [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
+      cp "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" "$active_target_snapshot"
+      chmod 600 "$active_target_snapshot" 2>/dev/null || true
+    else
+      : > "$active_target_snapshot.absent"
+      chmod 600 "$active_target_snapshot.absent" 2>/dev/null || true
+    fi
   fi
   local deterministic_todo_decomposition_output deterministic_todo_decomposition_status
   if deterministic_todo_decomposition_output="$(try_deterministic_todo_decomposition_repair "$run_stamp" 2>&1)"; then
@@ -15932,10 +15967,8 @@ NODE
       --backup "$delegated_scope_backup" \
       --objective "$(claim_field selected_todo)" 2>&1)"
     mismatch_scope_status=$?
-    if [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$active_target_snapshot" ]; then
-      cp "$active_target_snapshot" "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path"
-      mismatch_target_status=$?
-    fi
+    restore_pre_runtime_active_target_snapshot "$active_target_path" "$active_target_snapshot"
+    mismatch_target_status=$?
     # Do not call write_todo_claim here: if Runtime removed current.json that
     # helper would synthesize a fresh claim from live inputs. Recovery must
     # restore the durable claim captured immediately before Runtime instead.
