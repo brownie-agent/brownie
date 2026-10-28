@@ -2626,7 +2626,32 @@ fn add_external_loop_contract(
         .unwrap_or(0)
         > 0
         && !outcome.completed;
-    if failed_terminal_completion || terminal_task_closure_without_completion {
+    // A closure count is not failure evidence. It can be produced when a
+    // bounded drive stops before persisting its completion result. Preserve
+    // the runtime's resumable outcome in that case so the controller's retry
+    // budget and redelegation policy can act; only an explicit Failed result
+    // may terminalize the implementation claim.
+    if terminal_task_closure_without_completion && !failed_terminal_completion {
+        outcome.status = "continuation_required".to_string();
+        outcome.class_name = "continuation_required".to_string();
+        outcome.controller_action = "resume".to_string();
+        outcome.continuation_required = true;
+        outcome.completed = false;
+        outcome.blocked = true;
+        outcome.retryable = true;
+        outcome.terminal_failure = false;
+        outcome.stop_reason = "terminal_completion_evidence_missing".to_string();
+        outcome.next_invocation = next_invocation_for_controller_action("resume");
+        outcome.outcome_source = format!(
+            "{}_terminal_completion_evidence_missing",
+            outcome.outcome_source
+        );
+        payload.insert(
+            "terminal_completion_evidence_missing".to_string(),
+            Value::Bool(true),
+        );
+    }
+    if failed_terminal_completion {
         outcome.status = "terminal_failure".to_string();
         outcome.class_name = "terminal_failure".to_string();
         outcome.controller_action = "stop".to_string();
@@ -2637,12 +2662,7 @@ fn add_external_loop_contract(
         outcome.terminal_failure = true;
         outcome.stop_reason = "terminal_task_failed".to_string();
         outcome.next_invocation = None;
-        let suffix = if failed_terminal_completion {
-            "terminal_completion_evidence"
-        } else {
-            "terminal_completion_closure"
-        };
-        outcome.outcome_source = format!("{}_{}", outcome.outcome_source, suffix);
+        outcome.outcome_source = format!("{}_terminal_completion_evidence", outcome.outcome_source);
     }
     payload.insert(
         "continuation_required".to_string(),
@@ -6265,26 +6285,27 @@ mod tests {
     }
 
     #[test]
-    fn cli_run_fail_closes_unknown_nonterminal_with_terminal_task_count() {
+    fn cli_run_keeps_unknown_terminal_closure_resumable_without_failure_evidence() {
         let result: Value = serde_json::from_str(
             r#"{"status":"task_executed","session_id":"cli.run.failed","drive_id":"cli.run.failed.drive","start_session_sequence":0,"end_session_sequence":1,"replayed":false,"max_advances":3,"max_steps_per_advance":1,"advance_count":1,"executed_count":1,"replayed_count":0,"stop_reason":"budget_exhausted","drive_fingerprint":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","completion_closure":{"status":"unknown_nonterminal","stop_reason":"budget_exhausted","terminal_task_count":1,"total_task_count":1,"runnable_task_count":0,"blocked_task_count":0,"route_candidate_count":0,"progress_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","aggregate_sequence":8,"next_action":"inspect_progress_overview","closure_fingerprint":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"start_progress":{"progress_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","aggregate_sequence":5},"post_progress":{"progress_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","aggregate_sequence":8},"next_action":"inspect_progress_overview","execution_outcome":{"schema_version":1,"outcome_scope":"objective","class":"continuation_required","status":"continuation_required","controller_action":"resume","continuation_required":true,"completed":false,"blocked":false,"retryable":true,"terminal_failure":false,"stop_reason":"budget_exhausted","next_invocation":{"command":"resume","arguments":[]}}}"#,
         )
         .unwrap();
         let payload = cli_run_payload(&result).unwrap();
         assert_eq!(payload["completion_closure_terminal_task_count"], 1);
+        assert_eq!(payload["terminal_completion_evidence_missing"], true);
         assert_eq!(payload["blocked"], true);
-        assert_eq!(payload["terminal_failure"], true);
-        assert_eq!(payload["continuation_required"], false);
-        assert_eq!(payload["controller_action"], "stop");
-        assert_eq!(payload["stop_class"], "terminal_failure");
+        assert_eq!(payload["terminal_failure"], false);
+        assert_eq!(payload["continuation_required"], true);
+        assert_eq!(payload["controller_action"], "resume");
+        assert_eq!(payload["stop_class"], "continuation_required");
         assert_eq!(
             payload["automation"]["outcome_source"],
-            "runtime_terminal_completion_closure"
+            "runtime_terminal_completion_evidence_missing"
         );
     }
 
     #[test]
-    fn cli_run_fail_closes_no_eligible_closure_with_terminal_task_count() {
+    fn cli_run_keeps_no_eligible_terminal_closure_resumable_without_failure_evidence() {
         let result: Value = serde_json::from_str(
             r#"{"status":"no_eligible_task","session_id":"cli.run.failed","drive_id":"cli.run.failed.drive","start_session_sequence":0,"end_session_sequence":2,"replayed":false,"max_advances":3,"max_steps_per_advance":1,"advance_count":1,"executed_count":1,"replayed_count":0,"stop_reason":"no_eligible_task","drive_fingerprint":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","completion_closure":{"status":"no_eligible_task","stop_reason":"no_eligible_task","terminal_task_count":1,"total_task_count":1,"runnable_task_count":0,"blocked_task_count":0,"route_candidate_count":0,"progress_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","aggregate_sequence":8,"next_action":"inspect_progress_overview","closure_fingerprint":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"start_progress":{"progress_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","aggregate_sequence":5},"post_progress":{"progress_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","aggregate_sequence":8},"next_action":"inspect_progress_overview"}"#,
         )
@@ -6294,16 +6315,20 @@ mod tests {
         assert_eq!(payload["executed_count"], 1);
         assert_eq!(payload["task_execution_confirmed"], true);
         assert_eq!(payload["completion_closure_terminal_task_count"], 1);
+        assert_eq!(payload["terminal_completion_evidence_missing"], true);
         assert_eq!(payload["blocked"], true);
-        assert_eq!(payload["terminal_failure"], true);
-        assert_eq!(payload["continuation_required"], false);
-        assert_eq!(payload["controller_action"], "stop");
-        assert_eq!(payload["stop_class"], "terminal_failure");
-        assert_eq!(payload["stop_reason"], "terminal_task_failed");
-        assert!(payload.get("next_invocation").is_none());
+        assert_eq!(payload["terminal_failure"], false);
+        assert_eq!(payload["continuation_required"], true);
+        assert_eq!(payload["controller_action"], "resume");
+        assert_eq!(payload["stop_class"], "continuation_required");
+        assert_eq!(
+            payload["stop_reason"],
+            "terminal_completion_evidence_missing"
+        );
+        assert_eq!(payload["next_invocation"]["command"], "resume");
         assert_eq!(
             payload["automation"]["outcome_source"],
-            "legacy_cli_projection_terminal_completion_closure"
+            "legacy_cli_projection_terminal_completion_evidence_missing"
         );
     }
 

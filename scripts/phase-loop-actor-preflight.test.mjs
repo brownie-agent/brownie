@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
+  resolvePhaseLoopGitHubProfile,
   validatePhaseLoopActorPreflight
 } from './phase-loop-actor-preflight.mjs';
 
@@ -20,6 +21,43 @@ const policy = {
 test('controller passes the implementation workspace to actor preflight', () => {
   const controller = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'phase-loop.sh'), 'utf8');
   assert.match(controller, /phase-loop-actor-preflight\.mjs" --role implementation --repo-root "\$PHASE_LOOP_WORKSPACE_ROOT"/u);
+  assert.match(controller, /--print-gh-config-dir/u);
+  assert.match(controller, /GH_CONFIG_DIR="\$implementation_gh_config_dir" gh pr create/u);
+});
+
+test('implementation resolves only the repository-private brownie-agent profile', () => {
+  const repo = fs.mkdtempSync(path.join(process.cwd(), '.test-actor-profile-'));
+  try {
+    fs.mkdirSync(path.join(repo, '.brownie/private/gh-brownie-agent'), { recursive: true });
+    const profile = resolvePhaseLoopGitHubProfile({
+      repoRoot: repo,
+      role: 'implementation',
+      actor: 'brownie-agent',
+      env: { GH_CONFIG_DIR: '/must-not-be-used' }
+    });
+    assert.equal(profile.ok, true);
+    assert.equal(profile.profile_id, 'private-brownie-agent');
+    assert.equal(profile.github_config_dir, path.join(repo, '.brownie/private/gh-brownie-agent'));
+    assert.equal(profile.env.GH_CONFIG_DIR, profile.github_config_dir);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('implementation rejects a credential profile outside repository private state', () => {
+  const repo = fs.mkdtempSync(path.join(process.cwd(), '.test-actor-profile-'));
+  try {
+    const profile = resolvePhaseLoopGitHubProfile({
+      repoRoot: repo,
+      role: 'implementation',
+      actor: 'brownie-agent',
+      env: { PHASE_LOOP_IMPLEMENTATION_GH_CONFIG_DIR: '/tmp/not-brownie-private' }
+    });
+    assert.equal(profile.ok, false);
+    assert.equal(profile.code, 'implementation_github_profile_outside_private_root');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test('accepts brownie-agent implementation actor on implementation branch', () => {

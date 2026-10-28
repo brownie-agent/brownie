@@ -47,6 +47,7 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   const manageVmImages = options.manageVmImages ?? readText(repoRoot, 'scripts/manage-release-vm-images.mjs', errors);
   const bootstrapVms = options.bootstrapVms ?? readText(repoRoot, 'scripts/bootstrap-release-vms.mjs', errors);
   const phaseLoop = options.phaseLoop ?? readText(repoRoot, 'phase-loop.sh', errors);
+  const actorPreflight = options.actorPreflight ?? readText(repoRoot, 'scripts/phase-loop-actor-preflight.mjs', errors);
   const prActorGuard = options.prActorGuard ?? readText(repoRoot, 'scripts/phase-loop-pr-actor-guard.mjs', errors);
 
   requireValue(policy.schema_version === 1, errors, `${policyPath} schema_version must be 1.`);
@@ -135,6 +136,12 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
     errors,
     `${policyPath} requirements must place private local state under .brownie/private/.`
   );
+  requireValue(
+    Array.isArray(policy.requirements) &&
+      policy.requirements.some((requirement) => /repository-private brownie-agent GitHub profile/u.test(requirement)),
+    errors,
+    `${policyPath} must require a repository-private brownie-agent GitHub profile for implementation publishing.`
+  );
 
   requireValue(gitignore.includes('.brownie/private/'), errors, '.gitignore must ignore .brownie/private/.');
   requireValue(!/^\.brownie\/\s*$/m.test(gitignore), errors, '.gitignore must not ignore all of .brownie/.');
@@ -155,6 +162,10 @@ export function runPhaseLoopActorSeparationGuard(options = {}) {
   requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root guard:phase-loop-actor-separation'), errors, 'VSIX check must invoke guard:phase-loop-actor-separation.');
   requireValue(vsixPackageJson.scripts?.check?.includes('pnpm --workspace-root guard:phase-loop-actor-separation:test'), errors, 'VSIX check must invoke guard:phase-loop-actor-separation:test.');
   requireValue(phaseLoop.includes('phase-loop-pr-actor-guard.mjs'), errors, 'phase-loop.sh must invoke the implementation PR actor guard before commit/push/PR creation.');
+  requireValue(phaseLoop.includes('--print-gh-config-dir'), errors, 'phase-loop.sh must resolve a dedicated implementation GitHub profile before publish.');
+  requireValue(phaseLoop.includes('GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create'), errors, 'phase-loop.sh must use the dedicated implementation GitHub profile for PR creation.');
+  requireValue(actorPreflight.includes('resolvePhaseLoopGitHubProfile'), errors, 'actor preflight must resolve a role-specific GitHub profile.');
+  requireValue(actorPreflight.includes('implementation_github_profile_outside_private_root'), errors, 'actor preflight must reject implementation profiles outside .brownie/private/.');
   requireValue(prActorGuard.includes("expectedActor = 'brownie-agent'"), errors, 'phase-loop-pr-actor-guard.mjs must default implementation PR creation to actor brownie-agent.');
   requireValue(prActorGuard.includes('validateImplementationPrActor'), errors, 'phase-loop-pr-actor-guard.mjs must validate the authenticated implementation PR actor.');
 

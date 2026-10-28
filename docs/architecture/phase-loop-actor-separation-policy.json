@@ -56,6 +56,7 @@
     "Brownie Phase Loop replacement implementation work must push and create pull requests as brownie-agent, not globalpocket.",
     "Codex/globalpocket may review and merge Brownie Phase Loop implementation pull requests after required checks pass.",
     "Implementation preflight must fail closed when the authenticated GitHub actor is missing, unknown, globalpocket, or any actor other than brownie-agent.",
+    "Before an implementation preflight, commit, push, or pull-request operation, Phase Loop must select the repository-private brownie-agent GitHub profile and verify gh api user resolves to brownie-agent; it must never fall back to the host default account.",
     "Review preflight must fail closed when the authenticated GitHub actor is missing, unknown, brownie-agent, or any actor other than globalpocket.",
     "Merge preflight must fail closed when the authenticated GitHub actor is missing, unknown, brownie-agent, or any actor other than globalpocket.",
     "Private local state, VM disks, VM images, credentials, screenshots, and machine-local scratch files must live under .brownie/private/ so shared Brownie evidence under .brownie/release-evidence/ remains trackable."

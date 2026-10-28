@@ -54,7 +54,8 @@ const validPolicy = {
     }
   },
   requirements: [
-    'Private local state must live under .brownie/private/.'
+    'Private local state must live under .brownie/private/.',
+    'Before an implementation preflight, commit, push, or pull-request operation, Phase Loop must select the repository-private brownie-agent GitHub profile and verify gh api user resolves to brownie-agent; it must never fall back to the host default account.'
   ],
   forbidden_success_claims: [
     'Do not treat a Codex/globalpocket commit, push, or pull request as Brownie phase-loop implementation work.',
@@ -87,6 +88,8 @@ function run(overrides = {}) {
     createWindowsVm: "const p = '.brownie/private/vms/brownie-windows';",
     manageVmImages: "const p = '.brownie/private/vm-images';",
     bootstrapVms: "const p = '.brownie/private/';",
+    actorPreflight: "function resolvePhaseLoopGitHubProfile() {} const code = 'implementation_github_profile_outside_private_root';",
+    phaseLoop: 'phase-loop-pr-actor-guard.mjs --print-gh-config-dir GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create',
     ...overrides
   }).errors;
 }

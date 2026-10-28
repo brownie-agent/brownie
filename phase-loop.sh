@@ -10063,7 +10063,7 @@ phase_loop_create_pr_for_progress() {
   local stderr_log="$3"
   local workspace_before="$4"
   local workspace_after="$5"
-  local title body pr_url branch push_rc pending_publish="${6:-0}"
+  local title body pr_url branch push_rc pending_publish="${6:-0}" implementation_gh_config_dir
   if [ "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" != "1" ]; then
     return 0
   fi
@@ -10074,14 +10074,27 @@ phase_loop_create_pr_for_progress() {
   if [ "$pending_publish" != "1" ] && ! tracked_workspace_diff_exists; then
     return 0
   fi
+  implementation_gh_config_dir="$(
+    node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" \
+      --role implementation \
+      --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" \
+      --print-gh-config-dir 2>>"$SUPERVISOR_LOG"
+  )" || {
+    printf '%s pr_create_skipped reason=implementation_profile_preflight_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+    return 1
+  }
+  if [ -z "$implementation_gh_config_dir" ]; then
+    printf '%s pr_create_skipped reason=implementation_profile_missing\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+    return 1
+  fi
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" --role implementation --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" >/dev/null
+    GH_CONFIG_DIR="$implementation_gh_config_dir" node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" --role implementation --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" >/dev/null
   ) || {
     printf '%s pr_create_skipped reason=implementation_preflight_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 1
   }
-  if ! phase_loop_require_implementation_pr_actor; then
+  if ! GH_CONFIG_DIR="$implementation_gh_config_dir" phase_loop_require_implementation_pr_actor; then
     printf '%s pr_create_skipped reason=implementation_actor_guard_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 1
   fi
@@ -10120,7 +10133,7 @@ This PR was created by the external phase-loop controller after Brownie produced
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     git branch --show-current
   )"
-  if ! phase_loop_require_implementation_pr_actor; then
+  if ! GH_CONFIG_DIR="$implementation_gh_config_dir" phase_loop_require_implementation_pr_actor; then
     printf '%s pr_create_skipped reason=implementation_actor_guard_failed_before_push branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
     return 1
   fi
@@ -10128,7 +10141,7 @@ This PR was created by the external phase-loop controller after Brownie produced
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
     set +x
     if command -v gh >/dev/null 2>&1; then
-      BROWNIE_AGENT_TOKEN="$(gh auth token)"
+      BROWNIE_AGENT_TOKEN="$(GH_CONFIG_DIR="$implementation_gh_config_dir" gh auth token)"
       BROWNIE_AGENT_AUTH="$(printf 'x-access-token:%s' "$BROWNIE_AGENT_TOKEN" | base64 | tr -d '\n')"
       git -c credential.helper= -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $BROWNIE_AGENT_AUTH" push -u "$PHASE_LOOP_PR_REMOTE" "$branch"
       push_rc=$?
@@ -10143,21 +10156,21 @@ This PR was created by the external phase-loop controller after Brownie produced
 
   if (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    gh pr view "$branch" --json url --jq .url >/dev/null 2>&1
+    GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr view "$branch" --json url --jq .url >/dev/null 2>&1
   ); then
     pr_url="$(
       cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-      gh pr view "$branch" --json url --jq .url
+      GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr view "$branch" --json url --jq .url
     )"
   else
-    if ! phase_loop_require_implementation_pr_actor; then
+    if ! GH_CONFIG_DIR="$implementation_gh_config_dir" phase_loop_require_implementation_pr_actor; then
       printf '%s pr_create_skipped reason=implementation_actor_guard_failed_before_pr_create branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
       return 1
     fi
     if [ "$PHASE_LOOP_PR_DRAFT" = "1" ]; then
       if ! pr_url="$(
           cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-          gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body" --draft
+          GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body" --draft
         )"; then
         printf '%s pr_create_skipped reason=gh_pr_create_failed branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
         return 1
@@ -10165,7 +10178,7 @@ This PR was created by the external phase-loop controller after Brownie produced
     else
       if ! pr_url="$(
           cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-          gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body"
+          GH_CONFIG_DIR="$implementation_gh_config_dir" gh pr create --base "$PHASE_LOOP_PR_BASE" --head "$branch" --title "$title" --body "$body"
         )"; then
         printf '%s pr_create_skipped reason=gh_pr_create_failed branch=%s\n' "$(now_utc)" "$branch" >> "$SUPERVISOR_LOG"
         return 1
