@@ -170,6 +170,9 @@ test('migrates a legacy single-target recovery into an audited hash-bound target
   const sourceReceiptPath = path.join(root, record.contract_rebaseline_receipt);
   const sourceReceipt = JSON.parse(fs.readFileSync(sourceReceiptPath, 'utf8'));
   delete sourceReceipt.target_snapshots;
+  // Historical receipts can group several Create-only targets.  The second
+  // target must still be eligible for the hash-bound materialization capture.
+  sourceReceipt.contract_changes[0].before_contract.first_line = '- [ ] E-23b-release-artifact-download-roundtrip-target-01: Create only `scripts/a.mjs` and `scripts/a.test.mjs` for the downloaded roundtrip:';
   fs.writeFileSync(sourceReceiptPath, `${JSON.stringify(sourceReceipt, null, 2)}\n`);
   record.target_snapshot = record.target_snapshot.filter((target) => target.path !== 'scripts/a.test.mjs');
   fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
