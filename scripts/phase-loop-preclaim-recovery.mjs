@@ -65,11 +65,22 @@ function isReparableDecompositionDiagnostic(diagnostic) {
   return /Create only target already exists|TODO dependencies must not contain cycles|dependency .* present only in the breakdown ledger|abstract\/decomposed parent|superseded parent|dangling dependency|todo-replan|contract_unsatisfiable_dirty_scope/iu.test(text);
 }
 
-function targetScopes(firstLine) {
-  return [...String(firstLine ?? '').matchAll(/\b(Patch|Create) only\s+`([^`]+)`/gu)].map((match) => ({
-    operation: match[1],
-    path: match[2]
-  }));
+export function targetScopes(firstLine) {
+  const line = String(firstLine ?? '');
+  const operationStarts = [...line.matchAll(/\b(Patch|Create) only\s+/gu)];
+  const scopes = [];
+  for (const [index, operationMatch] of operationStarts.entries()) {
+    const start = operationMatch.index + operationMatch[0].length;
+    const nextOperation = operationStarts[index + 1]?.index ?? line.length;
+    const clause = line.slice(start, nextOperation)
+      // A lower-case "then patch only" starts the ancillary invocation
+      // clause; it is not one of the bounded implementation targets.
+      .split(/,?\s+then\s+(?:patch|create) only\b/u)[0];
+    for (const pathMatch of clause.matchAll(/`([^`]+)`/gu)) {
+      scopes.push({ operation: operationMatch[1], path: pathMatch[1] });
+    }
+  }
+  return scopes;
 }
 
 function allUncheckedTargetScopes(todoText) {

@@ -14376,8 +14376,40 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
   fi
   if [ "$status" -ne 0 ]; then
     if { [ "$stage" = "pre-claim" ] || [ "$stage" = "pre-claim-boundary" ] || [ "$stage" = "pre-completion" ]; } && [ "${PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0}" != "1" ] && [ -f "$ROOT_DIR/scripts/phase-loop-preclaim-recovery.mjs" ]; then
-      local recovery_output recovery_status recovery_diagnostic
+      local recovery_output recovery_status recovery_diagnostic recovery_replay_status
       recovery_diagnostic="$output"
+      # A failed preflight is normally JSON on stdout.  Some shell/command
+      # failures, however, have no captured payload.  Re-run the read-only
+      # preflight once to recover the *actual* diagnostic before considering
+      # the weaker TODO-guard fallback.  Otherwise a repair that is keyed to
+      # a preflight-specific error (for example a hash-bound materialization)
+      # is never offered the error that authorizes it.
+      if [ -z "$recovery_diagnostic" ]; then
+        set +e
+        recovery_diagnostic="$(
+          cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+          node "$ROOT_DIR/scripts/phase-loop-preflight.mjs" \
+            --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
+            --todo "$PHASE_LOOP_TODO" \
+            --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" \
+            --control-plane-root "$ROOT_DIR" \
+            --state-root "$STATE_DIR" \
+            --cli-root "$BROWNIE_BIN" \
+            --runtime-root "$BROWNIE_RUNTIME_PATH" \
+            ${PHASE_LOOP_BASE_COMMIT:+--base-commit "$PHASE_LOOP_BASE_COMMIT"} \
+            --expected-actor "$PHASE_LOOP_EXPECTED_ACTOR" \
+            --context-audit "$STATE_DIR/execution-context.json" \
+            --profile "$PHASE_LOOP_PREFLIGHT_PROFILE" \
+            --controller-fingerprint "$PHASE_LOOP_CONTROL_PLANE_FINGERPRINT" \
+            --claim "$TODO_CLAIM_FILE" \
+            --stage "$stage" \
+            ${snapshot_args[@]+"${snapshot_args[@]}"}
+          2>&1
+        )"
+        recovery_replay_status=$?
+        set -e
+        printf '%s run=%s preclaim_recovery_preflight_diagnostic_replay=true stage=%s exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$stage" "$recovery_replay_status" "${recovery_diagnostic:-<no output>}" >> "$SUPERVISOR_LOG"
+      fi
       if [ -z "$recovery_diagnostic" ] && [ -f "$ROOT_DIR/scripts/guard-todo-decomposition.mjs" ]; then
         recovery_diagnostic="$(
           cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
