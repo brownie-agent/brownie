@@ -6,6 +6,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { bindExecutionContext } from './phase-loop-execution-context.mjs';
 import {
+  matchesMaterializedTargetRebaselineChain,
   matchesMaterializedTargetRebaseline,
   protectedContract,
   readContractRebaselineRecords
@@ -533,7 +534,12 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings) {
         currentContract: protectedContract(block),
         targetPath: target,
         targetSha256: sha256
-      }));
+      })) ?? matchesMaterializedTargetRebaselineChain(rebaselineRecords, {
+        todoId: todoId(block),
+        currentContract: protectedContract(block),
+        targetPath: target,
+        targetSha256: sha256
+      });
       if (rebaselined) {
         warnings.push({
           code: 'rebaselined_dirty_target_placeholder',
