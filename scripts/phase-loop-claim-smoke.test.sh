@@ -845,6 +845,7 @@ cat <<'JSON'
   }
 }
 JSON
+exit 70
 SH
 chmod +x "$fake_brownie_runtime_authorization_expired"
 fake_brownie_terminal_no_eligible_counted="$(mktemp)"
