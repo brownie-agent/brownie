@@ -380,37 +380,36 @@ export function validateTodoQueueIntegrity({
       const afterDependencyValue = lineValue(afterBlock, 'Depends on');
       const afterDependencies = afterDependencyValue
         .split(/\s*,\s*/u).map((entry) => entry.trim()).filter((entry) => entry && entry !== '<none>');
-      // A deterministic controller repair may also add a missing prerequisite
-      // when its single durable breakdown graph proves the original queue was
-      // under-constrained.  Require the same exact receipt; never accept a
-      // bare dependency addition.
-      if (drift.length === 1 && drift[0] === 'depends_on') {
-        const beforeTodoSha256 = crypto.createHash('sha256').update(todoBefore ?? '', 'utf8').digest('hex');
-        const afterTodoSha256 = crypto.createHash('sha256').update(todoAfter ?? '', 'utf8').digest('hex');
-        const beforeBreakdownSha256 = beforeBreakdownText === null
-          ? null
-          : crypto.createHash('sha256').update(beforeBreakdownText, 'utf8').digest('hex');
-        const afterBreakdownSha256 = afterBreakdownText === null
-          ? null
-          : crypto.createHash('sha256').update(afterBreakdownText, 'utf8').digest('hex');
-        const beforeContract = protectedContract(beforeBlock);
-        const afterContract = protectedContract(afterBlock);
-        const approvedRecord = contractRebaselineRecordsInput.find((record) => matchesContractRebaselineRecord(record, {
-          todoId: id,
-          changedFields: drift,
-          beforeContract,
-          afterContract,
-          beforeTodoSha256,
-          afterTodoSha256,
-          beforeBreakdownSha256,
-          afterBreakdownSha256
-        }));
+      // Every protected field is immutable by default.  A controller-owned
+      // deterministic repair may change one or more fields only when an exact
+      // durable receipt binds the full before/after contracts.  This covers
+      // Create-to-Patch materialization as well as dependency reconciliation;
+      // neither path may rely on a broad drift exception.
+      const beforeTodoSha256 = crypto.createHash('sha256').update(todoBefore ?? '', 'utf8').digest('hex');
+      const afterTodoSha256 = crypto.createHash('sha256').update(todoAfter ?? '', 'utf8').digest('hex');
+      const beforeBreakdownSha256 = beforeBreakdownText === null
+        ? null
+        : crypto.createHash('sha256').update(beforeBreakdownText, 'utf8').digest('hex');
+      const afterBreakdownSha256 = afterBreakdownText === null
+        ? null
+        : crypto.createHash('sha256').update(afterBreakdownText, 'utf8').digest('hex');
+      const beforeContract = protectedContract(beforeBlock);
+      const afterContract = protectedContract(afterBlock);
+      const approvedRecord = contractRebaselineRecordsInput.find((record) => matchesContractRebaselineRecord(record, {
+        todoId: id,
+        changedFields: drift,
+        beforeContract,
+        afterContract,
+        beforeTodoSha256,
+        afterTodoSha256,
+        beforeBreakdownSha256,
+        afterBreakdownSha256
+      }));
+      if (approvedRecord) {
         const isCompletedDependencyPrune = afterDependencyValue === '<none>'
           && afterDependencies.length === 0
           && beforeDependencies.every((dependency) => completedIds.has(dependency));
-        const isApprovedDependencyRebaseline = Boolean(approvedRecord)
-          && (afterDependencies.length > 0 || isCompletedDependencyPrune);
-        if (isApprovedDependencyRebaseline) {
+        if (drift.length === 1 && drift[0] === 'depends_on' && (afterDependencies.length > 0 || isCompletedDependencyPrune)) {
           const warning = {
             code: afterDependencies.length === 0
               ? 'completed_dependency_pruned_rebaseline'
@@ -426,6 +425,14 @@ export function validateTodoQueueIntegrity({
           warnings.push(warning);
           continue;
         }
+        warnings.push({
+          code: 'todo_contract_rebaselined',
+          message: 'A protected TODO contract changed only through an exact approved deterministic rebaseline receipt.',
+          todo_id: id,
+          changed_fields: drift,
+          contract_rebaseline_run_stamp: approvedRecord.cause_run.run_stamp
+        });
+        continue;
       }
       errors.push({
         code: 'todo_contract_drift',

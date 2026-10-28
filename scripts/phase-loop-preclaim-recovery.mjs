@@ -5,6 +5,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   buildContractRebaselineReceipt,
+  readContractRebaselineRecords,
   writeContractRebaselineReceipt
 } from './phase-loop-todo-contract-rebaseline.mjs';
 
@@ -56,15 +57,154 @@ function readJson(filePath) {
 
 function isReparableDecompositionDiagnostic(diagnostic) {
   const text = String(diagnostic ?? '');
-  if (!text.includes('guard-todo-decomposition.mjs') && !text.includes('phase-loop-todo-queue-integrity.mjs')) {
+  if (!text.includes('guard-todo-decomposition.mjs')
+    && !text.includes('phase-loop-todo-queue-integrity.mjs')
+    && !text.includes('contract_unsatisfiable_dirty_scope')) {
     return false;
   }
-  return /Create only target already exists|TODO dependencies must not contain cycles|dependency .* present only in the breakdown ledger|abstract\/decomposed parent|superseded parent|dangling dependency|todo-replan/iu.test(text);
+  return /Create only target already exists|TODO dependencies must not contain cycles|dependency .* present only in the breakdown ledger|abstract\/decomposed parent|superseded parent|dangling dependency|todo-replan|contract_unsatisfiable_dirty_scope/iu.test(text);
+}
+
+function targetScopes(firstLine) {
+  return [...String(firstLine ?? '').matchAll(/\b(Patch|Create) only\s+`([^`]+)`/gu)].map((match) => ({
+    operation: match[1],
+    path: match[2]
+  }));
+}
+
+function allUncheckedTargetScopes(todoText) {
+  const byPath = new Map();
+  for (const block of todoBlocks(todoText)) {
+    for (const scope of targetScopes(block.split('\n')[0] ?? '')) {
+      const existing = byPath.get(scope.path);
+      if (existing && existing.operation !== scope.operation) {
+        throw new Error(`TODO queue declares conflicting operations for target: ${scope.path}`);
+      }
+      byPath.set(scope.path, scope);
+    }
+  }
+  return [...byPath.values()];
 }
 
 function todoBlocks(todoText) {
   const starts = [...todoText.matchAll(/^(?:[-*]|\d+[.)])\s+\[\s\]\s+/gmu)].map((match) => match.index);
   return starts.map((start, index) => todoText.slice(start, starts[index + 1] ?? todoText.length).trim());
+}
+
+function todoId(block) {
+  return String(block ?? '').split('\n')[0]
+    .trim()
+    .replace(/^(?:[-*]|\d+[.)])\s+\[\s\]\s+/u, '')
+    .split(':')[0]
+    ?.trim() ?? '';
+}
+
+function safeRelativePath(repo, filePath) {
+  const relative = path.relative(repo, path.resolve(repo, filePath));
+  return relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+    ? relative.split(path.sep).join('/')
+    : null;
+}
+
+function legacyAppliedRecoveryRecords(stateDir) {
+  const directory = path.join(stateDir, 'preclaim-recovery');
+  try {
+    return fs.readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const recordPath = path.join(directory, entry.name, 'record.json');
+        const record = readJson(recordPath);
+        return record.status === 'applied' ? { recordPath, record } : null;
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function isBoundedProposalPlaceholder(content) {
+  const text = String(content ?? '').trim();
+  return text.length <= 160 && /brownie bounded (?:patch|create)-only proposal\.?/iu.test(text);
+}
+
+function migrateLegacyTargetCapture({ repo, stateDir, todoPath, breakdownPath, todoText, runStamp, diagnostic }) {
+  if (!String(diagnostic).includes('contract_unsatisfiable_dirty_scope')) return false;
+  const liveBlocks = new Map(todoBlocks(todoText).map((block) => [todoId(block), block]));
+  const existingReceipts = readContractRebaselineRecords(repo);
+  for (const { recordPath, record } of legacyAppliedRecoveryRecords(stateDir)) {
+    const receiptRelative = safeRelativePath(repo, record.contract_rebaseline_receipt ?? '');
+    const beforeRelative = safeRelativePath(repo, record.rollback_snapshot?.todo ?? '');
+    if (!receiptRelative || !beforeRelative) continue;
+    const receiptPath = path.join(repo, receiptRelative);
+    const beforePath = path.join(repo, beforeRelative);
+    if (!fs.existsSync(receiptPath) || !fs.existsSync(beforePath)) continue;
+    const sourceReceipt = readJson(receiptPath);
+    for (const [id, block] of liveBlocks) {
+      const firstLine = block.split('\n')[0] ?? '';
+      const change = sourceReceipt.contract_changes?.find((entry) => entry?.todo_id === id && entry?.after_contract?.first_line === firstLine);
+      if (!change) continue;
+      for (const scope of targetScopes(firstLine).filter((entry) => entry.operation === 'Patch')) {
+        const beforeCreatedTarget = String(change.before_contract?.first_line ?? '').includes(`Create only \`${scope.path}\``);
+        if (!beforeCreatedTarget) continue;
+        const targetPath = path.join(repo, scope.path);
+        let targetContent = '';
+        try { targetContent = fs.readFileSync(targetPath, 'utf8'); } catch { continue; }
+        if (!isBoundedProposalPlaceholder(targetContent)) continue;
+        const targetSha256 = sha256Text(targetContent.trim());
+        const alreadyCaptured = existingReceipts.some((candidate) => candidate.target_capture?.mode === 'legacy_pre_capture_materialization'
+          && candidate.target_capture?.source_recovery_record === safeRelativePath(repo, recordPath)
+          && candidate.target_snapshots?.some((snapshot) => snapshot.path === scope.path && snapshot.sha256_after === targetSha256));
+        if (alreadyCaptured) return true;
+        const beforeTodoText = fs.readFileSync(beforePath, 'utf8');
+        const beforeBreakdownPath = record.rollback_snapshot?.breakdown;
+        const beforeBreakdownText = beforeBreakdownPath && fs.existsSync(beforeBreakdownPath)
+          ? fs.readFileSync(beforeBreakdownPath, 'utf8')
+          : null;
+        const afterBreakdownText = fs.existsSync(breakdownPath) ? fs.readFileSync(breakdownPath, 'utf8') : null;
+        const migrationEventKey = sha256Text(`${record.event_key}\n${id}\n${scope.path}\n${targetSha256}`);
+        const migrationReceipt = buildContractRebaselineReceipt({
+          repoRoot: repo,
+          beforeTodoText,
+          afterTodoText: todoText,
+          beforeBreakdownText,
+          afterBreakdownText,
+          runStamp: `${runStamp}-legacy-target-capture`,
+          eventKey: migrationEventKey,
+          diagnostic,
+          verification: {
+            repair_command: 'node scripts/phase-loop-preclaim-recovery.mjs',
+            guard_command: 'node scripts/guard-todo-decomposition.mjs',
+            integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+          },
+          todoIds: [id],
+          targetSnapshots: [{
+            operation: 'Create',
+            path: scope.path,
+            exists_before: null,
+            sha256_before: null,
+            exists_after: true,
+            sha256_after: targetSha256
+          }],
+          targetCapture: {
+            mode: 'legacy_pre_capture_materialization',
+            source_recovery_record: safeRelativePath(repo, recordPath),
+            source_contract_rebaseline_receipt: receiptRelative,
+            target_sha256: targetSha256
+          }
+        });
+        if (!migrationReceipt) continue;
+        const migrationRelative = writeContractRebaselineReceipt(repo, migrationReceipt);
+        const latestRecord = readJson(recordPath);
+        latestRecord.legacy_target_materialization_rebaselines = [
+          ...(Array.isArray(latestRecord.legacy_target_materialization_rebaselines) ? latestRecord.legacy_target_materialization_rebaselines : []),
+          migrationRelative
+        ];
+        writeJson(recordPath, latestRecord);
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function restoreSnapshot({ recoveryDir, todoPath, breakdownPath, breakdownExisted }) {
@@ -151,6 +291,21 @@ async function main(rawArgs) {
   let selectedTodo = typeof claim.selected_todo === 'string' && todoBeforeText.includes(claim.selected_todo)
     ? claim.selected_todo
     : todoBlocks(todoBeforeText)[0] ?? '';
+  // Older controller versions captured only the first declared target.  When
+  // that evidence proves a successful Create-only operation but omits the
+  // materialized sibling target, record one explicit, hash-bound migration
+  // before allowing the repaired Patch-only TODO to continue.
+  if (migrateLegacyTargetCapture({
+    repo,
+    stateDir,
+    todoPath,
+    breakdownPath,
+    todoText: todoBeforeText,
+    runStamp,
+    diagnostic
+  })) {
+    return 0;
+  }
   const todoBeforeHash = sha256Text(todoBeforeText);
   const breakdownBeforeHash = breakdownBeforeExists ? sha256Text(breakdownBeforeText) : null;
   const eventKey = sha256Text(`${todoBeforeHash}\n${breakdownBeforeHash ?? 'missing'}\n${diagnostic}`);
@@ -235,11 +390,15 @@ async function main(rawArgs) {
   }
 
   const firstLine = recoveryRecord?.claim_snapshot?.selected_todo_first_line ?? selectedTodo.split('\n')[0] ?? '';
-  const targetSnapshot = recoveryRecord?.target_snapshot ?? [...firstLine.matchAll(/\b(Patch|Create) only\s+`([^`]+)`/gu)].map((match) => {
-    const targetPath = path.resolve(repo, match[2]);
+  // Deterministic repair can normalize a sibling leaf (for example a
+  // Create-only test leaf) while repairing the selected TODO's graph.  Capture
+  // every currently executable target before mutation so a later rebaseline
+  // cannot accidentally authorize an uncaptured materialization.
+  const targetSnapshot = recoveryRecord?.target_snapshot ?? allUncheckedTargetScopes(todoBeforeText).map((scope) => {
+    const targetPath = path.resolve(repo, scope.path);
     return {
-      operation: match[1],
-      path: match[2],
+      operation: scope.operation,
+      path: scope.path,
       exists_before: fs.existsSync(targetPath),
       sha256_before: sha256File(targetPath)
     };
@@ -350,7 +509,8 @@ async function main(rawArgs) {
             repair_command: 'node scripts/repair-todo-decomposition.mjs',
             guard_command: 'node scripts/guard-todo-decomposition.mjs',
             integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
-          }
+          },
+          targetSnapshots: currentRecord.target_snapshot
         });
         if (contractReceipt) {
           currentRecord.contract_rebaseline_receipt = writeContractRebaselineReceipt(repo, contractReceipt);

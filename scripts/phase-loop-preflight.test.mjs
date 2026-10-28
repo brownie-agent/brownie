@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { duplicateJsonKeys, validatePhaseLoopPreflight } from './phase-loop-preflight.mjs';
+import { buildContractRebaselineReceipt, writeContractRebaselineReceipt } from './phase-loop-todo-contract-rebaseline.mjs';
 
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -45,7 +46,7 @@ test('detects duplicate JSON keys outside JSON.parse visibility', () => {
 test('rejects release contract readiness audit hash drift', () => {
   const repo = makeRepo();
   fs.writeFileSync(path.join(repo, 'docs/architecture/runtime-release-readiness-audit.json'), '{ "audited_main_commit": "1111111111111111111111111111111111111111", "runtime_release_ready": false, "runtime_release_ready": false }\n');
-  const result = validatePhaseLoopPreflight({ repo, skipCommands: true });
+  const result = validatePhaseLoopPreflight({ repo, expectedActor: 'fixture-implementation', skipCommands: true });
   assert.equal(result.valid, false);
   assert(result.errors.some((error) => error.code === 'json_duplicate_key'), JSON.stringify(result.errors));
   assert(result.errors.some((error) => error.code === 'readiness_audit_hash_mismatch'), JSON.stringify(result.errors));
@@ -69,6 +70,48 @@ test('rejects a dirty bounded-proposal placeholder before claiming its TODO', ()
   assert(failure, JSON.stringify(result.errors));
   assert.equal(failure.target, 'scripts/target.mjs');
   assert.match(failure.sha256, /^sha256:[a-f0-9]{64}$/u);
+});
+
+test('admits an audited Create-to-Patch placeholder only when its exact target hash is captured', () => {
+  const repo = makeRepo();
+  const before = '- [ ] E-guard: Create only `scripts/target.mjs`:\n  Route: implementation.\n  Verification: run `node --test scripts/target.test.mjs`.\n';
+  const after = before.replace('Create only', 'Patch only');
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), before);
+  execFileSync('git', ['add', '.brownie/todo.md'], { cwd: repo });
+  execFileSync('git', ['commit', '-m', 'create target contract'], { cwd: repo, stdio: 'ignore' });
+  const placeholder = '// Brownie bounded Create-only proposal.\n';
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), after);
+  fs.writeFileSync(path.join(repo, 'scripts/target.mjs'), placeholder);
+  writeContractRebaselineReceipt(repo, buildContractRebaselineReceipt({
+    repoRoot: repo,
+    beforeTodoText: before,
+    afterTodoText: after,
+    runStamp: 'fixture-materialized-target',
+    eventKey: 'fixture-materialized-target-event',
+    diagnostic: 'contract_unsatisfiable_dirty_scope',
+    verification: {
+      repair_command: 'node scripts/phase-loop-preclaim-recovery.mjs',
+      guard_command: 'node scripts/guard-todo-decomposition.mjs',
+      integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+    },
+    targetSnapshots: [{
+      operation: 'Create',
+      path: 'scripts/target.mjs',
+      exists_before: false,
+      sha256_before: null,
+      exists_after: true,
+      sha256_after: createHash('sha256').update(placeholder.trim()).digest('hex')
+    }]
+  }));
+  const result = validatePhaseLoopPreflight({ repo, expectedActor: 'fixture-implementation', skipCommands: true });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.deepEqual(result.warnings.find((warning) => warning.code === 'rebaselined_dirty_target_placeholder'), {
+    code: 'rebaselined_dirty_target_placeholder',
+    todo_id: 'E-guard',
+    target: 'scripts/target.mjs',
+    contract_rebaseline_run_stamp: 'fixture-materialized-target',
+    message: 'A materialized Create-only target is admitted as Patch-only only through an exact target-hash-bound rebaseline receipt.'
+  });
 });
 
 test('rejects an unchecked child whose parent TODO is already complete', () => {
