@@ -14560,6 +14560,86 @@ phase_loop_rebaseline_expired_runtime_authorization() {
   return 0
 }
 
+runtime_stdout_has_expired_authorization() {
+  local stdout_log="$1"
+  python3 - "$stdout_log" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    root = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+error = root.get("error") if isinstance(root, dict) else None
+code = root.get("status") if isinstance(root, dict) else None
+if not isinstance(code, str) and isinstance(error, dict):
+    code = error.get("code")
+sys.exit(0 if code == "runtime_proposal_apply_approval_expired" else 1)
+PY
+}
+
+# This recovery deliberately runs before Runtime admission validation.  An
+# expired proposal approval is an authenticated Runtime result, but it cannot
+# carry an execution attestation because apply never began.  Feeding it into
+# the generic admission-mismatch path used to make recovery depend on a
+# second, unrelated parser result and could leave a running status for the
+# EXIT trap to terminalize.  Keep the one-way recovery transactional: restore
+# workspace authority, archive only this claim's Runtime store, then require a
+# fresh Runtime invocation.
+phase_loop_recover_expired_runtime_authorization() {
+  local run_stamp="$1"
+  local stdout_log="$2"
+  local stderr_log="$3"
+  local delegated_scope_backup="$4"
+  local active_target_path="$5"
+  local active_target_snapshot="$6"
+  local claim_snapshot_before_runtime="$7"
+  local mismatch_scope_output mismatch_scope_status=0 mismatch_target_status=0 mismatch_claim_status=0
+  local detail authorization_rebaseline_applied
+
+  mismatch_scope_output="$(node "$ROOT_DIR/scripts/phase-loop-delegated-scope.mjs" \
+    --workspace "$PHASE_LOOP_WORKSPACE_ROOT" \
+    --backup "$delegated_scope_backup" \
+    --objective "$(claim_field selected_todo)" 2>&1)"
+  mismatch_scope_status=$?
+  if [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$active_target_snapshot" ]; then
+    cp "$active_target_snapshot" "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path"
+    mismatch_target_status=$?
+  fi
+  # Do not synthesize a claim from live queue inputs while recovering an
+  # interrupted Runtime session; preserve the exact pre-dispatch claim.
+  restore_claim_snapshot_before_runtime "$claim_snapshot_before_runtime"
+  mismatch_claim_status=$?
+  if [ "$mismatch_scope_status" -ne 0 ] || [ "$mismatch_target_status" -ne 0 ] || [ "$mismatch_claim_status" -ne 0 ]; then
+    detail="Runtime proposal authorization expired, but pre-dispatch authority could not be fully restored; refusing a stale resume. scope_status=$mismatch_scope_status target_status=$mismatch_target_status claim_status=$mismatch_claim_status scope=$mismatch_scope_output stdout=$stdout_log stderr=$stderr_log"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_recovery_restore_failed","owner_blocked":true}'
+    return 78
+  fi
+  if ! phase_loop_rebaseline_expired_runtime_authorization "$run_stamp" "$stdout_log"; then
+    detail="Runtime proposal authorization expired, but its prior session could not be safely archived and rebaselined; refusing a stale resume. result=${PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT:-<no output>} stdout=$stdout_log stderr=$stderr_log"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_rebaseline_failed","owner_blocked":true}'
+    return 78
+  fi
+  authorization_rebaseline_applied="$(printf '%s' "$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("rebaselined") is True else "0")' 2>/dev/null || printf '%s' "0")"
+  if [ "$authorization_rebaseline_applied" = "1" ]; then
+    detail="Runtime proposal authorization expired before apply. The claim-local Runtime session was archived with audit evidence and the next invocation is forced to create a fresh session. recovery=$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT stdout=$stdout_log stderr=$stderr_log"
+    printf '%s run=%s runtime_authorization_rebaselined=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT" >> "$SUPERVISOR_LOG"
+    write_status "continuation_required" "$detail" "$run_stamp" "0" "0" "" "true"
+    write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"runtime_proposal_apply_approval_expired","recovery_scope":"claim_runtime_store","fresh_run_required":true}'
+    return 0
+  fi
+  detail="Runtime proposal authorization expired and the configured rebaseline cap forbids another fresh Runtime session. recovery=$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT stdout=$stdout_log stderr=$stderr_log"
+  printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+  write_status "blocked" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
+  write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_rebaseline_cap_exhausted","owner_blocked":true}'
+  return 76
+}
+
 clear_runtime_authorization_rebaseline_pending() {
   local run_stamp="$1"
   local temporary pending_status
@@ -15815,34 +15895,21 @@ try {
 }
 NODE
   fi
+  if runtime_stdout_has_expired_authorization "$stdout_log"; then
+    phase_loop_recover_expired_runtime_authorization \
+      "$run_stamp" "$stdout_log" "$stderr_log" "$delegated_scope_backup" \
+      "$active_target_path" "$active_target_snapshot" "$claim_snapshot_before_runtime"
+    return $?
+  fi
   if runtime_admission_validation="$(node "$ROOT_DIR/scripts/phase-loop-runtime-admission.mjs" validate "$runtime_admission_snapshot" "$stdout_log" 2>&1)"; then
     runtime_admission_status=0
   else
     runtime_admission_status=$?
   fi
   if [ "$runtime_admission_status" -ne 0 ]; then
-    local runtime_admission_cause runtime_admission_snapshot_mismatch runtime_authorization_expired
+    local runtime_admission_cause runtime_admission_snapshot_mismatch
     runtime_admission_cause="$(printf '%s' "$runtime_admission_validation" | python3 -c 'import json,sys; value=json.load(sys.stdin); print(value.get("cause") or value.get("reason") or "runtime_admission_validation_failed")' 2>/dev/null || printf '%s' "runtime_admission_validation_failed")"
     runtime_admission_snapshot_mismatch="$(printf '%s' "$runtime_admission_validation" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("snapshot_mismatch") else "0")' 2>/dev/null || printf '%s' "1")"
-    runtime_authorization_expired=0
-    if python3 - "$stdout_log" 2>/dev/null <<'PY'
-import json
-import pathlib
-import sys
-
-try:
-    root = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-except Exception:
-    sys.exit(1)
-error = root.get("error") if isinstance(root, dict) else None
-code = root.get("status") if isinstance(root, dict) else None
-if not isinstance(code, str) and isinstance(error, dict):
-    code = error.get("code")
-sys.exit(0 if code == "runtime_proposal_apply_approval_expired" else 1)
-PY
-    then
-      runtime_authorization_expired=1
-    fi
     # Admission failure is a post-execution boundary failure. Roll back both
     # layers of workspace authority before returning: delegated scope restores
     # every out-of-scope tracked file, while the exact pre-runtime target
@@ -15864,32 +15931,6 @@ PY
     restore_claim_snapshot_before_runtime "$claim_snapshot_before_runtime"
     mismatch_claim_status=$?
     set -e
-    if [ "$runtime_authorization_expired" = "1" ] \
-      && [ "$mismatch_scope_status" -eq 0 ] \
-      && [ "$mismatch_target_status" -eq 0 ] \
-      && [ "$mismatch_claim_status" -eq 0 ]; then
-      if ! phase_loop_rebaseline_expired_runtime_authorization "$run_stamp" "$stdout_log"; then
-        detail="Runtime proposal authorization expired, but its prior session could not be safely archived and rebaselined; refusing a stale resume. result=${PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT:-<no output>} stdout=$stdout_log stderr=$stderr_log"
-        printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
-        write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
-        write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_rebaseline_failed","owner_blocked":true}'
-        return 78
-      fi
-      local authorization_rebaseline_applied
-      authorization_rebaseline_applied="$(printf '%s' "$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("rebaselined") is True else "0")' 2>/dev/null || printf '%s' "0")"
-      if [ "$authorization_rebaseline_applied" = "1" ]; then
-        detail="Runtime proposal authorization expired before apply. The claim-local Runtime session was archived with audit evidence and the next invocation is forced to create a fresh session. recovery=$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT stdout=$stdout_log stderr=$stderr_log"
-        printf '%s run=%s runtime_authorization_rebaselined=true recovery=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT" >> "$SUPERVISOR_LOG"
-        write_status "continuation_required" "$detail" "$run_stamp" "0" "0" "" "true"
-        write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"runtime_proposal_apply_approval_expired","recovery_scope":"claim_runtime_store","fresh_run_required":true}'
-        return 0
-      fi
-      detail="Runtime proposal authorization expired and the configured rebaseline cap forbids another fresh Runtime session. recovery=$PHASE_LOOP_RUNTIME_AUTHORIZATION_REBASELINE_OUTPUT stdout=$stdout_log stderr=$stderr_log"
-      printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
-      write_status "blocked" "$detail" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-1}"
-      write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_rebaseline_cap_exhausted","owner_blocked":true}'
-      return 76
-    fi
     write_runtime_terminal_repair_feedback "$run_stamp" "$stdout_log" "$stderr_log" || true
     if [ "$runtime_admission_cause" = "claimed_task_not_admitted" ] && [ "$runtime_admission_snapshot_mismatch" = "0" ]; then
       detail="Runtime attested the admitted claim snapshot but produced no task execution evidence; classified as execution_not_started and restored the pre-runtime delegated scope, target, and claim snapshots before bounded recovery. admission=$runtime_admission_validation scope_status=$mismatch_scope_status target_status=$mismatch_target_status claim_status=$mismatch_claim_status scope=$mismatch_scope_output stdout=$stdout_log stderr=$stderr_log"
