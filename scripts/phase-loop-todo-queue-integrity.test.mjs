@@ -282,6 +282,35 @@ test('allows Create-to-Patch materialization only with an exact approved receipt
   });
 });
 
+test('allows a contiguous approved Create-to-Patch rebaseline chain without a synthetic receipt', () => {
+  const before = queue(e20b.replace('Patch only `scripts/release-runtime-operational-evidence.mjs`', 'Create only `scripts/release-runtime-operational-evidence.mjs` and `scripts/release-runtime-operational-evidence.test.mjs`'));
+  const middle = queue(e20b.replace('Patch only `scripts/release-runtime-operational-evidence.mjs`', 'Patch only `scripts/release-runtime-operational-evidence.mjs` and Create only `scripts/release-runtime-operational-evidence.test.mjs`'));
+  const after = queue(e20b);
+  const verification = {
+    repair_command: 'node scripts/phase-loop-preclaim-recovery.mjs',
+    guard_command: 'node scripts/guard-todo-decomposition.mjs',
+    integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+  };
+  const first = buildContractRebaselineReceipt({
+    repoRoot: process.cwd(), beforeTodoText: before, afterTodoText: middle,
+    runStamp: 'materialized-chain-first', eventKey: 'materialized-chain-first-event',
+    diagnostic: 'contract_unsatisfiable_dirty_scope', verification
+  });
+  const second = buildContractRebaselineReceipt({
+    repoRoot: process.cwd(), beforeTodoText: middle, afterTodoText: after,
+    runStamp: 'materialized-chain-second', eventKey: 'materialized-chain-second-event',
+    diagnostic: 'contract_unsatisfiable_dirty_scope', verification
+  });
+  const result = validateTodoQueueIntegrity({
+    todoBefore: before,
+    todoAfter: after,
+    contractRebaselineRecords: [first, second]
+  });
+
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.equal(result.warnings.find((warning) => warning.code === 'todo_contract_rebaselined')?.contract_rebaseline_run_stamp, 'materialized-chain-second');
+});
+
 test('fails closed when an approved contract rebaseline record does not match the live before/after contracts', () => {
   const before = queue(e20a, e20b);
   const after = queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'));

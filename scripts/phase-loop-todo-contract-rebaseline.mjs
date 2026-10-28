@@ -318,6 +318,42 @@ export function matchesContractRebaselineRecord(record, {
     && JSON.stringify(change.after_contract) === JSON.stringify(afterContract);
 }
 
+// A pre-claim recovery can materialize several Create-only targets over more
+// than one controller attempt.  Each attempt has its own immutable receipt,
+// so queue integrity must accept a contiguous, fully-approved chain rather
+// than requiring a synthetic single receipt that erases those audit steps.
+export function matchesContractRebaselineChain(records, {
+  todoId: changedTodoId,
+  beforeContract,
+  afterContract
+}) {
+  const start = JSON.stringify(beforeContract);
+  const target = JSON.stringify(afterContract);
+  if (start === target) return null;
+  const edges = records.flatMap((record) => {
+    if (!validApprovedRebaselineRecord(record) || !record.target_todo_ids.includes(changedTodoId)) return [];
+    const change = record.contract_changes?.find((entry) => entry.todo_id === changedTodoId);
+    if (!change?.before_contract || !change?.after_contract) return [];
+    return [{
+      from: JSON.stringify(change.before_contract),
+      to: JSON.stringify(change.after_contract),
+      record
+    }];
+  });
+  const frontier = [start];
+  const visited = new Set([start]);
+  while (frontier.length > 0) {
+    const current = frontier.shift();
+    for (const edge of edges) {
+      if (edge.from !== current || visited.has(edge.to)) continue;
+      if (edge.to === target) return edge.record;
+      visited.add(edge.to);
+      frontier.push(edge.to);
+    }
+  }
+  return null;
+}
+
 export function matchesMaterializedTargetRebaseline(record, {
   todoId: currentTodoId,
   currentContract,

@@ -11,6 +11,7 @@ import {
   resolveTodoState
 } from './phase-loop-todo-state.mjs';
 import {
+  matchesContractRebaselineChain,
   matchesContractRebaselineRecord,
   readContractRebaselineRecords
 } from './phase-loop-todo-contract-rebaseline.mjs';
@@ -404,7 +405,11 @@ export function validateTodoQueueIntegrity({
         afterTodoSha256,
         beforeBreakdownSha256,
         afterBreakdownSha256
-      }));
+      })) ?? matchesContractRebaselineChain(contractRebaselineRecordsInput, {
+        todoId: id,
+        beforeContract,
+        afterContract
+      });
       if (approvedRecord) {
         const isCompletedDependencyPrune = afterDependencyValue === '<none>'
           && afterDependencies.length === 0
