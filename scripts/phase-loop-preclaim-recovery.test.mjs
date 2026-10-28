@@ -106,9 +106,15 @@ test('repairs reparable pre-claim decomposition drift and records a reversible t
   assert.equal(record.rollback_performed, false);
   assert.equal(record.attempts.length, 1);
   assert.equal(record.claim_snapshot.selected_todo_first_line.startsWith('- [ ] E-23b-release-artifact-download-roundtrip-target-01'), true);
-  assert.equal(record.target_snapshot.length, 1);
-  assert.equal(record.target_snapshot[0].path, 'scripts/a.mjs');
-  assert.equal(record.target_snapshot[0].exists_before, false);
+  assert.equal(record.target_snapshot.length, 5);
+  assert.deepEqual(record.target_snapshot.map((target) => target.path).sort(), [
+    '.github/workflows/release.yml',
+    'package.json',
+    'scripts/a.mjs',
+    'scripts/a.test.mjs',
+    'scripts/c.mjs'
+  ]);
+  assert.equal(record.target_snapshot.find((target) => target.path === 'scripts/a.mjs')?.exists_before, false);
   assert.notEqual(record.before.todo_sha256, record.after.todo_sha256);
   const repairedTodo = fs.readFileSync(path.join(root, '.brownie/todo.md'), 'utf8');
   assert.match(repairedTodo, /Completion condition: Patch only `scripts\/a\.test\.mjs` for the fixture\./u);
@@ -118,6 +124,7 @@ test('repairs reparable pre-claim decomposition drift and records a reversible t
   assert.equal(contractReceipt.status, 'approved');
   assert.equal(contractReceipt.cause_run.run_stamp, 'fixture-run');
   assert.equal(contractReceipt.verification.guard_passed, true);
+  assert.equal(contractReceipt.target_snapshots.length, 5);
   fs.copyFileSync(record.rollback_snapshot.todo, path.join(root, '.brownie/todo.md'));
   fs.copyFileSync(record.rollback_snapshot.breakdown, path.join(root, '.brownie/todo-breakdown.md'));
   const repeated = runRecovery(root, diagnostic);
@@ -148,6 +155,39 @@ test('resumes an interrupted started recovery after rolling back its snapshot', 
   assert.equal(record.recovery_resumes.length, 1);
   assert.equal(record.recovery_resumes[0].rollback_performed, true);
   assert.notEqual(fs.readFileSync(todoPath, 'utf8'), 'interrupted before repair completed\n');
+});
+
+test('migrates a legacy single-target recovery into an audited hash-bound target capture', () => {
+  const root = makeFixture();
+  const initialDiagnostic = 'node scripts/guard-todo-decomposition.mjs: Create only target already exists; TODO dependencies must not contain cycles; dependency E-23b-release-artifact-download-roundtrip is present only in the breakdown ledger';
+  const repaired = runRecovery(root, initialDiagnostic);
+  assert.equal(repaired.status, 0, `${repaired.stdout}\n${repaired.stderr}`);
+  const recoveryRoot = path.join(root, '.brownie/private/phase-loop/preclaim-recovery');
+  const recoveryDirectory = fs.readdirSync(recoveryRoot, { withFileTypes: true }).find((entry) => entry.isDirectory());
+  const recordPath = path.join(recoveryRoot, recoveryDirectory.name, 'record.json');
+  const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+  const sourceReceiptPath = path.join(root, record.contract_rebaseline_receipt);
+  const sourceReceipt = JSON.parse(fs.readFileSync(sourceReceiptPath, 'utf8'));
+  delete sourceReceipt.target_snapshots;
+  fs.writeFileSync(sourceReceiptPath, `${JSON.stringify(sourceReceipt, null, 2)}\n`);
+  record.target_snapshot = record.target_snapshot.filter((target) => target.path !== 'scripts/a.test.mjs');
+  fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+  fs.writeFileSync(path.join(root, 'scripts/a.test.mjs'), '// Brownie bounded Create-only proposal.\n');
+
+  const migrated = runRecovery(root, 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope');
+  assert.equal(migrated.status, 0, `${migrated.stdout}\n${migrated.stderr}`);
+  const migratedRecord = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+  assert.equal(migratedRecord.legacy_target_materialization_rebaselines.length, 1);
+  const migrationReceipt = JSON.parse(fs.readFileSync(path.join(root, migratedRecord.legacy_target_materialization_rebaselines[0]), 'utf8'));
+  assert.equal(migrationReceipt.target_capture.mode, 'legacy_pre_capture_materialization');
+  assert.deepEqual(migrationReceipt.target_snapshots, [{
+    operation: 'Create',
+    path: 'scripts/a.test.mjs',
+    exists_before: null,
+    sha256_before: null,
+    exists_after: true,
+    sha256_after: migrationReceipt.target_capture.target_sha256
+  }]);
 });
 
 test('fails closed and records a terminal audit when an interrupted recovery snapshot is missing', () => {

@@ -5,6 +5,11 @@ import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { bindExecutionContext } from './phase-loop-execution-context.mjs';
+import {
+  matchesMaterializedTargetRebaseline,
+  protectedContract,
+  readContractRebaselineRecords
+} from './phase-loop-todo-contract-rebaseline.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -501,22 +506,49 @@ function validateDirtyDelivery(repoRoot, todoText, errors, options = {}) {
   }
 }
 
-function validateDirtyTargetPlaceholders(repoRoot, todoText, errors) {
+function todoId(block) {
+  return String(block ?? '').split('\n')[0]
+    .trim()
+    .replace(/^(?:[-*]|\d+[.)])\s+\[[ xX]\]\s+/u, '')
+    .split(':')[0]
+    ?.trim() ?? '';
+}
+
+function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings) {
   const dirty = new Set(gitDirtyFiles(repoRoot));
   if (dirty.size === 0) return;
+  const rebaselineRecords = readContractRebaselineRecords(repoRoot);
   for (const block of uncheckedTodoBlocks(todoText)) {
     const firstLine = block.split('\n')[0] ?? '';
-    const target = /(?:Patch|Create) only `([^`]+)`/u.exec(firstLine)?.[1];
-    if (!target || !dirty.has(target)) continue;
-    const absoluteTarget = path.join(repoRoot, target);
-    let content = '';
-    try { content = fs.readFileSync(absoluteTarget, 'utf8').trim(); } catch { continue; }
-    if (content.length <= 160 && /brownie bounded (?:patch|create)-only proposal\.?/iu.test(content)) {
+    const targets = [...firstLine.matchAll(/(?:Patch|Create) only `([^`]+)`/gu)].map((match) => match[1]);
+    for (const target of targets) {
+      if (!dirty.has(target)) continue;
+      const absoluteTarget = path.join(repoRoot, target);
+      let content = '';
+      try { content = fs.readFileSync(absoluteTarget, 'utf8').trim(); } catch { continue; }
+      if (content.length > 160 || !/brownie bounded (?:patch|create)-only proposal\.?/iu.test(content)) continue;
+      const sha256 = crypto.createHash('sha256').update(content).digest('hex');
+      const rebaselined = rebaselineRecords.find((record) => matchesMaterializedTargetRebaseline(record, {
+        todoId: todoId(block),
+        currentContract: protectedContract(block),
+        targetPath: target,
+        targetSha256: sha256
+      }));
+      if (rebaselined) {
+        warnings.push({
+          code: 'rebaselined_dirty_target_placeholder',
+          todo_id: todoId(block),
+          target,
+          contract_rebaseline_run_stamp: rebaselined.cause_run.run_stamp,
+          message: 'A materialized Create-only target is admitted as Patch-only only through an exact target-hash-bound rebaseline receipt.'
+        });
+        continue;
+      }
       errors.push({
         code: 'contract_unsatisfiable_dirty_scope',
         todo: firstLine.trim(),
         target,
-        sha256: `sha256:${crypto.createHash('sha256').update(content).digest('hex')}`,
+        sha256: `sha256:${sha256}`,
         message: 'Selected TODO targets a dirty bounded-proposal placeholder. Snapshot and rebaseline the target set before any claim or retry.'
       });
     }
@@ -625,7 +657,7 @@ export function validatePhaseLoopPreflight(options = {}) {
     allowPendingCompletionRecovery: fixtureProfile,
     claimPath: options.claim
   });
-  validateDirtyTargetPlaceholders(repoRoot, todoText, errors);
+  validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings);
   // Claim-smoke fixtures intentionally model intermediate controller-owned
   // completion mutations. Production queues must never carry that shape.
   if (!fixtureProfile) {

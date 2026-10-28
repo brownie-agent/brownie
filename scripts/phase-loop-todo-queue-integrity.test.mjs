@@ -247,6 +247,41 @@ test('allows adding a missing prerequisite only with an exact deterministic rece
   assert.equal(result.warnings.find((warning) => warning.code === 'todo_dependency_rebaselined')?.todo_id, 'E-20a-golden-journey-workspace-mutation');
 });
 
+test('allows Create-to-Patch materialization only with an exact approved receipt', () => {
+  const before = queue(e20b.replace('Patch only `scripts/release-runtime-operational-evidence.mjs`', 'Create only `scripts/release-runtime-operational-evidence.mjs`'));
+  const after = queue(e20b);
+  const receipt = buildContractRebaselineReceipt({
+    repoRoot: process.cwd(),
+    beforeTodoText: before,
+    afterTodoText: after,
+    runStamp: 'materialized-target-run',
+    eventKey: 'materialized-target-event',
+    diagnostic: 'contract_unsatisfiable_dirty_scope',
+    verification: {
+      repair_command: 'node scripts/phase-loop-preclaim-recovery.mjs',
+      guard_command: 'node scripts/guard-todo-decomposition.mjs',
+      integrity_command: 'pnpm -s phase-loop:todo-queue-integrity'
+    },
+    targetSnapshots: [{
+      operation: 'Create',
+      path: 'scripts/release-runtime-operational-evidence.mjs',
+      exists_before: false,
+      sha256_before: null,
+      exists_after: true,
+      sha256_after: 'a'.repeat(64)
+    }]
+  });
+  const result = validateTodoQueueIntegrity({ todoBefore: before, todoAfter: after, contractRebaselineRecords: [receipt] });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.deepEqual(result.warnings.find((warning) => warning.code === 'todo_contract_rebaselined'), {
+    code: 'todo_contract_rebaselined',
+    message: 'A protected TODO contract changed only through an exact approved deterministic rebaseline receipt.',
+    todo_id: 'E-20b-stateful-soak-real-workload',
+    changed_fields: ['first_line'],
+    contract_rebaseline_run_stamp: 'materialized-target-run'
+  });
+});
+
 test('fails closed when an approved contract rebaseline record does not match the live before/after contracts', () => {
   const before = queue(e20a, e20b);
   const after = queue(e20b.replace('Depends on: E-20a-golden-journey-workspace-mutation.', 'Depends on: <none>.'));

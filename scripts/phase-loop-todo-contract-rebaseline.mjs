@@ -165,7 +165,9 @@ export function buildContractRebaselineReceipt({
   eventKey,
   diagnostic,
   verification,
-  todoIds = null
+  todoIds = null,
+  targetSnapshots = null,
+  targetCapture = null
 }) {
   const changes = contractChanges({ beforeTodoText, afterTodoText, todoIds });
   if (changes.length === 0) return null;
@@ -174,6 +176,16 @@ export function buildContractRebaselineReceipt({
   if (!runStamp || !eventKey || !diagnostic || !verification?.repair_command || !verification?.guard_command || !verification?.integrity_command) {
     throw new Error('contract rebaseline receipt requires cause run and verification path');
   }
+  const normalizedTargetSnapshots = Array.isArray(targetSnapshots)
+    ? targetSnapshots.map((snapshot) => ({
+      operation: String(snapshot?.operation ?? ''),
+      path: String(snapshot?.path ?? ''),
+      exists_before: snapshot?.exists_before ?? null,
+      sha256_before: snapshot?.sha256_before ?? null,
+      exists_after: snapshot?.exists_after ?? null,
+      sha256_after: snapshot?.sha256_after ?? null
+    })).filter((snapshot) => snapshot.path && ['Patch', 'Create'].includes(snapshot.operation))
+    : [];
   return {
     schema_version: 1,
     record_type: 'todo_contract_rebaseline',
@@ -200,9 +212,26 @@ export function buildContractRebaselineReceipt({
     after_todo_sha256: sha256Text(afterTodoText),
     before_breakdown_sha256: beforeBreakdownText === null ? null : sha256Text(beforeBreakdownText),
     after_breakdown_sha256: afterBreakdownText === null ? null : sha256Text(afterBreakdownText),
+    ...(normalizedTargetSnapshots.length > 0 ? { target_snapshots: normalizedTargetSnapshots } : {}),
+    ...(targetCapture && typeof targetCapture === 'object' ? { target_capture: targetCapture } : {}),
     generated_at: new Date().toISOString().replace(/\.\d{3}Z$/u, 'Z'),
     controller: 'phase-loop-preclaim-recovery'
   };
+}
+
+function validApprovedRebaselineRecord(record) {
+  return record?.schema_version === 1
+    && record.record_type === 'todo_contract_rebaseline'
+    && record.status === 'approved'
+    && record.approval === 'preclaim_deterministic_repair_guard_passed'
+    && Array.isArray(record.target_todo_ids)
+    && Array.isArray(record.parent_todo_ids)
+    && /^[a-f0-9]{64}$/u.test(String(record.before_todo_sha256 ?? ''))
+    && /^[a-f0-9]{64}$/u.test(String(record.after_todo_sha256 ?? ''))
+    && ((record.before_breakdown_sha256 ?? null) === null || /^[a-f0-9]{64}$/u.test(String(record.before_breakdown_sha256)))
+    && ((record.after_breakdown_sha256 ?? null) === null || /^[a-f0-9]{64}$/u.test(String(record.after_breakdown_sha256)))
+    && Boolean(record.cause_run?.run_stamp && record.cause_run?.event_key && record.cause_run?.diagnostic_sha256)
+    && Boolean(record.verification?.repair_command && record.verification?.guard_command && record.verification?.integrity_command && record.verification.guard_passed === true);
 }
 
 export function writeContractRebaselineReceipt(repoRoot, receipt) {
@@ -275,27 +304,36 @@ export function matchesContractRebaselineRecord(record, {
   beforeBreakdownSha256 = null,
   afterBreakdownSha256 = null
 }) {
-  if (record?.schema_version !== 1 || record.record_type !== 'todo_contract_rebaseline' || record.status !== 'approved') return false;
-  if (record.approval !== 'preclaim_deterministic_repair_guard_passed') return false;
-  if (!Array.isArray(record.target_todo_ids) || !record.target_todo_ids.includes(changedTodoId)) return false;
-  if (!Array.isArray(record.parent_todo_ids) || record.parent_todo_ids.length === 0) return false;
+  if (!validApprovedRebaselineRecord(record) || !record.target_todo_ids.includes(changedTodoId)) return false;
   // The whole-document hashes are immutable audit anchors for the repair
   // transaction, not a continuing precondition.  Later queue work may add
   // independent TODOs, which necessarily changes them without changing this
   // record's protected before/after contract.  Requiring their equality here
   // would turn a previously approved rebaseline into a permanent pre-claim
   // blocker.  The exact per-TODO contracts below remain the authorization.
-  if (!/^[a-f0-9]{64}$/u.test(String(record.before_todo_sha256 ?? ''))
-    || !/^[a-f0-9]{64}$/u.test(String(record.after_todo_sha256 ?? ''))) return false;
-  if ((record.before_breakdown_sha256 ?? null) !== null
-    && !/^[a-f0-9]{64}$/u.test(String(record.before_breakdown_sha256))) return false;
-  if ((record.after_breakdown_sha256 ?? null) !== null
-    && !/^[a-f0-9]{64}$/u.test(String(record.after_breakdown_sha256))) return false;
-  if (!record.cause_run?.run_stamp || !record.cause_run?.event_key || !record.cause_run?.diagnostic_sha256) return false;
-  if (!record.verification?.repair_command || !record.verification?.guard_command || !record.verification?.integrity_command || record.verification.guard_passed !== true) return false;
   const change = record.contract_changes?.find((entry) => entry.todo_id === changedTodoId);
   return Boolean(change)
     && JSON.stringify(change.changed_fields) === JSON.stringify(changedFields)
     && JSON.stringify(change.before_contract) === JSON.stringify(beforeContract)
     && JSON.stringify(change.after_contract) === JSON.stringify(afterContract);
+}
+
+export function matchesMaterializedTargetRebaseline(record, {
+  todoId: currentTodoId,
+  currentContract,
+  targetPath,
+  targetSha256
+}) {
+  if (!validApprovedRebaselineRecord(record) || !record.target_todo_ids.includes(currentTodoId)) return false;
+  const change = record.contract_changes?.find((entry) => entry.todo_id === currentTodoId);
+  if (!change || JSON.stringify(change.after_contract) !== JSON.stringify(currentContract)) return false;
+  const snapshot = record.target_snapshots?.find((entry) => entry?.path === targetPath);
+  if (!snapshot || snapshot.operation !== 'Create' || snapshot.exists_after !== true || snapshot.sha256_after !== targetSha256) return false;
+  const beforeCreatesTarget = String(change.before_contract?.first_line ?? '').includes(`Create only \`${targetPath}\``);
+  const afterPatchesTarget = String(change.after_contract?.first_line ?? '').includes(`Patch only \`${targetPath}\``);
+  const capturedBeforeAbsence = snapshot.exists_before === false && snapshot.sha256_before === null;
+  const legacyCapture = snapshot.exists_before === null
+    && snapshot.sha256_before === null
+    && record.target_capture?.mode === 'legacy_pre_capture_materialization';
+  return beforeCreatesTarget && afterPatchesTarget && (capturedBeforeAbsence || legacyCapture);
 }
