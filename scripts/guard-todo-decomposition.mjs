@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadTodoState } from './phase-loop-todo-state.mjs';
-import { boundedScopeValues, boundedScopes as boundedScopesFromFirstLine } from './phase-loop-bounded-scope.mjs';
+import { boundedScopeEntries, boundedScopeValues, boundedScopes as boundedScopesFromFirstLine } from './phase-loop-bounded-scope.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -536,8 +536,12 @@ function validateLeafBlock(block, errors, options = {}) {
   if (!hasAllowedVerification(block)) {
     errors.push(`${owner}: Verification must use bounded allowlisted commands or explicit inspect/blocker/fail-closed condition.`);
   }
-  if (scopes.length > 2) {
-    errors.push(`${owner}: Patch only/Create only scope must name at most two concrete backticked paths.`);
+  const clauseCounts = new Map();
+  for (const entry of boundedScopeEntries(scopeLine(block))) {
+    clauseCounts.set(entry.operation, (clauseCounts.get(entry.operation) ?? 0) + 1);
+  }
+  if ([...clauseCounts.values()].some((count) => count === 0)) {
+    errors.push(`${owner}: every Patch only/Create only clause must name a concrete backticked path.`);
   }
   for (const target of scopes) {
     if (target.endsWith('/')) {
@@ -798,7 +802,7 @@ function scoreLeafBlock(block) {
   const score = {
     todo_id: todoId(block),
     leaf_size_score: block.length <= 1200 && block.split('\n').length <= 9 ? 2 : block.length <= maxLeafBlockChars && block.split('\n').length <= maxLeafBlockLines ? 1 : 0,
-    scope_score: scopes.length > 0 && scopes.length <= 2 ? 2 : 0,
+    scope_score: scopes.length > 0 ? 2 : 0,
     verification_score: commands.length > 0 ? 2 : verificationLines(block).length > 0 ? 1 : 0,
     dependency_score: dependenciesLines(block).length === 1 && (deps.length > 0 || dependenciesLines(block)[0].includes('<none>')) ? 2 : 0,
     completion_clarity_score: completion.length >= 60 && !/fix everything|every problem|make .*release ready immediately|全部|すべて/i.test(completion) ? 2 : completion.length >= 40 ? 1 : 0,

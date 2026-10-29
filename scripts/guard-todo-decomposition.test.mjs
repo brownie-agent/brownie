@@ -58,6 +58,19 @@ test('scope parsing ignores descriptive backticks after the bounded path', () =>
   }), []);
 });
 
+test('accepts all concrete targets from repeated bounded clauses', () => {
+  const leaf = `- [ ] E-multi: Patch only \`scripts/a.mjs\` and \`scripts/a.test.mjs\`, then patch only \`package.json\` and \`.github/workflows/release.yml\`:
+  Route: implementation.
+  Source TODO: E-parent.
+  Depends on: <none>.
+  Completion condition: every declared target is implemented.
+  Forbidden changes: do not edit unrelated files.
+  Verification: run \`pnpm --workspace-root check\`.`;
+  assert.deepEqual(validateTodoDecompositionText(leaf, {
+    packageScripts: new Set(['check'])
+  }), []);
+});
+
 test('rejects decomposition leaf without required schema fields', () => {
   const errors = validateTodoDecompositionText(`- [ ] E-15b-child: Patch only \`scripts/example.mjs\`:
   Source TODO: E-15b: Decompose release evidence work.
