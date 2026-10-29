@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { rebaselineWorkspaceToApprovedBaseline } from './phase-loop-workspace-baseline-rebaseline.mjs';
@@ -195,6 +195,78 @@ test('controller reloads its process before using a fast-forwarded phase-loop sh
   assert.match(controller, /phase_loop_reload_supervisor_source\(\)/u);
   assert.match(controller, /exec \/bin\/bash "\$ROOT_DIR\/phase-loop\.sh" supervise/u);
   assert.match(controller, /exec \/bin\/bash "\$ROOT_DIR\/phase-loop\.sh" run-once/u);
+});
+
+test('controller captures reload status before errexit can bypass the run-once handoff', () => {
+  const controller = fs.readFileSync(new URL('../phase-loop.sh', import.meta.url), 'utf8');
+  const runFunctionStart = controller.indexOf('run_brownie_once() {');
+  const runFunctionEnd = controller.indexOf('\nphase_loop_finalize_unexpected_exit()', runFunctionStart);
+  const runOnceCaseStart = controller.indexOf('  run-once)');
+  const runOnceCaseEnd = controller.indexOf('\n  *)', runOnceCaseStart);
+
+  assert(runFunctionStart >= 0 && runFunctionEnd > runFunctionStart, 'run_brownie_once must remain extractable for status-capture coverage');
+  assert(runOnceCaseStart >= 0 && runOnceCaseEnd > runOnceCaseStart, 'run-once command branch must remain extractable for status-capture coverage');
+
+  const runFunction = controller.slice(runFunctionStart, runFunctionEnd);
+  const runOnceCase = controller.slice(runOnceCaseStart, runOnceCaseEnd);
+
+  assert.match(
+    runFunction,
+    /if _run_brownie_once "\$@"; then\s+run_status=0\s+else\s+run_status=\$\?\s+fi/u,
+    'run_brownie_once must capture a reload status from its inner run before errexit can exit the shell'
+  );
+  assert.match(
+    runOnceCase,
+    /if run_brownie_once; then\s+run_once_status=0\s+else\s+run_once_status=\$\?\s+fi/u,
+    'the run-once command branch must capture reload status before taking the lock-release and exec handoff'
+  );
+});
+
+test('run helper records its terminal state after a reload result enables errexit', () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-controller-reload-errexit-'));
+  const statusEvidence = path.join(sandbox, 'status-evidence.txt');
+  const deferredSignal = path.join(sandbox, 'deferred-signal');
+  const controller = fs.readFileSync(new URL('../phase-loop.sh', import.meta.url), 'utf8');
+  const runFunctionStart = controller.indexOf('run_brownie_once() {');
+  const runFunctionEnd = controller.indexOf('\nphase_loop_finalize_unexpected_exit()', runFunctionStart);
+  assert(runFunctionStart >= 0 && runFunctionEnd > runFunctionStart, 'run_brownie_once must remain extractable for errexit coverage');
+  const runFunction = controller.slice(runFunctionStart, runFunctionEnd);
+
+  const probe = `${runFunction}
+load_env() { :; }
+phase_loop_require_operational_configuration() { return 0; }
+validate_terminal_failure_retry_cap() { return 0; }
+validate_runtime_authorization_rebaseline_cap() { return 0; }
+now_utc() { printf '2026-10-29T00:00:00Z'; }
+write_status() { printf '%s|%s|%s|%s|%s\\n' "$@" > "$TEST_STATUS_EVIDENCE"; }
+_run_brownie_once() {
+  # Mirrors the rebaseline helper restoring errexit before yielding the
+  # controller-reload result.
+  set -e
+  PHASE_LOOP_TASK_LEDGER_FAILURE=1
+  PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL='reload handoff probe'
+  return 79
+}
+run_brownie_once
+`;
+  const result = spawnSync('bash', ['-eu', '-c', probe], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      TEST_STATUS_EVIDENCE: statusEvidence,
+      PHASE_LOOP_DEFERRED_SIGNAL_FILE: deferredSignal,
+      PROGRESS_STATE_FILE: path.join(sandbox, 'progress-state.json'),
+      SUPERVISOR_LOG: path.join(sandbox, 'supervisor.log'),
+      CONSECUTIVE_FAILURES: '0'
+    }
+  });
+
+  assert.equal(result.status, 78, `expected the captured reload result to reach terminal-state handling: ${result.stderr}`);
+  assert.equal(
+    fs.readFileSync(statusEvidence, 'utf8').split('|', 1)[0],
+    'blocked',
+    'run_brownie_once must run its terminal-state handler instead of exiting at the inner reload return'
+  );
 });
 
 test('controller reload detection canonicalizes an aliased workspace root', () => {

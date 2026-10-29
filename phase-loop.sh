@@ -17772,8 +17772,16 @@ run_brownie_once() {
   PHASE_LOOP_TASK_LEDGER_FAILURE=0
   PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL=""
   rm -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE"
-  _run_brownie_once "$@"
-  local run_status=$?
+  # The workspace rebaseline helper may enable errexit while it captures the
+  # Git result.  Capture a nonzero child status in a conditional so a reload
+  # request (79) reaches the caller that owns the lock handoff instead of
+  # terminating this shell before it can be handled.
+  local run_status
+  if _run_brownie_once "$@"; then
+    run_status=0
+  else
+    run_status=$?
+  fi
   if [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 1 ]; then
     local detail="Task ledger failed while recording the run; refusing to leave status running. ${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL} stdout=${PHASE_LOOP_ACTIVE_STDOUT_LOG:-<not-created>} stderr=${PHASE_LOOP_ACTIVE_STDERR_LOG:-<not-created>} progress=$PROGRESS_STATE_FILE"
     local task_ledger_failure_count="${CONSECUTIVE_FAILURES:-1}"
@@ -18411,8 +18419,14 @@ case "${1:-status}" in
     trap 'run_once_exit_code=$?; phase_loop_release_supervisor_lock; phase_loop_finalize_unexpected_exit "$run_once_exit_code"; unset PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION' EXIT
     trap 'phase_loop_handle_run_signal INT' INT
     trap 'phase_loop_handle_run_signal TERM' TERM
-    run_brownie_once
-    run_once_status=$?
+    # A controller source reload is an expected nonzero result.  Keep this
+    # invocation conditional even when an earlier preflight enabled errexit,
+    # so the ownership-safe release and exec path below always runs.
+    if run_brownie_once; then
+      run_once_status=0
+    else
+      run_once_status=$?
+    fi
     if [ "$run_once_status" -eq 79 ]; then
       if ! phase_loop_release_supervisor_lock || [ -d "$LOCK_DIR" ]; then
         write_status "blocked" "Controller shell reload refused because the run-once generation could not release its durable lock ownership." "" "78" "${CONSECUTIVE_FAILURES:-0}"
