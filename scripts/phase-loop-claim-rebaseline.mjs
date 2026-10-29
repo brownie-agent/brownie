@@ -132,6 +132,101 @@ function archivePath(claimDir, runStamp) {
   return candidate;
 }
 
+function validClaimTarget(target) {
+  if (typeof target !== 'string' || target.length === 0 || target.includes('\u0000') || target.includes('\\')) return false;
+  if (path.isAbsolute(target)) return false;
+  const normalized = path.posix.normalize(target);
+  return normalized === target && normalized !== '.' && normalized !== '..' && !normalized.startsWith('../');
+}
+
+function validRunStamp(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value);
+}
+
+function validateActiveClaimResumeAdmission({
+  resumeAdmissionPath,
+  stateDir,
+  runsDir,
+  claim,
+  queue,
+  runStamp,
+  selectedTodo,
+}) {
+  if (!resumeAdmissionPath) return { valid: false, reason: 'not_supplied', path: null };
+  const resolvedRuns = path.resolve(runsDir);
+  const expectedPath = path.join(resolvedRuns, `${runStamp}.active-claim-resume-admission.json`);
+  const resolvedPath = path.resolve(resumeAdmissionPath);
+  const relativeToState = path.relative(path.resolve(stateDir), resolvedPath);
+  if (resolvedPath !== expectedPath
+    || relativeToState === ''
+    || relativeToState === '..'
+    || relativeToState.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relativeToState)) {
+    return { valid: false, reason: 'path_not_current_run_receipt', path: resolvedPath };
+  }
+
+  const receipt = readJson(resolvedPath);
+  if (!receipt
+    || receipt.schema_version !== 1
+    || receipt.kind !== 'phase_loop_active_claim_resume_admission_receipt'
+    || receipt.issued_from_stage !== 'pre-claim-boundary'
+    || receipt.run_stamp !== runStamp
+    || receipt.claim_id !== claim.claim_id
+    || receipt.claim_run_stamp !== claim.run_stamp
+    || receipt.selected_todo_id !== selectedTodoId(selectedTodo)
+    || receipt.selected_todo_sha256 !== sha256(selectedTodo)
+    || receipt.queue_generation == null
+    || !receipt.queue_fingerprint
+    || String(receipt.queue_generation) !== String(claim.queue_generation ?? '')
+    || receipt.queue_fingerprint !== String(claim.queue_fingerprint ?? '')
+    || String(receipt.queue_generation) !== String(queue.generation ?? '')
+    || receipt.queue_fingerprint !== String(queue.fingerprint ?? '')) {
+    return { valid: false, reason: 'identity_or_queue_mismatch', path: resolvedPath };
+  }
+
+  const selectedTargets = new Set(selectedContract(selectedTodo).target_files);
+  if (selectedTargets.size === 0
+    || !Array.isArray(receipt.admitted_targets)
+    || receipt.admitted_targets.length === 0
+    || !Array.isArray(receipt.materializations)
+    || receipt.materializations.length === 0) {
+    return { valid: false, reason: 'missing_target_attestation', path: resolvedPath };
+  }
+
+  const admittedTargets = new Set();
+  for (const target of receipt.admitted_targets) {
+    if (!target
+      || !validClaimTarget(target.target)
+      || !selectedTargets.has(target.target)
+      || !/^sha256:[a-f0-9]{64}$/u.test(String(target.sha256 ?? ''))
+      || !validRunStamp(target.materialization_run_stamp)) {
+      return { valid: false, reason: 'invalid_admitted_target', path: resolvedPath };
+    }
+    admittedTargets.add(target.target);
+  }
+
+  const materializedTargets = new Set();
+  for (const materialization of receipt.materializations) {
+    if (!materialization
+      || !validClaimTarget(materialization.materialized_target)
+      || !selectedTargets.has(materialization.materialized_target)
+      || !validRunStamp(materialization.materialization_run_stamp)) {
+      return { valid: false, reason: 'invalid_materialization', path: resolvedPath };
+    }
+    materializedTargets.add(materialization.materialized_target);
+  }
+  if ([...admittedTargets].some((target) => !materializedTargets.has(target))) {
+    return { valid: false, reason: 'admitted_target_not_materialized', path: resolvedPath };
+  }
+
+  return {
+    valid: true,
+    reason: 'current_boundary_admission_verified',
+    path: resolvedPath,
+    admitted_targets: [...admittedTargets].sort(),
+  };
+}
+
 export function rebaselineStaleClaim({
   repo,
   stateDir,
@@ -144,6 +239,7 @@ export function rebaselineStaleClaim({
   todoPath,
   runStamp,
   baselineRef = 'origin/main',
+  resumeAdmissionPath = '',
 }) {
   const claim = readJson(claimPath);
   const status = readJson(statusPath) ?? {};
@@ -202,6 +298,39 @@ export function rebaselineStaleClaim({
   ) || (
     claim.queue_fingerprint && queue.fingerprint && claim.queue_fingerprint !== queue.fingerprint
   );
+  const ledgerEvidence = readLedger(ledgerPath).filter((event) => event.claim_id === claim.claim_id && ['failed', 'blocked', 'replanned', 'completed'].includes(event.to_state));
+  const priorRuns = priorTerminalEvidence(runsDir, claim.claim_id);
+  const resumeAdmission = validateActiveClaimResumeAdmission({
+    resumeAdmissionPath,
+    stateDir,
+    runsDir,
+    claim,
+    queue,
+    runStamp,
+    selectedTodo: String(claim.selected_todo ?? ''),
+  });
+  // A stale status can describe the boundary failure that was just repaired
+  // by this run's preflight.  Preserve only a receipt issued by that exact
+  // preflight, for this exact claim and queue, and only absent any terminal
+  // projection or terminal evidence.  A missing, stale, or malformed receipt
+  // remains fail-closed and follows the ordinary stale-claim isolation path.
+  const boundaryAdmittedResume = resumeAdmission.valid
+    && staleMaterializedScopeBoundary
+    && !queueMismatch
+    && selectedTodoStillPending
+    && !terminalProjection
+    && ledgerEvidence.length === 0
+    && priorRuns.length === 0;
+  if (boundaryAdmittedResume) {
+    return {
+      ok: true,
+      rebaselined: false,
+      reason: 'boundary_admitted_materialized_claim_preserved_for_resume',
+      claim_id: claim.claim_id,
+      resume_admission_path: resumeAdmission.path,
+      admitted_targets: resumeAdmission.admitted_targets,
+    };
+  }
   if (resumableContinuation && !queueMismatch && !staleClaimSnapshot) {
     return {
       ok: true,
@@ -210,8 +339,6 @@ export function rebaselineStaleClaim({
       claim_id: claim.claim_id,
     };
   }
-  const ledgerEvidence = readLedger(ledgerPath).filter((event) => event.claim_id === claim.claim_id && ['failed', 'blocked', 'replanned', 'completed'].includes(event.to_state));
-  const priorRuns = priorTerminalEvidence(runsDir, claim.claim_id);
   const staleRun = claim.run_stamp && claim.run_stamp !== runStamp;
   // A non-running persisted status is the controller's durable indication
   // that the previous owner is no longer active.  Do not trust a stale PID
@@ -276,6 +403,12 @@ export function rebaselineStaleClaim({
       selected_todo_still_pending: selectedTodoStillPending,
       ledger_terminal_events: ledgerEvidence,
       prior_terminal_runs: priorRuns,
+      resume_admission: {
+        supplied: Boolean(resumeAdmissionPath),
+        valid: resumeAdmission.valid,
+        reason: resumeAdmission.reason,
+        path: resumeAdmission.path,
+      },
     },
     recovery_state: 'redelegatable',
     retry_policy: 'do_not_inherit_source_claim_retry_cap_or_terminal_state',
@@ -437,6 +570,7 @@ function main() {
       todoPath: path.resolve(args.get('todo')),
       runStamp: args.get('run-stamp'),
       baselineRef: args.get('baseline-ref') ?? 'origin/main',
+      resumeAdmissionPath: args.get('resume-admission') ?? '',
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     process.exit(result.ok ? 0 : 78);

@@ -50,6 +50,36 @@ function fixture() {
   return { root, stateDir, claims, runs, selected, claimPath };
 }
 
+function writeResumeAdmission(f, runStamp, overrides = {}) {
+  const claim = JSON.parse(fs.readFileSync(f.claimPath, 'utf8'));
+  const target = 'scripts/roundtrip.test.mjs';
+  const receipt = {
+    schema_version: 1,
+    kind: 'phase_loop_active_claim_resume_admission_receipt',
+    issued_from_stage: 'pre-claim-boundary',
+    run_stamp: runStamp,
+    claim_id: claim.claim_id,
+    claim_run_stamp: claim.run_stamp,
+    selected_todo_id: 'E-23b-roundtrip-target-02',
+    selected_todo_sha256: crypto.createHash('sha256').update(f.selected).digest('hex'),
+    queue_generation: claim.queue_generation,
+    queue_fingerprint: claim.queue_fingerprint,
+    admitted_targets: [{
+      target,
+      sha256: `sha256:${'a'.repeat(64)}`,
+      materialization_run_stamp: claim.run_stamp,
+    }],
+    materializations: [{
+      materialization_run_stamp: claim.run_stamp,
+      materialized_target: target,
+    }],
+    ...overrides,
+  };
+  const receiptPath = path.join(f.runs, `${runStamp}.active-claim-resume-admission.json`);
+  writeJson(receiptPath, receipt);
+  return receiptPath;
+}
+
 test('isolates stale running r3 claim and records source/queue rebaseline before fresh delegation', () => {
   const f = fixture();
   const result = rebaselineStaleClaim({
@@ -156,6 +186,122 @@ test('isolates a stale pre-claim materialized-scope boundary claim even when its
   assert.equal(audit.reasons.stale_applied_projection, true);
   assert.equal(audit.reasons.selected_todo_still_pending, false);
   assert.equal(fs.existsSync(f.claimPath), false);
+});
+
+test('preserves a stale boundary claim only when this run attests its exact materialized placeholder', () => {
+  const f = fixture();
+  const runStamp = '20261020T090000Z';
+  writeJson(path.join(f.stateDir, 'status.json'), {
+    status: 'blocked',
+    detail: 'Phase-loop preflight failed before continuing; code=contract_unsatisfiable_dirty_scope.',
+  });
+  writeJson(path.join(f.stateDir, 'progress-state.json'), {
+    classification: 'progress',
+    progress_projection: {
+      claim_id: 'todo-g541-roundtrip-r3',
+      applied: 'True',
+      controller_action: 'resume',
+      stop_class: 'continuation_required',
+    },
+  });
+  writeJson(path.join(f.claims, 'todo-queue-state.json'), { generation: 541, fingerprint: 'old-queue' });
+  const receiptPath = writeResumeAdmission(f, runStamp);
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp,
+    baselineRef: 'origin/main',
+    resumeAdmissionPath: receiptPath,
+  });
+  assert.equal(result.rebaselined, false, JSON.stringify(result));
+  assert.equal(result.reason, 'boundary_admitted_materialized_claim_preserved_for_resume');
+  assert.deepEqual(result.admitted_targets, ['scripts/roundtrip.test.mjs']);
+  assert.equal(fs.existsSync(f.claimPath), true);
+});
+
+test('isolates a stale boundary claim when the purported current-run admission is stale or malformed', () => {
+  const f = fixture();
+  const runStamp = '20261020T090000Z';
+  writeJson(path.join(f.stateDir, 'status.json'), {
+    status: 'blocked',
+    detail: 'Phase-loop preflight failed before continuing; code=contract_unsatisfiable_dirty_scope.',
+  });
+  writeJson(path.join(f.stateDir, 'progress-state.json'), {
+    classification: 'progress',
+    progress_projection: {
+      claim_id: 'todo-g541-roundtrip-r3',
+      controller_action: 'resume',
+      stop_class: 'continuation_required',
+    },
+  });
+  writeJson(path.join(f.claims, 'todo-queue-state.json'), { generation: 541, fingerprint: 'old-queue' });
+  const receiptPath = writeResumeAdmission(f, runStamp, { run_stamp: '20261019T071825Z' });
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp,
+    baselineRef: 'origin/main',
+    resumeAdmissionPath: receiptPath,
+  });
+  assert.equal(result.rebaselined, true, JSON.stringify(result));
+  const audit = JSON.parse(fs.readFileSync(result.audit_path, 'utf8'));
+  assert.equal(audit.reasons.resume_admission.valid, false);
+  assert.equal(audit.reasons.resume_admission.reason, 'identity_or_queue_mismatch');
+  assert.equal(fs.existsSync(f.claimPath), false);
+});
+
+test('does not preserve a boundary-admitted claim when terminal ledger evidence exists', () => {
+  const f = fixture();
+  const runStamp = '20261020T090000Z';
+  writeJson(path.join(f.stateDir, 'status.json'), {
+    status: 'blocked',
+    detail: 'Phase-loop preflight failed before continuing; code=contract_unsatisfiable_dirty_scope.',
+  });
+  writeJson(path.join(f.stateDir, 'progress-state.json'), {
+    classification: 'progress',
+    progress_projection: {
+      claim_id: 'todo-g541-roundtrip-r3',
+      controller_action: 'resume',
+      stop_class: 'continuation_required',
+    },
+  });
+  writeJson(path.join(f.claims, 'todo-queue-state.json'), { generation: 541, fingerprint: 'old-queue' });
+  fs.writeFileSync(path.join(f.stateDir, 'task-ledger.jsonl'), `${JSON.stringify({
+    claim_id: 'todo-g541-roundtrip-r3', to_state: 'failed',
+  })}\n`);
+  const receiptPath = writeResumeAdmission(f, runStamp);
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp,
+    baselineRef: 'origin/main',
+    resumeAdmissionPath: receiptPath,
+  });
+  assert.equal(result.rebaselined, true, JSON.stringify(result));
+  const audit = JSON.parse(fs.readFileSync(result.audit_path, 'utf8'));
+  assert.equal(audit.reasons.resume_admission.valid, true);
+  assert.equal(audit.reasons.ledger_terminal_events.length, 1);
 });
 
 test('preserves an applied continuation when a completed TODO immediately follows its exact selected TODO', () => {
