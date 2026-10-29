@@ -88,10 +88,13 @@ export function admitMaterializedScopeRebaseline({ repoRoot, baselineRef, todoId
   const changes = contractChanges({ beforeTodoText, afterTodoText, todoIds: [todoId] });
   if (changes.length !== 1 || changes[0].todo_id !== todoId) throw new Error(`expected one changed contract for ${todoId}`);
   const change = changes[0];
-  // Operations are intentionally absent from `bounded_scopes`: it is the
-  // stable target-path projection.  A pure Create-to-Patch conversion thus
-  // changes the rendered first line but not the protected path list.
-  if (JSON.stringify(change.changed_fields) !== JSON.stringify(['first_line'])) {
+  // Operations are intentionally absent from `bounded_scopes`. A pure
+  // Create-to-Patch conversion changes only the rendered line; a harmless
+  // clause reordering also changes the ordered path projection. The map
+  // validation below still requires exactly the same target set.
+  const supportedDrift = JSON.stringify(change.changed_fields) === JSON.stringify(['first_line'])
+    || JSON.stringify(change.changed_fields) === JSON.stringify(['first_line', 'bounded_scopes']);
+  if (!supportedDrift) {
     throw new Error(`unsupported materialized scope contract drift: ${change.changed_fields.join(', ')}`);
   }
   const targetSnapshots = validateMaterializedScopeRebaseline({

@@ -52,8 +52,8 @@ test('rejects added scope and uncaptured content', () => {
 
 test('writes an exact receipt for a captured Create-to-Patch contract drift', () => {
   const { root, target, records } = fixture();
-  const before = `- [ ] E-fixture: Create only \`${target}\`:\n  Route: implementation.\n  Depends on: <none>.\n  Completion condition: complete.\n  Forbidden changes: none.\n  Verification: run \`node --test\`.\n`;
-  const after = before.replace('Create only', 'Patch only');
+  const before = `- [ ] E-fixture: Create only \`${target}\`, then patch only \`package.json\`:\n  Route: implementation.\n  Depends on: <none>.\n  Completion condition: complete.\n  Forbidden changes: none.\n  Verification: run \`node --test\`.\n`;
+  const after = before.replace(`Create only \`${target}\`, then patch only \`package.json\``, `Patch only \`package.json\`, then patch only \`${target}\``);
   fs.mkdirSync(path.join(root, '.brownie'), { recursive: true });
   fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-claims/contract-rebaselines'), { recursive: true });
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
