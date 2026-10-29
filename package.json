@@ -99,6 +99,7 @@
     "phase-loop:todo-queue-integrity": "node scripts/phase-loop-todo-queue-integrity.mjs",
     "phase-loop:todo-queue-integrity:test": "node --test scripts/phase-loop-todo-queue-integrity.test.mjs",
     "phase-loop:contract-rebaseline:test": "node --test scripts/phase-loop-todo-contract-rebaseline.test.mjs",
+    "phase-loop:materialized-scope-rebaseline:test": "node --test scripts/phase-loop-admit-materialized-scope-rebaseline.test.mjs",
     "phase-loop:preflight": "node scripts/phase-loop-preflight.mjs",
     "phase-loop:preflight:test": "node --test scripts/phase-loop-preflight.test.mjs",
     "phase-loop:execution-context:test": "node --test scripts/phase-loop-execution-context.test.mjs",
