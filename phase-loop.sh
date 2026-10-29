@@ -203,6 +203,13 @@ claim_path_for_run() {
   if [ -z "$archived_claim" ]; then
     archived_claim="$(find "$TODO_CLAIM_DIR" -maxdepth 1 -type f -name "*${run_stamp}*.json" -print 2>/dev/null | LC_ALL=C sort | tail -n 1)"
   fi
+  # The integrated supervisor can archive a claim with its own wall-clock
+  # stamp while handling this run's terminal recovery.  The pre-runtime
+  # snapshot is immutable and bound to this exact run, so use it before
+  # giving up on a public terminal trajectory identity.
+  if [ -z "$archived_claim" ] && [ -f "$RUN_DIR/$run_stamp.claim.before-runtime.json" ]; then
+    archived_claim="$RUN_DIR/$run_stamp.claim.before-runtime.json"
+  fi
   if [ -n "$archived_claim" ] && [ -f "$archived_claim" ]; then
     printf '%s\n' "$archived_claim"
   else
@@ -220,6 +227,62 @@ claim_snapshot_field() {
   claim_snapshot_json | python3 -c 'import json,sys; value=json.load(sys.stdin).get(sys.argv[1]); print("" if value is None else value)' "$field"
 }
 
+ensure_bdk_trajectory_state_machine_prefix() {
+  local run_stamp="$1"
+  local trajectory_path prefix_state
+  trajectory_path="$BDK_TRAJECTORY_DIR/$run_stamp.jsonl"
+
+  # A terminal or repair-feedback event can be emitted from a deterministic
+  # pre-Runtime recovery branch.  Those branches still performed fallback
+  # work for the selected claim, so publish the same observable state-machine
+  # prefix as a Runtime path.  Inspect the per-run public trajectory rather
+  # than trusting a branch-local flag: this also protects future recovery
+  # branches from silently bypassing the BDK contract.
+  prefix_state="$(python3 - "$trajectory_path" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+required = ("todo.claimed", "workflow.routed", "skill.selected")
+cursor = 0
+if path.exists():
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        for event in record.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if cursor < len(required) and event.get("type") == required[cursor]:
+                cursor += 1
+
+if cursor == len(required):
+    print("complete")
+elif cursor == 2:
+    print("skill")
+elif cursor == 1:
+    print("route-skill")
+else:
+    print("claim-route-skill")
+PY
+)" || return 78
+
+  # Calling write_bdk_trajectory_event for these non-terminal event types is
+  # intentionally non-recursive.  Do not append a duplicate prefix when a
+  # normal Runtime route already recorded it; append only the missing suffix.
+  if [ "$prefix_state" = "claim-route-skill" ]; then
+    write_bdk_trajectory_event "$run_stamp" "todo.claimed" '{"source":"phase-loop","reason":"bdk_prefix_recovery"}'
+  fi
+  if [ "$prefix_state" = "claim-route-skill" ] || [ "$prefix_state" = "route-skill" ]; then
+    write_bdk_trajectory_event "$run_stamp" "workflow.routed" '{"source":"phase-loop","bdk_state":"fallback","llm_route":"none","reason":"bdk_prefix_recovery"}'
+  fi
+  if [ "$prefix_state" = "claim-route-skill" ] || [ "$prefix_state" = "route-skill" ] || [ "$prefix_state" = "skill" ]; then
+    write_bdk_trajectory_event "$run_stamp" "skill.selected" '{"skill_id":"brownie.phase-loop.terminal-recovery","adapter":"bdk-agent-skills"}'
+  fi
+}
+
 write_bdk_trajectory_event() {
   local run_stamp="$1"
   local event_type="$2"
@@ -228,6 +291,11 @@ write_bdk_trajectory_event() {
   if [ -z "$payload_json" ]; then
     payload_json="{}"
   fi
+  case "$event_type" in
+    todo.completed|todo.replanned|todo.blocked|todo.repair_feedback)
+      ensure_bdk_trajectory_state_machine_prefix "$run_stamp" || return $?
+      ;;
+  esac
   local trajectory_claim_path claim_snapshot
   trajectory_claim_path="$(claim_path_for_run "$run_stamp")"
   claim_snapshot="$(claim_snapshot_json "$trajectory_claim_path")"
@@ -293,8 +361,14 @@ elif event_type == "todo.blocked":
 # the copy published to the harness. In particular, verification command
 # results often include the absolute cwd even when the command itself is safe.
 absolute_path = re.compile(r"(?:/Users/[^\s'\"]+|/home/[^\s'\"]+|[A-Za-z]:[/\\]Users[/\\][^\s'\"]+)", re.IGNORECASE)
+private_state_path = re.compile(r"(?:^|[/\\])\.brownie[/\\]private(?:[/\\]|$)", re.IGNORECASE)
 def public_value(value, key=""):
     if isinstance(value, str):
+        # Public BDK events must never disclose controller-private paths,
+        # including relative paths such as .brownie/private/... that do not
+        # match the user-home redaction above.
+        if private_state_path.search(value):
+            return "<private-state-path>"
         if key == "command" or key.endswith("_command") or "command" in key or key in {"stdout", "stderr", "path", "cwd"}:
             return absolute_path.sub("<workspace-path>", value)
         return absolute_path.sub("<user-path>", value)
@@ -9946,6 +10020,12 @@ todo_md_edit_allowed = (
     or "blocker todo" in selected_todo_lower
 )
 selected_first_line = progress_projection["selected_todo"].splitlines()[0] if progress_projection["selected_todo"].splitlines() else ""
+selected_todo_still_pending_in_queue = False
+if selected_first_line:
+    try:
+        selected_todo_still_pending_in_queue = selected_first_line in todo_path.read_text(encoding="utf-8")
+    except Exception:
+        selected_todo_still_pending_in_queue = True
 selected_first_line_still_pending = False
 todo_apply_paths = {"todo.md", ".brownie/todo.md", str(todo_path)}
 try:
@@ -9991,6 +10071,11 @@ no_actionable_after_apply = (
     and previous_applied
     and not semantic_completion_required
     and not previous_todo_md_apply_left_selected_todo_pending
+    # A previous objective proposal is not completion evidence while the
+    # selected queue entry remains. Without this guard, a later zero-candidate
+    # resume can erase the active claim's failure path and falsely terminalize
+    # work that Runtime did not execute in the current run.
+    and not selected_todo_still_pending_in_queue
     and progress_projection["cli_status"] in ("no_eligible_task", "no_actionable_work")
     and progress_projection["stop_class"] == "no_actionable_work"
 )
@@ -10072,6 +10157,7 @@ if todo_md_only_apply or selected_first_line_still_pending:
     workspace_changed = False
 progress_projection["todo_md_only_apply_blocked_as_progress"] = todo_md_only_apply
 progress_projection["selected_todo_first_line_still_pending_after_todo_md_apply"] = selected_first_line_still_pending
+progress_projection["selected_todo_still_pending_in_queue"] = selected_todo_still_pending_in_queue
 terminal_non_progress = (
     exit_code == 0
     and not workspace_changed

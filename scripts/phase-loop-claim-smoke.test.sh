@@ -713,7 +713,7 @@ fake_brownie_todo_md_only_apply="$(mktemp)"
 cat > "$fake_brownie_todo_md_only_apply" <<'SH'
 #!/usr/bin/env bash
 set -eu
-cat <<'JSON'
+cat <<JSON
 {
   "automation": {
     "schema_version": 1,
@@ -746,7 +746,7 @@ cat <<'JSON'
   "stop_reason": "objective_proposal_candidate_ready",
   "objective_apply_applied": true,
   "objective_apply_apply_status": "Applied",
-  "objective_apply_path": "todo.md",
+  "objective_apply_path": "${PHASE_LOOP_TEST_OBJECTIVE_APPLY_PATH:-todo.md}",
   "next_invocation": {"command": "resume", "arguments": []}
 }
 JSON
@@ -3421,7 +3421,7 @@ BROWNIE_BIN="$fake_brownie_must_not_run" \
 PHASE_LOOP_WORKSPACE_ROOT="$test_workspace" \
 run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-python3 - "$state_explicit_blocker/status.json" "$state_explicit_blocker/todo-claims/current.json" "$state_explicit_blocker/todo-claims/blocked.jsonl" <<'PY'
+python3 - "$state_explicit_blocker/status.json" "$state_explicit_blocker/todo-claims/current.json" "$state_explicit_blocker/todo-claims/blocked.jsonl" "$state_explicit_blocker/bdk-harness-feedback.json" "$state_explicit_blocker/trajectories" <<'PY'
 import json
 import pathlib
 import sys
@@ -3429,12 +3429,25 @@ import sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 claim = json.load(open(sys.argv[2], encoding="utf-8"))
 blocked = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+feedback = json.load(open(sys.argv[4], encoding="utf-8"))
+trajectory_dir = pathlib.Path(sys.argv[5])
+events = []
+for trajectory_path in trajectory_dir.glob("*.jsonl"):
+    for line in trajectory_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("claim_id") == claim["claim_id"]:
+            events.extend(record.get("events", []))
+types = [event["type"] for event in events]
 assert status["status"] == "blocked_todo_recorded", status
 assert status["exit_code"] == "0", status
 assert "explicit owner/release blocker" in status["detail"], status
 assert claim["status"] == "blocked", claim
 assert claim["selected_todo"].startswith("- [ ] E-15e-doc-sync-blocker:"), claim
 assert "E-15e-doc-sync-blocker" in blocked, blocked
+assert feedback["ok"] is True, feedback
+assert feedback["terminal_event_count"] == 1, feedback
+assert types == ["todo.claimed", "workflow.routed", "skill.selected", "todo.blocked"], types
+assert events[-1]["payload"]["owner_blocked"] is True, events[-1]
 PY
 
 PHASE_LOOP_STATE_DIR="$state_explicit_blocker" \
@@ -3538,6 +3551,21 @@ assert progress["classification"] == "no_progress", progress
 assert progress["same_progress_count"] == 3, progress
 assert progress["meaningful_progress"] is False, progress
 PY
+python3 - "$state_stagnation/bdk-harness-feedback.json" "$state_stagnation/trajectories" <<'PY'
+import json
+import pathlib
+import sys
+
+feedback = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+trajectory_dir = pathlib.Path(sys.argv[2])
+latest = sorted(trajectory_dir.glob("*.jsonl"))[-1]
+records = [json.loads(line) for line in latest.read_text(encoding="utf-8").splitlines() if line.strip()]
+events = [event for record in records for event in record.get("events", [])]
+assert feedback["ok"] is True, feedback
+assert feedback["terminal_event_count"] == 1, feedback
+assert any(event.get("type") == "todo.replanned" for event in events), events
+assert all(".brownie/private/" not in json.dumps(event.get("payload", {})) for event in events), events
+PY
 git -C "$queue_stagnation_workspace" restore --worktree -- .brownie
 test_workspace="$queue_workspace"
 
@@ -3612,6 +3640,72 @@ assert progress["meaningful_progress"] is False, progress
 assert projection["completed_by_no_actionable_after_apply"] is False, projection
 assert claim["status"] == "in_progress", claim
 assert "E-08b-next" in todo, todo
+PY
+
+# A proposal applied to a product target does not make the selected queue item
+# complete. If the next resume reports zero candidates, the controller must
+# retain the TODO and route the no-execution result through terminal recovery
+# instead of inheriting the previous apply as a completion signal.
+state_non_todo_no_eligible="$(mktemp -d)"
+prompt_non_todo_no_eligible="$(mktemp)"
+todo_non_todo_no_eligible="$(mktemp)"
+workspace_non_todo_no_eligible="$(mktemp -d)"
+git -C "$workspace_non_todo_no_eligible" init -b main >/dev/null
+mkdir -p "$workspace_non_todo_no_eligible/.brownie"
+printf '%s\n' '{"name":"brownie-claim-smoke-non-todo-no-eligible-fixture","private":true,"scripts":{"guard:todo-decomposition":"true","phase-loop:todo-queue-integrity":"true"}}' > "$workspace_non_todo_no_eligible/package.json"
+printf '# queue fixture breakdown\n' > "$workspace_non_todo_no_eligible/.brownie/todo-breakdown.md"
+: > "$workspace_non_todo_no_eligible/phase-loop-smoke-non-todo.txt"
+git -C "$workspace_non_todo_no_eligible" add package.json .brownie/todo-breakdown.md phase-loop-smoke-non-todo.txt
+git -C "$workspace_non_todo_no_eligible" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+printf 'base prompt\n' > "$prompt_non_todo_no_eligible"
+printf -- '- [ ] E-08c-next: Preserve this implementation TODO until Runtime proves completion:\n  Route: implementation.\n  Completion condition: a current Runtime task execution proves the selected work complete.\n  Forbidden changes: do not infer completion from a prior objective proposal.\n  Verification: inspect terminal recovery evidence.\n' > "$todo_non_todo_no_eligible"
+
+PHASE_LOOP_STATE_DIR="$state_non_todo_no_eligible" \
+PHASE_LOOP_PROMPT="$prompt_non_todo_no_eligible" \
+PHASE_LOOP_TODO="$todo_non_todo_no_eligible" \
+BROWNIE_BIN="$fake_brownie_todo_md_only_apply" \
+PHASE_LOOP_TEST_OBJECTIVE_APPLY_PATH="phase-loop-smoke-non-todo.txt" \
+PHASE_LOOP_WORKSPACE_ROOT="$workspace_non_todo_no_eligible" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+PHASE_LOOP_STATE_DIR="$state_non_todo_no_eligible" \
+PHASE_LOOP_PROMPT="$prompt_non_todo_no_eligible" \
+PHASE_LOOP_TODO="$todo_non_todo_no_eligible" \
+BROWNIE_BIN="$fake_brownie_no_actionable" \
+PHASE_LOOP_WORKSPACE_ROOT="$workspace_non_todo_no_eligible" \
+PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+python3 - "$state_non_todo_no_eligible/status.json" "$state_non_todo_no_eligible/todo-claims/current.json" "$state_non_todo_no_eligible/todo-claims/blocked.jsonl" "$todo_non_todo_no_eligible" "$state_non_todo_no_eligible/bdk-harness-feedback.json" "$state_non_todo_no_eligible/trajectories" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+claim = json.load(open(sys.argv[2], encoding="utf-8"))
+blocked = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+todo = open(sys.argv[4], encoding="utf-8").read()
+feedback = json.load(open(sys.argv[5], encoding="utf-8"))
+events = []
+for trajectory_path in pathlib.Path(sys.argv[6]).glob("*.jsonl"):
+    for line in trajectory_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("claim_id") == claim["claim_id"]:
+            events.extend(record.get("events", []))
+types = [event["type"] for event in events]
+assert status["status"] == "blocked_todo_recorded", status
+assert status["exit_code"] == "0", status
+assert claim["status"] == "blocked", claim
+assert claim["selected_todo"].startswith("- [ ] E-08c-next-blocker:"), claim
+assert "E-08c-next-blocker" in blocked, blocked
+assert "- [ ] E-08c-next-blocker:" in todo, todo
+assert "Source TODO: E-08c-next." in todo, todo
+assert "- [ ] E-08c-next:" not in todo, todo
+assert feedback["ok"] is True, feedback
+assert feedback["terminal_event_count"] == 1, feedback
+assert types == ["todo.claimed", "workflow.routed", "skill.selected", "todo.blocked"], types
+assert events[-1]["payload"]["owner_blocked"] is True, events[-1]
+assert "todo.completed" not in types, types
 PY
 
 state_workspace_progress="$(mktemp -d)"

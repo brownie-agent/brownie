@@ -1522,7 +1522,15 @@ function upsertBreakdownSection({ breakdownText, decompositionId, sourceId, leav
   if (!breakdownText.includes(sectionHeader)) {
     return `${breakdownText.trimEnd()}\n\n${section}\n`;
   }
-  const pattern = new RegExp(`(?ms)^## ${decompositionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n.*?(?=^## |\\Z)`);
+  const escapedDecompositionId = decompositionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // JavaScript has no Python-style inline flags or \Z anchor. Match every
+  // character explicitly and stop only at the next top-level section or the
+  // actual end of the input; `$` with the multiline flag would stop at each
+  // line end instead of the end of this breakdown section.
+  const pattern = new RegExp(
+    `^## ${escapedDecompositionId}\\n[\\s\\S]*?(?=^## |(?![\\s\\S]))`,
+    'm'
+  );
   return breakdownText.replace(pattern, `${section}\n`);
 }
 

@@ -46,6 +46,7 @@ function activeClaimPlaceholderFixture(repo, options = {}) {
   const claimPath = path.join(stateRoot, 'todo-claims/current.json');
   const queuePath = path.join(stateRoot, 'todo-claims/todo-queue-state.json');
   const runStamp = '20261029T130826Z';
+  const claimRunStamp = options.claimRunStamp ?? runStamp;
   const claimId = 'todo-g624-active-r1';
   const queueGeneration = 624;
   const queueFingerprint = 'fixture-active-queue';
@@ -83,7 +84,7 @@ function activeClaimPlaceholderFixture(repo, options = {}) {
     selected_todo: selectedTodo,
     queue_generation: queueGeneration,
     queue_fingerprint: queueFingerprint,
-    run_stamp: runStamp,
+    run_stamp: claimRunStamp,
     terminal_failure_execution_evidence_path: evidencePath
   });
   writeJson(queuePath, {
@@ -133,6 +134,7 @@ function activeClaimPlaceholderFixture(repo, options = {}) {
     evidencePath,
     claimId,
     runStamp,
+    claimRunStamp,
     target
   };
 }
@@ -209,6 +211,60 @@ test('admits an active claim whose selected TODO is followed by a completed TODO
   });
   assert.equal(result.valid, true, JSON.stringify(result.errors));
   assert.equal(result.warnings.filter((warning) => warning.code === 'active_claim_owned_dirty_target_placeholder').length, 1);
+});
+
+test('uses immutable materialization evidence after a claim continuation and defers only a shared future target', () => {
+  const repo = makeRepo();
+  const fixture = activeClaimPlaceholderFixture(repo, { claimRunStamp: '20261029T152111Z' });
+  const result = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim-boundary',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.equal(result.warnings.find((warning) => warning.code === 'active_claim_owned_dirty_target_placeholder')?.run_stamp, fixture.runStamp);
+  const deferred = result.warnings.find((warning) => warning.code === 'active_claim_shared_dirty_target_deferred');
+  assert(deferred, JSON.stringify(result.warnings));
+  assert.equal(deferred.claim_id, fixture.claimId);
+  assert.equal(deferred.materialization_run_stamp, fixture.runStamp);
+  assert.equal(deferred.selected_todo_id, 'E-active');
+  assert.equal(deferred.todo_id, 'E-later');
+  assert.equal(deferred.target, fixture.target);
+
+  const unrelatedTodo = [
+    '- [ ] E-unrelated: Patch only `scripts/unrelated.mjs`:',
+    '  Route: implementation.',
+    '  Depends on: E-active.',
+    '  Completion condition: do not inherit the active claim.',
+    '  Verification: run `node --test scripts/unrelated.test.mjs`.'
+  ].join('\n');
+  fs.appendFileSync(path.join(repo, '.brownie/todo.md'), `\n${unrelatedTodo}\n`);
+  fs.writeFileSync(path.join(repo, 'scripts/unrelated.mjs'), '// Brownie bounded Patch-only proposal.\n');
+  const unrelated = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim-boundary',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert(unrelated.errors.some((error) => error.code === 'contract_unsatisfiable_dirty_scope' && error.target === 'scripts/unrelated.mjs'), JSON.stringify(unrelated.errors));
+
+  const claim = JSON.parse(fs.readFileSync(fixture.claimPath, 'utf8'));
+  claim.status = 'completed';
+  writeJson(fixture.claimPath, claim);
+  const settled = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim-boundary',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert(settled.errors.some((error) => error.code === 'contract_unsatisfiable_dirty_scope' && error.target === fixture.target), JSON.stringify(settled.errors));
 });
 
 test('keeps active-claim placeholder admission fail-closed for generic stage, missing target attestation, queue drift, and a non-pending selected TODO', () => {

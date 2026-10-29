@@ -559,11 +559,10 @@ function payloadValue(payload, automation, field) {
   return payload?.[field] ?? automation?.[field] ?? null;
 }
 
-function activeClaimPlaceholderOwnership({ repoRoot, stateRoot, claimPath, stage, todoText, target }) {
-  // This narrowly authorizes a resume of work that the current admitted claim
-  // itself materialized.  It is deliberately unavailable to generic/manual
-  // preflight calls and to fresh claims, so a future leaf cannot inherit an
-  // unproven dirty placeholder merely because it shares a path.
+function activeClaimMaterializedPlaceholder({ repoRoot, stateRoot, claimPath, stage, todoText }) {
+  // This narrowly proves materialization by the current admitted claim. It is
+  // deliberately unavailable to generic/manual preflight calls and to fresh
+  // claims, so a future leaf cannot inherit an unproven dirty placeholder.
   if (!['pre-claim-boundary', 'pre-claim'].includes(stage)) return null;
   if (!stateRoot || !claimPath || !isPathInside(stateRoot, claimPath)) return null;
 
@@ -571,9 +570,11 @@ function activeClaimPlaceholderOwnership({ repoRoot, stateRoot, claimPath, stage
   if (!claim || claim.status !== 'in_progress') return null;
   const claimId = typeof claim.claim_id === 'string' ? claim.claim_id : '';
   const selectedTodo = typeof claim.selected_todo === 'string' ? claim.selected_todo : '';
-  const runStamp = typeof claim.run_stamp === 'string' ? claim.run_stamp : '';
+  // `write_todo_claim` updates this stamp for every continuation. It records
+  // the latest attempt, not the immutable run that materialized a target.
+  const claimRunStamp = typeof claim.run_stamp === 'string' ? claim.run_stamp : '';
   const queueFingerprint = typeof claim.queue_fingerprint === 'string' ? claim.queue_fingerprint : '';
-  if (!claimId || !selectedTodo || !runStamp || !queueFingerprint || claim.queue_generation == null) return null;
+  if (!claimId || !selectedTodo || !claimRunStamp || !queueFingerprint || claim.queue_generation == null) return null;
   // The claim must still identify one exact unchecked queue entry.  A
   // substring match would let a stale claim borrow authority from prose or a
   // modified successor leaf that merely repeats its text.
@@ -587,7 +588,7 @@ function activeClaimPlaceholderOwnership({ repoRoot, stateRoot, claimPath, stage
   const selectedTargets = boundedScopeEntries(selectedFirstLine)
     .map((entry) => entry.path)
     .filter((entry) => validClaimTarget(entry));
-  if (!selectedTargets.includes(target)) return null;
+  if (selectedTargets.length === 0) return null;
 
   const queue = readJsonInside(stateRoot, path.join(stateRoot, 'todo-claims', 'todo-queue-state.json'));
   if (!queue
@@ -599,20 +600,22 @@ function activeClaimPlaceholderOwnership({ repoRoot, stateRoot, claimPath, stage
   const evidencePath = resolveRepositoryArtifactPath(repoRoot, claim.terminal_failure_execution_evidence_path);
   const evidence = evidencePath ? readJsonInside(stateRoot, evidencePath) : null;
   const selectedTodoSha256 = sha256Hex(selectedTodo);
+  const materializationRunStamp = typeof evidence?.run_stamp === 'string' ? evidence.run_stamp : '';
   if (!evidence
-    || evidence.run_stamp !== runStamp
+    || !materializationRunStamp
     || evidence.claim_id !== claimId
     || evidence.runtime_claim_id !== claimId
     || evidence.claim_matches !== true
     || evidence.selected_todo_id !== todoId(selectedTodo)
     || evidence.selected_todo_sha256 !== selectedTodoSha256
     || evidence.task_execution_confirmed !== true
-    || !Array.isArray(evidence.target_files)
-    || !evidence.target_files.includes(target)) {
+    || !Array.isArray(evidence.target_files)) {
     return null;
   }
 
-  const admission = readJsonInside(stateRoot, path.join(stateRoot, 'runs', `${runStamp}.runtime-admission.json`));
+  // The evidence run, rather than the mutable latest claim run, is the only
+  // admission that can prove where this dirty proposal originated.
+  const admission = readJsonInside(stateRoot, path.join(stateRoot, 'runs', `${materializationRunStamp}.runtime-admission.json`));
   if (!admission
     || admission.status !== 'admitted'
     || admission.claim_id !== claimId
@@ -627,23 +630,42 @@ function activeClaimPlaceholderOwnership({ repoRoot, stateRoot, claimPath, stage
   const stdout = stdoutPath ? readJsonInside(stateRoot, stdoutPath) : null;
   const payload = phaseLoopPayload(stdout);
   const automation = payload.automation && typeof payload.automation === 'object' ? payload.automation : {};
+  const materializedTarget = typeof payload.objective_apply_path === 'string' ? payload.objective_apply_path : '';
   if (payloadValue(payload, automation, 'phase_loop_claim_id') !== claimId
     || payloadValue(payload, automation, 'phase_loop_selected_todo_sha256') !== selectedTodoSha256
     || String(payloadValue(payload, automation, 'phase_loop_queue_generation') ?? '') !== String(claim.queue_generation)
     || String(payloadValue(payload, automation, 'phase_loop_queue_fingerprint') ?? '') !== queueFingerprint
     || payload.objective_apply_applied !== true
-    || payload.objective_apply_path !== target
+    || !validClaimTarget(materializedTarget)
+    || !selectedTargets.includes(materializedTarget)
+    || !evidence.target_files.includes(materializedTarget)
     || payload.status !== 'objective_proposal_applied') {
     return null;
   }
 
-  return { claim_id: claimId, run_stamp: runStamp };
+  return {
+    claim_id: claimId,
+    claim_run_stamp: claimRunStamp,
+    materialization_run_stamp: materializationRunStamp,
+    selected_todo: selectedTodo,
+    selected_todo_id: todoId(selectedTodo),
+    selected_todo_first_line: selectedFirstLine,
+    materialized_target: materializedTarget
+  };
 }
 
 function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, options = {}) {
   const dirty = new Set(gitDirtyFiles(repoRoot));
   if (dirty.size === 0) return;
   const warnedActiveClaimTargets = new Set();
+  const warnedSharedClaimTargets = new Set();
+  const activeMaterialization = activeClaimMaterializedPlaceholder({
+    repoRoot,
+    stateRoot: options.stateRoot,
+    claimPath: options.claimPath,
+    stage: options.stage,
+    todoText
+  });
   const rebaselineRecords = readContractRebaselineRecords(repoRoot);
   for (const block of uncheckedTodoBlocks(todoText)) {
     const firstLine = block.split('\n')[0] ?? '';
@@ -678,25 +700,47 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, o
         });
         continue;
       }
-      const ownership = activeClaimPlaceholderOwnership({
-        repoRoot,
-        stateRoot: options.stateRoot,
-        claimPath: options.claimPath,
-        stage: options.stage,
-        todoText,
-        target
-      });
-      if (ownership) {
-        const warningKey = `${ownership.claim_id}\u0000${target}`;
+      const materializedTarget = activeMaterialization?.materialized_target === target;
+      // `uncheckedTodoBlocks` intentionally retains intervening completed
+      // entries, whereas claimSelectorTodoBlocks terminates at either checkbox
+      // state. The selector proof above establishes the full exact claim;
+      // match the unchecked view by the same unchecked first line and ID.
+      const blockIsSelectedClaim = (
+        firstLine === activeMaterialization?.selected_todo_first_line
+        && todoId(block) === activeMaterialization?.selected_todo_id
+      );
+      if (materializedTarget && blockIsSelectedClaim) {
+        const warningKey = `${activeMaterialization.claim_id}\u0000${target}`;
         if (!warnedActiveClaimTargets.has(warningKey)) {
           warnedActiveClaimTargets.add(warningKey);
           warnings.push({
             code: 'active_claim_owned_dirty_target_placeholder',
-            claim_id: ownership.claim_id,
-            run_stamp: ownership.run_stamp,
+            claim_id: activeMaterialization.claim_id,
+            run_stamp: activeMaterialization.materialization_run_stamp,
             target,
             sha256: `sha256:${sha256}`,
             message: 'A dirty bounded-proposal placeholder is attributable to the exact active Runtime claim and is admitted only for that claim resume.'
+          });
+        }
+        continue;
+      }
+      if (materializedTarget) {
+        // A sibling can name the same path, but it has not inherited the
+        // active claim's authority. Defer this one dirty target only while
+        // that exact claim is active; the normal fail-closed check resumes as
+        // soon as the claim settles or its evidence no longer matches.
+        const warningKey = `${activeMaterialization.claim_id}\u0000${todoId(block)}\u0000${target}`;
+        if (!warnedSharedClaimTargets.has(warningKey)) {
+          warnedSharedClaimTargets.add(warningKey);
+          warnings.push({
+            code: 'active_claim_shared_dirty_target_deferred',
+            claim_id: activeMaterialization.claim_id,
+            materialization_run_stamp: activeMaterialization.materialization_run_stamp,
+            selected_todo_id: activeMaterialization.selected_todo_id,
+            todo_id: todoId(block),
+            target,
+            sha256: `sha256:${sha256}`,
+            message: 'A later TODO shares a dirty target materialized by the exact active claim; it is deferred without inheriting resume authority.'
           });
         }
         continue;
