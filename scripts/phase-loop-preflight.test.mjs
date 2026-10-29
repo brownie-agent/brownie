@@ -139,6 +139,52 @@ function activeClaimPlaceholderFixture(repo, options = {}) {
   };
 }
 
+function appendActiveClaimMaterialization(repo, fixture, { runStamp, target }) {
+  const claim = JSON.parse(fs.readFileSync(fixture.claimPath, 'utf8'));
+  const selectedTodo = claim.selected_todo;
+  const selectedHash = createHash('sha256').update(selectedTodo).digest('hex');
+  const evidencePath = path.join(fixture.stateRoot, 'runs', `${runStamp}.execution-evidence.json`);
+  const stdoutPath = path.join(fixture.stateRoot, 'runs', `${runStamp}.stdout.log`);
+  writeJson(path.join(fixture.stateRoot, 'runs', `${runStamp}.runtime-admission.json`), {
+    schema_version: 1,
+    kind: 'phase_loop_runtime_admission',
+    status: 'admitted',
+    claim_id: fixture.claimId,
+    selected_todo_id: 'E-active',
+    selected_todo_sha256: selectedHash,
+    queue_generation: 624,
+    queue_fingerprint: 'fixture-active-queue'
+  });
+  writeJson(evidencePath, {
+    schema_version: 1,
+    kind: 'phase_loop_terminal_failure_execution_evidence',
+    run_stamp: runStamp,
+    claim_id: fixture.claimId,
+    runtime_claim_id: fixture.claimId,
+    claim_matches: true,
+    selected_todo_id: 'E-active',
+    selected_todo_sha256: selectedHash,
+    target_files: ['scripts/active.test.mjs', fixture.target],
+    task_execution_confirmed: true,
+    stdout_path: stdoutPath
+  });
+  writeJson(stdoutPath, {
+    run: {
+      status: 'objective_proposal_applied',
+      phase_loop_claim_id: fixture.claimId,
+      phase_loop_selected_todo_sha256: selectedHash,
+      phase_loop_queue_generation: 624,
+      phase_loop_queue_fingerprint: 'fixture-active-queue',
+      objective_apply_applied: true,
+      objective_apply_path: target
+    }
+  });
+  claim.run_stamp = runStamp;
+  claim.terminal_failure_execution_evidence_path = evidencePath;
+  writeJson(fixture.claimPath, claim);
+  return { runStamp, evidencePath, stdoutPath, target };
+}
+
 test('detects duplicate JSON keys outside JSON.parse visibility', () => {
   const duplicates = duplicateJsonKeys('{ "a": 1, "nested": { "b": 1, "b": 2 }, "a": 3 }', 'fixture.json');
   assert.equal(duplicates.length, 2);
@@ -215,7 +261,11 @@ test('admits an active claim whose selected TODO is followed by a completed TODO
 
 test('uses immutable materialization evidence after a claim continuation and defers only a shared future target', () => {
   const repo = makeRepo();
-  const fixture = activeClaimPlaceholderFixture(repo, { claimRunStamp: '20261029T152111Z' });
+  const fixture = activeClaimPlaceholderFixture(repo);
+  const later = appendActiveClaimMaterialization(repo, fixture, {
+    runStamp: '20261029T152111Z',
+    target: 'scripts/active.test.mjs'
+  });
   const result = validatePhaseLoopPreflight({
     repo,
     stateRoot: fixture.stateRoot,
@@ -233,6 +283,7 @@ test('uses immutable materialization evidence after a claim continuation and def
   assert.equal(deferred.selected_todo_id, 'E-active');
   assert.equal(deferred.todo_id, 'E-later');
   assert.equal(deferred.target, fixture.target);
+  assert.equal(later.runStamp, '20261029T152111Z');
 
   const unrelatedTodo = [
     '- [ ] E-unrelated: Patch only `scripts/unrelated.mjs`:',

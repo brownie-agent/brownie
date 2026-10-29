@@ -559,6 +559,87 @@ function payloadValue(payload, automation, field) {
   return payload?.[field] ?? automation?.[field] ?? null;
 }
 
+function activeClaimEvidencePaths({ repoRoot, stateRoot, claim }) {
+  const candidates = new Set();
+  const currentEvidencePath = resolveRepositoryArtifactPath(repoRoot, claim.terminal_failure_execution_evidence_path);
+  if (currentEvidencePath && isPathInside(stateRoot, currentEvidencePath)) {
+    candidates.add(currentEvidencePath);
+  }
+
+  // A continuation updates the mutable claim pointer to its latest execution
+  // evidence.  Each earlier successful proposal is still independently bound
+  // to the same immutable claim, queue, runtime admission, and stdout. Scan
+  // only the state-root run evidence so a later continuation cannot strand a
+  // previously materialized target behind a newer, unrelated target.
+  const runsDirectory = path.join(stateRoot, 'runs');
+  if (!isPathInside(stateRoot, runsDirectory)) return [...candidates].sort();
+  try {
+    for (const entry of fs.readdirSync(runsDirectory, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^[A-Za-z0-9_.-]+\.execution-evidence\.json$/u.test(entry.name)) continue;
+      candidates.add(path.join(runsDirectory, entry.name));
+    }
+  } catch {
+    // The claim-pointer candidate remains sufficient for a one-run claim.
+  }
+  return [...candidates].sort();
+}
+
+function verifiedActiveClaimMaterialization({
+  repoRoot,
+  stateRoot,
+  evidencePath,
+  claimId,
+  selectedTodoId,
+  selectedTodoSha256,
+  queueGeneration,
+  queueFingerprint,
+  selectedTargets
+}) {
+  const evidence = readJsonInside(stateRoot, evidencePath);
+  const materializationRunStamp = typeof evidence?.run_stamp === 'string' ? evidence.run_stamp : '';
+  if (!evidence
+    || !materializationRunStamp
+    || evidence.claim_id !== claimId
+    || evidence.runtime_claim_id !== claimId
+    || evidence.claim_matches !== true
+    || evidence.selected_todo_id !== selectedTodoId
+    || evidence.selected_todo_sha256 !== selectedTodoSha256
+    || evidence.task_execution_confirmed !== true
+    || !Array.isArray(evidence.target_files)) {
+    return null;
+  }
+
+  const admission = readJsonInside(stateRoot, path.join(stateRoot, 'runs', `${materializationRunStamp}.runtime-admission.json`));
+  if (!admission
+    || admission.status !== 'admitted'
+    || admission.claim_id !== claimId
+    || admission.selected_todo_id !== selectedTodoId
+    || admission.selected_todo_sha256 !== selectedTodoSha256
+    || String(admission.queue_generation ?? '') !== String(queueGeneration)
+    || String(admission.queue_fingerprint ?? '') !== queueFingerprint) {
+    return null;
+  }
+
+  const stdoutPath = resolveRepositoryArtifactPath(repoRoot, evidence.stdout_path);
+  const stdout = stdoutPath ? readJsonInside(stateRoot, stdoutPath) : null;
+  const payload = phaseLoopPayload(stdout);
+  const automation = payload.automation && typeof payload.automation === 'object' ? payload.automation : {};
+  const materializedTarget = typeof payload.objective_apply_path === 'string' ? payload.objective_apply_path : '';
+  if (payloadValue(payload, automation, 'phase_loop_claim_id') !== claimId
+    || payloadValue(payload, automation, 'phase_loop_selected_todo_sha256') !== selectedTodoSha256
+    || String(payloadValue(payload, automation, 'phase_loop_queue_generation') ?? '') !== String(queueGeneration)
+    || String(payloadValue(payload, automation, 'phase_loop_queue_fingerprint') ?? '') !== queueFingerprint
+    || payload.objective_apply_applied !== true
+    || !validClaimTarget(materializedTarget)
+    || !selectedTargets.includes(materializedTarget)
+    || !evidence.target_files.includes(materializedTarget)
+    || payload.status !== 'objective_proposal_applied') {
+    return null;
+  }
+
+  return { materialization_run_stamp: materializationRunStamp, materialized_target: materializedTarget };
+}
+
 function activeClaimMaterializedPlaceholder({ repoRoot, stateRoot, claimPath, stage, todoText }) {
   // This narrowly proves materialization by the current admitted claim. It is
   // deliberately unavailable to generic/manual preflight calls and to fresh
@@ -597,60 +678,38 @@ function activeClaimMaterializedPlaceholder({ repoRoot, stateRoot, claimPath, st
     return null;
   }
 
-  const evidencePath = resolveRepositoryArtifactPath(repoRoot, claim.terminal_failure_execution_evidence_path);
-  const evidence = evidencePath ? readJsonInside(stateRoot, evidencePath) : null;
   const selectedTodoSha256 = sha256Hex(selectedTodo);
-  const materializationRunStamp = typeof evidence?.run_stamp === 'string' ? evidence.run_stamp : '';
-  if (!evidence
-    || !materializationRunStamp
-    || evidence.claim_id !== claimId
-    || evidence.runtime_claim_id !== claimId
-    || evidence.claim_matches !== true
-    || evidence.selected_todo_id !== todoId(selectedTodo)
-    || evidence.selected_todo_sha256 !== selectedTodoSha256
-    || evidence.task_execution_confirmed !== true
-    || !Array.isArray(evidence.target_files)) {
-    return null;
+  const materializationsByTarget = new Map();
+  for (const evidencePath of activeClaimEvidencePaths({ repoRoot, stateRoot, claim })) {
+    const materialization = verifiedActiveClaimMaterialization({
+      repoRoot,
+      stateRoot,
+      evidencePath,
+      claimId,
+      selectedTodoId: todoId(selectedTodo),
+      selectedTodoSha256,
+      queueGeneration: claim.queue_generation,
+      queueFingerprint,
+      selectedTargets
+    });
+    if (!materialization) continue;
+    const existing = materializationsByTarget.get(materialization.materialized_target);
+    if (!existing || materialization.materialization_run_stamp < existing.materialization_run_stamp) {
+      materializationsByTarget.set(materialization.materialized_target, materialization);
+    }
   }
-
-  // The evidence run, rather than the mutable latest claim run, is the only
-  // admission that can prove where this dirty proposal originated.
-  const admission = readJsonInside(stateRoot, path.join(stateRoot, 'runs', `${materializationRunStamp}.runtime-admission.json`));
-  if (!admission
-    || admission.status !== 'admitted'
-    || admission.claim_id !== claimId
-    || admission.selected_todo_id !== todoId(selectedTodo)
-    || admission.selected_todo_sha256 !== selectedTodoSha256
-    || String(admission.queue_generation ?? '') !== String(claim.queue_generation)
-    || String(admission.queue_fingerprint ?? '') !== queueFingerprint) {
-    return null;
-  }
-
-  const stdoutPath = resolveRepositoryArtifactPath(repoRoot, evidence?.stdout_path);
-  const stdout = stdoutPath ? readJsonInside(stateRoot, stdoutPath) : null;
-  const payload = phaseLoopPayload(stdout);
-  const automation = payload.automation && typeof payload.automation === 'object' ? payload.automation : {};
-  const materializedTarget = typeof payload.objective_apply_path === 'string' ? payload.objective_apply_path : '';
-  if (payloadValue(payload, automation, 'phase_loop_claim_id') !== claimId
-    || payloadValue(payload, automation, 'phase_loop_selected_todo_sha256') !== selectedTodoSha256
-    || String(payloadValue(payload, automation, 'phase_loop_queue_generation') ?? '') !== String(claim.queue_generation)
-    || String(payloadValue(payload, automation, 'phase_loop_queue_fingerprint') ?? '') !== queueFingerprint
-    || payload.objective_apply_applied !== true
-    || !validClaimTarget(materializedTarget)
-    || !selectedTargets.includes(materializedTarget)
-    || !evidence.target_files.includes(materializedTarget)
-    || payload.status !== 'objective_proposal_applied') {
-    return null;
-  }
+  const materializations = [...materializationsByTarget.values()]
+    .sort((left, right) => left.materialized_target.localeCompare(right.materialized_target)
+      || left.materialization_run_stamp.localeCompare(right.materialization_run_stamp));
+  if (materializations.length === 0) return null;
 
   return {
     claim_id: claimId,
     claim_run_stamp: claimRunStamp,
-    materialization_run_stamp: materializationRunStamp,
     selected_todo: selectedTodo,
     selected_todo_id: todoId(selectedTodo),
     selected_todo_first_line: selectedFirstLine,
-    materialized_target: materializedTarget
+    materializations
   };
 }
 
@@ -700,7 +759,9 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, o
         });
         continue;
       }
-      const materializedTarget = activeMaterialization?.materialized_target === target;
+      const targetMaterialization = activeMaterialization?.materializations
+        ?.find((materialization) => materialization.materialized_target === target) ?? null;
+      const materializedTarget = targetMaterialization !== null;
       // `uncheckedTodoBlocks` intentionally retains intervening completed
       // entries, whereas claimSelectorTodoBlocks terminates at either checkbox
       // state. The selector proof above establishes the full exact claim;
@@ -716,7 +777,7 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, o
           warnings.push({
             code: 'active_claim_owned_dirty_target_placeholder',
             claim_id: activeMaterialization.claim_id,
-            run_stamp: activeMaterialization.materialization_run_stamp,
+            run_stamp: targetMaterialization.materialization_run_stamp,
             target,
             sha256: `sha256:${sha256}`,
             message: 'A dirty bounded-proposal placeholder is attributable to the exact active Runtime claim and is admitted only for that claim resume.'
@@ -735,7 +796,7 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, o
           warnings.push({
             code: 'active_claim_shared_dirty_target_deferred',
             claim_id: activeMaterialization.claim_id,
-            materialization_run_stamp: activeMaterialization.materialization_run_stamp,
+            materialization_run_stamp: targetMaterialization.materialization_run_stamp,
             selected_todo_id: activeMaterialization.selected_todo_id,
             todo_id: todoId(block),
             target,
