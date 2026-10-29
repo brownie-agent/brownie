@@ -586,7 +586,7 @@ function activeClaimPlaceholderOwnership({ repoRoot, stateRoot, claimPath, stage
   const selectedFirstLine = selectedTodo.split('\n')[0] ?? '';
   const selectedTargets = boundedScopeEntries(selectedFirstLine)
     .map((entry) => entry.path)
-    .filter(validClaimTarget);
+    .filter((entry) => validClaimTarget(entry));
   if (!selectedTargets.includes(target)) return null;
 
   const queue = readJsonInside(stateRoot, path.join(stateRoot, 'todo-claims', 'todo-queue-state.json'));
@@ -647,7 +647,9 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, o
   const rebaselineRecords = readContractRebaselineRecords(repoRoot);
   for (const block of uncheckedTodoBlocks(todoText)) {
     const firstLine = block.split('\n')[0] ?? '';
-    const targets = boundedScopeEntries(firstLine).map((entry) => entry.path).filter(validClaimTarget);
+    const targets = boundedScopeEntries(firstLine)
+      .map((entry) => entry.path)
+      .filter((entry) => validClaimTarget(entry));
     for (const target of targets) {
       if (!dirty.has(target)) continue;
       const absoluteTarget = path.join(repoRoot, target);
