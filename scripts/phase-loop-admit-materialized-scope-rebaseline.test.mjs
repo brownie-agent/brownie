@@ -16,7 +16,7 @@ function fixture() {
   const target = 'scripts/journey.mjs';
   fs.mkdirSync(path.join(root, 'scripts'));
   fs.writeFileSync(path.join(root, target), '// placeholder\n');
-  const sha256 = crypto.createHash('sha256').update(fs.readFileSync(path.join(root, target))).digest('hex');
+  const sha256 = crypto.createHash('sha256').update(fs.readFileSync(path.join(root, target), 'utf8').trim(), 'utf8').digest('hex');
   const records = [{ target_todo_ids: ['E-fixture'], target_capture: { mode: 'legacy_pre_capture_materialization' }, target_snapshots: [{ operation: 'Create', path: target, exists_after: true, sha256_after: sha256 }] }];
   return { root, target, records };
 }
