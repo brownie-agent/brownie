@@ -218,7 +218,13 @@ printf '%s\n' "$PWD" > "${PHASE_LOOP_TEST_PNPM_CWD_FILE:?}"
 SH
   chmod +x "$fake_bin/pnpm"
 
+  # Exercise the GitHub PR environment explicitly. The isolated snapshot
+  # must use its own synthetic baseline rather than inheriting the outer
+  # checkout's PR identity.
   quality_output="$(
+    GITHUB_BASE_REF=main \
+    GITHUB_EVENT_NAME=pull_request \
+    GITHUB_ACTIONS=true \
     PHASE_LOOP_WORKSPACE_ROOT="$workspace" \
     PHASE_LOOP_TEST_PNPM_CWD_FILE="$pnpm_cwd" \
     PATH="$fake_bin:$PATH" \

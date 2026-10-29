@@ -6688,7 +6688,17 @@ if needs_isolated_workspace_check:
         validation_root, validation_base_ref = create_isolated_validation_root(changed)
         validation_context["workspace"] = "isolated_git_archive_with_run_delta"
         validation_context["git_context"] = "synthetic_baseline_with_run_delta"
-        validation_environment = dict(os.environ)
+        # The isolated archive deliberately has a synthetic one-commit Git
+        # history: HEAD is the baseline and the current run's delta is an
+        # uncommitted overlay.  GitHub pull-request variables describe the
+        # outer checkout instead, and make repository-aware guards interpret
+        # that synthetic baseline as an invalid PR base equal to HEAD.  Do not
+        # let host CI identity leak into this self-contained validation repo.
+        validation_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GITHUB_")
+        }
         validation_environment["BROWNIE_JS_REACHABILITY_BASE"] = validation_base_ref
         validation_environment["BROWNIE_PHASE_VALUE_CHANGED_FILES"] = json.dumps(changed)
     except Exception as error:
