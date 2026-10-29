@@ -5308,6 +5308,133 @@ assert feedback.get("completed") is not True, feedback
 assert feedback["reason"] == "semantic_completion_not_satisfied", feedback
 PY
 
+# A multi-target parent can begin with a test file while an exact Runtime
+# rejection names a later structured target.  The generated prompt must retain
+# every allowed target, select the rejected target for repair, and must not
+# falsely constrain the invocation to the first test file.
+multitarget_repair_state="$(mktemp -d)"
+multitarget_repair_prompt="$(mktemp)"
+multitarget_repair_todo="$(mktemp)"
+multitarget_repair_workspace="$(mktemp -d)"
+multitarget_repair_argv="$multitarget_repair_state/fake-brownie.argv"
+git -C "$multitarget_repair_workspace" init -b main >/dev/null
+git -C "$multitarget_repair_workspace" config user.name Brownie
+git -C "$multitarget_repair_workspace" config user.email brownie@example.invalid
+mkdir -p "$multitarget_repair_workspace/scripts" "$multitarget_repair_workspace/.github/workflows"
+cat > "$multitarget_repair_workspace/package.json" <<'EOF'
+{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs"}}
+EOF
+printf 'export const runtimeJourney = true;\n' > "$multitarget_repair_workspace/scripts/release-artifact-runtime-journey.mjs"
+printf 'export const runtimeJourneyTest = true;\n' > "$multitarget_repair_workspace/scripts/release-artifact-runtime-journey.test.mjs"
+printf 'name: release\n' > "$multitarget_repair_workspace/.github/workflows/release.yml"
+git -C "$multitarget_repair_workspace" add .
+git -C "$multitarget_repair_workspace" commit -m init >/dev/null
+printf 'base prompt\n' > "$multitarget_repair_prompt"
+cat > "$multitarget_repair_todo" <<'EOF'
+- [ ] E-multitarget: Patch only `scripts/release-artifact-runtime-journey.test.mjs` and `scripts/release-artifact-runtime-journey.mjs`, then patch only `package.json` and `.github/workflows/release.yml` to invoke them:
+  Route: implementation.
+  Source TODO: E-multitarget-parent.
+  Depends on: <none>.
+  Completion condition: the extracted package runs a bounded runtime journey.
+  Forbidden changes: do not access production credentials.
+  Verification: run `node --test scripts/release-artifact-runtime-journey.test.mjs`.
+EOF
+mkdir -p "$multitarget_repair_state/todo-claims"
+cat > "$multitarget_repair_state/progress-state.json" <<'EOF'
+{"schema_version":1,"progress_projection":{"route":"{\"command\":\"resume\",\"arguments\":[]}"}}
+EOF
+cat > "$multitarget_repair_state/todo-claims/current.json" <<'EOF'
+{
+  "claim_id": "todo-g1-multitarget",
+  "queue_fingerprint": "multi",
+  "queue_generation": 1,
+  "run_stamp": "20260913T000002Z",
+  "schema_version": 1,
+  "selected_todo": "- [ ] E-multitarget: Patch only `scripts/release-artifact-runtime-journey.test.mjs` and `scripts/release-artifact-runtime-journey.mjs`, then patch only `package.json` and `.github/workflows/release.yml` to invoke them:\n  Route: implementation.\n  Source TODO: E-multitarget-parent.\n  Depends on: <none>.\n  Completion condition: the extracted package runs a bounded runtime journey.\n  Forbidden changes: do not access production credentials.\n  Verification: run `node --test scripts/release-artifact-runtime-journey.test.mjs`.",
+  "status": "in_progress"
+}
+EOF
+cat > "$multitarget_repair_state/todo-claims/repair-feedback.json" <<'EOF'
+{
+  "claim_id": "todo-g1-multitarget",
+  "kind": "phase_loop_objective_apply_rejected",
+  "reason": "objective_apply_rejected_before_write",
+  "repair_mode": "structured_candidate_repair",
+  "run_stamp": "20260913T000002Z",
+  "selected_target_path": "package.json",
+  "objective_apply": {
+    "operation": "replace_file",
+    "reason": "candidate JSON is not parseable",
+    "failed_checks": ["structured_content_parseable"],
+    "applied": false
+  },
+  "verification": {
+    "completed": false,
+    "reason": "objective_apply_rejected_before_write",
+    "repair_hint": "Read the exact target, form one complete replacement/patch candidate, and run the structured parse check."
+  }
+}
+EOF
+
+PHASE_LOOP_STATE_DIR="$multitarget_repair_state" \
+PHASE_LOOP_PROMPT="$multitarget_repair_prompt" \
+PHASE_LOOP_TODO="$multitarget_repair_todo" \
+PHASE_LOOP_WORKSPACE_ROOT="$multitarget_repair_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_ARGV_FILE="$multitarget_repair_argv" \
+BROWNIE_BIN="$fake_brownie_repair_feedback" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+multitarget_repair_prompt_file="$(find "$multitarget_repair_state/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
+python3 - "$multitarget_repair_prompt_file" <<'PY'
+import pathlib
+import sys
+
+prompt = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "repair_selected_target_path: `package.json`" in prompt, prompt
+assert "repair_mode: `structured_candidate_repair`" in prompt, prompt
+assert 'objective_apply_failed_checks: ["structured_content_parseable"]' in prompt, prompt
+assert "leaf_allowed_targets_policy" in prompt, prompt
+assert "`scripts/release-artifact-runtime-journey.test.mjs`, `scripts/release-artifact-runtime-journey.mjs`, `package.json`, `.github/workflows/release.yml`" in prompt, prompt
+assert "test_leaf_execution_policy" not in prompt, prompt
+assert "leaf_repair_target_policy: the previous Runtime feedback selected `package.json`" in prompt, prompt
+assert "leaf_initial_read_policy: if the target contents are not already embedded in this prompt, the next tool may be exactly one `workspace.read` for `package.json`" in prompt, prompt
+PY
+
+# Feedback must never redirect the runtime to an arbitrary file outside the
+# active TODO contract.  In that case prompt generation fails closed rather
+# than falling back to the first listed test target.
+python3 - "$multitarget_repair_state/todo-claims/repair-feedback.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+feedback = json.loads(path.read_text(encoding="utf-8"))
+feedback["selected_target_path"] = "scripts/not-allowed.mjs"
+path.write_text(json.dumps(feedback), encoding="utf-8")
+PY
+PHASE_LOOP_STATE_DIR="$multitarget_repair_state" \
+PHASE_LOOP_PROMPT="$multitarget_repair_prompt" \
+PHASE_LOOP_TODO="$multitarget_repair_todo" \
+PHASE_LOOP_WORKSPACE_ROOT="$multitarget_repair_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_ARGV_FILE="$multitarget_repair_argv" \
+BROWNIE_BIN="$fake_brownie_repair_feedback" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+multitarget_out_of_scope_prompt_file="$(find "$multitarget_repair_state/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
+python3 - "$multitarget_out_of_scope_prompt_file" <<'PY'
+import pathlib
+import sys
+
+prompt = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "repair_selected_target_rejected_as_out_of_scope: `scripts/not-allowed.mjs`" in prompt, prompt
+assert "leaf_scope_guard_policy" in prompt, prompt
+assert "leaf_scope_guard_required_outcome" in prompt, prompt
+assert "leaf_initial_read_policy" not in prompt, prompt
+PY
+
 contract_replan_feedback_state="$(mktemp -d)"
 contract_replan_feedback_prompt="$(mktemp)"
 contract_replan_feedback_todo="$(mktemp)"

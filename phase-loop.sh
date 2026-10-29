@@ -12070,10 +12070,43 @@ selected_parent_id = ""
 selected_id_match = re.match(r"^\s*[-*]\s+\[\s*\]\s+([^:\s]+)", selected_first_line)
 if selected_id_match:
     selected_parent_id = selected_id_match.group(1).strip()
-selected_leaf_target_path = ""
-selected_leaf_target_match = re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:\s+(?:Patch only|Create only)\s+`([^`]+)`", selected_todo)
-if selected_leaf_target_match:
-    selected_leaf_target_path = selected_leaf_target_match.group(1).strip()
+
+def bounded_scope_paths(todo_first_line):
+    """Return every explicitly bounded Patch/Create target in source order.
+
+    A parent TODO may name several concrete targets (for example a test,
+    implementation file, package manifest, and workflow).  Prompt policy must
+    retain that complete allowed set rather than silently treating the first
+    backticked target as the whole contract.
+    """
+    paths = []
+    for scope in re.finditer(
+        r"(?i)\b(?:Patch|Create)\s+only\s+((?:`[^`\n]+`\s*(?:,\s*|and\s+)?)+)",
+        todo_first_line,
+    ):
+        for raw_path in re.findall(r"`([^`\n]+)`", scope.group(1)):
+            path = raw_path.strip()
+            if path and path not in paths:
+                paths.append(path)
+    return paths
+
+def feedback_selected_target_path(feedback):
+    if not isinstance(feedback, dict):
+        return ""
+    verification = feedback.get("verification") if isinstance(feedback.get("verification"), dict) else {}
+    return str(
+        feedback.get("selected_target_path")
+        or verification.get("selected_target_path")
+        or ""
+    ).strip()
+
+selected_leaf_target_paths = bounded_scope_paths(selected_first_line)
+selected_leaf_target_path = selected_leaf_target_paths[0] if selected_leaf_target_paths else ""
+selected_repair_target_path = feedback_selected_target_path(repair_feedback)
+if selected_repair_target_path in selected_leaf_target_paths:
+    selected_leaf_target_path = selected_repair_target_path
+else:
+    selected_repair_target_path = ""
 if claim and selected_todo:
     try:
         workspace_root_for_guard = workspace_root_path
@@ -12131,11 +12164,6 @@ if claim and selected_todo:
             }
             bdk_state = "todo_queue_repair"
             llm_route = "code"
-selected_leaf_adjacent_test_path = ""
-if selected_leaf_target_path and selected_leaf_target_path.endswith(".mjs") and not selected_leaf_target_path.endswith(".test.mjs"):
-    adjacent_candidate = selected_leaf_target_path[:-4] + ".test.mjs"
-    if pathlib.Path(adjacent_candidate).exists():
-        selected_leaf_adjacent_test_path = adjacent_candidate
 if repair_feedback and selected_leaf_target_path:
     verification_for_stale_check = repair_feedback.get("verification") if isinstance(repair_feedback.get("verification"), dict) else {}
     reason_for_stale_check = str(repair_feedback.get("reason") or verification_for_stale_check.get("reason") or "")
@@ -12179,6 +12207,22 @@ if repair_feedback and selected_leaf_target_path:
         if harness_feedback and harness_feedback.get("ok") is False:
             bdk_state = "verify_or_repair"
             llm_route = "code"
+selected_repair_target_path = feedback_selected_target_path(repair_feedback)
+if selected_repair_target_path in selected_leaf_target_paths:
+    selected_leaf_target_path = selected_repair_target_path
+else:
+    selected_repair_target_path = ""
+    selected_leaf_target_path = selected_leaf_target_paths[0] if selected_leaf_target_paths else ""
+reported_repair_target_path = feedback_selected_target_path(repair_feedback)
+repair_feedback_target_out_of_scope = bool(
+    reported_repair_target_path
+    and reported_repair_target_path not in selected_leaf_target_paths
+)
+selected_leaf_adjacent_test_path = ""
+if selected_leaf_target_path and selected_leaf_target_path.endswith(".mjs") and not selected_leaf_target_path.endswith(".test.mjs"):
+    adjacent_candidate = selected_leaf_target_path[:-4] + ".test.mjs"
+    if pathlib.Path(adjacent_candidate).exists():
+        selected_leaf_adjacent_test_path = adjacent_candidate
 selected_decomposition_active = bool(re.search(
     r"^\s*Route:\s*todo-decomposition\.?\s*$",
     selected_todo,
@@ -12279,13 +12323,19 @@ leaf_todo_refinement_rejected_for_implementation = bool(
     )
 )
 selected_leaf_is_test_only = bool(
-    selected_leaf_target_path
+    selected_leaf_target_paths
     and (
-        selected_leaf_target_path.endswith(".test.mjs")
-        or "Forbidden changes: do not modify production" in selected_todo
-        or "test-only leaf" in selected_todo.lower()
+        all(path.endswith(".test.mjs") for path in selected_leaf_target_paths)
+        or (
+            len(selected_leaf_target_paths) == 1
+            and (
+                "Forbidden changes: do not modify production" in selected_todo
+                or "test-only leaf" in selected_todo.lower()
+            )
+        )
     )
 )
+selected_leaf_has_multiple_targets = len(selected_leaf_target_paths) > 1
 selected_linux_helper_source_identity_repair = (
     "E-16a-artifact-source-linux-producer-helper" in selected_todo
     and selected_leaf_target_path == "scripts/release-linux-x64-docker-artifact.mjs"
@@ -12406,11 +12456,24 @@ if (
     and "Source TODO:" in selected_todo
     and re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:\s+Patch only\s+`", selected_todo)
 ):
-    leaf_execution_policy_lines = [
-        "- leaf_execution_policy: this selected TODO is already a bounded derived leaf; patch the named target file. If repair feedback shows an oversized, input_too_large, or truncated target patch, retry only one smaller complete target-file hunk using saved exact context, or final-answer a concrete fail-closed blocker.",
-        "- leaf_no_refinement_policy: a bounded leaf with one Patch only target must not be converted into child TODOs because a target patch is large, truncated, or input_too_large.",
-        "- leaf_todo_write_forbidden_policy: for a bounded Patch only leaf, `workspace.write` to `.brownie/todo.md` is not progress and must not be attempted. Use `workspace.read` for the target only when exact context is unavailable, then `workspace.write` for the target path, or final-answer a concrete fail-closed blocker.",
-    ]
+    if selected_leaf_has_multiple_targets:
+        allowed_targets = ", ".join(f"`{path}`" for path in selected_leaf_target_paths)
+        leaf_execution_policy_lines = [
+            "- leaf_execution_policy: this selected TODO explicitly permits multiple bounded targets. Preserve that complete allowed set; do not classify it as test-only merely because the first target is a test file.",
+            f"- leaf_allowed_targets_policy: the only implementation targets allowed by this TODO are {allowed_targets}. Do not modify a path outside that set and do not create child TODOs merely to choose among them.",
+            "- leaf_no_refinement_policy: use one exact target at a time. A repair feedback target inside the allowed set takes precedence over the first-listed target; after resolving it, continue only within the same allowed set or report a concrete fail-closed blocker.",
+            "- leaf_todo_write_forbidden_policy: `workspace.write` to `.brownie/todo.md` is not progress for this bounded implementation TODO. Read and patch only an allowed target, or final-answer a concrete fail-closed blocker.",
+        ]
+        if selected_repair_target_path:
+            leaf_execution_policy_lines.append(
+                f"- leaf_repair_target_policy: the previous Runtime feedback selected `{selected_repair_target_path}`. If its exact contents are not embedded, the next tool may be exactly one `workspace.read` for `{selected_repair_target_path}`; then emit one complete `workspace.write` for that same target before touching another allowed target."
+            )
+    else:
+        leaf_execution_policy_lines = [
+            "- leaf_execution_policy: this selected TODO is already a bounded derived leaf; patch the named target file. If repair feedback shows an oversized, input_too_large, or truncated target patch, retry only one smaller complete target-file hunk using saved exact context, or final-answer a concrete fail-closed blocker.",
+            "- leaf_no_refinement_policy: a bounded leaf with one Patch only target must not be converted into child TODOs because a target patch is large, truncated, or input_too_large.",
+            "- leaf_todo_write_forbidden_policy: for a bounded Patch only leaf, `workspace.write` to `.brownie/todo.md` is not progress and must not be attempted. Use `workspace.read` for the target only when exact context is unavailable, then `workspace.write` for the target path, or final-answer a concrete fail-closed blocker.",
+        ]
     if leaf_has_contract_replan_feedback:
         leaf_execution_policy_lines.append(
             "- leaf_contract_replan_policy: Supervisor repair feedback says this selected leaf has repeatedly failed because its TODO contract may be too narrow. This is the explicit exception to normal bounded-leaf no-refinement. Patch `.brownie/todo.md` to replace only the selected leaf with one or more smaller implementable leaves, or emit one concrete fail-closed blocker if no implementable split exists."
@@ -12481,7 +12544,22 @@ if (
         leaf_execution_policy_lines.append(
             f"- leaf_initial_read_policy: if the target contents are not already embedded in this prompt, the next tool may be exactly one `workspace.read` for `{selected_leaf_target_path or '<selected Patch only target>'}`; after that read, move to `workspace.write` for the same target."
         )
-if "Source TODO:" in selected_todo and re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:\s+Create only\s+`", selected_todo):
+if (
+    repair_feedback_target_out_of_scope
+    and not selected_decomposition_active
+    and "Source TODO:" in selected_todo
+    and re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:\s+(?:Patch|Create) only\s+`", selected_todo)
+):
+    leaf_execution_policy_lines = [
+        "- leaf_scope_guard_policy: Runtime repair feedback named a target outside the selected TODO's explicit allowed target set. Do not read or write any implementation target from this feedback.",
+        f"- leaf_scope_guard_reported_target: `{reported_repair_target_path}`",
+        "- leaf_scope_guard_required_outcome: final-answer one concrete TODO-contract blocker naming the mismatch. Do not fall back to the first-listed target, expand scope, or patch `.brownie/todo.md` without an explicit todo-decomposition route.",
+    ]
+if (
+    not repair_feedback_target_out_of_scope
+    and "Source TODO:" in selected_todo
+    and re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:\s+Create only\s+`", selected_todo)
+):
     if leaf_has_contract_replan_feedback:
         leaf_execution_policy_lines = [
             "- leaf_execution_policy: this selected TODO is a bounded Create only derived leaf, but Supervisor repair feedback says this selected leaf has repeatedly failed because its TODO contract may be too narrow.",
@@ -12526,6 +12604,24 @@ if repair_feedback:
         f"- repair_reason: `{repair_feedback.get('reason', '')}`",
         f"- repair_run_stamp: `{repair_feedback.get('run_stamp', '')}`",
     ]
+    if reported_repair_target_path:
+        if selected_repair_target_path:
+            repair_feedback_lines.append(f"- repair_selected_target_path: `{selected_repair_target_path}`")
+            repair_feedback_lines.append("- repair_selected_target_policy: this target is an allowed path in the selected TODO. Read its exact current content before forming a new complete candidate; do not retry the rejected candidate or switch to another allowed target first.")
+        else:
+            repair_feedback_lines.append(f"- repair_selected_target_rejected_as_out_of_scope: `{reported_repair_target_path}`")
+            repair_feedback_lines.append("- repair_selected_target_scope_policy: the reported target is not in the selected TODO's explicit allowed target set. Do not write it; report a concrete TODO-contract blocker instead of expanding scope.")
+    if repair_feedback.get("repair_mode"):
+        repair_feedback_lines.append(f"- repair_mode: `{repair_feedback.get('repair_mode')}`")
+    objective_apply = repair_feedback.get("objective_apply") if isinstance(repair_feedback.get("objective_apply"), dict) else {}
+    if objective_apply:
+        if objective_apply.get("operation"):
+            repair_feedback_lines.append(f"- objective_apply_operation: `{objective_apply.get('operation')}`")
+        if objective_apply.get("reason"):
+            repair_feedback_lines.append(f"- objective_apply_reason: {json.dumps(str(objective_apply.get('reason'))[-1200:], ensure_ascii=False)}")
+        failed_checks = objective_apply.get("failed_checks") if isinstance(objective_apply.get("failed_checks"), list) else []
+        if failed_checks:
+            repair_feedback_lines.append(f"- objective_apply_failed_checks: {json.dumps(failed_checks[:12], ensure_ascii=False)}")
     if "scripts/release-runtime-operational-evidence.mjs" in selected_todo:
         target_text = read_text(pathlib.Path("scripts/release-runtime-operational-evidence.mjs"))
         duplicate_names = duplicate_const_declarations(target_text, "soakEvidenceFixture")
