@@ -738,11 +738,56 @@ sys.exit(0)
 PY
 }
 
+phase_loop_configured_binaries_are_workspace_managed() {
+  # A deployment must name its binaries explicitly, but an explicit path can
+  # still be the paired Cargo output of the selected workspace. Derive that
+  # pair from Cargo metadata at runtime instead of treating any configured
+  # path as an external operator-owned binary. This permits a merged Rust
+  # controller change to rebuild its own local pair while preserving the
+  # prohibition on overwriting arbitrary external binaries.
+  local cargo_target_dir
+  if [ -z "${PHASE_LOOP_WORKSPACE_ROOT:-}" ] || [ -z "${BROWNIE_BIN:-}" ] || [ -z "${BROWNIE_RUNTIME_PATH:-}" ]; then
+    printf '%s\n' 'configured Brownie binary pair is incomplete; refusing automatic rebuild.' >&2
+    return 1
+  fi
+  if ! cargo_target_dir="$(
+    cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
+    cargo metadata --format-version 1 --no-deps 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin).get("target_directory", ""))'
+  )"; then
+    printf '%s\n' 'unable to derive the selected workspace Cargo target directory; refusing automatic rebuild.' >&2
+    return 1
+  fi
+  if [ -z "$cargo_target_dir" ]; then
+    printf '%s\n' 'selected workspace Cargo metadata has no target directory; refusing automatic rebuild.' >&2
+    return 1
+  fi
+  if ! python3 - "$BROWNIE_BIN" "$BROWNIE_RUNTIME_PATH" "$cargo_target_dir" <<'PY'
+import pathlib
+import sys
+
+configured_cli = pathlib.Path(sys.argv[1]).expanduser().resolve(strict=False)
+configured_runtime = pathlib.Path(sys.argv[2]).expanduser().resolve(strict=False)
+target_directory = pathlib.Path(sys.argv[3]).expanduser().resolve(strict=False)
+
+expected_cli = target_directory / "debug" / "brownie"
+expected_runtime = target_directory / "debug" / "brownie-runtime"
+raise SystemExit(0 if (
+    configured_cli == expected_cli
+    and configured_runtime == expected_runtime
+) else 1)
+PY
+  then
+    printf '%s\n' 'configured Brownie binary pair is not the selected workspace-managed Cargo target pair; refusing automatic rebuild.' >&2
+    return 1
+  fi
+  return 0
+}
+
 rebuild_brownie_binaries_for_freshness() {
   if [ "$PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK" = "1" ]; then
     return 0
   fi
-  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 1 ]; then
+  if [ "$PHASE_LOOP_BROWNIE_BIN_EXPLICIT" -eq 1 ] && ! phase_loop_configured_binaries_are_workspace_managed; then
     return 1
   fi
   local build_root
@@ -15792,16 +15837,22 @@ _run_brownie_once() {
   elif ! freshness_output="$(check_brownie_binary_freshness 2>&1)"; then
     local rebuild_output rebuild_status freshness_after_rebuild_output
     printf '%s binary_freshness_stale=true run=%s detail=%s\n' "$(now_utc)" "$run_stamp" "${freshness_output:-Brownie binary freshness check failed.}" >> "$SUPERVISOR_LOG"
-    rebuild_output="$(rebuild_brownie_binaries_for_freshness 2>&1)"
-    rebuild_status=$?
+    if rebuild_output="$(rebuild_brownie_binaries_for_freshness 2>&1)"; then
+      rebuild_status=0
+    else
+      rebuild_status=$?
+    fi
     if [ "$rebuild_status" -eq 0 ] && freshness_after_rebuild_output="$(check_brownie_binary_freshness 2>&1)"; then
       printf '%s binary_freshness_auto_rebuild_succeeded=true run=%s output=%s\n' "$(now_utc)" "$run_stamp" "$rebuild_output" >> "$SUPERVISOR_LOG"
     else
       local freshness_target_restored=0 rebuild_after_restore_output="" rebuild_after_restore_status=1 freshness_after_restore_output=""
       if restore_active_target_baseline; then
         freshness_target_restored=1
-        rebuild_after_restore_output="$(rebuild_brownie_binaries_for_freshness 2>&1)"
-        rebuild_after_restore_status=$?
+        if rebuild_after_restore_output="$(rebuild_brownie_binaries_for_freshness 2>&1)"; then
+          rebuild_after_restore_status=0
+        else
+          rebuild_after_restore_status=$?
+        fi
         if [ "$rebuild_after_restore_status" -eq 0 ] && freshness_after_restore_output="$(check_brownie_binary_freshness 2>&1)"; then
           printf '%s binary_freshness_restore_rebuild_succeeded=true run=%s restore_rebuild=%s freshness=%s\n' "$(now_utc)" "$run_stamp" "$rebuild_after_restore_output" "$freshness_after_restore_output" >> "$SUPERVISOR_LOG"
           freshness_output=""
