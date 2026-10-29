@@ -100,18 +100,48 @@ function safeRelativePath(value) {
     && !relativePath.includes(`..${path.sep}`);
 }
 
-function replaceTodoFirstLine(text, todoId, beforeLine, afterLine) {
+const protectedContractFields = [
+  ['route', 'Route'],
+  ['depends_on', 'Depends on'],
+  ['completion_condition', 'Completion condition'],
+  ['forbidden_changes', 'Forbidden changes'],
+  ['verification', 'Verification']
+];
+
+function replaceTodoProtectedContract(text, todoId, beforeContract, afterContract) {
   const source = String(text ?? '');
   const entry = todoBlocksWithOffsets(source).find((candidate) => protectedContract(candidate.block).id === todoId);
   if (!entry) throw new Error(`TODO contract is absent from index: ${todoId}`);
-  const lineEnd = source.indexOf('\n', entry.start);
-  const effectiveEnd = lineEnd < 0 ? source.length : lineEnd;
-  const line = source.slice(entry.start, effectiveEnd);
-  const offset = line.indexOf(beforeLine);
-  if (offset < 0 || line.trim() !== beforeLine) {
-    throw new Error(`TODO contract line is not the approved before-state: ${todoId}`);
+  if (!sameContract(protectedContract(entry.block), beforeContract)) {
+    throw new Error(`TODO contract is not the approved before-state: ${todoId}`);
   }
-  return `${source.slice(0, entry.start + offset)}${afterLine}${source.slice(entry.start + offset + beforeLine.length)}`;
+  const originalBlock = source.slice(entry.start, entry.end);
+  const trailingWhitespace = originalBlock.slice(entry.block.length);
+  const lines = entry.block.split('\n');
+  const firstLineIndent = lines[0].match(/^\s*/u)?.[0] ?? '';
+  lines[0] = `${firstLineIndent}${afterContract.first_line}`;
+  for (const [field, label] of protectedContractFields) {
+    if (beforeContract[field] === afterContract[field]) continue;
+    const matchingLines = lines
+      .map((line, index) => ({ line, index }))
+      .filter((candidate) => candidate.line.trim().startsWith(`${label}:`));
+    if (matchingLines.length > 1) {
+      throw new Error(`TODO contract has duplicate protected field: ${todoId} ${label}`);
+    }
+    const nextLine = `${label}: ${afterContract[field]}${afterContract[field] ? '.' : ''}`;
+    if (matchingLines.length === 1) {
+      const [{ line, index }] = matchingLines;
+      const indent = line.match(/^\s*/u)?.[0] ?? '';
+      lines[index] = `${indent}${nextLine}`;
+    } else {
+      lines.push(`  ${nextLine}`);
+    }
+  }
+  const replacement = `${lines.join('\n')}${trailingWhitespace}`;
+  if (!sameContract(protectedContract(replacement), afterContract)) {
+    throw new Error(`TODO contract cannot reproduce approved after-state: ${todoId}`);
+  }
+  return `${source.slice(0, entry.start)}${replacement}${source.slice(entry.end)}`;
 }
 
 function removeTodoBlock(text, todoId, expectedContracts) {
@@ -415,14 +445,20 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
       appliedTodoIds.push(todoId);
     } else {
       for (const transition of pathTransitions.slice(stateIndex)) {
-        candidateTodoText = replaceTodoFirstLine(
+        candidateTodoText = replaceTodoProtectedContract(
           candidateTodoText,
           todoId,
-          transition.before_contract.first_line,
-          transition.after_contract.first_line
+          transition.before_contract,
+          transition.after_contract
         );
       }
       if (stateIndex < pathTransitions.length) appliedTodoIds.push(todoId);
+      const expectedContract = states.at(-1);
+      const staged = contractForTodo(candidateTodoText, todoId);
+      if (!staged || !sameContract(staged.contract, expectedContract)) {
+        errors.push({ code: 'materialized_scope_contract_apply_mismatch', todo_id: todoId });
+        continue;
+      }
     }
     checked.push({
       todo_id: todoId,

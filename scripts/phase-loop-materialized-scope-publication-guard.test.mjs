@@ -21,8 +21,14 @@ function sha256Text(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-function todo(firstLine) {
-  return `${firstLine}\n  Route: implementation.\n  Depends on: <none>.\n  Completion condition: complete.\n  Forbidden changes: none.\n  Verification: run \`node --test\`.\n`;
+function todo(firstLine, {
+  route = 'implementation',
+  dependsOn = '<none>',
+  completionCondition = 'complete',
+  forbiddenChanges = 'none',
+  verification = 'run `node --test`'
+} = {}) {
+  return `${firstLine}\n  Route: ${route}.\n  Depends on: ${dependsOn}.\n  Completion condition: ${completionCondition}.\n  Forbidden changes: ${forbiddenChanges}.\n  Verification: ${verification}.\n`;
 }
 
 function receipt({ id, before, after, target, placeholderSha256, runStamp }) {
@@ -49,12 +55,12 @@ function writeReceipt(root, value) {
   fs.writeFileSync(path.join(directory, `${value.cause_run.run_stamp}.json`), `${JSON.stringify(value)}\n`);
 }
 
-function fixture() {
+function fixture({ beforeOptions = {}, afterOptions = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-materialized-publication-'));
   const id = 'E-fixture';
   const target = 'scripts/journey.mjs';
-  const before = todo(`- [ ] ${id}: Create only \`${target}\`:`);
-  const after = todo(`- [ ] ${id}: Patch only \`${target}\`:`);
+  const before = todo(`- [ ] ${id}: Create only \`${target}\`:`, beforeOptions);
+  const after = todo(`- [ ] ${id}: Patch only \`${target}\`:`, afterOptions);
   fs.mkdirSync(path.join(root, '.brownie'), { recursive: true });
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
   fs.writeFileSync(path.join(root, '.brownie/todo.md'), before);
@@ -91,6 +97,23 @@ test('stages only the approved TODO transition once the implementation target is
   assert.deepEqual(result.auto_staged_todo_ids, [id]);
   assert.equal(git(root, ['show', ':.brownie/todo.md']), after.trim());
   assert.deepEqual(git(root, ['diff', '--cached', '--name-only']).split('\n').sort(), ['.brownie/todo.md', target].sort());
+});
+
+test('stages every approved protected contract field with the materialized target', () => {
+  const { root, id, target, after } = fixture({
+    beforeOptions: { dependsOn: 'E-superseded-parent' },
+    afterOptions: { dependsOn: 'E-repaired-parent' }
+  });
+  git(root, ['add', target]);
+  const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(result.valid, true, JSON.stringify(result, null, 2));
+  assert.equal(result.applied, true);
+  const stagedTodo = git(root, ['show', ':.brownie/todo.md']);
+  assert.deepEqual(protectedContract(stagedTodo), protectedContract(after));
+  assert.match(stagedTodo, /Depends on: E-repaired-parent\./u);
+  assert.doesNotMatch(stagedTodo, /E-superseded-parent/u);
+  assert.deepEqual(git(root, ['diff', '--cached', '--name-only']).split('\n').sort(), ['.brownie/todo.md', target].sort());
+  assert.deepEqual(result.auto_staged_todo_ids, [id]);
 });
 
 test('stages the exact TODO removal when a completed materialized TODO is absent from the worktree', () => {
