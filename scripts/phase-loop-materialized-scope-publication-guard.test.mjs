@@ -17,6 +17,10 @@ function sha256File(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
+function sha256Text(value) {
+  return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
 function todo(firstLine) {
   return `${firstLine}\n  Route: implementation.\n  Depends on: <none>.\n  Completion condition: complete.\n  Forbidden changes: none.\n  Verification: run \`node --test\`.\n`;
 }
@@ -89,6 +93,19 @@ test('stages only the approved TODO transition once the implementation target is
   assert.deepEqual(git(root, ['diff', '--cached', '--name-only']).split('\n').sort(), ['.brownie/todo.md', target].sort());
 });
 
+test('stages the exact TODO removal when a completed materialized TODO is absent from the worktree', () => {
+  const { root, id, target } = fixture();
+  git(root, ['add', target]);
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), '');
+  const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(result.valid, true, JSON.stringify(result, null, 2));
+  assert.equal(result.applied, true);
+  assert.deepEqual(result.auto_staged_todo_ids, [id]);
+  assert.equal(git(root, ['show', ':.brownie/todo.md']), '');
+  assert.equal(result.checked[0].completion_removed, true);
+  assert.deepEqual(git(root, ['diff', '--cached', '--name-only']).split('\n').sort(), ['.brownie/todo.md', target].sort());
+});
+
 test('fails before mutating the index when the materialized implementation target is absent from the candidate', () => {
   const { root } = fixture();
   const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
@@ -105,6 +122,36 @@ test('rejects an index contract that is neither the recorded before-state nor af
   const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
   assert.equal(result.valid, false);
   assert(result.errors.some((error) => error.code === 'materialized_scope_index_contract_mismatch'));
+});
+
+test('rejects a newline-terminated legacy placeholder whose receipt used a trimmed hash', () => {
+  const { root, id, target, before, after } = fixture();
+  const targetPath = path.join(root, target);
+  const placeholder = '// brownie bounded create-only proposal\n';
+  fs.writeFileSync(targetPath, placeholder);
+  const legacy = receipt({
+    id,
+    before,
+    after,
+    target,
+    placeholderSha256: sha256Text(placeholder.trim()),
+    runStamp: 'fixture-run'
+  });
+  legacy.target_capture = { mode: 'legacy_pre_capture_materialization' };
+  legacy.target_snapshots = [{
+    operation: 'Create',
+    path: target,
+    exists_before: null,
+    sha256_before: null,
+    exists_after: true,
+    sha256_after: sha256Text(placeholder.trim())
+  }];
+  writeReceipt(root, legacy);
+  git(root, ['add', target]);
+  const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'materialized_scope_target_still_placeholder'));
+  assert.equal(git(root, ['show', ':.brownie/todo.md']), before.trim());
 });
 
 test('applies an approved multi-receipt Create-to-Patch chain without broad staging', () => {

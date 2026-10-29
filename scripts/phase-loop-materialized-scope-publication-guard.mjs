@@ -64,6 +64,10 @@ function sha256File(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
+function sha256Text(value) {
+  return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
 function todoBlocksWithOffsets(text) {
   const source = String(text ?? '');
   const starts = [...source.matchAll(/^(?:[-*]|\d+[.)])\s+\[[ xX]\]\s+/gmu)].map((match) => match.index);
@@ -110,6 +114,17 @@ function replaceTodoFirstLine(text, todoId, beforeLine, afterLine) {
   return `${source.slice(0, entry.start + offset)}${afterLine}${source.slice(entry.start + offset + beforeLine.length)}`;
 }
 
+function removeTodoBlock(text, todoId, expectedContracts) {
+  const source = String(text ?? '');
+  const entry = todoBlocksWithOffsets(source).find((candidate) => protectedContract(candidate.block).id === todoId);
+  if (!entry) throw new Error(`TODO contract is absent from index: ${todoId}`);
+  const actual = protectedContract(entry.block);
+  if (!expectedContracts.some((expected) => sameContract(actual, expected))) {
+    throw new Error(`TODO contract is not an approved completion state: ${todoId}`);
+  }
+  return `${source.slice(0, entry.start)}${source.slice(entry.end)}`;
+}
+
 function writeIndexText(repoRoot, relativePath, text) {
   const blob = git(repoRoot, ['hash-object', '-w', '--stdin'], { input: text });
   git(repoRoot, ['update-index', '--add', '--cacheinfo', '100644', blob, relativePath]);
@@ -134,7 +149,11 @@ function materializedTransitions(records) {
         if (operation !== 'create' || afterScopes.get(target) !== 'patch') continue;
         const snapshot = record.target_snapshots?.find((entry) => entry?.path === target && entry?.exists_after === true);
         if (!snapshot?.sha256_after) continue;
-        targets.push({ path: target, placeholder_sha256: String(snapshot.sha256_after) });
+        targets.push({
+          path: target,
+          placeholder_sha256: String(snapshot.sha256_after),
+          target_capture_mode: String(record.target_capture?.mode ?? '')
+        });
       }
       if (targets.length === 0) continue;
       transitions.push({
@@ -172,6 +191,23 @@ function findTransitionPath(transitions, start, target) {
   return null;
 }
 
+function findTerminalTransitionPath(transitions, start) {
+  const path = [];
+  const visited = new Set();
+  let current = start;
+  while (true) {
+    const currentKey = JSON.stringify(current);
+    if (visited.has(currentKey)) return null;
+    visited.add(currentKey);
+    const outgoing = transitions.filter((transition) => JSON.stringify(transition.before_contract) === currentKey);
+    if (outgoing.length === 0) return path;
+    if (outgoing.length !== 1) return null;
+    const [transition] = outgoing;
+    path.push(transition);
+    current = transition.after_contract;
+  }
+}
+
 function validateTargetCandidate(repoRoot, baseRef, transition, errors) {
   for (const target of transition.targets) {
     if (!safeRelativePath(target.path)) {
@@ -193,7 +229,10 @@ function validateTargetCandidate(repoRoot, baseRef, transition, errors) {
       errors.push({ code: 'materialized_scope_target_index_mismatch', todo_id: transition.todo_id, path: target.path });
       continue;
     }
-    if (sha256File(absolutePath) === target.placeholder_sha256) {
+    const rawPlaceholderMatch = sha256File(absolutePath) === target.placeholder_sha256;
+    const legacyTrimmedPlaceholderMatch = target.target_capture_mode === 'legacy_pre_capture_materialization'
+      && sha256Text(fs.readFileSync(absolutePath, 'utf8').trim()) === target.placeholder_sha256;
+    if (rawPlaceholderMatch || legacyTrimmedPlaceholderMatch) {
       errors.push({ code: 'materialized_scope_target_still_placeholder', todo_id: transition.todo_id, path: target.path });
       continue;
     }
@@ -243,43 +282,64 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
   for (const todoId of todoIds) {
     const base = contractForTodo(baseTodoText, todoId);
     const worktree = contractForTodo(worktreeTodoText, todoId);
-    if (!base || !worktree || !worktree.unchecked || sameContract(base.contract, worktree.contract)) continue;
-    const pathTransitions = findTransitionPath(
-      transitions.filter((transition) => transition.todo_id === todoId),
-      base.contract,
-      worktree.contract
-    );
+    if (!base) continue;
+    const todoTransitions = transitions.filter((transition) => transition.todo_id === todoId);
+    const completed = !worktree;
+    if (!completed && (!worktree.unchecked || sameContract(base.contract, worktree.contract))) continue;
+    const pathTransitions = completed
+      ? findTerminalTransitionPath(todoTransitions, base.contract)
+      : findTransitionPath(todoTransitions, base.contract, worktree.contract);
     if (!pathTransitions) {
-      const beginsAtBase = transitions.some((transition) => transition.todo_id === todoId && sameContract(transition.before_contract, base.contract));
+      const beginsAtBase = todoTransitions.some((transition) => sameContract(transition.before_contract, base.contract));
       if (beginsAtBase) {
-        errors.push({ code: 'materialized_scope_publication_chain_missing', todo_id: todoId, base_ref: baseRef });
+        errors.push({
+          code: completed ? 'materialized_scope_completion_chain_ambiguous' : 'materialized_scope_publication_chain_missing',
+          todo_id: todoId,
+          base_ref: baseRef
+        });
       }
       continue;
     }
 
+    // No materialized transition starts at this branch's TODO state. Another
+    // completion path owns the queue removal, so this guard must not stage an
+    // unrelated TODO edit merely because an older receipt still exists.
+    if (completed && pathTransitions.length === 0) continue;
+
     const candidate = contractForTodo(candidateTodoText, todoId);
     const states = [base.contract, ...pathTransitions.map((transition) => transition.after_contract)];
+    if (completed && !candidate) continue;
     const stateIndex = states.findIndex((state) => candidate && sameContract(state, candidate.contract));
     if (stateIndex < 0) {
       errors.push({ code: 'materialized_scope_index_contract_mismatch', todo_id: todoId });
       continue;
     }
-    if (!sameContract(states.at(-1), worktree.contract)) {
+    if (!completed && !sameContract(states.at(-1), worktree.contract)) {
       errors.push({ code: 'materialized_scope_worktree_contract_mismatch', todo_id: todoId });
       continue;
     }
     for (const transition of pathTransitions) validateTargetCandidate(repoRoot, baseRef, transition, errors);
     if (errors.length > 0) continue;
-    for (const transition of pathTransitions.slice(stateIndex)) {
-      candidateTodoText = replaceTodoFirstLine(
-        candidateTodoText,
-        todoId,
-        transition.before_contract.first_line,
-        transition.after_contract.first_line
-      );
+    if (completed) {
+      candidateTodoText = removeTodoBlock(candidateTodoText, todoId, states);
+      appliedTodoIds.push(todoId);
+    } else {
+      for (const transition of pathTransitions.slice(stateIndex)) {
+        candidateTodoText = replaceTodoFirstLine(
+          candidateTodoText,
+          todoId,
+          transition.before_contract.first_line,
+          transition.after_contract.first_line
+        );
+      }
+      if (stateIndex < pathTransitions.length) appliedTodoIds.push(todoId);
     }
-    checked.push({ todo_id: todoId, receipt_run_stamps: pathTransitions.map((transition) => transition.receipt_run_stamp), targets: pathTransitions.flatMap((transition) => transition.targets.map((target) => target.path)) });
-    if (stateIndex < pathTransitions.length) appliedTodoIds.push(todoId);
+    checked.push({
+      todo_id: todoId,
+      completion_removed: completed,
+      receipt_run_stamps: pathTransitions.map((transition) => transition.receipt_run_stamp),
+      targets: pathTransitions.flatMap((transition) => transition.targets.map((target) => target.path))
+    });
   }
 
   if (errors.length === 0 && candidateTodoText !== indexTodoText && applyIndex) {
