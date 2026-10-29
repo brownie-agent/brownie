@@ -41,7 +41,7 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function activeClaimPlaceholderFixture(repo) {
+function activeClaimPlaceholderFixture(repo, options = {}) {
   const stateRoot = path.join(repo, '.brownie/private/phase-loop');
   const claimPath = path.join(stateRoot, 'todo-claims/current.json');
   const queuePath = path.join(stateRoot, 'todo-claims/todo-queue-state.json');
@@ -68,7 +68,13 @@ function activeClaimPlaceholderFixture(repo) {
   const stdoutPath = path.join(stateRoot, 'runs', `${runStamp}.stdout.log`);
   const evidencePath = path.join(stateRoot, 'runs', `${runStamp}.execution-evidence.json`);
 
-  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `${selectedTodo}\n\n${laterTodo}\n`);
+  const completedTodo = [
+    '- [x] E-completed: A completed entry that must not alter the active claim block.',
+    '  Route: implementation.',
+    '  Verification: run `node --test scripts/completed.test.mjs`.'
+  ].join('\n');
+  const interveningTodo = options.completedTodoAfterSelected === true ? `\n\n${completedTodo}` : '';
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `${selectedTodo}${interveningTodo}\n\n${laterTodo}\n`);
   fs.writeFileSync(path.join(repo, target), '// Brownie bounded Patch-only proposal.\n');
   writeJson(claimPath, {
     schema_version: 1,
@@ -187,6 +193,21 @@ test('admits an exact active-claim placeholder only for the authenticated resume
     sha256: `sha256:${createHash('sha256').update('// Brownie bounded Patch-only proposal.').digest('hex')}`,
     message: 'A dirty bounded-proposal placeholder is attributable to the exact active Runtime claim and is admitted only for that claim resume.'
   });
+  assert.equal(result.warnings.filter((warning) => warning.code === 'active_claim_owned_dirty_target_placeholder').length, 1);
+});
+
+test('admits an active claim whose selected TODO is followed by a completed TODO entry', () => {
+  const repo = makeRepo();
+  const fixture = activeClaimPlaceholderFixture(repo, { completedTodoAfterSelected: true });
+  const result = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim-boundary',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
   assert.equal(result.warnings.filter((warning) => warning.code === 'active_claim_owned_dirty_target_placeholder').length, 1);
 });
 

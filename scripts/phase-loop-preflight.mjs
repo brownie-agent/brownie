@@ -6,6 +6,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { boundedScopeEntries } from './phase-loop-bounded-scope.mjs';
 import { bindExecutionContext } from './phase-loop-execution-context.mjs';
+import { uncheckedTodoBlocks as claimSelectorTodoBlocks } from './guard-todo-decomposition.mjs';
 import {
   matchesMaterializedTargetRebaselineChain,
   matchesMaterializedTargetRebaseline,
@@ -576,7 +577,11 @@ function activeClaimPlaceholderOwnership({ repoRoot, stateRoot, claimPath, stage
   // The claim must still identify one exact unchecked queue entry.  A
   // substring match would let a stale claim borrow authority from prose or a
   // modified successor leaf that merely repeats its text.
-  if (!uncheckedTodoBlocks(todoText).includes(selectedTodo)) return null;
+  // The claim selector uses the decomposition guard's parser, which ends a
+  // block at either an unchecked or checked checkbox entry.  Reuse it here so
+  // exact claim matching cannot reject a valid selected block merely because
+  // a completed entry immediately follows it in the queue.
+  if (!claimSelectorTodoBlocks(todoText).includes(selectedTodo)) return null;
 
   const selectedFirstLine = selectedTodo.split('\n')[0] ?? '';
   const selectedTargets = boundedScopeEntries(selectedFirstLine)
