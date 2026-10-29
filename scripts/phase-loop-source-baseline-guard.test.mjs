@@ -116,3 +116,17 @@ test('phase-loop refuses to enter a Brownie run before the source baseline guard
   assert.match(controller, /phase-loop-workspace-baseline-guard\.mjs/u);
   assert.match(controller, /--workspace-root "\$PHASE_LOOP_WORKSPACE_ROOT" --baseline-ref "\$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE"/u);
 });
+
+test('phase-loop stages the materialized-scope publication contract before committing a PR', () => {
+  const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
+  const stageIndex = controller.indexOf('stage_runtime_applied_paths "$stdout_log"');
+  const publicationGuardIndex = controller.indexOf('if ! phase_loop_require_materialized_scope_publication');
+  const commitIndex = controller.indexOf('git commit -m "$title"');
+  assert(stageIndex >= 0);
+  assert(publicationGuardIndex > stageIndex);
+  assert(commitIndex > publicationGuardIndex);
+  assert.match(controller, /staged_workspace_diff_exists\(\)/u);
+  assert.match(controller, /\[ "\$workspace_before" = "\$workspace_after" \] && ! staged_workspace_diff_exists/u);
+  assert.match(controller, /scripts\/phase-loop-materialized-scope-publication-guard\.mjs/u);
+  assert.match(controller, /pr_create_skipped reason=materialized_scope_publication_guard_failed/u);
+});

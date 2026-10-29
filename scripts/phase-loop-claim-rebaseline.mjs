@@ -152,6 +152,20 @@ export function rebaselineStaleClaim({
   const projection = progress.progress_projection && typeof progress.progress_projection === 'object'
     ? progress.progress_projection : {};
   const claimMatchesProjection = projection.claim_id === claim.claim_id;
+  // A contract-boundary rejection happens before Runtime can produce a
+  // terminal task event.  Leaving its old in-progress claim resumable makes
+  // every later run replay an authorization whose target snapshot is already
+  // known invalid.  Treat only the explicit materialized-scope boundary and
+  // an applied projection whose selected TODO was removed as durable stale
+  // evidence; ordinary preflight failures remain fail-closed for repair.
+  const blockedDetail = String(status.detail ?? '');
+  const staleMaterializedScopeBoundary = claimMatchesProjection
+    && status.status === 'blocked'
+    && /contract_unsatisfiable_dirty_scope|materialized[_ -]scope|pre-claim-boundary/iu.test(blockedDetail);
+  const staleAppliedProjection = claimMatchesProjection
+    && String(projection.applied ?? '').toLowerCase() === 'true'
+    && projection.selected_todo_first_line_still_pending_after_todo_md_apply === false;
+  const staleClaimSnapshot = staleMaterializedScopeBoundary || staleAppliedProjection;
   // A run-once process is expected to exit after it records a durable
   // continuation.  The next invocation first normalizes that ownerless
   // "running" status, so do not mistake its historical terminal ledger
@@ -173,7 +187,7 @@ export function rebaselineStaleClaim({
   ) || (
     claim.queue_fingerprint && queue.fingerprint && claim.queue_fingerprint !== queue.fingerprint
   );
-  if (resumableContinuation && !queueMismatch) {
+  if (resumableContinuation && !queueMismatch && !staleClaimSnapshot) {
     return {
       ok: true,
       rebaselined: false,
@@ -189,7 +203,13 @@ export function rebaselineStaleClaim({
   // left in the status file: the run-once entrypoint has already performed
   // the live-owner check before reaching this recovery guard.
   const ownerStopped = status.status !== 'running';
-  const shouldRebaseline = staleRun && ownerStopped && (queueMismatch || terminalProjection || ledgerEvidence.length > 0 || priorRuns.length > 0);
+  const shouldRebaseline = staleRun && ownerStopped && (
+    queueMismatch
+    || terminalProjection
+    || ledgerEvidence.length > 0
+    || priorRuns.length > 0
+    || staleClaimSnapshot
+  );
   if (!shouldRebaseline) {
     return {
       ok: true,
@@ -235,6 +255,8 @@ export function rebaselineStaleClaim({
       owner_stopped: ownerStopped,
       queue_mismatch: queueMismatch,
       terminal_projection: terminalProjection,
+      stale_materialized_scope_boundary: staleMaterializedScopeBoundary,
+      stale_applied_projection: staleAppliedProjection,
       ledger_terminal_events: ledgerEvidence,
       prior_terminal_runs: priorRuns,
     },
