@@ -738,6 +738,42 @@ test('deterministically decomposes E-19h release contract trace binding with all
       claim_id: 'claim-test',
       selected_todo: selected
     }, null, 2));
+    fs.writeFileSync(path.join(root, '.brownie/todo-breakdown.md'), [
+      '# TODO breakdown',
+      '',
+      '## TODO-decompose-broad-todo-9430463ff3c2',
+      '',
+      'Parent TODO: stale-parent.',
+      '',
+      'Dependency graph:',
+      '- stale-leaf: <none>',
+      '',
+      'Verification ledger:',
+      '- stale-leaf: `node --test scripts/stale.test.mjs`',
+      '',
+      'Quality rubric:',
+      '- stale rubric.',
+      '',
+      'History:',
+      '- stale entry.',
+      '',
+      '## unrelated-breakdown-section',
+      '',
+      'Parent TODO: unrelated-parent.',
+      '',
+      'Dependency graph:',
+      '- unrelated-leaf: <none>',
+      '',
+      'Verification ledger:',
+      '- unrelated-leaf: `node --test scripts/unrelated.test.mjs`',
+      '',
+      'Quality rubric:',
+      '- unrelated rubric.',
+      '',
+      'History:',
+      '- unrelated entry.',
+      ''
+    ].join('\n'));
 
     const result = runRepair(root);
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
@@ -750,6 +786,9 @@ test('deterministically decomposes E-19h release contract trace binding with all
     assert(todoText.includes('pnpm --workspace-root guard:release-contract:test'), todoText);
     assert(todoText.includes('pnpm --workspace-root guard:runtime-release-readiness'), todoText);
     assert(breakdownText.includes('E-19h-release-contract-trace-test'), breakdownText);
+    assert(!breakdownText.includes('stale-leaf'), breakdownText);
+    assert(breakdownText.includes('## unrelated-breakdown-section'), breakdownText);
+    assert(breakdownText.includes('- unrelated-leaf: <none>'), breakdownText);
     assert.deepEqual(validateTodoDecompositionText(todoText, {
       path: '.brownie/todo.md',
       repoRoot: root,
