@@ -327,19 +327,36 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
   const todoIds = [...new Set(transitions.map((transition) => transition.todo_id))];
   for (const todoId of todoIds) {
     const base = contractForTodo(baseTodoText, todoId);
+    const index = contractForTodo(indexTodoText, todoId);
     const worktree = contractForTodo(worktreeTodoText, todoId);
     if (!base) continue;
     const todoTransitions = transitions.filter((transition) => transition.todo_id === todoId);
-    const completed = !worktree;
-    if (!completed && (!worktree.unchecked || sameContract(base.contract, worktree.contract))) continue;
-    const pathTransitions = completed
+    const indexCompleted = !index;
+    const worktreeCompleted = !worktree;
+    const candidateChangesContract = indexCompleted || !sameContract(base.contract, index.contract);
+    // Establish candidate involvement from the index before looking at the
+    // worktree.  The index is what can be committed; a restored worktree TODO
+    // must never make a staged contract or target invisible to validation.
+    const candidateIncludesTarget = todoTransitions.some((transition) => transition.targets.some((target) => targetIsInCandidate(repoRoot, baseRef, target)));
+    if (!candidateIncludesTarget && !candidateChangesContract) continue;
+
+    const indexPathTransitions = indexCompleted
+      ? findTerminalTransitionPath(todoTransitions, base.contract)
+      : findTransitionPath(todoTransitions, base.contract, index.contract);
+    const worktreePathTransitions = worktreeCompleted
       ? findTerminalTransitionPath(todoTransitions, base.contract)
       : findTransitionPath(todoTransitions, base.contract, worktree.contract);
+    const pathTransitions = candidateChangesContract ? indexPathTransitions : worktreePathTransitions;
+    const completed = candidateChangesContract ? indexCompleted : worktreeCompleted;
     if (!pathTransitions) {
       const beginsAtBase = todoTransitions.some((transition) => sameContract(transition.before_contract, base.contract));
       if (beginsAtBase) {
         errors.push({
-          code: completed ? 'materialized_scope_completion_chain_ambiguous' : 'materialized_scope_publication_chain_missing',
+          code: candidateChangesContract && !indexCompleted
+            ? 'materialized_scope_index_contract_mismatch'
+            : completed
+              ? 'materialized_scope_completion_chain_ambiguous'
+              : 'materialized_scope_publication_chain_missing',
           todo_id: todoId,
           base_ref: baseRef
         });
@@ -354,19 +371,21 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
 
     const candidate = contractForTodo(candidateTodoText, todoId);
     const states = [base.contract, ...pathTransitions.map((transition) => transition.after_contract)];
-    const candidateIncludesTarget = pathTransitions.some((transition) => transition.targets.some((target) => targetIsInCandidate(repoRoot, baseRef, target)));
-    const candidateChangesContract = !candidate || !sameContract(base.contract, candidate.contract);
-    // Receipts may outlive the PR that produced them.  A dirty worktree can
-    // therefore contain many rebased TODOs, but publication may only validate
-    // and stage the TODO whose target or contract is actually in this
-    // candidate.  Unrelated receipt history must not block that candidate.
-    if (!candidateIncludesTarget && !candidateChangesContract) continue;
+    if (!candidateChangesContract && pathTransitions.length === 0) {
+      errors.push({ code: 'materialized_scope_contract_transition_missing', todo_id: todoId });
+      continue;
+    }
+    const worktreeMatchesIndex = indexCompleted === worktreeCompleted
+      && (indexCompleted || sameContract(index.contract, worktree.contract));
     // A caller may already have staged the exact queue removal before this
     // guard runs.  That is a valid candidate shape, but it must not bypass
     // target validation: otherwise a staged removal plus an unchanged
     // placeholder implementation could be published without a contract.
     if (completed && !candidate) {
       for (const transition of pathTransitions) validateTargetCandidate(repoRoot, baseRef, transition, errors);
+      if (!worktreeMatchesIndex) {
+        errors.push({ code: 'materialized_scope_worktree_contract_mismatch', todo_id: todoId });
+      }
       if (errors.length > 0) continue;
       checked.push({
         todo_id: todoId,
@@ -382,11 +401,10 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
       errors.push({ code: 'materialized_scope_index_contract_mismatch', todo_id: todoId });
       continue;
     }
-    if (!completed && !sameContract(states.at(-1), worktree.contract)) {
-      errors.push({ code: 'materialized_scope_worktree_contract_mismatch', todo_id: todoId });
-      continue;
-    }
     for (const transition of pathTransitions) validateTargetCandidate(repoRoot, baseRef, transition, errors);
+    if (candidateChangesContract && !worktreeMatchesIndex) {
+      errors.push({ code: 'materialized_scope_worktree_contract_mismatch', todo_id: todoId });
+    }
     if (errors.length > 0) continue;
     if (completed) {
       candidateTodoText = removeTodoBlock(candidateTodoText, todoId, states);

@@ -146,6 +146,28 @@ test('rejects an index contract that is neither the recorded before-state nor af
   assert(result.errors.some((error) => error.code === 'materialized_scope_index_contract_mismatch'));
 });
 
+test('rejects a staged Patch contract when the worktree TODO was restored to Create and its target is a placeholder', () => {
+  const { root, target, before, after } = fixture();
+  fs.writeFileSync(path.join(root, target), '// brownie bounded create-only proposal\n');
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), after);
+  git(root, ['add', '.brownie/todo.md', target]);
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), before);
+  const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'materialized_scope_target_still_placeholder'));
+  assert(result.errors.some((error) => error.code === 'materialized_scope_worktree_contract_mismatch'));
+});
+
+test('rejects a staged materialized target without any indexed or worktree contract transition', () => {
+  const { root, target, before } = fixture();
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), before);
+  git(root, ['add', target]);
+  const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'materialized_scope_contract_transition_missing'));
+  assert.equal(git(root, ['show', ':.brownie/todo.md']), before.trim());
+});
+
 test('rejects a newline-terminated legacy placeholder whose receipt used a trimmed hash', () => {
   const { root, id, target, before, after } = fixture();
   const targetPath = path.join(root, target);
