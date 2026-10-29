@@ -123,6 +123,16 @@ function functionHasReachableReference(repoRoot, sourceFiles, declaration) {
   if (sameFileCallPattern.test(sameFileWithoutDeclaration)) {
     return true;
   }
+  // A function passed directly to a collection iterator is invoked by that
+  // iterator at runtime, even though its source reference is not written as
+  // `name(...)`.  Treat the bounded callback forms as execution paths without
+  // accepting arbitrary bare identifier mentions.
+  const sameFileCallbackPattern = new RegExp(
+    `\\.(?:every|filter|find|findIndex|flatMap|forEach|map|reduce|reduceRight|some)\\(\\s*${escaped}\\s*(?:,|\\))`
+  );
+  if (sameFileCallbackPattern.test(sameFileWithoutDeclaration)) {
+    return true;
+  }
   const namedImportPattern = new RegExp(`import\\s*\\{[^}]*\\b${escaped}\\b[^}]*\\}\\s*from\\s*['"][^'"]+['"]`, 'g');
   for (const relativePath of sourceFiles) {
     if (relativePath === declaration.relativePath) {

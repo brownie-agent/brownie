@@ -120,6 +120,7 @@ test('preserves an ownerless same-queue continuation claim for resume despite hi
 
 test('isolates a stale pre-claim materialized-scope boundary claim even when its queue is unchanged', () => {
   const f = fixture();
+  fs.writeFileSync(path.join(f.root, 'todo.md'), '- [ ] E-replacement: Patch only `scripts/replacement.mjs`:\n  Route: implementation.\n');
   writeJson(path.join(f.stateDir, 'status.json'), {
     status: 'blocked',
     detail: 'Phase-loop preflight failed before continuing; code=contract_unsatisfiable_dirty_scope.',
@@ -153,7 +154,77 @@ test('isolates a stale pre-claim materialized-scope boundary claim even when its
   assert.equal(audit.reasons.queue_mismatch, false);
   assert.equal(audit.reasons.stale_materialized_scope_boundary, true);
   assert.equal(audit.reasons.stale_applied_projection, true);
+  assert.equal(audit.reasons.selected_todo_still_pending, false);
   assert.equal(fs.existsSync(f.claimPath), false);
+});
+
+test('preserves an applied continuation when a completed TODO immediately follows its exact selected TODO', () => {
+  const f = fixture();
+  fs.writeFileSync(path.join(f.root, 'todo.md'), `${f.selected}\n- [x] E-completed-after-selection: Completed sibling.\n- [ ] E-later-pending: Later pending work.\n`);
+  writeJson(path.join(f.stateDir, 'status.json'), { status: 'stopped' });
+  writeJson(path.join(f.stateDir, 'progress-state.json'), {
+    classification: 'progress',
+    continuation_required: true,
+    progress_projection: {
+      claim_id: 'todo-g541-roundtrip-r3',
+      applied: 'True',
+      controller_action: 'resume',
+      stop_class: 'continuation_required',
+      selected_todo_first_line_still_pending_after_todo_md_apply: false,
+    },
+  });
+  writeJson(path.join(f.claims, 'todo-queue-state.json'), { generation: 541, fingerprint: 'old-queue' });
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp: '20261020T090000Z',
+    baselineRef: 'origin/main',
+  });
+  assert.equal(result.rebaselined, false, JSON.stringify(result));
+  assert.equal(result.selected_todo_still_pending, true);
+  assert.equal(fs.existsSync(f.claimPath), true);
+});
+
+test('does not preserve an applied continuation when the selected TODO survives only as prose', () => {
+  const f = fixture();
+  fs.writeFileSync(path.join(f.root, 'todo.md'), `Archived selection: ${f.selected}\n`);
+  writeJson(path.join(f.stateDir, 'status.json'), { status: 'stopped' });
+  writeJson(path.join(f.stateDir, 'progress-state.json'), {
+    classification: 'progress',
+    continuation_required: true,
+    progress_projection: {
+      claim_id: 'todo-g541-roundtrip-r3',
+      applied: 'True',
+      controller_action: 'resume',
+      stop_class: 'continuation_required',
+      selected_todo_first_line_still_pending_after_todo_md_apply: false,
+    },
+  });
+  writeJson(path.join(f.claims, 'todo-queue-state.json'), { generation: 541, fingerprint: 'old-queue' });
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp: '20261020T090000Z',
+    baselineRef: 'origin/main',
+  });
+  assert.equal(result.rebaselined, true, JSON.stringify(result));
+  const audit = JSON.parse(fs.readFileSync(result.audit_path, 'utf8'));
+  assert.equal(audit.reasons.selected_todo_still_pending, false);
+  assert.equal(audit.reasons.stale_applied_projection, true);
 });
 
 test('requires current-run task execution evidence before terminal failure recording', () => {

@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { boundedScopeEntries } from './phase-loop-bounded-scope.mjs';
 import { bindExecutionContext } from './phase-loop-execution-context.mjs';
+import { uncheckedTodoBlocks as claimSelectorTodoBlocks } from './guard-todo-decomposition.mjs';
 import {
   matchesMaterializedTargetRebaselineChain,
   matchesMaterializedTargetRebaseline,
@@ -515,13 +517,139 @@ function todoId(block) {
     ?.trim() ?? '';
 }
 
-function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings) {
+function isPathInside(root, candidate) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function readJsonInside(root, candidate) {
+  if (!isPathInside(root, candidate) || !fs.existsSync(candidate)) return null;
+  try {
+    const realRoot = fs.realpathSync(root);
+    const realCandidate = fs.realpathSync(candidate);
+    if (!isPathInside(realRoot, realCandidate)) return null;
+    const value = JSON.parse(fs.readFileSync(realCandidate, 'utf8'));
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveRepositoryArtifactPath(repoRoot, candidate) {
+  return typeof candidate === 'string' && candidate ? path.resolve(repoRoot, candidate) : null;
+}
+
+function sha256Hex(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+function validClaimTarget(target) {
+  if (typeof target !== 'string' || !target || path.posix.isAbsolute(target)) return false;
+  const parts = target.split('/');
+  return !parts.includes('..') && !parts.includes('.') && !parts.includes('');
+}
+
+function phaseLoopPayload(value) {
+  if (value?.run && typeof value.run === 'object') return value.run;
+  if (value?.resume && typeof value.resume === 'object') return value.resume;
+  return value && typeof value === 'object' ? value : {};
+}
+
+function payloadValue(payload, automation, field) {
+  return payload?.[field] ?? automation?.[field] ?? null;
+}
+
+function activeClaimPlaceholderOwnership({ repoRoot, stateRoot, claimPath, stage, todoText, target }) {
+  // This narrowly authorizes a resume of work that the current admitted claim
+  // itself materialized.  It is deliberately unavailable to generic/manual
+  // preflight calls and to fresh claims, so a future leaf cannot inherit an
+  // unproven dirty placeholder merely because it shares a path.
+  if (!['pre-claim-boundary', 'pre-claim'].includes(stage)) return null;
+  if (!stateRoot || !claimPath || !isPathInside(stateRoot, claimPath)) return null;
+
+  const claim = readJsonInside(stateRoot, claimPath);
+  if (!claim || claim.status !== 'in_progress') return null;
+  const claimId = typeof claim.claim_id === 'string' ? claim.claim_id : '';
+  const selectedTodo = typeof claim.selected_todo === 'string' ? claim.selected_todo : '';
+  const runStamp = typeof claim.run_stamp === 'string' ? claim.run_stamp : '';
+  const queueFingerprint = typeof claim.queue_fingerprint === 'string' ? claim.queue_fingerprint : '';
+  if (!claimId || !selectedTodo || !runStamp || !queueFingerprint || claim.queue_generation == null) return null;
+  // The claim must still identify one exact unchecked queue entry.  A
+  // substring match would let a stale claim borrow authority from prose or a
+  // modified successor leaf that merely repeats its text.
+  // The claim selector uses the decomposition guard's parser, which ends a
+  // block at either an unchecked or checked checkbox entry.  Reuse it here so
+  // exact claim matching cannot reject a valid selected block merely because
+  // a completed entry immediately follows it in the queue.
+  if (!claimSelectorTodoBlocks(todoText).includes(selectedTodo)) return null;
+
+  const selectedFirstLine = selectedTodo.split('\n')[0] ?? '';
+  const selectedTargets = boundedScopeEntries(selectedFirstLine)
+    .map((entry) => entry.path)
+    .filter((entry) => validClaimTarget(entry));
+  if (!selectedTargets.includes(target)) return null;
+
+  const queue = readJsonInside(stateRoot, path.join(stateRoot, 'todo-claims', 'todo-queue-state.json'));
+  if (!queue
+    || String(queue.generation ?? '') !== String(claim.queue_generation)
+    || String(queue.fingerprint ?? '') !== queueFingerprint) {
+    return null;
+  }
+
+  const evidencePath = resolveRepositoryArtifactPath(repoRoot, claim.terminal_failure_execution_evidence_path);
+  const evidence = evidencePath ? readJsonInside(stateRoot, evidencePath) : null;
+  const selectedTodoSha256 = sha256Hex(selectedTodo);
+  if (!evidence
+    || evidence.run_stamp !== runStamp
+    || evidence.claim_id !== claimId
+    || evidence.runtime_claim_id !== claimId
+    || evidence.claim_matches !== true
+    || evidence.selected_todo_id !== todoId(selectedTodo)
+    || evidence.selected_todo_sha256 !== selectedTodoSha256
+    || evidence.task_execution_confirmed !== true
+    || !Array.isArray(evidence.target_files)
+    || !evidence.target_files.includes(target)) {
+    return null;
+  }
+
+  const admission = readJsonInside(stateRoot, path.join(stateRoot, 'runs', `${runStamp}.runtime-admission.json`));
+  if (!admission
+    || admission.status !== 'admitted'
+    || admission.claim_id !== claimId
+    || admission.selected_todo_id !== todoId(selectedTodo)
+    || admission.selected_todo_sha256 !== selectedTodoSha256
+    || String(admission.queue_generation ?? '') !== String(claim.queue_generation)
+    || String(admission.queue_fingerprint ?? '') !== queueFingerprint) {
+    return null;
+  }
+
+  const stdoutPath = resolveRepositoryArtifactPath(repoRoot, evidence?.stdout_path);
+  const stdout = stdoutPath ? readJsonInside(stateRoot, stdoutPath) : null;
+  const payload = phaseLoopPayload(stdout);
+  const automation = payload.automation && typeof payload.automation === 'object' ? payload.automation : {};
+  if (payloadValue(payload, automation, 'phase_loop_claim_id') !== claimId
+    || payloadValue(payload, automation, 'phase_loop_selected_todo_sha256') !== selectedTodoSha256
+    || String(payloadValue(payload, automation, 'phase_loop_queue_generation') ?? '') !== String(claim.queue_generation)
+    || String(payloadValue(payload, automation, 'phase_loop_queue_fingerprint') ?? '') !== queueFingerprint
+    || payload.objective_apply_applied !== true
+    || payload.objective_apply_path !== target
+    || payload.status !== 'objective_proposal_applied') {
+    return null;
+  }
+
+  return { claim_id: claimId, run_stamp: runStamp };
+}
+
+function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, options = {}) {
   const dirty = new Set(gitDirtyFiles(repoRoot));
   if (dirty.size === 0) return;
+  const warnedActiveClaimTargets = new Set();
   const rebaselineRecords = readContractRebaselineRecords(repoRoot);
   for (const block of uncheckedTodoBlocks(todoText)) {
     const firstLine = block.split('\n')[0] ?? '';
-    const targets = [...firstLine.matchAll(/(?:Patch|Create) only `([^`]+)`/gu)].map((match) => match[1]);
+    const targets = boundedScopeEntries(firstLine)
+      .map((entry) => entry.path)
+      .filter((entry) => validClaimTarget(entry));
     for (const target of targets) {
       if (!dirty.has(target)) continue;
       const absoluteTarget = path.join(repoRoot, target);
@@ -548,6 +676,29 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings) {
           contract_rebaseline_run_stamp: rebaselined.cause_run.run_stamp,
           message: 'A materialized Create-only target is admitted as Patch-only only through an exact target-hash-bound rebaseline receipt.'
         });
+        continue;
+      }
+      const ownership = activeClaimPlaceholderOwnership({
+        repoRoot,
+        stateRoot: options.stateRoot,
+        claimPath: options.claimPath,
+        stage: options.stage,
+        todoText,
+        target
+      });
+      if (ownership) {
+        const warningKey = `${ownership.claim_id}\u0000${target}`;
+        if (!warnedActiveClaimTargets.has(warningKey)) {
+          warnedActiveClaimTargets.add(warningKey);
+          warnings.push({
+            code: 'active_claim_owned_dirty_target_placeholder',
+            claim_id: ownership.claim_id,
+            run_stamp: ownership.run_stamp,
+            target,
+            sha256: `sha256:${sha256}`,
+            message: 'A dirty bounded-proposal placeholder is attributable to the exact active Runtime claim and is admitted only for that claim resume.'
+          });
+        }
         continue;
       }
       errors.push({
@@ -639,6 +790,8 @@ export function validatePhaseLoopPreflight(options = {}) {
   }
   const todoPath = options.todo ?? '.brownie/todo.md';
   const fixtureProfile = profile === 'claim-smoke-fixture';
+  const stateRoot = path.resolve(repoRoot, options.stateRoot ?? path.join(repoRoot, '.brownie/private/phase-loop'));
+  const claimPath = path.resolve(repoRoot, options.claim ?? '.brownie/private/phase-loop/todo-claims/current.json');
   const fixturePathOptions = fixtureProfile ? { allowOutsideRepository: true } : {};
   const todoText = readText(repoRoot, todoPath, errors, fixturePathOptions);
   const breakdownPath = options.breakdown ?? '.brownie/todo-breakdown.md';
@@ -663,7 +816,11 @@ export function validatePhaseLoopPreflight(options = {}) {
     allowPendingCompletionRecovery: fixtureProfile,
     claimPath: options.claim
   });
-  validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings);
+  validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, {
+    stateRoot,
+    claimPath,
+    stage: options.stage ?? 'general'
+  });
   // Claim-smoke fixtures intentionally model intermediate controller-owned
   // completion mutations. Production queues must never carry that shape.
   if (!fixtureProfile) {

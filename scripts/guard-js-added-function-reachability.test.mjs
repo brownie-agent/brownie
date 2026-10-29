@@ -47,6 +47,16 @@ test('accepts a newly added function that is connected to an execution path', ()
   assert.equal(result.valid, true);
 });
 
+test('accepts a newly added function passed to a collection callback execution path', () => {
+  const { repoRoot, baseRef } = tempRepo();
+  fs.appendFileSync(
+    path.join(repoRoot, 'scripts/example.mjs'),
+    '\nfunction validateCallback(value) { return Boolean(value); }\n[true].filter(validateCallback);\n'
+  );
+  const result = validateAddedFunctionReachability({ repoRoot, baseRef });
+  assert.equal(result.valid, true);
+});
+
 test('accepts a newly added exported function covered by a test import', () => {
   const { repoRoot, baseRef } = tempRepo();
   fs.writeFileSync(
