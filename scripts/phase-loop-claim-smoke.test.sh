@@ -119,6 +119,7 @@ run_pre_runtime_target_snapshot_regression() {
   # target, while an existing Patch-only target gets its exact bytes back.
   printf '%s\n' '{"selected_todo":"- [ ] fixture: Create only `scripts/first.mjs` and `scripts/second.mjs`, then Patch only `scripts/existing.mjs`."}' > "$claim"
   printf '%s\n' '// before runtime' > "$workspace/scripts/existing.mjs"
+  chmod 755 "$workspace/scripts/existing.mjs"
   PHASE_LOOP_WORKSPACE_ROOT="$workspace" TODO_CLAIM_FILE="$claim" bash -c '
     source "$1"
     capture_pre_runtime_active_target_snapshots "$2"
@@ -136,10 +137,123 @@ run_pre_runtime_target_snapshot_regression() {
     test -f "$2/restore-audit.json"
     test -f "$2/discarded-post-dispatch/1.after"
   ' _ "$helper" "$snapshot"
+  python3 - "$workspace/scripts/existing.mjs" <<'PY'
+import os
+import stat
+import sys
+
+assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755
+PY
   rm -rf "$fixture"
 }
 
 run_pre_runtime_target_snapshot_regression
+
+run_changed_file_quality_gate_regression() {
+  local fixture helper workspace baseline fake_bin pnpm_cwd quality_output
+  fixture="$(mktemp -d)"
+  helper="$fixture/quality-gate.sh"
+  workspace="$fixture/workspace"
+  baseline="$fixture/workspace-status.before"
+  fake_bin="$fixture/bin"
+  pnpm_cwd="$fixture/pnpm.cwd"
+  mkdir -p "$workspace/.brownie/headless" "$workspace/extensions/brownie-vsix/node_modules" "$workspace/scripts" "$workspace/docs/architecture" "$fake_bin"
+  git -C "$workspace" init -b main >/dev/null
+  git -C "$workspace" config user.name Brownie
+  git -C "$workspace" config user.email brownie@example.invalid
+  printf '%s\n' '{"name":"quality-gate-fixture","private":true,"version":"0.1.0","scripts":{"check":"true"}}' > "$workspace/package.json"
+  printf '%s\n' '{"name":"brownie-vsix-fixture","private":true,"version":"0.1.0"}' > "$workspace/extensions/brownie-vsix/package.json"
+  printf '%s\n' 'package-local dependency sentinel' > "$workspace/extensions/brownie-vsix/node_modules/.brownie-quality-gate-sentinel"
+  cp "$REPO_ROOT/scripts/guard-js-added-function-reachability.mjs" "$workspace/scripts/guard-js-added-function-reachability.mjs"
+  cp "$REPO_ROOT/scripts/guard-phase-value.mjs" "$workspace/scripts/guard-phase-value.mjs"
+  cp "$REPO_ROOT/docs/architecture/phase-value-manifest.json" "$workspace/docs/architecture/phase-value-manifest.json"
+  cat > "$workspace/scripts/runtime-change.mjs" <<'JS'
+export function existingFunction() {}
+existingFunction()
+JS
+  printf '%s\n' 'tracked baseline' > "$workspace/tracked.txt"
+  git -C "$workspace" add package.json extensions/brownie-vsix/package.json scripts docs/architecture/phase-value-manifest.json tracked.txt
+  git -C "$workspace" commit -m init >/dev/null
+
+  # The controller must not reinterpret baseline-untracked leaves as new
+  # merely because a later porcelain query collapses them to a directory.
+  printf '%s\n' '{ intentionally malformed baseline fixture' > "$workspace/.brownie/headless/preexisting.json"
+  printf '%s\n' 'pre-existing dirty tracked file' >> "$workspace/tracked.txt"
+  git -C "$workspace" status --porcelain=v1 --untracked-files=all > "$baseline"
+  printf '%s\n' '{"name":"quality-gate-fixture","private":true,"version":"0.2.0","scripts":{"check":"true"}}' > "$workspace/package.json"
+  cat > "$workspace/scripts/runtime-change.mjs" <<'JS'
+export function existingFunction() {}
+existingFunction()
+export function addedReachableFunction() {}
+addedReachableFunction()
+JS
+
+  python3 - "$PHASE_LOOP" "$helper" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = source.index("run_changed_file_quality_gates() {")
+end = source.index("\n}\n\ntry_deterministic_todo_decomposition_repair", start) + 3
+pathlib.Path(sys.argv[2]).write_text(source[start:end], encoding="utf-8")
+PY
+  cat > "$fake_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+set -eu
+test "$PWD" != "${PHASE_LOOP_WORKSPACE_ROOT:?}"
+test -L extensions/brownie-vsix/node_modules
+test -f extensions/brownie-vsix/node_modules/.brownie-quality-gate-sentinel
+git rev-parse --verify "${BROWNIE_JS_REACHABILITY_BASE:?}" >/dev/null
+test "$(git diff --name-only "$BROWNIE_JS_REACHABILITY_BASE" -- package.json scripts/runtime-change.mjs)" = $'package.json\nscripts/runtime-change.mjs'
+node - <<'NODE'
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+if (pkg.version !== '0.2.0') process.exit(42);
+const changed = JSON.parse(process.env.BROWNIE_PHASE_VALUE_CHANGED_FILES || 'null');
+if (JSON.stringify(changed) !== JSON.stringify(['package.json', 'scripts/runtime-change.mjs'])) process.exit(43);
+NODE
+node scripts/guard-js-added-function-reachability.mjs
+node scripts/guard-phase-value.mjs
+printf '%s\n' "$PWD" > "${PHASE_LOOP_TEST_PNPM_CWD_FILE:?}"
+SH
+  chmod +x "$fake_bin/pnpm"
+
+  # Exercise the GitHub PR environment explicitly. The isolated snapshot
+  # must use its own synthetic baseline rather than inheriting the outer
+  # checkout's PR identity.
+  quality_output="$(
+    GITHUB_BASE_REF=main \
+    GITHUB_EVENT_NAME=pull_request \
+    GITHUB_ACTIONS=true \
+    PHASE_LOOP_WORKSPACE_ROOT="$workspace" \
+    PHASE_LOOP_TEST_PNPM_CWD_FILE="$pnpm_cwd" \
+    PATH="$fake_bin:$PATH" \
+    bash -c 'source "$1"; run_changed_file_quality_gates "$2"' _ "$helper" "$baseline"
+  )"
+
+  python3 - "$quality_output" "$workspace" "$pnpm_cwd" "$PHASE_LOOP" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(sys.argv[1])
+workspace = pathlib.Path(sys.argv[2]).resolve()
+pnpm_cwd = pathlib.Path(sys.argv[3])
+source = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
+assert payload["completed"] is True, payload
+assert payload["changed_files"] == ["package.json", "scripts/runtime-change.mjs"], payload
+assert payload["validation_context"]["workspace"] == "isolated_git_archive_with_run_delta", payload
+assert payload["validation_context"]["git_context"] == "synthetic_baseline_with_run_delta", payload
+validated_root = pathlib.Path(pnpm_cwd.read_text(encoding="utf-8").strip()).resolve()
+assert validated_root != workspace, (validated_root, workspace)
+assert not validated_root.exists(), validated_root
+failure_start = source.index('if ! changed_file_quality_gate="$(run_changed_file_quality_gates')
+failure_end = source.index('write_repair_feedback "$run_stamp"', failure_start)
+failure_recovery = source[failure_start:failure_end]
+assert 'restore_pre_runtime_active_target_snapshots "$active_target_snapshots"' in failure_recovery, failure_recovery
+PY
+  rm -rf "$fixture"
+}
 
 phase_loop_smoke_cpu_count() {
   local detected=""
@@ -252,7 +366,10 @@ esac
 if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   claim_smoke_shard_dir="$(mktemp -d)"
   claim_smoke_shards=(core terminal completion terminal-absent queue-claim queue-recovery queue-integrity pr guards feedback lifecycle)
-  claim_smoke_expected_exit_contract="guards=76"
+  # A guards shard must pass end-to-end. Treating its historical static-check
+  # failure as success would mask the very controller regressions this suite
+  # exists to catch.
+  claim_smoke_expected_exit_contract="guards=0"
   phase_loop_claim_smoke_run_scheduler \
     "$claim_smoke_shard_dir" "$0" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
     "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" \
@@ -4475,11 +4592,17 @@ test_workspace="$lifecycle_original_workspace"
 fi
 
 if claim_smoke_section_enabled guards; then
+run_changed_file_quality_gate_regression
+
 exact_workspace="$(mktemp -d)"
 git -C "$exact_workspace" init -b main >/dev/null
 git -C "$exact_workspace" config user.name Brownie
 git -C "$exact_workspace" config user.email brownie@example.invalid
-mkdir -p "$exact_workspace/docs"
+mkdir -p "$exact_workspace/docs/architecture"
+# This is the success-path completion fixture. It deliberately has no release
+# readiness manifest or release-blocker evidence, so an empty queue is valid
+# without making a Product Ready claim.
+printf '{"scripts":{}}\n' > "$exact_workspace/package.json"
 cat > "$exact_workspace/docs/golden.js" <<'EOF'
 export const evidence = {
   status: 'failed',
@@ -4488,7 +4611,7 @@ export const evidence = {
   commands,
 };
 EOF
-git -C "$exact_workspace" add docs/golden.js
+git -C "$exact_workspace" add docs
 git -C "$exact_workspace" commit -m init >/dev/null
 
 fake_brownie_should_not_run="$(mktemp)"

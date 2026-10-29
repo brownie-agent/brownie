@@ -3779,7 +3779,10 @@ elif selected_id == "e-19a-prevent-empty-queue-completion":
         "todo_removal_reverts_live_queue": "completed_todo_removal_reverted=true" in phase_loop_text and "cp \"$todo_backup\" \"$PHASE_LOOP_TODO\"" in phase_loop_text,
         "claim_restored_to_in_progress": "write_todo_claim \"$(claim_field claim_id)\" \"in_progress\"" in phase_loop_text,
         "success_status_forced_to_no_progress": "PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED" in phase_loop_text and "status=\"no_progress\"" in phase_loop_text and "force_status_exit_code=\"76\"" in phase_loop_text,
-        "claim_smoke_package_script_present": scripts.get("phase-loop:claim-smoke") == "bash scripts/phase-loop-claim-smoke.test.sh",
+        # The smoke suite may be wrapped by its bounded parallel scheduler.
+        # Require the real test entrypoint, not one historical command string.
+        "claim_smoke_package_script_present": isinstance(scripts.get("phase-loop:claim-smoke"), str)
+        and "scripts/phase-loop-claim-smoke.test.sh" in scripts.get("phase-loop:claim-smoke", ""),
         "vsix_check_runs_claim_smoke": "pnpm --workspace-root phase-loop:claim-smoke" in vsix_check,
         "smoke_covers_empty_queue_revert": "E-empty-queue-exact" in smoke_text and "completed_todo_removal_reverted=true" in smoke_text and "test \"$empty_queue_guard_exit\" = \"76\"" in smoke_text,
         "smoke_has_rg_fallback_for_ci": "if ! command -v rg" in smoke_text and "grep -E" in smoke_text,
@@ -6398,20 +6401,27 @@ restore_active_target_baseline() {
 run_changed_file_quality_gates() {
   local before_status_path="${1:-}"
   python3 - "$PHASE_LOOP_WORKSPACE_ROOT" "$before_status_path" <<'PY'
+import hashlib
+import io
 import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import time
 
 workspace_root = pathlib.Path(sys.argv[1])
 before_status_path = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
 
-def run(args, timeout=240):
+def run(args, timeout=240, cwd=None, env=None):
     completed = subprocess.run(
         args,
-        cwd=workspace_root,
+        cwd=cwd or workspace_root,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -6472,10 +6482,115 @@ def parse_porcelain_paths(lines):
         paths[path] = raw_line
     return paths
 
-after_status = git_lines(["status", "--porcelain=v1"])
+def safe_relative_path(value):
+    candidate = pathlib.PurePosixPath(value)
+    if not value or candidate.is_absolute() or ".." in candidate.parts or candidate == pathlib.PurePosixPath("."):
+        raise ValueError(f"unsafe changed path: {value!r}")
+    return candidate
+
+def initialize_isolated_validation_git(snapshot):
+    """Give the archive a baseline commit so repository-aware guards see the run delta."""
+    commands = (
+        (["git", "init", "--quiet"], 60),
+        (["git", "add", "--force", "--all"], 120),
+        ([
+            "git", "-c", "user.name=Brownie", "-c", "user.email=brownie@example.invalid",
+            "-c", "commit.gpgSign=false", "commit", "--quiet", "-m", "phase-loop quality-gate baseline",
+        ], 120),
+    )
+    for args, timeout in commands:
+        completed = subprocess.run(args, cwd=snapshot, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        if completed.returncode != 0:
+            raise RuntimeError(sanitize(completed.stderr) or f"{' '.join(args)} failed")
+    completed = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=snapshot,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise RuntimeError(sanitize(completed.stderr) or "isolated validation baseline is unavailable")
+    return completed.stdout.strip()
+
+def link_workspace_package_node_modules(snapshot):
+    """Mirror pnpm's package-local dependency links without importing source dirt."""
+    ignored_directory_names = {".git", ".brownie", "node_modules", "target", "dist", "out", "coverage"}
+    package_directories = []
+    for raw_directory, directory_names, file_names in os.walk(workspace_root, topdown=True, followlinks=False):
+        directory_names[:] = [name for name in directory_names if name not in ignored_directory_names]
+        if "package.json" in file_names:
+            package_directories.append(pathlib.Path(raw_directory))
+    for package_directory in package_directories:
+        source_node_modules = package_directory / "node_modules"
+        if not source_node_modules.exists():
+            continue
+        relative_package_directory = package_directory.relative_to(workspace_root)
+        target_node_modules = snapshot.joinpath(*relative_package_directory.parts, "node_modules")
+        if target_node_modules.exists() or target_node_modules.is_symlink():
+            continue
+        target_node_modules.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(source_node_modules, target_node_modules, target_is_directory=True)
+
+def create_isolated_validation_root(paths):
+    """Materialize HEAD plus this run's delta without importing baseline dirt."""
+    snapshot = pathlib.Path(tempfile.mkdtemp(prefix="brownie-phase-loop-quality-"))
+    try:
+        archived = subprocess.run(
+            ["git", "archive", "--format=tar", "HEAD"],
+            cwd=workspace_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        if archived.returncode != 0:
+            raise RuntimeError(sanitize(archived.stderr) or "git archive HEAD failed")
+        with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as archive:
+            snapshot_root = snapshot.resolve()
+            for member in archive.getmembers():
+                relative = safe_relative_path(member.name)
+                target = snapshot.joinpath(*relative.parts).resolve(strict=False)
+                if os.path.commonpath([str(snapshot_root), str(target)]) != str(snapshot_root):
+                    raise ValueError(f"archive member escapes validation root: {member.name!r}")
+                if not (member.isfile() or member.isdir()):
+                    raise ValueError(f"unsupported archive member: {member.name!r}")
+                archive.extract(member, snapshot)
+        baseline_ref = initialize_isolated_validation_git(snapshot)
+        for path in paths:
+            relative = safe_relative_path(path)
+            source = workspace_root.joinpath(*relative.parts)
+            target = snapshot.joinpath(*relative.parts)
+            if source.exists():
+                if source.is_dir() or source.is_symlink():
+                    raise ValueError(f"changed path is not a regular file: {path!r}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                previous_mtime_ns = target.stat().st_mtime_ns if target.exists() and not target.is_symlink() else 0
+                shutil.copyfile(source, target)
+                os.chmod(target, source.stat().st_mode & 0o777)
+                # A same-size edit made within the filesystem timestamp
+                # granularity can otherwise remain racily clean in this
+                # synthetic Git index. Make the run delta observable.
+                overlay_mtime_ns = max(time.time_ns(), previous_mtime_ns + 1)
+                os.utime(target, ns=(overlay_mtime_ns, overlay_mtime_ns))
+            elif target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+        link_workspace_package_node_modules(snapshot)
+        return snapshot, baseline_ref
+    except Exception:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+
+after_status = git_lines(["status", "--porcelain=v1", "--untracked-files=all"])
 after_paths = parse_porcelain_paths(after_status)
+baseline_status_sha256 = None
 if before_status_path and before_status_path.exists():
-    before_paths = parse_porcelain_paths(before_status_path.read_text(encoding="utf-8").splitlines())
+    before_status_text = before_status_path.read_text(encoding="utf-8")
+    baseline_status_sha256 = hashlib.sha256(before_status_text.encode("utf-8")).hexdigest()
+    before_paths = parse_porcelain_paths(before_status_text.splitlines())
     changed = {
         path
         for path, raw_line in after_paths.items()
@@ -6560,25 +6675,70 @@ if any(path.endswith(("package.json", "pnpm-lock.yaml")) for path in changed):
     if (workspace_root / "package.json").exists():
         commands.append((["pnpm", "--workspace-root", "check"], 600))
 
-for args, timeout in commands:
-    result = run(args, timeout=timeout)
-    results.append(result)
-    if result["exit_code"] != 0:
+needs_isolated_workspace_check = any(path.endswith(("package.json", "pnpm-lock.yaml")) for path in changed)
+validation_root = None
+validation_environment = None
+validation_context = {
+    "baseline_status_sha256": baseline_status_sha256,
+    "workspace": "live_workspace",
+    "git_context": "live_workspace",
+}
+if needs_isolated_workspace_check:
+    try:
+        validation_root, validation_base_ref = create_isolated_validation_root(changed)
+        validation_context["workspace"] = "isolated_git_archive_with_run_delta"
+        validation_context["git_context"] = "synthetic_baseline_with_run_delta"
+        # The isolated archive deliberately has a synthetic one-commit Git
+        # history: HEAD is the baseline and the current run's delta is an
+        # uncommitted overlay.  GitHub pull-request variables describe the
+        # outer checkout instead, and make repository-aware guards interpret
+        # that synthetic baseline as an invalid PR base equal to HEAD.  Do not
+        # let host CI identity leak into this self-contained validation repo.
+        validation_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GITHUB_")
+        }
+        validation_environment["BROWNIE_JS_REACHABILITY_BASE"] = validation_base_ref
+        validation_environment["BROWNIE_PHASE_VALUE_CHANGED_FILES"] = json.dumps(changed)
+    except Exception as error:
         print(json.dumps({
             "completed": False,
-            "reason": "changed_file_quality_gate_failed",
+            "reason": "changed_file_validation_snapshot_failed",
             "changed_files": changed,
-            "failed_command": result["command"],
-            "repair_hint": "Fix the changed source or TODO contract, then rerun the same verification. Do not mark the TODO complete while any changed-file quality gate fails.",
-            "results": results,
+            "repair_hint": "Unable to build an isolated quality-gate snapshot; preserve the live workspace and repair the controller snapshot path before retrying.",
+            "validation_context": validation_context,
+            "results": [{"command": "git archive HEAD", "exit_code": 1, "stderr_tail": sanitize(str(error))}],
         }, sort_keys=True))
         raise SystemExit(1)
+
+try:
+    for args, timeout in commands:
+        command_root = validation_root if validation_root and args == ["pnpm", "--workspace-root", "check"] else workspace_root
+        command_environment = validation_environment if validation_root and command_root == validation_root else None
+        result = run(args, timeout=timeout, cwd=command_root, env=command_environment)
+        results.append(result)
+        if result["exit_code"] != 0:
+            print(json.dumps({
+                "completed": False,
+                "reason": "changed_file_quality_gate_failed",
+                "changed_files": changed,
+                "failed_command": result["command"],
+                "repair_hint": "Fix the changed source or TODO contract, then rerun the same verification. Do not mark the TODO complete while any changed-file quality gate fails.",
+                "validation_context": validation_context,
+                "results": results,
+            }, sort_keys=True))
+            raise SystemExit(1)
+finally:
+    if validation_root is not None:
+        shutil.rmtree(validation_root, ignore_errors=True)
 
 print(json.dumps({
     "completed": True,
     "reason": "changed_file_quality_gates_passed",
     "changed_files": changed,
     "commands_run": [result["command"] for result in results],
+    "validation_context": validation_context,
     "results": results,
 }, sort_keys=True))
 PY
@@ -8698,7 +8858,11 @@ try:
                 raise ValueError("target is not a regular file")
             stored = temporary / f"{index}.before"
             shutil.copyfile(absolute, stored)
-            entry.update({"state": "file", "sha256": sha256(stored)})
+            entry.update({
+                "state": "file",
+                "sha256": sha256(stored),
+                "mode": absolute.stat().st_mode & 0o777,
+            })
         else:
             entry["state"] = "absent"
         entries.append(entry)
@@ -8794,9 +8958,16 @@ try:
         expected_sha256 = entry.get("sha256")
         if not stored.is_file() or not isinstance(expected_sha256, str) or sha256(stored) != expected_sha256:
             raise ValueError("snapshot bytes are unavailable or corrupt")
+        mode = entry.get("mode")
+        if type(mode) is not int or mode < 0 or mode > 0o777:
+            # Legacy v1 snapshots did not persist mode. Preserve the stored
+            # file's mode as a compatibility fallback; new snapshots always
+            # carry the exact original mode.
+            mode = stored.stat().st_mode & 0o777
         absolute.parent.mkdir(parents=True, exist_ok=True)
         temporary = absolute.with_name(f".{absolute.name}.phase-loop-restore")
         shutil.copyfile(stored, temporary)
+        os.chmod(temporary, mode)
         os.replace(temporary, absolute)
     (snapshot_dir / "restore-audit.json").write_text(json.dumps({"schema_version": 1, "kind": "phase_loop_pre_runtime_target_restore", "targets": audit}, sort_keys=True) + "\n", encoding="utf-8")
 except Exception as error:
@@ -16883,13 +17054,24 @@ PY
 
     local changed_file_quality_gate
     if ! changed_file_quality_gate="$(run_changed_file_quality_gates "$workspace_status_before" 2>&1)"; then
-      local restored_quality_gate_target=0
-      if [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$active_target_snapshot" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
+      local restored_quality_gate_targets=0
+      # Quality-gate rejection is post-dispatch recovery, not a request to
+      # preserve a partial proposal. Restore the complete claim-scoped target
+      # snapshot so a multi-target runtime patch cannot leave a later Create-
+      # only or package target behind. The legacy single-target snapshot is
+      # retained only as a compatibility fallback for interrupted old runs.
+      if [ -n "$active_target_snapshots" ] && [ -f "$active_target_snapshots/manifest.json" ]; then
+        if restore_pre_runtime_active_target_snapshots "$active_target_snapshots" >/dev/null; then
+          restored_quality_gate_targets=1
+        fi
+      elif [ -n "$active_target_path" ] && [ -n "$active_target_snapshot" ] && [ -f "$active_target_snapshot" ] && [ -f "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path" ]; then
         restore_active_target_baseline >/dev/null || cp "$active_target_snapshot" "$PHASE_LOOP_WORKSPACE_ROOT/$active_target_path"
-        restored_quality_gate_target=1
+        restored_quality_gate_targets=1
+      fi
+      if [ "$restored_quality_gate_targets" -eq 1 ]; then
         workspace_after="$(git_workspace_fingerprint)"
       fi
-      changed_file_quality_gate="$(python3 - "$changed_file_quality_gate" "$active_target_path" "$restored_quality_gate_target" <<'PY'
+      changed_file_quality_gate="$(python3 - "$changed_file_quality_gate" "$active_target_path" "$restored_quality_gate_targets" <<'PY'
 import json
 import sys
 
@@ -16905,12 +17087,13 @@ except Exception:
 target = sys.argv[2]
 restored = sys.argv[3] == "1"
 payload["target_restored_from_pre_run_snapshot"] = restored
+payload["targets_restored_from_pre_run_snapshot"] = restored
 if target:
     payload["selected_target_path"] = target
 payload["repair_mode"] = "bounded_target_repair"
 payload["repair_hint"] = (
     "The previous patch failed changed-file quality gates. "
-    + ("The supervisor restored the selected target from its pre-run snapshot. " if restored else "")
+    + ("The supervisor restored every declared target from its pre-run snapshot. " if restored else "")
     + "Repair only the selected target or the TODO contract if the TODO itself is invalid. "
     + "Preserve the selected TODO completion condition and forbidden changes. "
     + "Do not append syntax fragments such as stray return expressions or closing braces; patch one complete function/object at a time."
@@ -16919,6 +17102,7 @@ payload["semantic_repair_policy"] = {
     "mode": "bounded_target_repair",
     "selected_target_path": target,
     "target_restored_from_pre_run_snapshot": restored,
+    "targets_restored_from_pre_run_snapshot": restored,
     "must_preserve_selected_todo_intent": True,
     "must_not_only_make_checks_green": True,
     "allowed_next_actions": [
