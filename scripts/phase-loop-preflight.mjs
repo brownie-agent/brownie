@@ -708,14 +708,21 @@ function activeClaimMaterializedPlaceholder({ repoRoot, stateRoot, claimPath, st
     claim_run_stamp: claimRunStamp,
     selected_todo: selectedTodo,
     selected_todo_id: todoId(selectedTodo),
+    selected_todo_sha256: selectedTodoSha256,
     selected_todo_first_line: selectedFirstLine,
+    queue_generation: claim.queue_generation,
+    queue_fingerprint: queueFingerprint,
     materializations
   };
 }
 
 function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, options = {}) {
   const dirty = new Set(gitDirtyFiles(repoRoot));
-  if (dirty.size === 0) return;
+  const result = {
+    active_materialization: null,
+    admitted_active_claim_targets: []
+  };
+  if (dirty.size === 0) return result;
   const warnedActiveClaimTargets = new Set();
   const warnedSharedClaimTargets = new Set();
   const activeMaterialization = activeClaimMaterializedPlaceholder({
@@ -771,6 +778,12 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, o
         && todoId(block) === activeMaterialization?.selected_todo_id
       );
       if (materializedTarget && blockIsSelectedClaim) {
+        result.active_materialization = activeMaterialization;
+        result.admitted_active_claim_targets.push({
+          target,
+          sha256: `sha256:${sha256}`,
+          materialization_run_stamp: targetMaterialization.materialization_run_stamp
+        });
         const warningKey = `${activeMaterialization.claim_id}\u0000${target}`;
         if (!warnedActiveClaimTargets.has(warningKey)) {
           warnedActiveClaimTargets.add(warningKey);
@@ -815,6 +828,9 @@ function validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, o
       });
     }
   }
+  result.admitted_active_claim_targets.sort((left, right) => left.target.localeCompare(right.target)
+    || left.materialization_run_stamp.localeCompare(right.materialization_run_stamp));
+  return result;
 }
 
 function validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors) {
@@ -921,7 +937,7 @@ export function validatePhaseLoopPreflight(options = {}) {
     allowPendingCompletionRecovery: fixtureProfile,
     claimPath: options.claim
   });
-  validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, {
+  const dirtyTargetValidation = validateDirtyTargetPlaceholders(repoRoot, todoText, errors, warnings, {
     stateRoot,
     claimPath,
     stage: options.stage ?? 'general'
@@ -932,6 +948,27 @@ export function validatePhaseLoopPreflight(options = {}) {
     validateCompletedParentPendingChildren(todoText, errors);
   }
   const commandResults = options.skipCommands ? [] : validateRequiredCommands(repoRoot, todoPath, breakdownPath, controlPlaneRoot, profile, errors);
+  // A pre-claim boundary can authorize preservation of an ownerless active
+  // claim only when this invocation just re-verified the exact dirty
+  // placeholder(s) it owns.  This is deliberately narrower than the warning:
+  // generic preflight and later leafs never receive a resume admission.
+  const activeClaimResumeAdmission = (
+    (options.stage ?? 'general') === 'pre-claim-boundary'
+    && errors.length === 0
+    && dirtyTargetValidation.active_materialization !== null
+    && dirtyTargetValidation.admitted_active_claim_targets.length > 0
+  ) ? {
+      schema_version: 1,
+      kind: 'phase_loop_active_claim_resume_admission',
+      claim_id: dirtyTargetValidation.active_materialization.claim_id,
+      claim_run_stamp: dirtyTargetValidation.active_materialization.claim_run_stamp,
+      selected_todo_id: dirtyTargetValidation.active_materialization.selected_todo_id,
+      selected_todo_sha256: dirtyTargetValidation.active_materialization.selected_todo_sha256,
+      queue_generation: dirtyTargetValidation.active_materialization.queue_generation,
+      queue_fingerprint: dirtyTargetValidation.active_materialization.queue_fingerprint,
+      admitted_targets: dirtyTargetValidation.admitted_active_claim_targets,
+      materializations: dirtyTargetValidation.active_materialization.materializations
+    } : null;
 
   return {
     schema_version: 1,
@@ -941,6 +978,7 @@ export function validatePhaseLoopPreflight(options = {}) {
     errors,
     warnings,
     ...(snapshotAudit ? { snapshot_audit: snapshotAudit } : {}),
+    ...(activeClaimResumeAdmission ? { active_claim_resume_admission: activeClaimResumeAdmission } : {}),
     execution_context: { ...executionContext.context, errors: executionContext.errors },
     command_results: commandResults
   };

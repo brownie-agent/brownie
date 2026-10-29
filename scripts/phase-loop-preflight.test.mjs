@@ -242,6 +242,26 @@ test('admits an exact active-claim placeholder only for the authenticated resume
     message: 'A dirty bounded-proposal placeholder is attributable to the exact active Runtime claim and is admitted only for that claim resume.'
   });
   assert.equal(result.warnings.filter((warning) => warning.code === 'active_claim_owned_dirty_target_placeholder').length, 1);
+  const activeClaim = JSON.parse(fs.readFileSync(fixture.claimPath, 'utf8'));
+  assert.deepEqual(result.active_claim_resume_admission, {
+    schema_version: 1,
+    kind: 'phase_loop_active_claim_resume_admission',
+    claim_id: fixture.claimId,
+    claim_run_stamp: fixture.claimRunStamp,
+    selected_todo_id: 'E-active',
+    selected_todo_sha256: createHash('sha256').update(activeClaim.selected_todo).digest('hex'),
+    queue_generation: 624,
+    queue_fingerprint: 'fixture-active-queue',
+    admitted_targets: [{
+      target: fixture.target,
+      sha256: `sha256:${createHash('sha256').update('// Brownie bounded Patch-only proposal.').digest('hex')}`,
+      materialization_run_stamp: fixture.runStamp
+    }],
+    materializations: [{
+      materialization_run_stamp: fixture.runStamp,
+      materialized_target: fixture.target
+    }]
+  });
 });
 
 test('admits an active claim whose selected TODO is followed by a completed TODO entry', () => {
@@ -329,6 +349,18 @@ test('keeps active-claim placeholder admission fail-closed for generic stage, mi
     skipCommands: true
   });
   assert(generic.errors.some((error) => error.code === 'contract_unsatisfiable_dirty_scope'), JSON.stringify(generic.errors));
+  assert.equal(generic.active_claim_resume_admission, undefined);
+
+  const preClaim = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert.equal(preClaim.valid, true, JSON.stringify(preClaim.errors));
+  assert.equal(preClaim.active_claim_resume_admission, undefined);
 
   const evidence = JSON.parse(fs.readFileSync(fixture.evidencePath, 'utf8'));
   evidence.target_files = ['scripts/active.test.mjs'];
@@ -820,6 +852,14 @@ test('places the strict preflight boundary before claim rebaseline and forbids l
   const auditFailureBoundary = controller.slice(auditFailure, auditFailureReturn);
   assert.match(auditFailureBoundary, /phase_loop_snapshot_audit_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden/u);
   assert.doesNotMatch(auditFailureBoundary, /phase_loop_rebaseline_stale_claim|write_bdk_trajectory_event|run_brownie_runtime/u);
+  const resumeAdmissionWriter = controller.indexOf('write_phase_loop_active_claim_resume_admission()');
+  const resumeAdmissionWrite = controller.indexOf('if ! write_phase_loop_active_claim_resume_admission "$run_stamp" "$output"; then', preflightFunction);
+  assert.ok(resumeAdmissionWriter >= 0);
+  assert.ok(resumeAdmissionWrite > auditFailure);
+  assert.ok(resumeAdmissionWrite < boundary);
+  assert.match(controller.slice(resumeAdmissionWrite, rebaseline), /active_claim_resume_admission_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden/u);
+  const staleRebaseline = controller.slice(controller.indexOf('phase_loop_rebaseline_stale_claim()'), controller.indexOf('\n}\n\nwrite_runtime_execution_evidence()', controller.indexOf('phase_loop_rebaseline_stale_claim()')));
+  assert.match(staleRebaseline, /--resume-admission/u);
 });
 
 test('expands optional snapshot arguments safely and rejects incomplete snapshot configuration', () => {

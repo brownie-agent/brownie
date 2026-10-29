@@ -99,6 +99,7 @@ PHASE_LOOP_REBASELINED_CLAIM=0
 PHASE_LOOP_REBASELINE_RETRY_ALLOWED=0
 PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE=""
 PHASE_LOOP_RUNTIME_EXECUTION_CONFIRMED=0
+PHASE_LOOP_ACTIVE_CLAIM_RESUME_ADMISSION_FILE=""
 
 PHASE_LOOP_PROMPT="${PHASE_LOOP_PROMPT:-}"
 PHASE_LOOP_TODO="${PHASE_LOOP_TODO:-}"
@@ -14188,9 +14189,17 @@ phase_loop_rebaseline_workspace_to_approved_baseline() {
 phase_loop_rebaseline_stale_claim() {
   local run_stamp="$1"
   local output status rebaselined
+  local -a resume_admission_args=()
   if [ ! -f "$ROOT_DIR/scripts/phase-loop-claim-rebaseline.mjs" ]; then
     printf '%s run=%s stale_claim_rebaseline_guard_missing=true\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
     return 78
+  fi
+  if [ -n "$PHASE_LOOP_ACTIVE_CLAIM_RESUME_ADMISSION_FILE" ]; then
+    if [ ! -f "$PHASE_LOOP_ACTIVE_CLAIM_RESUME_ADMISSION_FILE" ]; then
+      printf '%s run=%s stale_claim_rebaseline_resume_admission_missing=true path=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_ACTIVE_CLAIM_RESUME_ADMISSION_FILE" >> "$SUPERVISOR_LOG"
+      return 78
+    fi
+    resume_admission_args=(--resume-admission "$PHASE_LOOP_ACTIVE_CLAIM_RESUME_ADMISSION_FILE")
   fi
   set +e
   output="$(
@@ -14206,7 +14215,8 @@ phase_loop_rebaseline_stale_claim() {
       --runs "$RUN_DIR" \
       --todo "$PHASE_LOOP_TODO" \
       --run-stamp "$run_stamp" \
-      --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" 2>&1
+      --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" \
+      ${resume_admission_args[@]+"${resume_admission_args[@]}"} 2>&1
   )"
   status=$?
   set -e
@@ -14638,6 +14648,98 @@ for target in (audit_path, current_path):
 ' "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_DIR/$run_stamp.json" "$PHASE_LOOP_TODO_SNAPSHOT_AUDIT_FILE" "$run_stamp"
 }
 
+write_phase_loop_active_claim_resume_admission() {
+  local run_stamp="$1"
+  local preflight_output="$2"
+  local receipt_path output status
+  PHASE_LOOP_ACTIVE_CLAIM_RESUME_ADMISSION_FILE=""
+  receipt_path="$RUN_DIR/$run_stamp.active-claim-resume-admission.json"
+  set +e
+  output="$(printf '%s' "$preflight_output" | python3 -c '
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+
+receipt_path = pathlib.Path(sys.argv[1])
+run_stamp = sys.argv[2]
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", run_stamp):
+    raise RuntimeError("invalid run stamp")
+try:
+    payload = json.load(sys.stdin)
+except Exception as error:
+    raise RuntimeError(f"preflight output is not valid JSON: {error}")
+admission = payload.get("active_claim_resume_admission")
+if admission is None:
+    print("absent")
+    raise SystemExit(0)
+if not isinstance(admission, dict):
+    raise RuntimeError("preflight resume admission is not an object")
+required = (
+    ("schema_version", 1),
+    ("kind", "phase_loop_active_claim_resume_admission"),
+)
+if any(admission.get(key) != value for key, value in required):
+    raise RuntimeError("preflight resume admission schema is invalid")
+for key in ("claim_id", "selected_todo_id", "selected_todo_sha256", "queue_fingerprint"):
+    if not isinstance(admission.get(key), str) or not admission[key]:
+        raise RuntimeError(f"preflight resume admission is missing {key}")
+if admission.get("queue_generation") is None:
+    raise RuntimeError("preflight resume admission is missing queue_generation")
+if not isinstance(admission.get("admitted_targets"), list) or not admission["admitted_targets"]:
+    raise RuntimeError("preflight resume admission has no admitted targets")
+if not isinstance(admission.get("materializations"), list) or not admission["materializations"]:
+    raise RuntimeError("preflight resume admission has no materializations")
+if receipt_path.exists():
+    raise RuntimeError("current-run resume admission receipt already exists")
+receipt = {
+    **admission,
+    "schema_version": 1,
+    "kind": "phase_loop_active_claim_resume_admission_receipt",
+    "issued_from_stage": "pre-claim-boundary",
+    "run_stamp": run_stamp,
+}
+receipt_path.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=receipt_path.name + ".", dir=str(receipt_path.parent))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(receipt, handle, ensure_ascii=False, sort_keys=True)
+        handle.write("\\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, receipt_path)
+    os.chmod(receipt_path, 0o600)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+print("written")
+' "$receipt_path" "$run_stamp" 2>&1)"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    printf '%s run=%s active_claim_resume_admission_write_failed=true result=%s\n' "$(now_utc)" "$run_stamp" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  case "$output" in
+    written)
+      PHASE_LOOP_ACTIVE_CLAIM_RESUME_ADMISSION_FILE="$receipt_path"
+      printf '%s run=%s active_claim_resume_admission_written=true path=%s\n' "$(now_utc)" "$run_stamp" "$receipt_path" >> "$SUPERVISOR_LOG"
+      ;;
+    absent) ;;
+    *)
+      printf '%s run=%s active_claim_resume_admission_write_failed=true result=%s\n' "$(now_utc)" "$run_stamp" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+      return 78
+      ;;
+  esac
+  return 0
+}
+
 write_phase_loop_snapshot_mutation_audit() {
   local run_stamp="$1"
   local previous_snapshot_path="$2"
@@ -14890,6 +14992,13 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
       detail="Phase-loop TODO snapshot audit could not be durably written; refusing claim rebaseline, claim selection, task-ledger transition, and Runtime start."
       printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
       printf '%s run=%s phase_loop_snapshot_audit_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
+    if ! write_phase_loop_active_claim_resume_admission "$run_stamp" "$output"; then
+      detail="Phase-loop active-claim resume admission could not be durably written; refusing stale-claim rebaseline, claim selection, task-ledger transition, and Runtime start."
+      printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+      printf '%s run=%s active_claim_resume_admission_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
       write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
       return 78
     fi
