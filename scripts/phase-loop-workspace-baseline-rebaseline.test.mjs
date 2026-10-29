@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import test from 'node:test';
 
 import { rebaselineWorkspaceToApprovedBaseline } from './phase-loop-workspace-baseline-rebaseline.mjs';
@@ -197,76 +197,61 @@ test('controller reloads its process before using a fast-forwarded phase-loop sh
   assert.match(controller, /exec \/bin\/bash "\$ROOT_DIR\/phase-loop\.sh" run-once/u);
 });
 
-test('controller captures reload status before errexit can bypass the run-once handoff', () => {
+test('controller owns its error policy and rebaseline cannot mutate it', () => {
   const controller = fs.readFileSync(new URL('../phase-loop.sh', import.meta.url), 'utf8');
-  const runFunctionStart = controller.indexOf('run_brownie_once() {');
-  const runFunctionEnd = controller.indexOf('\nphase_loop_finalize_unexpected_exit()', runFunctionStart);
-  const runOnceCaseStart = controller.indexOf('  run-once)');
-  const runOnceCaseEnd = controller.indexOf('\n  *)', runOnceCaseStart);
-
-  assert(runFunctionStart >= 0 && runFunctionEnd > runFunctionStart, 'run_brownie_once must remain extractable for status-capture coverage');
-  assert(runOnceCaseStart >= 0 && runOnceCaseEnd > runOnceCaseStart, 'run-once command branch must remain extractable for status-capture coverage');
-
-  const runFunction = controller.slice(runFunctionStart, runFunctionEnd);
-  const runOnceCase = controller.slice(runOnceCaseStart, runOnceCaseEnd);
+  const helperStart = controller.indexOf('phase_loop_rebaseline_workspace_to_approved_baseline() {');
+  const helperEnd = controller.indexOf('\nphase_loop_rebaseline_stale_claim()', helperStart);
+  assert(helperStart >= 0 && helperEnd > helperStart, 'workspace rebaseline shell helper must remain extractable');
+  const helper = controller.slice(helperStart, helperEnd);
 
   assert.match(
-    runFunction,
-    /if _run_brownie_once "\$@"; then\s+run_status=0\s+else\s+run_status=\$\?\s+fi/u,
-    'run_brownie_once must capture a reload status from its inner run before errexit can exit the shell'
+    controller,
+    /^#!\/usr\/bin\/env bash\n[\s\S]*?^set \+e\nset -u$/mu,
+    'the controller must explicitly keep nonzero results in its state machine instead of inheriting errexit'
   );
   assert.match(
-    runOnceCase,
-    /if run_brownie_once; then\s+run_once_status=0\s+else\s+run_once_status=\$\?\s+fi/u,
-    'the run-once command branch must capture reload status before taking the lock-release and exec handoff'
+    helper,
+    /if output="\$\([\s\S]+?\)"; then\s+status=0\s+else\s+status=\$\?\s+fi/u,
+    'the rebaseline result must be captured by its own conditional command substitution'
+  );
+  assert.doesNotMatch(
+    helper,
+    /^\s*set -e\s*$/mu,
+    'the rebaseline helper must not leak errexit into the controller after capturing its child result'
   );
 });
 
-test('run helper records its terminal state after a reload result enables errexit', () => {
+test('workspace rebaseline preserves an ambient errexit setting', () => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-controller-reload-errexit-'));
-  const statusEvidence = path.join(sandbox, 'status-evidence.txt');
-  const deferredSignal = path.join(sandbox, 'deferred-signal');
-  const controller = fs.readFileSync(new URL('../phase-loop.sh', import.meta.url), 'utf8');
-  const runFunctionStart = controller.indexOf('run_brownie_once() {');
-  const runFunctionEnd = controller.indexOf('\nphase_loop_finalize_unexpected_exit()', runFunctionStart);
-  assert(runFunctionStart >= 0 && runFunctionEnd > runFunctionStart, 'run_brownie_once must remain extractable for errexit coverage');
-  const runFunction = controller.slice(runFunctionStart, runFunctionEnd);
+  const controllerRoot = path.join(sandbox, 'controller');
+  const stateDir = path.join(sandbox, 'state');
+  const fakeBin = path.join(sandbox, 'bin');
+  fs.mkdirSync(path.join(controllerRoot, 'scripts'), { recursive: true });
+  fs.mkdirSync(path.join(stateDir, 'logs'), { recursive: true });
+  fs.mkdirSync(fakeBin, { recursive: true });
+  fs.writeFileSync(path.join(controllerRoot, 'scripts/phase-loop-workspace-baseline-rebaseline.mjs'), '// fixture\n');
+  const fakeNode = path.join(fakeBin, 'node');
+  fs.writeFileSync(fakeNode, '#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"ok":true,"rebaselined":true,"controller_shell_reload_required":true}\'\n');
+  fs.chmodSync(fakeNode, 0o755);
 
-  const probe = `${runFunction}
-load_env() { :; }
-phase_loop_require_operational_configuration() { return 0; }
-validate_terminal_failure_retry_cap() { return 0; }
-validate_runtime_authorization_rebaseline_cap() { return 0; }
-now_utc() { printf '2026-10-29T00:00:00Z'; }
-write_status() { printf '%s|%s|%s|%s|%s\\n' "$@" > "$TEST_STATUS_EVIDENCE"; }
-_run_brownie_once() {
-  # Mirrors the rebaseline helper restoring errexit before yielding the
-  # controller-reload result.
-  set -e
-  PHASE_LOOP_TASK_LEDGER_FAILURE=1
-  PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL='reload handoff probe'
-  return 79
-}
-run_brownie_once
-`;
-  const result = spawnSync('bash', ['-eu', '-c', probe], {
+  const controller = fs.readFileSync(new URL('../phase-loop.sh', import.meta.url), 'utf8');
+  const start = controller.indexOf('phase_loop_rebaseline_workspace_to_approved_baseline() {');
+  const end = controller.indexOf('\nphase_loop_rebaseline_stale_claim()', start);
+  const helper = controller.slice(start, end);
+  const output = execFileSync('bash', ['-ceu', `${helper}\nnow_utc() { printf \'2026-10-29T00:00:00Z\'; }\nphase_loop_rebaseline_workspace_to_approved_baseline test-run\ncase "$-" in *e*) printf \'errexit-preserved\\n\' ;; *) exit 1 ;; esac`], {
     encoding: 'utf8',
     env: {
       ...process.env,
-      TEST_STATUS_EVIDENCE: statusEvidence,
-      PHASE_LOOP_DEFERRED_SIGNAL_FILE: deferredSignal,
-      PROGRESS_STATE_FILE: path.join(sandbox, 'progress-state.json'),
-      SUPERVISOR_LOG: path.join(sandbox, 'supervisor.log'),
-      CONSECUTIVE_FAILURES: '0'
+      ROOT_DIR: controllerRoot,
+      PHASE_LOOP_WORKSPACE_ROOT: controllerRoot,
+      PHASE_LOOP_APPROVED_CONTROLLER_BASELINE: 'origin/main',
+      STATE_DIR: stateDir,
+      SUPERVISOR_LOG: path.join(stateDir, 'logs', 'supervisor.log'),
+      PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUIRED: '0',
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`
     }
-  });
-
-  assert.equal(result.status, 78, `expected the captured reload result to reach terminal-state handling: ${result.stderr}`);
-  assert.equal(
-    fs.readFileSync(statusEvidence, 'utf8').split('|', 1)[0],
-    'blocked',
-    'run_brownie_once must run its terminal-state handler instead of exiting at the inner reload return'
-  );
+  }).trim();
+  assert.equal(output, 'errexit-preserved');
 });
 
 test('controller reload detection canonicalizes an aliased workspace root', () => {

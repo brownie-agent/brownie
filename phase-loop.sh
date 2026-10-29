@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# The controller records and classifies every nonzero result explicitly.  Do
+# not inherit `errexit` from an invoking shell: doing so would bypass durable
+# status/lock cleanup and turn an expected state-machine result (such as a
+# controller reload) into an unobserved process exit.
+set +e
 set -u
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13876,17 +13881,23 @@ phase_loop_rebaseline_workspace_to_approved_baseline() {
     printf '%s run=%s workspace_baseline_rebaseline_failed=true reason=script_missing path=%s\n' "$(now_utc)" "$run_stamp" "$rebaseline_script" >> "$SUPERVISOR_LOG"
     return 78
   fi
-  set +e
-  output="$(
+  # Capture the helper result without changing the caller's shell options.
+  # In particular, this helper used to unconditionally `set -e` after its
+  # command substitution.  That leaked errexit into the state machine and
+  # could make a required reload return exit before run-once released its
+  # lock and exec'd the approved controller source.
+  if output="$(
     cd "$ROOT_DIR" || exit 70
     node "$rebaseline_script" rebaseline \
       --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
       --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" \
       --state-dir "$STATE_DIR" \
       --run-stamp "$run_stamp" 2>&1
-  )"
-  status=$?
-  set -e
+  )"; then
+    status=0
+  else
+    status=$?
+  fi
   PHASE_LOOP_WORKSPACE_BASELINE_REBASELINE_OUTPUT="$output"
   if [ "$status" -ne 0 ]; then
     printf '%s run=%s workspace_baseline_rebaseline_failed=true baseline=%s result=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
@@ -17772,16 +17783,8 @@ run_brownie_once() {
   PHASE_LOOP_TASK_LEDGER_FAILURE=0
   PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL=""
   rm -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE"
-  # The workspace rebaseline helper may enable errexit while it captures the
-  # Git result.  Capture a nonzero child status in a conditional so a reload
-  # request (79) reaches the caller that owns the lock handoff instead of
-  # terminating this shell before it can be handled.
-  local run_status
-  if _run_brownie_once "$@"; then
-    run_status=0
-  else
-    run_status=$?
-  fi
+  _run_brownie_once "$@"
+  local run_status=$?
   if [ "$PHASE_LOOP_TASK_LEDGER_FAILURE" -eq 1 ]; then
     local detail="Task ledger failed while recording the run; refusing to leave status running. ${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL} stdout=${PHASE_LOOP_ACTIVE_STDOUT_LOG:-<not-created>} stderr=${PHASE_LOOP_ACTIVE_STDERR_LOG:-<not-created>} progress=$PROGRESS_STATE_FILE"
     local task_ledger_failure_count="${CONSECUTIVE_FAILURES:-1}"
@@ -18419,14 +18422,8 @@ case "${1:-status}" in
     trap 'run_once_exit_code=$?; phase_loop_release_supervisor_lock; phase_loop_finalize_unexpected_exit "$run_once_exit_code"; unset PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION' EXIT
     trap 'phase_loop_handle_run_signal INT' INT
     trap 'phase_loop_handle_run_signal TERM' TERM
-    # A controller source reload is an expected nonzero result.  Keep this
-    # invocation conditional even when an earlier preflight enabled errexit,
-    # so the ownership-safe release and exec path below always runs.
-    if run_brownie_once; then
-      run_once_status=0
-    else
-      run_once_status=$?
-    fi
+    run_brownie_once
+    run_once_status=$?
     if [ "$run_once_status" -eq 79 ]; then
       if ! phase_loop_release_supervisor_lock || [ -d "$LOCK_DIR" ]; then
         write_status "blocked" "Controller shell reload refused because the run-once generation could not release its durable lock ownership." "" "78" "${CONSECUTIVE_FAILURES:-0}"
