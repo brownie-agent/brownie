@@ -168,6 +168,21 @@ test('rejects a staged materialized target without any indexed or worktree contr
   assert.equal(git(root, ['show', ':.brownie/todo.md']), before.trim());
 });
 
+test('allows a later target edit after its Patch contract was already published', () => {
+  const { root, target } = fixture();
+  git(root, ['add', target]);
+  const firstPublication = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(firstPublication.valid, true, JSON.stringify(firstPublication, null, 2));
+  git(root, ['commit', '-qm', 'publish Patch contract']);
+  fs.writeFileSync(path.join(root, target), 'export const journey = "later implementation";\n');
+  git(root, ['add', target]);
+  const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(result.valid, true, JSON.stringify(result, null, 2));
+  assert.equal(result.applied, false);
+  assert.deepEqual(result.checked, []);
+  assert.deepEqual(git(root, ['diff', '--cached', '--name-only']).split('\n'), [target]);
+});
+
 test('rejects a newline-terminated legacy placeholder whose receipt used a trimmed hash', () => {
   const { root, id, target, before, after } = fixture();
   const targetPath = path.join(root, target);

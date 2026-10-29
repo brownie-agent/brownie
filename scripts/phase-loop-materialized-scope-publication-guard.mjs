@@ -334,10 +334,15 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
     const indexCompleted = !index;
     const worktreeCompleted = !worktree;
     const candidateChangesContract = indexCompleted || !sameContract(base.contract, index.contract);
+    const receiptBeginsAtBase = todoTransitions.some((transition) => sameContract(transition.before_contract, base.contract));
     // Establish candidate involvement from the index before looking at the
     // worktree.  The index is what can be committed; a restored worktree TODO
     // must never make a staged contract or target invisible to validation.
-    const candidateIncludesTarget = todoTransitions.some((transition) => transition.targets.some((target) => targetIsInCandidate(repoRoot, baseRef, target)));
+    // A receipt whose transition already ends at this branch's base is
+    // historical evidence, not an obligation to re-publish the same contract
+    // for every later target edit.
+    const candidateIncludesTarget = receiptBeginsAtBase
+      && todoTransitions.some((transition) => transition.targets.some((target) => targetIsInCandidate(repoRoot, baseRef, target)));
     if (!candidateIncludesTarget && !candidateChangesContract) continue;
 
     const indexPathTransitions = indexCompleted
@@ -349,8 +354,7 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
     const pathTransitions = candidateChangesContract ? indexPathTransitions : worktreePathTransitions;
     const completed = candidateChangesContract ? indexCompleted : worktreeCompleted;
     if (!pathTransitions) {
-      const beginsAtBase = todoTransitions.some((transition) => sameContract(transition.before_contract, base.contract));
-      if (beginsAtBase) {
+      if (receiptBeginsAtBase) {
         errors.push({
           code: candidateChangesContract && !indexCompleted
             ? 'materialized_scope_index_contract_mismatch'
