@@ -197,7 +197,7 @@ test('controller reloads its process before using a fast-forwarded phase-loop sh
   assert.match(controller, /exec \/bin\/bash "\$ROOT_DIR\/phase-loop\.sh" run-once/u);
 });
 
-test('controller owns its error policy and rebaseline cannot mutate it', () => {
+test('controller carries a requested reload in-band instead of returning it as errexit-sensitive failure', () => {
   const controller = fs.readFileSync(new URL('../phase-loop.sh', import.meta.url), 'utf8');
   const helperStart = controller.indexOf('phase_loop_rebaseline_workspace_to_approved_baseline() {');
   const helperEnd = controller.indexOf('\nphase_loop_rebaseline_stale_claim()', helperStart);
@@ -219,6 +219,63 @@ test('controller owns its error policy and rebaseline cannot mutate it', () => {
     /^\s*set -e\s*$/mu,
     'the rebaseline helper must not leak errexit into the controller after capturing its child result'
   );
+  assert.match(
+    controller,
+    /write_status "controller_reloading"[\s\S]+?"79"[\s\S]+?PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUESTED=1[\s\S]+?return 0/u,
+    'reload must be a durable status plus an in-band handoff request, not a nonzero shell return'
+  );
+  assert.doesNotMatch(controller, /\[ "\$run_once_status" -eq 79 \]/u, 'run-once must not rely on an errexit-sensitive reload exit code');
+});
+
+test('run-once releases ownership and execs the refreshed controller after an in-band reload request', () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-controller-run-once-reload-'));
+  const controllerRoot = path.join(sandbox, 'controller');
+  const lockDir = path.join(sandbox, 'phase-loop.lock');
+  const reloadProbe = path.join(sandbox, 'reload-probe');
+  const statusProbe = path.join(sandbox, 'status-probe');
+  const supervisorLog = path.join(sandbox, 'supervisor.log');
+  fs.mkdirSync(controllerRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(controllerRoot, 'phase-loop.sh'),
+    '#!/usr/bin/env bash\n[ "$1" = "run-once" ] || exit 91\n[ ! -d "$PHASE_LOOP_TEST_LOCK_DIR" ] || exit 92\nprintf "reloaded\\n" > "$PHASE_LOOP_RELOAD_PROBE"\n'
+  );
+  fs.chmodSync(path.join(controllerRoot, 'phase-loop.sh'), 0o755);
+
+  const controller = fs.readFileSync(new URL('../phase-loop.sh', import.meta.url), 'utf8');
+  const caseStart = controller.indexOf('  run-once)\n');
+  const caseEnd = controller.indexOf('\n    ;;', caseStart);
+  assert(caseStart >= 0 && caseEnd > caseStart, 'run-once dispatch body must remain extractable');
+  const dispatchBody = controller.slice(caseStart + '  run-once)\n'.length, caseEnd);
+  const harness = `
+set +e
+set -u
+ROOT_DIR=${JSON.stringify(controllerRoot)}
+LOCK_DIR=${JSON.stringify(lockDir)}
+STOP_FILE=${JSON.stringify(path.join(sandbox, 'stop'))}
+SUPERVISOR_LOG=${JSON.stringify(supervisorLog)}
+PHASE_LOOP_TEST_LOCK_DIR=${JSON.stringify(lockDir)}
+PHASE_LOOP_RELOAD_PROBE=${JSON.stringify(reloadProbe)}
+PHASE_LOOP_STATUS_PROBE=${JSON.stringify(statusProbe)}
+export PHASE_LOOP_TEST_LOCK_DIR PHASE_LOOP_RELOAD_PROBE
+load_env() { :; }
+phase_loop_require_operational_configuration() { return 0; }
+acquire_lock() { mkdir -p "$LOCK_DIR"; }
+phase_loop_release_supervisor_lock() { rmdir "$LOCK_DIR"; }
+phase_loop_finalize_unexpected_exit() { :; }
+write_status() { printf '%s\\n' "$*" >> "$PHASE_LOOP_STATUS_PROBE"; }
+run_brownie_once() {
+  set -e
+  PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUESTED=1
+  return 0
+}
+run_once_dispatch() {
+${dispatchBody}
+}
+run_once_dispatch
+`;
+  execFileSync('bash', ['-cu', harness], { encoding: 'utf8' });
+  assert.equal(fs.readFileSync(reloadProbe, 'utf8'), 'reloaded\n');
+  assert.equal(fs.existsSync(lockDir), false, 'reload exec must happen only after releasing the durable lock');
 });
 
 test('workspace rebaseline preserves an ambient errexit setting', () => {
