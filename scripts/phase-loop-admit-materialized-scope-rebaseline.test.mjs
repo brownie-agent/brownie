@@ -3,8 +3,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import test from 'node:test';
-import { validateMaterializedScopeRebaseline } from './phase-loop-admit-materialized-scope-rebaseline.mjs';
+import { admitMaterializedScopeRebaseline, validateMaterializedScopeRebaseline } from './phase-loop-admit-materialized-scope-rebaseline.mjs';
 
 function contract(firstLine) {
   return { id: 'E-fixture', first_line: firstLine, route: 'implementation', depends_on: '<none>', completion_condition: 'complete', forbidden_changes: 'none', verification: 'run `node --test`' };
@@ -47,4 +48,32 @@ test('rejects added scope and uncaptured content', () => {
     repoRoot: root,
     records
   }), /not bound/u);
+});
+
+test('writes an exact receipt for a captured Create-to-Patch contract drift', () => {
+  const { root, target, records } = fixture();
+  const before = `- [ ] E-fixture: Create only \`${target}\`:\n  Route: implementation.\n  Depends on: <none>.\n  Completion condition: complete.\n  Forbidden changes: none.\n  Verification: run \`node --test\`.\n`;
+  const after = before.replace('Create only', 'Patch only');
+  fs.mkdirSync(path.join(root, '.brownie'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-claims/contract-rebaselines'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), before);
+  fs.writeFileSync(path.join(root, '.brownie/todo-breakdown.md'), 'Dependency graph:\n');
+  fs.writeFileSync(path.join(root, 'scripts/guard-todo-decomposition.mjs'), 'process.exit(0);\n');
+  execFileSync('git', ['init', '-b', 'main'], { cwd: root, stdio: 'ignore' });
+  execFileSync('git', ['add', '.brownie/todo.md', '.brownie/todo-breakdown.md'], { cwd: root, stdio: 'ignore' });
+  execFileSync('git', ['-c', 'user.name=Brownie', '-c', 'user.email=brownie@example.invalid', 'commit', '-m', 'baseline'], { cwd: root, stdio: 'ignore' });
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), after);
+  fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-claims/contract-rebaselines/capture.json'), `${JSON.stringify(records[0])}\n`);
+  const result = admitMaterializedScopeRebaseline({
+    repoRoot: root,
+    baselineRef: 'HEAD',
+    todoId: 'E-fixture',
+    runStamp: 'fixture-run',
+    eventKey: 'fixture-event',
+    diagnostic: 'fixture recovery'
+  });
+  assert.equal(result.applied, true);
+  assert.equal(result.target_snapshots[0].path, target);
+  assert.equal(fs.existsSync(path.join(root, result.receipt_path)), true);
 });
