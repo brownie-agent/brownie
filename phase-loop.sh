@@ -10286,6 +10286,13 @@ tracked_workspace_diff_exists() {
   )
 }
 
+staged_workspace_diff_exists() {
+  (
+    cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 1
+    ! git diff --cached --quiet --exit-code
+  )
+}
+
 stage_runtime_applied_paths() {
   local stdout_log="$1"
   (
@@ -10340,6 +10347,22 @@ PY
   )
 }
 
+phase_loop_require_materialized_scope_publication() {
+  local guard_script="$ROOT_DIR/scripts/phase-loop-materialized-scope-publication-guard.mjs"
+  if [ ! -f "$guard_script" ]; then
+    printf '%s materialized_scope_publication_guard_failed=true reason=guard_missing path=%s\n' "$(now_utc)" "$guard_script" >> "$SUPERVISOR_LOG"
+    return 1
+  fi
+  if ! node "$guard_script" \
+    --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
+    --base-ref HEAD \
+    --apply-index >> "$SUPERVISOR_LOG" 2>&1; then
+    printf '%s materialized_scope_publication_guard_failed=true\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+    return 1
+  fi
+  return 0
+}
+
 phase_loop_safe_pr_title() {
   python3 - "$PHASE_LOOP_PR_TITLE_PREFIX" "$(claim_field selected_todo 2>/dev/null || true)" <<'PY'
 import re
@@ -10373,11 +10396,11 @@ phase_loop_create_pr_for_progress() {
   if [ "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" != "1" ]; then
     return 0
   fi
-  if [ "$pending_publish" != "1" ] && [ "$workspace_before" = "$workspace_after" ]; then
+  if [ "$pending_publish" != "1" ] && [ "$workspace_before" = "$workspace_after" ] && ! staged_workspace_diff_exists; then
     printf '%s pr_create_skipped reason=no_runtime_workspace_change\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
     return 0
   fi
-  if [ "$pending_publish" != "1" ] && ! tracked_workspace_diff_exists; then
+  if [ "$pending_publish" != "1" ] && ! tracked_workspace_diff_exists && ! staged_workspace_diff_exists; then
     return 0
   fi
   implementation_gh_config_dir="$(
@@ -10423,13 +10446,22 @@ phase_loop_create_pr_for_progress() {
 
 This PR was created by the external phase-loop controller after Brownie produced tracked workspace changes."
 
+  if tracked_workspace_diff_exists; then
+    if ! stage_runtime_applied_paths "$stdout_log"; then
+      printf '%s pr_create_skipped reason=stage_runtime_applied_paths_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+      return 1
+    fi
+  fi
+  if tracked_workspace_diff_exists || staged_workspace_diff_exists; then
+    if ! phase_loop_require_materialized_scope_publication; then
+      printf '%s pr_create_skipped reason=materialized_scope_publication_guard_failed\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+      return 1
+    fi
+  fi
+
   (
     cd "$PHASE_LOOP_WORKSPACE_ROOT" || exit 70
-    if tracked_workspace_diff_exists; then
-      stage_runtime_applied_paths "$stdout_log"
-      if git diff --cached --quiet --exit-code; then
-        exit 1
-      fi
+    if ! git diff --cached --quiet --exit-code; then
       GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-$PHASE_LOOP_EXPECTED_ACTOR}" \
         GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-$PHASE_LOOP_EXPECTED_ACTOR@users.noreply.github.com}" \
         GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$PHASE_LOOP_EXPECTED_ACTOR}" \
