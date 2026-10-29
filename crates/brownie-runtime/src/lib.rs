@@ -19227,7 +19227,7 @@ modes:
             .expect("append proposal");
     }
 
-    fn append_generated_patch_hunk_proposal(
+    pub(super) fn append_generated_patch_hunk_proposal(
         store: &BrownieStore,
         record: &TaskRecord,
         proposal_id: &str,
@@ -70041,6 +70041,9 @@ esac
         }
     }
 }
+
+#[cfg(test)]
+mod proposal_apply_structured_content_tests;
 
 #[cfg(test)]
 mod agentmodes_test_support;
