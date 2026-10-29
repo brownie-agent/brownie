@@ -14706,7 +14706,7 @@ fd, temporary = tempfile.mkstemp(prefix=receipt_path.name + ".", dir=str(receipt
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(receipt, handle, ensure_ascii=False, sort_keys=True)
-        handle.write("\\n")
+        handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
     os.chmod(temporary, 0o600)
