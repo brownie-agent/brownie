@@ -13867,6 +13867,56 @@ phase_loop_require_approved_controller_baseline() {
   return 0
 }
 
+phase_loop_rebaseline_workspace_to_approved_baseline() {
+  local run_stamp="$1"
+  local rebaseline_script="$ROOT_DIR/scripts/phase-loop-workspace-baseline-rebaseline.mjs"
+  local output status rebaselined reload_required controller_root_physical workspace_root_physical
+  if [ ! -f "$rebaseline_script" ]; then
+    PHASE_LOOP_WORKSPACE_BASELINE_REBASELINE_OUTPUT="missing rebaseline script: $rebaseline_script"
+    printf '%s run=%s workspace_baseline_rebaseline_failed=true reason=script_missing path=%s\n' "$(now_utc)" "$run_stamp" "$rebaseline_script" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  set +e
+  output="$(
+    cd "$ROOT_DIR" || exit 70
+    node "$rebaseline_script" rebaseline \
+      --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
+      --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" \
+      --state-dir "$STATE_DIR" \
+      --run-stamp "$run_stamp" 2>&1
+  )"
+  status=$?
+  set -e
+  PHASE_LOOP_WORKSPACE_BASELINE_REBASELINE_OUTPUT="$output"
+  if [ "$status" -ne 0 ]; then
+    printf '%s run=%s workspace_baseline_rebaseline_failed=true baseline=%s result=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  rebaselined="$(printf '%s' "$output" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("rebaselined") else "0")' 2>/dev/null || true)"
+  reload_required="$(printf '%s' "$output" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("controller_shell_reload_required") else "0")' 2>/dev/null || true)"
+  if [ "$reload_required" = "1" ]; then
+    # The deployment may spell the workspace path through a symlink or a
+    # lexical alias such as `..`.  The rebaseline can therefore replace this
+    # process's phase-loop.sh even when the raw configured path differs from
+    # ROOT_DIR.  Compare physical identities, and stop safely rather than
+    # continuing with stale loaded shell functions if either identity cannot
+    # be resolved.
+    if ! controller_root_physical="$(cd "$ROOT_DIR" && pwd -P)"; then
+      PHASE_LOOP_WORKSPACE_BASELINE_REBASELINE_OUTPUT="${output:-<no output>}; unable to resolve physical controller root for required shell reload"
+      return 78
+    fi
+    if ! workspace_root_physical="$(cd "$PHASE_LOOP_WORKSPACE_ROOT" && pwd -P)"; then
+      PHASE_LOOP_WORKSPACE_BASELINE_REBASELINE_OUTPUT="${output:-<no output>}; unable to resolve physical workspace root for required shell reload"
+      return 78
+    fi
+    if [ "$controller_root_physical" = "$workspace_root_physical" ]; then
+      PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUIRED=1
+    fi
+  fi
+  printf '%s run=%s workspace_baseline_rebaseline_passed=true rebaselined=%s baseline=%s result=%s\n' "$(now_utc)" "$run_stamp" "${rebaselined:-0}" "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+  return 0
+}
+
 phase_loop_rebaseline_stale_claim() {
   local run_stamp="$1"
   local output status rebaselined
@@ -15072,6 +15122,7 @@ _run_brownie_once() {
   PHASE_LOOP_REBASELINE_RETRY_ALLOWED=0
   PHASE_LOOP_RUNTIME_EXECUTION_EVIDENCE=""
   PHASE_LOOP_RUNTIME_EXECUTION_CONFIRMED=0
+  PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUIRED=0
   stdout_log="$RUN_DIR/$run_stamp.stdout.log"
   stderr_log="$RUN_DIR/$run_stamp.stderr.log"
   effective_prompt="$RUN_DIR/$run_stamp.prompt.md"
@@ -15099,6 +15150,20 @@ _run_brownie_once() {
       write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
       return 78
     fi
+  fi
+
+  if ! phase_loop_rebaseline_workspace_to_approved_baseline "$run_stamp"; then
+    detail="Phase-loop workspace cannot be safely rebaselined to the approved ${PHASE_LOOP_APPROVED_CONTROLLER_BASELINE} baseline; refusing to run the controller. ${PHASE_LOOP_WORKSPACE_BASELINE_REBASELINE_OUTPUT:-<no diagnostic>}"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+
+  if [ "${PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUIRED:-0}" -eq 1 ]; then
+    detail="Approved baseline fast-forward changed phase-loop.sh; refusing to execute stale shell functions and requiring an ownership-safe process reload. ${PHASE_LOOP_WORKSPACE_BASELINE_REBASELINE_OUTPUT:-<no diagnostic>}"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "controller_reloading" "$detail" "$run_stamp" "79" "${CONSECUTIVE_FAILURES:-0}"
+    return 79
   fi
 
   if ! phase_loop_require_approved_controller_baseline; then
@@ -17825,6 +17890,22 @@ PY
   fi
 }
 
+phase_loop_reload_supervisor_source() {
+  if [ "${PHASE_LOOP_SUPERVISOR_PID:-}" != "$$" ]; then
+    write_status "blocked" "Controller shell reload refused because the current process is not the recorded supervisor owner." "" "78" "${CONSECUTIVE_FAILURES:-0}"
+    exit 78
+  fi
+  if ! phase_loop_release_supervisor_lock || [ -d "$LOCK_DIR" ]; then
+    write_status "blocked" "Controller shell reload refused because the current supervisor could not release its durable lock ownership." "" "78" "${CONSECUTIVE_FAILURES:-0}"
+    exit 78
+  fi
+  trap - EXIT
+  printf '%s supervisor_source_reload=true pid=%s\n' "$(now_utc)" "$$" >> "$SUPERVISOR_LOG"
+  exec /bin/bash "$ROOT_DIR/phase-loop.sh" supervise
+  write_status "blocked" "Controller shell reload failed to exec the approved phase-loop.sh source." "" "78" "${CONSECUTIVE_FAILURES:-0}"
+  exit 78
+}
+
 phase_loop_drain_deferred_signal() {
   if [ "${PHASE_LOOP_DEFERRED_SIGNAL_PENDING:-0}" -ne 1 ] && [ -f "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" ]; then
     PHASE_LOOP_DEFERRED_SIGNAL_CODE="$(cat "$PHASE_LOOP_DEFERRED_SIGNAL_FILE" 2>/dev/null || true)"
@@ -18077,6 +18158,10 @@ supervise() {
       interruptible_sleep "$PHASE_LOOP_INTERVAL_SECONDS" || true
     else
       local run_status=$?
+      if [ "$run_status" -eq 79 ]; then
+        printf '%s controller_shell_reload_requested=true\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
+        phase_loop_reload_supervisor_source
+      fi
       if [ "$run_status" -eq 65 ]; then
         printf '%s owner_blockers_only observed; exiting supervisor\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
         exit 0
@@ -18328,6 +18413,17 @@ case "${1:-status}" in
     trap 'phase_loop_handle_run_signal TERM' TERM
     run_brownie_once
     run_once_status=$?
+    if [ "$run_once_status" -eq 79 ]; then
+      if ! phase_loop_release_supervisor_lock || [ -d "$LOCK_DIR" ]; then
+        write_status "blocked" "Controller shell reload refused because the run-once generation could not release its durable lock ownership." "" "78" "${CONSECUTIVE_FAILURES:-0}"
+        exit 78
+      fi
+      trap - INT TERM EXIT
+      unset PHASE_LOOP_SUPPRESS_STATUS_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_PID PHASE_LOOP_SUPERVISOR_GENERATION
+      exec /bin/bash "$ROOT_DIR/phase-loop.sh" run-once
+      write_status "blocked" "Controller shell reload failed to exec the approved phase-loop.sh source." "" "78" "${CONSECUTIVE_FAILURES:-0}"
+      exit 78
+    fi
     trap - INT TERM EXIT
     exit "$run_once_status"
     ;;
