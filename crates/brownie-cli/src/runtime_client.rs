@@ -4051,9 +4051,7 @@ fn classify_direct_proposal_apply_result(
         ) {
             return Err(RuntimeClientError::InvalidResponse);
         }
-        for key in ["path"] {
-            required_display_string(apply, key)?;
-        }
+        required_display_string(apply, "path")?;
         required_apply_rejection_reason(apply)?;
         return Ok(DirectProposalApplyOutcome::Rejected);
     }
@@ -4080,6 +4078,7 @@ fn validate_direct_proposal_apply_checks(checks: &[Value]) -> Result<(), Runtime
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_direct_proposal_apply_result(result: &Value) -> Result<(), RuntimeClientError> {
     match classify_direct_proposal_apply_result(result)? {
         DirectProposalApplyOutcome::Applied => Ok(()),
