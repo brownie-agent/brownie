@@ -106,6 +106,27 @@ test('stages the exact TODO removal when a completed materialized TODO is absent
   assert.deepEqual(git(root, ['diff', '--cached', '--name-only']).split('\n').sort(), ['.brownie/todo.md', target].sort());
 });
 
+test('validates a completed materialized target when its exact TODO removal is already staged', () => {
+  const { root, id, target } = fixture();
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), '');
+  git(root, ['add', '.brownie/todo.md', target]);
+  const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(result.valid, true, JSON.stringify(result, null, 2));
+  assert.equal(result.applied, false);
+  assert.equal(result.checked[0].todo_id, id);
+  assert.equal(result.checked[0].completion_removal_already_staged, true);
+});
+
+test('rejects a placeholder target when its completed TODO removal is already staged', () => {
+  const { root, target } = fixture();
+  fs.writeFileSync(path.join(root, target), '// brownie bounded create-only proposal\n');
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), '');
+  git(root, ['add', '.brownie/todo.md', target]);
+  const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });
+  assert.equal(result.valid, false);
+  assert(result.errors.some((error) => error.code === 'materialized_scope_target_still_placeholder'));
+});
+
 test('fails before mutating the index when the materialized implementation target is absent from the candidate', () => {
   const { root } = fixture();
   const result = guardMaterializedScopePublication({ repoRoot: root, applyIndex: true });

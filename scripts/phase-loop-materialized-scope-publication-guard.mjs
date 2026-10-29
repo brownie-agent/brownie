@@ -308,7 +308,22 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
 
     const candidate = contractForTodo(candidateTodoText, todoId);
     const states = [base.contract, ...pathTransitions.map((transition) => transition.after_contract)];
-    if (completed && !candidate) continue;
+    // A caller may already have staged the exact queue removal before this
+    // guard runs.  That is a valid candidate shape, but it must not bypass
+    // target validation: otherwise a staged removal plus an unchanged
+    // placeholder implementation could be published without a contract.
+    if (completed && !candidate) {
+      for (const transition of pathTransitions) validateTargetCandidate(repoRoot, baseRef, transition, errors);
+      if (errors.length > 0) continue;
+      checked.push({
+        todo_id: todoId,
+        completion_removed: true,
+        completion_removal_already_staged: true,
+        receipt_run_stamps: pathTransitions.map((transition) => transition.receipt_run_stamp),
+        targets: pathTransitions.flatMap((transition) => transition.targets.map((target) => target.path))
+      });
+      continue;
+    }
     const stateIndex = states.findIndex((state) => candidate && sameContract(state, candidate.contract));
     if (stateIndex < 0) {
       errors.push({ code: 'materialized_scope_index_contract_mismatch', todo_id: todoId });
