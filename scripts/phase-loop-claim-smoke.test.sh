@@ -141,6 +141,82 @@ run_pre_runtime_target_snapshot_regression() {
 
 run_pre_runtime_target_snapshot_regression
 
+run_changed_file_quality_gate_regression() {
+  local fixture helper workspace baseline fake_bin pnpm_cwd quality_output
+  fixture="$(mktemp -d)"
+  helper="$fixture/quality-gate.sh"
+  workspace="$fixture/workspace"
+  baseline="$fixture/workspace-status.before"
+  fake_bin="$fixture/bin"
+  pnpm_cwd="$fixture/pnpm.cwd"
+  mkdir -p "$workspace/.brownie/headless" "$fake_bin"
+  git -C "$workspace" init -b main >/dev/null
+  git -C "$workspace" config user.name Brownie
+  git -C "$workspace" config user.email brownie@example.invalid
+  printf '%s\n' '{"name":"quality-gate-fixture","private":true,"version":"0.1.0","scripts":{"check":"true"}}' > "$workspace/package.json"
+  printf '%s\n' 'tracked baseline' > "$workspace/tracked.txt"
+  git -C "$workspace" add package.json tracked.txt
+  git -C "$workspace" commit -m init >/dev/null
+
+  # The controller must not reinterpret baseline-untracked leaves as new
+  # merely because a later porcelain query collapses them to a directory.
+  printf '%s\n' '{ intentionally malformed baseline fixture' > "$workspace/.brownie/headless/preexisting.json"
+  printf '%s\n' 'pre-existing dirty tracked file' >> "$workspace/tracked.txt"
+  git -C "$workspace" status --porcelain=v1 --untracked-files=all > "$baseline"
+  printf '%s\n' '{"name":"quality-gate-fixture","private":true,"version":"0.2.0","scripts":{"check":"true"}}' > "$workspace/package.json"
+
+  python3 - "$PHASE_LOOP" "$helper" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = source.index("run_changed_file_quality_gates() {")
+end = source.index("\n}\n\ntry_deterministic_todo_decomposition_repair", start) + 3
+pathlib.Path(sys.argv[2]).write_text(source[start:end], encoding="utf-8")
+PY
+  cat > "$fake_bin/pnpm" <<'SH'
+#!/usr/bin/env bash
+set -eu
+test "$PWD" != "${PHASE_LOOP_WORKSPACE_ROOT:?}"
+node - <<'NODE'
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+if (pkg.version !== '0.2.0') process.exit(42);
+NODE
+printf '%s\n' "$PWD" > "${PHASE_LOOP_TEST_PNPM_CWD_FILE:?}"
+SH
+  chmod +x "$fake_bin/pnpm"
+
+  quality_output="$(
+    PHASE_LOOP_WORKSPACE_ROOT="$workspace" \
+    PHASE_LOOP_TEST_PNPM_CWD_FILE="$pnpm_cwd" \
+    PATH="$fake_bin:$PATH" \
+    bash -c 'source "$1"; run_changed_file_quality_gates "$2"' _ "$helper" "$baseline"
+  )"
+
+  python3 - "$quality_output" "$workspace" "$pnpm_cwd" "$PHASE_LOOP" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(sys.argv[1])
+workspace = pathlib.Path(sys.argv[2]).resolve()
+pnpm_cwd = pathlib.Path(sys.argv[3])
+source = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
+assert payload["completed"] is True, payload
+assert payload["changed_files"] == ["package.json"], payload
+assert payload["validation_context"]["workspace"] == "isolated_git_archive_with_run_delta", payload
+validated_root = pathlib.Path(pnpm_cwd.read_text(encoding="utf-8").strip()).resolve()
+assert validated_root != workspace, (validated_root, workspace)
+assert not validated_root.exists(), validated_root
+failure_start = source.index('if ! changed_file_quality_gate="$(run_changed_file_quality_gates')
+failure_end = source.index('write_repair_feedback "$run_stamp"', failure_start)
+failure_recovery = source[failure_start:failure_end]
+assert 'restore_pre_runtime_active_target_snapshots "$active_target_snapshots"' in failure_recovery, failure_recovery
+PY
+  rm -rf "$fixture"
+}
+
 phase_loop_smoke_cpu_count() {
   local detected=""
   if command -v getconf >/dev/null 2>&1; then
@@ -252,7 +328,10 @@ esac
 if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   claim_smoke_shard_dir="$(mktemp -d)"
   claim_smoke_shards=(core terminal completion terminal-absent queue-claim queue-recovery queue-integrity pr guards feedback lifecycle)
-  claim_smoke_expected_exit_contract="guards=76"
+  # A guards shard must pass end-to-end. Treating its historical static-check
+  # failure as success would mask the very controller regressions this suite
+  # exists to catch.
+  claim_smoke_expected_exit_contract="guards=0"
   phase_loop_claim_smoke_run_scheduler \
     "$claim_smoke_shard_dir" "$0" "$PHASE_LOOP_CLAIM_SMOKE_BATCH_SIZE" \
     "$PHASE_LOOP_CLAIM_SMOKE_TIMEOUT_SECONDS" "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" \
@@ -4475,6 +4554,8 @@ test_workspace="$lifecycle_original_workspace"
 fi
 
 if claim_smoke_section_enabled guards; then
+run_changed_file_quality_gate_regression
+
 exact_workspace="$(mktemp -d)"
 git -C "$exact_workspace" init -b main >/dev/null
 git -C "$exact_workspace" config user.name Brownie
