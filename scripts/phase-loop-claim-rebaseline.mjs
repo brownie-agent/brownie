@@ -75,6 +75,19 @@ function selectedTodoId(selectedTodo) {
   return String(selectedTodo ?? '').split('\n')[0].match(/^\s*(?:[-*]|\d+[.)])\s+\[[ xX]\]\s+([^:\s]+)/u)?.[1] ?? '';
 }
 
+function hasExactPendingTodo(todoText, selectedTodo) {
+  const selected = String(selectedTodo ?? '');
+  if (!selected) return false;
+  const starts = [];
+  const pattern = /^(?:[-*]|\d+[.)])\s+\[\s\]\s+/gmu;
+  let match;
+  while ((match = pattern.exec(todoText)) !== null) starts.push(match.index);
+  return starts.some((start, index) => {
+    const end = index + 1 < starts.length ? starts[index + 1] : todoText.length;
+    return todoText.slice(start, end).trimEnd() === selected;
+  });
+}
+
 function selectedContract(selectedTodo) {
   const text = String(selectedTodo ?? '');
   const targetText = text.match(/\b(?:Patch|Create) only\s+([^\n]*)/u)?.[1] ?? '';
@@ -152,6 +165,14 @@ export function rebaselineStaleClaim({
   const projection = progress.progress_projection && typeof progress.progress_projection === 'object'
     ? progress.progress_projection : {};
   const claimMatchesProjection = projection.claim_id === claim.claim_id;
+  let selectedTodoStillPending = false;
+  try {
+    const selectedTodo = String(claim.selected_todo ?? '');
+    selectedTodoStillPending = hasExactPendingTodo(fs.readFileSync(todoPath, 'utf8'), selectedTodo);
+  } catch {
+    // An unreadable queue is not evidence that a continuation remains valid.
+    selectedTodoStillPending = false;
+  }
   // A contract-boundary rejection happens before Runtime can produce a
   // terminal task event.  Leaving its old in-progress claim resumable makes
   // every later run replay an authorization whose target snapshot is already
@@ -164,7 +185,8 @@ export function rebaselineStaleClaim({
     && /contract_unsatisfiable_dirty_scope|materialized[_ -]scope|pre-claim-boundary/iu.test(blockedDetail);
   const staleAppliedProjection = claimMatchesProjection
     && String(projection.applied ?? '').toLowerCase() === 'true'
-    && projection.selected_todo_first_line_still_pending_after_todo_md_apply === false;
+    && projection.selected_todo_first_line_still_pending_after_todo_md_apply === false
+    && !selectedTodoStillPending;
   const staleClaimSnapshot = staleMaterializedScopeBoundary || staleAppliedProjection;
   // A run-once process is expected to exit after it records a durable
   // continuation.  The next invocation first normalizes that ownerless
@@ -217,6 +239,7 @@ export function rebaselineStaleClaim({
       reason: 'claim_is_current_or_no_terminal_staleness',
       claim_id: claim.claim_id,
       queue_mismatch: queueMismatch,
+      selected_todo_still_pending: selectedTodoStillPending,
       terminal_projection: terminalProjection,
       ledger_terminal_events: ledgerEvidence.length,
       prior_terminal_runs: priorRuns.length,
@@ -257,6 +280,7 @@ export function rebaselineStaleClaim({
       terminal_projection: terminalProjection,
       stale_materialized_scope_boundary: staleMaterializedScopeBoundary,
       stale_applied_projection: staleAppliedProjection,
+      selected_todo_still_pending: selectedTodoStillPending,
       ledger_terminal_events: ledgerEvidence,
       prior_terminal_runs: priorRuns,
     },

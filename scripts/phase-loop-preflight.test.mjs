@@ -36,6 +36,101 @@ function makeRepo() {
   return repo;
 }
 
+function writeJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function activeClaimPlaceholderFixture(repo) {
+  const stateRoot = path.join(repo, '.brownie/private/phase-loop');
+  const claimPath = path.join(stateRoot, 'todo-claims/current.json');
+  const queuePath = path.join(stateRoot, 'todo-claims/todo-queue-state.json');
+  const runStamp = '20261029T130826Z';
+  const claimId = 'todo-g624-active-r1';
+  const queueGeneration = 624;
+  const queueFingerprint = 'fixture-active-queue';
+  const target = 'scripts/target.mjs';
+  const selectedTodo = [
+    '- [ ] E-active: Patch only `scripts/active.test.mjs`, then patch only `scripts/target.mjs`:',
+    '  Route: implementation.',
+    '  Depends on: <none>.',
+    '  Completion condition: resume the exact active Runtime claim.',
+    '  Verification: run `node --test scripts/active.test.mjs`.'
+  ].join('\n');
+  const laterTodo = [
+    '- [ ] E-later: Patch only `scripts/target.mjs`:',
+    '  Route: implementation.',
+    '  Depends on: E-active.',
+    '  Completion condition: consume the later workflow leaf only after E-active.',
+    '  Verification: run `node --test scripts/target.test.mjs`.'
+  ].join('\n');
+  const selectedHash = createHash('sha256').update(selectedTodo).digest('hex');
+  const stdoutPath = path.join(stateRoot, 'runs', `${runStamp}.stdout.log`);
+  const evidencePath = path.join(stateRoot, 'runs', `${runStamp}.execution-evidence.json`);
+
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), `${selectedTodo}\n\n${laterTodo}\n`);
+  fs.writeFileSync(path.join(repo, target), '// Brownie bounded Patch-only proposal.\n');
+  writeJson(claimPath, {
+    schema_version: 1,
+    claim_id: claimId,
+    status: 'in_progress',
+    selected_todo: selectedTodo,
+    queue_generation: queueGeneration,
+    queue_fingerprint: queueFingerprint,
+    run_stamp: runStamp,
+    terminal_failure_execution_evidence_path: evidencePath
+  });
+  writeJson(queuePath, {
+    schema_version: 1,
+    generation: queueGeneration,
+    fingerprint: queueFingerprint
+  });
+  writeJson(path.join(stateRoot, 'runs', `${runStamp}.runtime-admission.json`), {
+    schema_version: 1,
+    kind: 'phase_loop_runtime_admission',
+    status: 'admitted',
+    claim_id: claimId,
+    selected_todo_id: 'E-active',
+    selected_todo_sha256: selectedHash,
+    queue_generation: queueGeneration,
+    queue_fingerprint: queueFingerprint
+  });
+  writeJson(evidencePath, {
+    schema_version: 1,
+    kind: 'phase_loop_terminal_failure_execution_evidence',
+    run_stamp: runStamp,
+    claim_id: claimId,
+    runtime_claim_id: claimId,
+    claim_matches: true,
+    selected_todo_id: 'E-active',
+    selected_todo_sha256: selectedHash,
+    target_files: ['scripts/active.test.mjs', target],
+    task_execution_confirmed: true,
+    stdout_path: stdoutPath
+  });
+  writeJson(stdoutPath, {
+    run: {
+      status: 'objective_proposal_applied',
+      phase_loop_claim_id: claimId,
+      phase_loop_selected_todo_sha256: selectedHash,
+      phase_loop_queue_generation: queueGeneration,
+      phase_loop_queue_fingerprint: queueFingerprint,
+      objective_apply_applied: true,
+      objective_apply_path: target
+    }
+  });
+
+  return {
+    stateRoot,
+    claimPath,
+    queuePath,
+    evidencePath,
+    claimId,
+    runStamp,
+    target
+  };
+}
+
 test('detects duplicate JSON keys outside JSON.parse visibility', () => {
   const duplicates = duplicateJsonKeys('{ "a": 1, "nested": { "b": 1, "b": 2 }, "a": 3 }', 'fixture.json');
   assert.equal(duplicates.length, 2);
@@ -70,6 +165,85 @@ test('rejects a dirty bounded-proposal placeholder before claiming its TODO', ()
   assert(failure, JSON.stringify(result.errors));
   assert.equal(failure.target, 'scripts/target.mjs');
   assert.match(failure.sha256, /^sha256:[a-f0-9]{64}$/u);
+});
+
+test('admits an exact active-claim placeholder only for the authenticated resume path', () => {
+  const repo = makeRepo();
+  const fixture = activeClaimPlaceholderFixture(repo);
+  const result = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim-boundary',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.deepEqual(result.warnings.find((warning) => warning.code === 'active_claim_owned_dirty_target_placeholder'), {
+    code: 'active_claim_owned_dirty_target_placeholder',
+    claim_id: fixture.claimId,
+    run_stamp: fixture.runStamp,
+    target: fixture.target,
+    sha256: `sha256:${createHash('sha256').update('// Brownie bounded Patch-only proposal.').digest('hex')}`,
+    message: 'A dirty bounded-proposal placeholder is attributable to the exact active Runtime claim and is admitted only for that claim resume.'
+  });
+  assert.equal(result.warnings.filter((warning) => warning.code === 'active_claim_owned_dirty_target_placeholder').length, 1);
+});
+
+test('keeps active-claim placeholder admission fail-closed for generic stage, missing target attestation, queue drift, and a non-pending selected TODO', () => {
+  const repo = makeRepo();
+  const fixture = activeClaimPlaceholderFixture(repo);
+  const generic = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert(generic.errors.some((error) => error.code === 'contract_unsatisfiable_dirty_scope'), JSON.stringify(generic.errors));
+
+  const evidence = JSON.parse(fs.readFileSync(fixture.evidencePath, 'utf8'));
+  evidence.target_files = ['scripts/active.test.mjs'];
+  writeJson(fixture.evidencePath, evidence);
+  const noTargetAttestation = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert(noTargetAttestation.errors.some((error) => error.code === 'contract_unsatisfiable_dirty_scope'), JSON.stringify(noTargetAttestation.errors));
+
+  evidence.target_files.push(fixture.target);
+  writeJson(fixture.evidencePath, evidence);
+  const queue = JSON.parse(fs.readFileSync(fixture.queuePath, 'utf8'));
+  queue.fingerprint = 'shifted-queue';
+  writeJson(fixture.queuePath, queue);
+  const queueDrift = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert(queueDrift.errors.some((error) => error.code === 'contract_unsatisfiable_dirty_scope'), JSON.stringify(queueDrift.errors));
+
+  queue.fingerprint = 'fixture-active-queue';
+  writeJson(fixture.queuePath, queue);
+  const todo = fs.readFileSync(path.join(repo, '.brownie/todo.md'), 'utf8')
+    .replace('- [ ] E-active:', '- [x] E-active:');
+  fs.writeFileSync(path.join(repo, '.brownie/todo.md'), todo);
+  const completedSelectedTodo = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-claim',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert(completedSelectedTodo.errors.some((error) => error.code === 'contract_unsatisfiable_dirty_scope'), JSON.stringify(completedSelectedTodo.errors));
 });
 
 test('admits an audited Create-to-Patch placeholder only when its exact target hash is captured', () => {
