@@ -31,6 +31,10 @@ function sha256File(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
+function legacyCaptureSha256(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath, 'utf8').trim(), 'utf8').digest('hex');
+}
+
 function scopeMap(firstLine) {
   const result = new Map();
   for (const entry of boundedScopeEntries(firstLine)) {
@@ -40,13 +44,13 @@ function scopeMap(firstLine) {
   return result;
 }
 
-function capturedPlaceholder(records, todoId, targetPath, targetSha256) {
+function capturedPlaceholder(records, todoId, targetPath, targetSha256Candidates) {
   return records.some((record) => record?.target_capture?.mode === 'legacy_pre_capture_materialization'
     && record?.target_todo_ids?.includes(todoId)
     && record?.target_snapshots?.some((snapshot) => snapshot.operation === 'Create'
       && snapshot.path === targetPath
       && snapshot.exists_after === true
-      && snapshot.sha256_after === targetSha256));
+      && targetSha256Candidates.includes(snapshot.sha256_after)));
 }
 
 export function validateMaterializedScopeRebaseline({ beforeContract, afterContract, repoRoot, records }) {
@@ -70,7 +74,11 @@ export function validateMaterializedScopeRebaseline({ beforeContract, afterContr
     const absoluteTarget = path.join(repoRoot, target);
     if (!fs.existsSync(absoluteTarget)) throw new Error(`materialized target is absent: ${target}`);
     const sha256 = sha256File(absoluteTarget);
-    if (!capturedPlaceholder(records, afterContract.id, target, sha256)) {
+    // Legacy pre-capture records hashed trimmed text. Restrict compatibility
+    // to that record mode and retain the raw current file hash in the new
+    // receipt so all future comparisons are byte exact.
+    const legacySha256 = legacyCaptureSha256(absoluteTarget);
+    if (!capturedPlaceholder(records, afterContract.id, target, [sha256, legacySha256])) {
       throw new Error(`materialized target is not bound to a legacy placeholder capture: ${target}`);
     }
     converted.push({ operation: 'Patch', path: target, exists_before: true, sha256_before: sha256, exists_after: true, sha256_after: sha256 });
