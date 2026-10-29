@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
+import { boundedScopeEntries } from './phase-loop-bounded-scope.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,13 +24,15 @@ function todoId(todo) {
 }
 
 function patchOnlyTargets(todo) {
-  const match = firstLine(todo).match(/Patch only\s+(.+?)(?::|$)/);
-  return match ? backtickedValues(match[1]) : [];
+  return boundedScopeEntries(firstLine(todo))
+    .filter((entry) => entry.operation === 'patch')
+    .map((entry) => entry.path);
 }
 
 function createOnlyTargets(todo) {
-  const match = firstLine(todo).match(/Create only\s+(.+?)(?::|$)/);
-  return match ? backtickedValues(match[1]) : [];
+  return boundedScopeEntries(firstLine(todo))
+    .filter((entry) => entry.operation === 'create')
+    .map((entry) => entry.path);
 }
 
 function verificationCommands(todo) {

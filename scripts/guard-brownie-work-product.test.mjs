@@ -34,6 +34,20 @@ test('rejects changed files outside patch-only scope', () => {
   assert(errors.some((error) => error.includes('outside Patch only/Create only scope')), errors.join('\n'));
 });
 
+test('accepts every target in multiple mixed-case bounded clauses', () => {
+  const multiClauseTodo = `- [ ] E-20b: Patch only \`scripts/target.mjs\`, then patch only \`package.json\` and \`.github/workflows/release.yml\`:
+  Route: implementation.
+  Completion condition: all declared files are updated.
+  Forbidden changes: do not edit \`README.md\`.
+  Verification: run \`pnpm --workspace-root check\`.`;
+  assert.deepEqual(validateBrownieWorkProduct({
+    actor: 'implementation-bot',
+    selected_todo: multiClauseTodo,
+    changed_files: ['scripts/target.mjs', 'package.json', '.github/workflows/release.yml'],
+    verification_commands_executed: ['pnpm --workspace-root check']
+  }, actorOptions), []);
+});
+
 test('rejects forbidden changed files', () => {
   const errors = validateBrownieWorkProduct({
     actor: 'implementation-bot',

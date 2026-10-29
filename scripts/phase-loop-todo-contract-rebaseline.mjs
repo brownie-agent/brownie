@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { boundedScopeValues, boundedScopes } from './phase-loop-bounded-scope.mjs';
 
 function sha256Text(value) {
   return crypto.createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex');
@@ -31,23 +32,6 @@ function lineValue(block, label) {
   return line ? line.slice(prefix.length).trim().replace(/[.]$/u, '') : '';
 }
 
-function boundedScopeValues(firstLine, keyword) {
-  const start = firstLine.indexOf(keyword);
-  if (start < 0) return [];
-  let rest = firstLine.slice(start + keyword.length).trimStart();
-  const values = [];
-  while (rest.startsWith('`')) {
-    const end = rest.indexOf('`', 1);
-    if (end < 0) break;
-    values.push(rest.slice(1, end));
-    rest = rest.slice(end + 1).trimStart();
-    const separator = rest.match(/^(?:,|and\b|&)\s*/u);
-    if (!separator) break;
-    rest = rest.slice(separator[0].length).trimStart();
-  }
-  return values;
-}
-
 export function protectedContract(block) {
   const firstLine = String(block ?? '').split('\n')[0]?.trim() ?? '';
   return {
@@ -58,10 +42,7 @@ export function protectedContract(block) {
     completion_condition: lineValue(block, 'Completion condition'),
     forbidden_changes: lineValue(block, 'Forbidden changes'),
     verification: lineValue(block, 'Verification'),
-    bounded_scopes: [
-      ...boundedScopeValues(firstLine, 'Patch only'),
-      ...boundedScopeValues(firstLine, 'Create only')
-    ]
+    bounded_scopes: boundedScopes(firstLine)
   };
 }
 
@@ -365,8 +346,8 @@ export function matchesMaterializedTargetRebaseline(record, {
   if (!change || JSON.stringify(change.after_contract) !== JSON.stringify(currentContract)) return false;
   const snapshot = record.target_snapshots?.find((entry) => entry?.path === targetPath);
   if (!snapshot || snapshot.operation !== 'Create' || snapshot.exists_after !== true || snapshot.sha256_after !== targetSha256) return false;
-  const beforeCreatesTarget = boundedScopeValues(String(change.before_contract?.first_line ?? ''), 'Create only').includes(targetPath);
-  const afterPatchesTarget = boundedScopeValues(String(change.after_contract?.first_line ?? ''), 'Patch only').includes(targetPath);
+  const beforeCreatesTarget = boundedScopeValues(String(change.before_contract?.first_line ?? ''), 'create').includes(targetPath);
+  const afterPatchesTarget = boundedScopeValues(String(change.after_contract?.first_line ?? ''), 'patch').includes(targetPath);
   const capturedBeforeAbsence = snapshot.exists_before === false && snapshot.sha256_before === null;
   const legacyCapture = snapshot.exists_before === null
     && snapshot.sha256_before === null

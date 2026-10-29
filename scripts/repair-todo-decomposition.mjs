@@ -232,7 +232,7 @@ function leadingCreateOnlyScopes(block) {
 function boundedScopeClauses(block) {
   const line = firstLine(block);
   const clauses = [];
-  const markerPattern = /\b(Patch|Create) only\b/gu;
+  const markerPattern = /\b(Patch|Create) only\b/giu;
   let marker;
   while ((marker = markerPattern.exec(line)) !== null) {
     const parsed = leadingBacktickedScopes(line.slice(marker.index + marker[0].length));
@@ -240,7 +240,7 @@ function boundedScopeClauses(block) {
       continue;
     }
     clauses.push({
-      operation: marker[1],
+      operation: marker[1].toLowerCase() === 'patch' ? 'Patch' : 'Create',
       targets: parsed.scopes,
       start: marker.index,
       end: marker.index + marker[0].length + parsed.end

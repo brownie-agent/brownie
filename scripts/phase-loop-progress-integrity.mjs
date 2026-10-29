@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { loadTodoState } from './phase-loop-todo-state.mjs';
+import { boundedScopes } from './phase-loop-bounded-scope.mjs';
 
 const defaultTodoPath = '.brownie/todo.md';
 
@@ -151,37 +152,6 @@ function verificationValue(block) {
   return lineValue(block, 'Verification');
 }
 
-function boundedScopeValues(first, keyword) {
-  const start = first.indexOf(keyword);
-  if (start < 0) {
-    return [];
-  }
-  let rest = first.slice(start + keyword.length).trimStart();
-  const scopes = [];
-  while (rest.startsWith('`')) {
-    const end = rest.indexOf('`', 1);
-    if (end < 0) {
-      break;
-    }
-    scopes.push(rest.slice(1, end));
-    rest = rest.slice(end + 1).trimStart();
-    const separator = rest.match(/^(?:,|and\b|&)\s*/u);
-    if (!separator) {
-      break;
-    }
-    rest = rest.slice(separator[0].length).trimStart();
-  }
-  return scopes;
-}
-
-function boundedScopes(block) {
-  const first = firstLine(block);
-  return [
-    ...boundedScopeValues(first, 'Patch only'),
-    ...boundedScopeValues(first, 'Create only')
-  ];
-}
-
 function protectedContract(block) {
   return {
     id: todoId(block),
@@ -191,7 +161,7 @@ function protectedContract(block) {
     completion_condition: completionValue(block),
     forbidden_changes: forbiddenValue(block),
     verification: verificationValue(block),
-    bounded_scopes: boundedScopes(block)
+    bounded_scopes: boundedScopes(firstLine(block))
   };
 }
 
@@ -252,7 +222,7 @@ export function validatePhaseLoopProgressIntegrity(input) {
   const selected = typeof claim.selected_todo === 'string' ? claim.selected_todo : '';
   const selectedId = todoId(selected);
   const selectedRoute = routeValue(selected);
-  const selectedScopes = boundedScopes(selected);
+  const selectedScopes = boundedScopes(firstLine(selected));
   const diffFiles = normalizeFileList(input.diffFiles);
   const baselineDiffFiles = normalizeFileList(input.baselineDiffFiles ?? claim.baseline_diff_files);
   const claimChangedFiles = baselineDiffFiles.length > 0 ? subtractFileList(diffFiles, baselineDiffFiles) : diffFiles;

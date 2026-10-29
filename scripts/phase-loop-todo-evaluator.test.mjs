@@ -48,6 +48,7 @@ test('CLI isolates phase-loop workspace lineage from the evaluator controller ch
   fs.mkdirSync(controllerScripts, { recursive: true });
   for (const file of [
     'phase-loop-todo-evaluator.mjs',
+    'phase-loop-bounded-scope.mjs',
     'phase-loop-todo-state.mjs',
     'guard-todo-decomposition.mjs'
   ]) {

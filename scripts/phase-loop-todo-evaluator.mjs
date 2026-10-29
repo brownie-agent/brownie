@@ -12,6 +12,7 @@ import {
   resolveTodoState,
   todoStateSummary
 } from './phase-loop-todo-state.mjs';
+import { boundedScopes as boundedScopesFromFirstLine } from './phase-loop-bounded-scope.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -70,11 +71,7 @@ function routeValue(block) {
 
 function boundedScopes(block) {
   const firstLine = block.split('\n')[0]?.trim() ?? '';
-  const match = firstLine.match(/(?:Patch only|Create only)\s+(.+?)(?::|$)/);
-  if (!match) {
-    return [];
-  }
-  return [...match[1].matchAll(/`([^`\n]+)`/g)].map((entry) => entry[1]);
+  return boundedScopesFromFirstLine(firstLine);
 }
 
 function targetScopeKey(block) {
