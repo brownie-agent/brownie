@@ -158,8 +158,9 @@ test('isolates a stale pre-claim materialized-scope boundary claim even when its
   assert.equal(fs.existsSync(f.claimPath), false);
 });
 
-test('preserves an applied continuation when its exact selected TODO remains pending', () => {
+test('preserves an applied continuation when a completed TODO immediately follows its exact selected TODO', () => {
   const f = fixture();
+  fs.writeFileSync(path.join(f.root, 'todo.md'), `${f.selected}\n- [x] E-completed-after-selection: Completed sibling.\n- [ ] E-later-pending: Later pending work.\n`);
   writeJson(path.join(f.stateDir, 'status.json'), { status: 'stopped' });
   writeJson(path.join(f.stateDir, 'progress-state.json'), {
     classification: 'progress',

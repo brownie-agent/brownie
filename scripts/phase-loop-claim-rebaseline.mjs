@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { uncheckedTodoBlocks as claimSelectorTodoBlocks } from './guard-todo-decomposition.mjs';
 
 function argsFrom(argv) {
   const args = new Map();
@@ -77,15 +78,7 @@ function selectedTodoId(selectedTodo) {
 
 function hasExactPendingTodo(todoText, selectedTodo) {
   const selected = String(selectedTodo ?? '');
-  if (!selected) return false;
-  const starts = [];
-  const pattern = /^(?:[-*]|\d+[.)])\s+\[\s\]\s+/gmu;
-  let match;
-  while ((match = pattern.exec(todoText)) !== null) starts.push(match.index);
-  return starts.some((start, index) => {
-    const end = index + 1 < starts.length ? starts[index + 1] : todoText.length;
-    return todoText.slice(start, end).trimEnd() === selected;
-  });
+  return Boolean(selected) && claimSelectorTodoBlocks(todoText).includes(selected);
 }
 
 function selectedContract(selectedTodo) {
