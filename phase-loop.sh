@@ -10126,6 +10126,9 @@ progress_projection = {
     "closure": text(payload.get("completion_closure_status")),
     "applied": text(payload.get("objective_apply_applied")) or text(payload.get("objective_apply_apply_status")),
     "applied_path": text(payload.get("objective_apply_path")),
+    "apply_reason": text(payload.get("objective_apply_apply_reason")),
+    "apply_failed_checks": text(payload.get("objective_apply_failed_checks")),
+    "apply_blocked_checks": text(payload.get("objective_apply_blocked_checks")),
     "accepted": text(payload.get("accepted_completion_status")) or text(payload.get("objective_completion_acceptance_acceptance_status")),
     "finalization": text(payload.get("completion_finalization_status")) or text(payload.get("completion_finalization_finalization_fingerprint")),
     "terminal_final_state": text(payload.get("terminal_completion_final_state")),
@@ -15312,6 +15315,146 @@ sys.exit(0 if code == "runtime_proposal_apply_approval_expired" else 1)
 PY
 }
 
+# A controlled Runtime proposal.apply denial is distinct from a transport or
+# schema failure: the candidate was rejected before any workspace write. Keep
+# the exact Runtime target and named checks, but accept this recovery route
+# only when every control-plane field is bounded and internally consistent.
+# Returning non-zero leaves malformed/untrusted output to the fail-closed
+# generic validators rather than inventing repair authority.
+runtime_stdout_objective_apply_rejection_feedback() {
+  local stdout_log="$1"
+  local active_target_path="${2:-}"
+  python3 - "$stdout_log" "$active_target_path" <<'PY'
+import json
+import pathlib
+import sys
+
+def safe_relative_path(value):
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        return None
+    if "\x00" in value or "\r" in value or "\n" in value or "\\" in value:
+        return None
+    candidate = pathlib.PurePosixPath(value)
+    if candidate.is_absolute() or not candidate.parts:
+        return None
+    if any(part in ("", ".", "..") for part in candidate.parts):
+        return None
+    return str(candidate)
+
+def bounded_text(value, limit=256):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > limit or "\x00" in value or "\r" in value or "\n" in value:
+        return None
+    return value
+
+def bounded_checks(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 16:
+        return None
+    checks = []
+    for item in value:
+        item = bounded_text(item)
+        if item is None:
+            return None
+        checks.append(item)
+    return checks
+
+try:
+    root = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+if isinstance(root, dict) and isinstance(root.get("run"), dict):
+    payload = root["run"]
+elif isinstance(root, dict) and isinstance(root.get("resume"), dict):
+    payload = root["resume"]
+else:
+    payload = root
+if not isinstance(payload, dict):
+    sys.exit(1)
+
+if payload.get("status") != "objective_proposal_apply_rejected":
+    sys.exit(1)
+if payload.get("objective_apply_apply_status") != "Denied":
+    sys.exit(1)
+if payload.get("objective_apply_applied") is not False:
+    sys.exit(1)
+if payload.get("objective_apply_authorization_consumed") is not False:
+    sys.exit(1)
+
+target_path = safe_relative_path(payload.get("objective_apply_path"))
+operation = bounded_text(payload.get("objective_apply_operation"))
+apply_reason = bounded_text(payload.get("objective_apply_apply_reason"), limit=2048)
+failed_checks = bounded_checks(payload.get("objective_apply_failed_checks"))
+blocked_checks = bounded_checks(payload.get("objective_apply_blocked_checks"))
+if (
+    target_path is None
+    or operation not in {"replace_file", "create_file", "patch_file"}
+    or apply_reason is None
+    or failed_checks is None
+    or blocked_checks is None
+    or not (failed_checks or blocked_checks)
+):
+    sys.exit(1)
+
+checks = failed_checks + [check for check in blocked_checks if check not in failed_checks]
+structured = any("structured_content_parseable" in check for check in checks)
+repair_mode = "structured_candidate_repair" if structured else "candidate_apply_repair"
+if structured:
+    repair_hint = (
+        f"Runtime rejected the candidate for `{target_path}` before any workspace write because it is not parseable structured content. "
+        "Do not re-submit the same candidate. Read the exact target, form one complete replacement/patch candidate, run the structured parse check, then run the selected TODO verification."
+    )
+else:
+    repair_hint = (
+        f"Runtime rejected the candidate for `{target_path}` before any workspace write. "
+        "Read the exact target and satisfy the named Runtime checks with a new complete candidate before the selected TODO verification."
+    )
+
+feedback = {
+    "schema_version": 1,
+    "kind": "phase_loop_objective_apply_rejected",
+    "completed": False,
+    "reason": "objective_apply_rejected_before_write",
+    "selected_target_path": target_path,
+    "selected_target_path_source": "runtime_objective_apply",
+    "repair_mode": repair_mode,
+    "repair_hint": repair_hint,
+    "objective_apply": {
+        "operation": operation,
+        "status": "Denied",
+        "reason": apply_reason,
+        "failed_checks": failed_checks,
+        "blocked_checks": blocked_checks,
+        "applied": False,
+        "authorization_consumed": False,
+    },
+    "semantic_repair_policy": {
+        "mode": repair_mode,
+        "selected_target_path": target_path,
+        "must_preserve_selected_todo_intent": True,
+        "must_not_only_make_checks_green": True,
+        "required_next_actions": [
+            "read the exact selected_target_path before writing",
+            "form one new complete candidate for the selected target",
+            "run every named Runtime failed/blocked check before selected TODO verification",
+            "run selected TODO verification after the candidate preflight passes",
+        ],
+        "forbidden_next_actions": [
+            "retry the same rejected candidate",
+            "redirect repair to an unrelated first Patch-only target",
+            "append a second top-level object or raw fragment to structured content",
+            "weaken or remove a guard merely to pass a check",
+            "mark the TODO complete without a successful new candidate and verification",
+        ],
+    },
+}
+print(json.dumps(feedback, ensure_ascii=False, sort_keys=True))
+PY
+}
+
 # This recovery deliberately runs before Runtime admission validation.  An
 # expired proposal approval is an authenticated Runtime result, but it cannot
 # carry an execution attestation because apply never began.  Feeding it into
@@ -17085,6 +17228,23 @@ PY
     )"
     write_bdk_trajectory_event "$run_stamp" "progress.classified" "$progress_summary"
 
+    # Runtime can reject a proposal before writing when candidate preflight
+    # detects (for example) malformed strict JSON. This is valid control
+    # evidence, not generic no-progress. Convert it to exact-target feedback
+    # before the workspace-change integrity guard, which otherwise knows only
+    # that no claimed file changed and would lose the failed check/path.
+    local objective_apply_rejection_feedback
+    if objective_apply_rejection_feedback="$(runtime_stdout_objective_apply_rejection_feedback "$stdout_log" "$active_target_path" 2>&1)"; then
+      write_repair_feedback "$run_stamp" "$objective_apply_rejection_feedback" "$stdout_log" "$stderr_log" || true
+      write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+      detail="Brownie rejected an objective candidate before any workspace write; recorded exact-target repair feedback and refused to resume the rejected candidate. feedback=$objective_apply_rejection_feedback stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
+      write_status "no_progress" "$detail" "$run_id" "76" "${CONSECUTIVE_FAILURES:-1}"
+      printf '%s run=%s objective_apply_rejected_before_write=true feedback=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$objective_apply_rejection_feedback" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+      write_bdk_trajectory_event "$run_stamp" "verification.run" "$objective_apply_rejection_feedback"
+      write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"objective_apply_rejected_before_write"}'
+      return 76
+    fi
+
     local progress_integrity_validation
     if ! progress_integrity_validation="$(validate_phase_loop_progress_integrity_after_runtime_apply "$run_stamp" 2>&1)"; then
       if phase_loop_can_defer_selected_target_change_for_continuation "$progress_integrity_validation" "$stdout_log"; then
@@ -17182,6 +17342,7 @@ PY
       fi
       changed_file_quality_gate="$(python3 - "$changed_file_quality_gate" "$active_target_path" "$restored_quality_gate_targets" <<'PY'
 import json
+import shlex
 import sys
 
 try:
@@ -17195,36 +17356,114 @@ except Exception:
 
 target = sys.argv[2]
 restored = sys.argv[3] == "1"
+changed_files = payload.get("changed_files")
+if not isinstance(changed_files, list):
+    changed_files = []
+changed_files = [path for path in changed_files if isinstance(path, str)]
+failed_results = [
+    result
+    for result in payload.get("results", [])
+    if isinstance(result, dict) and result.get("exit_code") not in (None, 0)
+]
+
+# The active target is the first declared Patch-only path and is useful for
+# ordinary repairs, but it may not be the file that failed a structured-file
+# gate. Derive the failing path from local quality-gate evidence and retain it
+# explicitly so a retry cannot be redirected to an unrelated first target.
+structured_target_paths = []
+structured_parse_failures = []
+for result in failed_results:
+    command = result.get("command")
+    if not isinstance(command, str) or "guard-json-parse.mjs" not in command:
+        continue
+    try:
+        command_tokens = shlex.split(command)
+    except ValueError:
+        command_tokens = []
+    command_paths = [
+        path
+        for path in changed_files
+        if path.endswith((".json", ".jsonc")) and path in command_tokens
+    ]
+    for path in command_paths:
+        if path not in structured_target_paths:
+            structured_target_paths.append(path)
+    if command_paths:
+        structured_parse_failures.append({
+            "command": command,
+            "paths": command_paths,
+            "stderr_tail": str(result.get("stderr_tail", ""))[-2000:],
+        })
+
 payload["target_restored_from_pre_run_snapshot"] = restored
 payload["targets_restored_from_pre_run_snapshot"] = restored
-if target:
-    payload["selected_target_path"] = target
-payload["repair_mode"] = "bounded_target_repair"
-payload["repair_hint"] = (
-    "The previous patch failed changed-file quality gates. "
-    + ("The supervisor restored every declared target from its pre-run snapshot. " if restored else "")
-    + "Repair only the selected target or the TODO contract if the TODO itself is invalid. "
-    + "Preserve the selected TODO completion condition and forbidden changes. "
-    + "Do not append syntax fragments such as stray return expressions or closing braces; patch one complete function/object at a time."
-)
-payload["semantic_repair_policy"] = {
-    "mode": "bounded_target_repair",
-    "selected_target_path": target,
-    "target_restored_from_pre_run_snapshot": restored,
-    "targets_restored_from_pre_run_snapshot": restored,
-    "must_preserve_selected_todo_intent": True,
-    "must_not_only_make_checks_green": True,
-    "allowed_next_actions": [
-        "patch the selected target with one small complete semantic edit",
-        "patch .brownie/todo.md only if the selected TODO contract is invalid or impossible",
-    ],
-    "forbidden_next_actions": [
-        "append isolated syntax fragments",
-        "delete validation or guards merely to pass a check",
-        "modify unrelated files",
-        "mark the TODO complete while any quality gate fails",
-    ],
-}
+if structured_target_paths:
+    payload["structured_target_paths"] = structured_target_paths
+    payload["structured_parse_failures"] = structured_parse_failures
+    payload["selected_target_path"] = structured_target_paths[0]
+    payload["selected_target_path_source"] = "changed_file_quality_gate"
+    if target and target not in structured_target_paths:
+        payload["legacy_selected_target_path"] = target
+    payload["repair_mode"] = "structured_target_repair"
+    payload["repair_hint"] = (
+        "The previous patch made structured target(s) unparsable: "
+        + ", ".join(structured_target_paths)
+        + ". "
+        + ("The supervisor restored every declared target from its pre-run snapshot. " if restored else "")
+        + "Repair the listed structured target(s), not an unrelated first Patch-only target. "
+        + "Read each listed target before editing, make one small complete property/object edit, and preserve JSON/JSONC parseability. "
+        + "Do not append a second top-level object or raw fragment after the closing delimiter."
+    )
+    payload["semantic_repair_policy"] = {
+        "mode": "structured_target_repair",
+        "structured_target_paths": structured_target_paths,
+        "selected_target_path": structured_target_paths[0],
+        "legacy_selected_target_path": target if target and target not in structured_target_paths else None,
+        "target_restored_from_pre_run_snapshot": restored,
+        "targets_restored_from_pre_run_snapshot": restored,
+        "must_preserve_selected_todo_intent": True,
+        "must_not_only_make_checks_green": True,
+        "required_next_actions": [
+            "read each structured_target_paths entry before writing",
+            "patch only a listed structured target with one small complete edit",
+            "run the reported JSON/JSONC parse command before selected TODO verification",
+        ],
+        "forbidden_next_actions": [
+            "redirect repair to an unrelated first Patch-only target",
+            "append a second top-level object or raw JSON fragment",
+            "delete validation or guards merely to pass a check",
+            "mark the TODO complete while any quality gate fails",
+        ],
+    }
+else:
+    if target:
+        payload["selected_target_path"] = target
+    payload["repair_mode"] = "bounded_target_repair"
+    payload["repair_hint"] = (
+        "The previous patch failed changed-file quality gates. "
+        + ("The supervisor restored every declared target from its pre-run snapshot. " if restored else "")
+        + "Repair only the selected target or the TODO contract if the TODO itself is invalid. "
+        + "Preserve the selected TODO completion condition and forbidden changes. "
+        + "Do not append syntax fragments such as stray return expressions or closing braces; patch one complete function/object at a time."
+    )
+    payload["semantic_repair_policy"] = {
+        "mode": "bounded_target_repair",
+        "selected_target_path": target,
+        "target_restored_from_pre_run_snapshot": restored,
+        "targets_restored_from_pre_run_snapshot": restored,
+        "must_preserve_selected_todo_intent": True,
+        "must_not_only_make_checks_green": True,
+        "allowed_next_actions": [
+            "patch the selected target with one small complete semantic edit",
+            "patch .brownie/todo.md only if the selected TODO contract is invalid or impossible",
+        ],
+        "forbidden_next_actions": [
+            "append isolated syntax fragments",
+            "delete validation or guards merely to pass a check",
+            "modify unrelated files",
+            "mark the TODO complete while any quality gate fails",
+        ],
+    }
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 PY
 )"

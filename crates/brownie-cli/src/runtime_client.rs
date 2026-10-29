@@ -39,6 +39,11 @@ const MAX_RENDERED_OUTPUT_CHARS: usize = 16 * 1024;
 const MAX_ATTESTED_TODO_ID_CHARS: usize = 128;
 const ATTESTED_TODO_ID_PREFIX_CHARS: usize = 48;
 const MAX_TEXT_FIELD_CHARS: usize = 256;
+const MAX_APPLY_CHECKS_TRANSPORT: usize = 16;
+// A pre-write Runtime rejection can safely include the selected path plus a
+// parser diagnostic.  Keep that evidence available for exact-target repair
+// while bounding it separately from ordinary transport labels and IDs.
+const MAX_APPLY_REJECTION_REASON_CHARS: usize = 2 * 1024;
 const MAX_TASK_LIST_ROWS: usize = 10;
 const MAX_TASK_LIST_GROUP_ROWS: usize = 5;
 const MAX_HEADLESS_ROUTE_ROWS: usize = 5;
@@ -748,10 +753,10 @@ impl RuntimeClient {
             canonicalize_direct_proposal_apply_result(apply_result).map_err(|error| {
                 debug_invalid_response("canonicalize_direct_proposal_apply_result", error)
             })?;
-        validate_direct_proposal_apply_result(&apply_result).map_err(|error| {
-            debug_invalid_response("validate_direct_proposal_apply_result", error)
+        let outcome = classify_direct_proposal_apply_result(&apply_result).map_err(|error| {
+            debug_invalid_response("classify_direct_proposal_apply_result", error)
         })?;
-        merge_direct_proposal_apply_result(result, apply_result)
+        merge_direct_proposal_apply_result(result, apply_result, outcome)
             .map_err(|error| debug_invalid_response("merge_direct_proposal_apply_result", error))
     }
 
@@ -2374,12 +2379,20 @@ fn cli_run_payload(result: &Value) -> Result<Value, RuntimeClientError> {
         .and_then(|result| result.get("apply_result"))
         .and_then(Value::as_object)
     {
-        for key in ["operation", "path", "apply_status", "next_action"] {
+        for key in [
+            "operation",
+            "path",
+            "apply_status",
+            "next_action",
+            "apply_reason",
+        ] {
             if let Some(value) = apply.get(key) {
-                payload.insert(
-                    format!("objective_apply_{key}"),
-                    bounded_json_string(value)?,
-                );
+                let value = if key == "apply_reason" {
+                    bounded_json_apply_rejection_reason(value)?
+                } else {
+                    bounded_json_string(value)?
+                };
+                payload.insert(format!("objective_apply_{key}"), value);
             }
         }
         if let Some(value) = apply.get("applied") {
@@ -2387,6 +2400,14 @@ fn cli_run_payload(result: &Value) -> Result<Value, RuntimeClientError> {
                 "objective_apply_applied".to_string(),
                 Value::Bool(json_bool(value)?),
             );
+        }
+        for key in ["failed_checks", "blocked_checks"] {
+            if let Some(value) = apply.get(key) {
+                payload.insert(
+                    format!("objective_apply_{key}"),
+                    bounded_json_string_list(value, MAX_APPLY_CHECKS_TRANSPORT)?,
+                );
+            }
         }
         if let Some(value) = apply.get("authorization_consumed") {
             payload.insert(
@@ -2836,6 +2857,19 @@ fn automation_outcome_from_legacy_payload(
                     true,
                     payload_string(payload, "stop_reason")
                         .unwrap_or_else(|| "objective_proposal_applied".to_string()),
+                ),
+                // A controlled proposal.apply rejection is valid Runtime
+                // evidence, not a malformed response.  Stop the current
+                // continuation so the phase-loop can turn the exact target
+                // and failed preflight checks into bounded repair feedback
+                // rather than resuming the same candidate blindly.
+                "objective_proposal_apply_rejected" => (
+                    "repair_required",
+                    "stop",
+                    false,
+                    true,
+                    payload_string(payload, "stop_reason")
+                        .unwrap_or_else(|| "objective_proposal_apply_rejected".to_string()),
                 ),
                 _ => return Err(RuntimeClientError::InvalidResponse),
             }
@@ -3966,38 +4000,91 @@ fn sha256_fingerprint(bytes: &[u8]) -> String {
     format!("sha256:{}", hex_prefix(&digest, 32))
 }
 
-fn validate_direct_proposal_apply_result(result: &Value) -> Result<(), RuntimeClientError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectProposalApplyOutcome {
+    Applied,
+    Rejected,
+}
+
+fn classify_direct_proposal_apply_result(
+    result: &Value,
+) -> Result<DirectProposalApplyOutcome, RuntimeClientError> {
     let object = result
         .as_object()
         .ok_or(RuntimeClientError::InvalidResponse)?;
     let apply = object_field_from_value(object, "apply_result")?;
-    if display_string(apply, "apply_status")? == "Denied"
-        && !display_bool(apply, "applied")?
-        && !display_bool(apply, "authorization_consumed")?
-        && apply
-            .get("failed_checks")
-            .and_then(Value::as_array)
-            .is_some_and(|checks| {
-                checks.iter().any(|check| {
-                    check
-                        .as_str()
-                        .is_some_and(|value| value == "approval_not_expired")
-                })
-            })
+    let apply_status = display_string(apply, "apply_status")?;
+    let applied = display_bool(apply, "applied")?;
+    let authorization_consumed = display_bool(apply, "authorization_consumed")?;
+    let failed_checks = apply
+        .get("failed_checks")
+        .and_then(Value::as_array)
+        .ok_or(RuntimeClientError::InvalidResponse)?;
+    let blocked_checks: &[Value] = apply
+        .get("blocked_checks")
+        .map(|checks| {
+            checks
+                .as_array()
+                .map(Vec::as_slice)
+                .ok_or(RuntimeClientError::InvalidResponse)
+        })
+        .transpose()?
+        .unwrap_or(&[]);
+    validate_direct_proposal_apply_checks(failed_checks)?;
+    validate_direct_proposal_apply_checks(blocked_checks)?;
+    let has_expired_authorization = failed_checks.iter().any(|check| {
+        check
+            .as_str()
+            .is_some_and(|value| value == "approval_not_expired")
+    });
+    if apply_status == "Denied" && !applied && !authorization_consumed && has_expired_authorization
     {
         return Err(RuntimeClientError::ProposalApplyAuthorizationExpired);
+    }
+    if apply_status == "Denied" && !applied && !authorization_consumed {
+        if failed_checks.is_empty() && blocked_checks.is_empty() {
+            return Err(RuntimeClientError::InvalidResponse);
+        }
+        if !matches!(
+            required_display_string(apply, "operation")?.as_str(),
+            "replace_file" | "create_file" | "patch_file"
+        ) {
+            return Err(RuntimeClientError::InvalidResponse);
+        }
+        for key in ["path"] {
+            required_display_string(apply, key)?;
+        }
+        required_apply_rejection_reason(apply)?;
+        return Ok(DirectProposalApplyOutcome::Rejected);
     }
     if !matches!(
         display_string(apply, "operation")?.as_str(),
         "replace_file" | "create_file" | "patch_file"
-    ) || display_string(apply, "apply_status")? != "Applied"
-        || !display_bool(apply, "applied")?
-        || !display_bool(apply, "authorization_consumed")?
+    ) || apply_status != "Applied"
+        || !applied
+        || !authorization_consumed
     {
         return Err(RuntimeClientError::InvalidResponse);
     }
     validate_sha256_fingerprint(&required_display_string(apply, "post_write_sha256")?)?;
+    Ok(DirectProposalApplyOutcome::Applied)
+}
+
+fn validate_direct_proposal_apply_checks(checks: &[Value]) -> Result<(), RuntimeClientError> {
+    if checks.len() > MAX_APPLY_CHECKS_TRANSPORT {
+        return Err(RuntimeClientError::InvalidResponse);
+    }
+    for check in checks {
+        bounded_string(check)?;
+    }
     Ok(())
+}
+
+fn validate_direct_proposal_apply_result(result: &Value) -> Result<(), RuntimeClientError> {
+    match classify_direct_proposal_apply_result(result)? {
+        DirectProposalApplyOutcome::Applied => Ok(()),
+        DirectProposalApplyOutcome::Rejected => Err(RuntimeClientError::InvalidResponse),
+    }
 }
 
 /// Normalizes the two documented `proposal.apply` result envelopes used by
@@ -4037,32 +4124,44 @@ fn canonicalize_direct_proposal_apply_result(result: Value) -> Result<Value, Run
 fn merge_direct_proposal_apply_result(
     original: Value,
     proposal_apply: Value,
+    outcome: DirectProposalApplyOutcome,
 ) -> Result<Value, RuntimeClientError> {
     let mut object = original
         .as_object()
         .cloned()
         .ok_or(RuntimeClientError::InvalidResponse)?;
     object.insert("proposal_apply_result".to_string(), proposal_apply);
-    object.insert(
-        "status".to_string(),
-        Value::String("objective_proposal_applied".to_string()),
-    );
+    // The direct `proposal.apply` result is newer than the drive's retained
+    // execution outcome.  A pre-write denial must supersede a stale resume
+    // outcome, otherwise the controller would repeat the rejected candidate
+    // instead of materializing exact-target repair feedback.
+    if outcome == DirectProposalApplyOutcome::Rejected {
+        object.remove("execution_outcome");
+    }
+    let (status, reason) = match outcome {
+        DirectProposalApplyOutcome::Applied => (
+            "objective_proposal_applied",
+            "objective proposal applied through Runtime proposal.apply",
+        ),
+        DirectProposalApplyOutcome::Rejected => (
+            "objective_proposal_apply_rejected",
+            "Runtime rejected the proposal before any workspace write; create bounded repair feedback from the reported target and failed checks.",
+        ),
+    };
+    object.insert("status".to_string(), Value::String(status.to_string()));
     object.insert(
         "next_route".to_string(),
         json!({
             "kind": "inspect_progress_overview",
             "next_action": "inspect_progress_overview",
-            "reason": "objective proposal applied through Runtime proposal.apply"
+            "reason": reason,
         }),
     );
     object.insert(
         "next_action".to_string(),
         Value::String("inspect_progress_overview".to_string()),
     );
-    object.insert(
-        "stop_reason".to_string(),
-        Value::String("objective_proposal_applied".to_string()),
-    );
+    object.insert("stop_reason".to_string(), Value::String(status.to_string()));
     Ok(Value::Object(object))
 }
 
@@ -5079,6 +5178,15 @@ fn required_display_string(
     bounded_string(value)
 }
 
+fn required_apply_rejection_reason(
+    object: &serde_json::Map<String, Value>,
+) -> Result<String, RuntimeClientError> {
+    let Some(value) = object.get("apply_reason") else {
+        return Err(RuntimeClientError::InvalidResponse);
+    };
+    bounded_apply_rejection_reason(value)
+}
+
 fn display_optional_string(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -5146,6 +5254,36 @@ fn validate_sha256_fingerprint(value: &str) -> Result<(), RuntimeClientError> {
 
 fn bounded_json_string(value: &Value) -> Result<Value, RuntimeClientError> {
     bounded_string(value).map(Value::String)
+}
+
+fn bounded_apply_rejection_reason(value: &Value) -> Result<String, RuntimeClientError> {
+    let value = value.as_str().ok_or(RuntimeClientError::InvalidResponse)?;
+    if value.is_empty()
+        || value.chars().count() > MAX_APPLY_REJECTION_REASON_CHARS
+        || value.contains('\n')
+        || value.contains('\r')
+    {
+        return Err(RuntimeClientError::InvalidResponse);
+    }
+    Ok(value.to_string())
+}
+
+fn bounded_json_apply_rejection_reason(value: &Value) -> Result<Value, RuntimeClientError> {
+    bounded_apply_rejection_reason(value).map(Value::String)
+}
+
+fn bounded_json_string_list(value: &Value, max_items: usize) -> Result<Value, RuntimeClientError> {
+    let values = value
+        .as_array()
+        .ok_or(RuntimeClientError::InvalidResponse)?;
+    if values.len() > max_items {
+        return Err(RuntimeClientError::InvalidResponse);
+    }
+    values
+        .iter()
+        .map(bounded_json_string)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
 }
 
 fn bounded_json_optional_string(value: &Value) -> Result<Value, RuntimeClientError> {
@@ -5732,6 +5870,76 @@ mod tests {
     }
 
     #[test]
+    fn direct_proposal_apply_classifies_prewrite_rejection_for_targeted_repair() {
+        let apply_result = json!({
+            "apply_result": {
+                "operation": "patch_file",
+                "path": "package.json",
+                "apply_status": "Denied",
+                "apply_reason": "Structured content preflight rejected `package.json` because the candidate JSON is not parseable.",
+                "applied": false,
+                "authorization_consumed": false,
+                "failed_checks": ["structured_content_parseable"],
+                "blocked_checks": []
+            }
+        });
+
+        assert_eq!(
+            classify_direct_proposal_apply_result(&apply_result),
+            Ok(DirectProposalApplyOutcome::Rejected)
+        );
+        assert_eq!(
+            validate_direct_proposal_apply_result(&apply_result),
+            Err(RuntimeClientError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn direct_proposal_apply_projects_a_bounded_long_rejection_reason() {
+        let path = format!("fixtures/{}/package.json", "nested/".repeat(22));
+        let reason = format!(
+            "Structured content preflight rejected `{path}` because the candidate JSON is not parseable: {}",
+            "trailing-content ".repeat(24).trim_end()
+        );
+        assert!(reason.chars().count() > MAX_TEXT_FIELD_CHARS);
+        assert!(reason.chars().count() <= MAX_APPLY_REJECTION_REASON_CHARS);
+        let apply_result = json!({
+            "apply_result": {
+                "operation": "patch_file",
+                "path": path,
+                "apply_status": "Denied",
+                "apply_reason": reason,
+                "applied": false,
+                "authorization_consumed": false,
+                "failed_checks": ["structured_content_parseable"],
+                "blocked_checks": []
+            }
+        });
+
+        assert_eq!(
+            classify_direct_proposal_apply_result(&apply_result),
+            Ok(DirectProposalApplyOutcome::Rejected)
+        );
+        let result = merge_direct_proposal_apply_result(
+            json!({
+                "status": "task_executed",
+                "session_id": "cli.run.long-rejection",
+                "drive_id": "cli.run.long-rejection.drive",
+                "next_action": "apply_authorized_objective_proposal",
+                "stop_reason": "objective_proposal_authorization_preflight_ready"
+            }),
+            apply_result,
+            DirectProposalApplyOutcome::Rejected,
+        )
+        .expect("long bounded rejection remains a control result");
+        let payload = cli_run_payload(&result).expect("controller projection");
+
+        assert_eq!(payload["objective_apply_apply_reason"], reason);
+        assert_eq!(payload["controller_action"], "stop");
+        assert!(payload.get("next_invocation").is_none());
+    }
+
+    #[test]
     fn direct_proposal_apply_normalizes_flat_expired_authorization_result() {
         let apply_result = json!({
             "operation": "create_file",
@@ -5779,6 +5987,64 @@ mod tests {
             canonicalize_direct_proposal_apply_result(apply_result),
             Err(RuntimeClientError::InvalidResponse)
         );
+    }
+
+    #[test]
+    fn cli_run_projects_prewrite_rejection_for_controller_repair() {
+        let apply_result = json!({
+            "apply_result": {
+                "operation": "patch_file",
+                "path": "package.json",
+                "apply_status": "Denied",
+                "apply_reason": "Structured content preflight rejected `package.json` because the candidate JSON is not parseable.",
+                "applied": false,
+                "authorization_consumed": false,
+                "failed_checks": ["structured_content_parseable"],
+                "blocked_checks": []
+            }
+        });
+        let result = merge_direct_proposal_apply_result(
+            json!({
+                "status": "task_executed",
+                "session_id": "cli.run.rejected",
+                "drive_id": "cli.run.rejected.drive",
+                "next_action": "apply_authorized_objective_proposal",
+                "stop_reason": "objective_proposal_authorization_preflight_ready",
+                "execution_outcome": {
+                    "schema_version": 1,
+                    "outcome_scope": "objective",
+                    "class": "continuation_required",
+                    "status": "continuation_required",
+                    "controller_action": "resume",
+                    "continuation_required": true,
+                    "completed": false,
+                    "blocked": false,
+                    "retryable": true,
+                    "terminal_failure": false,
+                    "stop_reason": "budget_exhausted",
+                    "next_invocation": {"command": "resume", "arguments": []}
+                }
+            }),
+            apply_result,
+            DirectProposalApplyOutcome::Rejected,
+        )
+        .expect("rejection is an acknowledged control result");
+
+        assert!(result.get("execution_outcome").is_none());
+        let payload = cli_run_payload(&result).expect("controller projection");
+        assert_eq!(payload["status"], "objective_proposal_apply_rejected");
+        assert_eq!(payload["objective_apply_path"], "package.json");
+        assert_eq!(
+            payload["objective_apply_failed_checks"],
+            json!(["structured_content_parseable"])
+        );
+        assert_eq!(payload["objective_apply_authorization_consumed"], false);
+        assert_eq!(payload["controller_action"], "stop");
+        assert_eq!(payload["stop_class"], "repair_required");
+        assert_eq!(payload["continuation_required"], false);
+        assert_eq!(payload["retryable"], true);
+        assert!(payload.get("next_invocation").is_none());
+        assert!(payload["automation"]["next_invocation"].is_null());
     }
 
     #[test]

@@ -898,6 +898,89 @@ test('writes a parseable current-run active-claim resume-admission receipt', () 
   assert.equal(receipt.run_stamp, '20261029T210410Z');
 });
 
+test('quality-gate repair feedback keeps the exact malformed structured target', () => {
+  const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
+  const marker = 'changed_file_quality_gate="$(python3 - "$changed_file_quality_gate" "$active_target_path" "$restored_quality_gate_targets" <<\'PY\'\n';
+  const start = controller.indexOf(marker);
+  assert.ok(start >= 0);
+  const end = controller.indexOf('\nPY\n)"', start);
+  assert.ok(end > start);
+  const feedbackNormalizer = controller.slice(start + marker.length, end);
+  const normalized = JSON.parse(execFileSync('python3', [
+    '-c',
+    feedbackNormalizer,
+    JSON.stringify({
+      completed: false,
+      reason: 'changed_file_quality_gate_failed',
+      changed_files: ['package.json', 'scripts/release-artifact-runtime-journey.test.mjs'],
+      results: [{
+        command: 'node scripts/guard-json-parse.mjs package.json',
+        exit_code: 1,
+        stderr_tail: 'package.json: invalid JSON'
+      }]
+    }),
+    'scripts/release-artifact-runtime-journey.test.mjs',
+    '1'
+  ], { encoding: 'utf8' }));
+
+  assert.equal(normalized.repair_mode, 'structured_target_repair');
+  assert.deepEqual(normalized.structured_target_paths, ['package.json']);
+  assert.equal(normalized.selected_target_path, 'package.json');
+  assert.equal(normalized.selected_target_path_source, 'changed_file_quality_gate');
+  assert.equal(normalized.legacy_selected_target_path, 'scripts/release-artifact-runtime-journey.test.mjs');
+  assert.deepEqual(normalized.semantic_repair_policy.structured_target_paths, ['package.json']);
+  assert(normalized.semantic_repair_policy.forbidden_next_actions.includes('redirect repair to an unrelated first Patch-only target'));
+});
+
+test('objective apply rejection becomes exact-target structured repair feedback before progress integrity', () => {
+  const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
+  const helperStart = controller.indexOf('runtime_stdout_objective_apply_rejection_feedback()');
+  const marker = '  python3 - "$stdout_log" "$active_target_path" <<\'PY\'\n';
+  const start = controller.indexOf(marker, helperStart);
+  const end = controller.indexOf('\nPY\n}', start);
+  assert.ok(helperStart >= 0);
+  assert.ok(start > helperStart);
+  assert.ok(end > start);
+  const feedbackBuilder = controller.slice(start + marker.length, end);
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-objective-apply-rejection-'));
+  const stdoutPath = path.join(fixtureDir, 'run.stdout.json');
+  const applyReason = `Structured content preflight rejected \`package.json\` because the candidate JSON is not parseable: ${'trailing-content '.repeat(24).trim()}`;
+  writeJson(stdoutPath, {
+    run: {
+      status: 'objective_proposal_apply_rejected',
+      objective_apply_operation: 'patch_file',
+      objective_apply_path: 'package.json',
+      objective_apply_apply_status: 'Denied',
+      objective_apply_apply_reason: applyReason,
+      objective_apply_applied: false,
+      objective_apply_authorization_consumed: false,
+      objective_apply_failed_checks: ['structured_content_parseable'],
+      objective_apply_blocked_checks: []
+    }
+  });
+  const feedback = JSON.parse(execFileSync('python3', [
+    '-c',
+    feedbackBuilder,
+    stdoutPath,
+    'scripts/release-artifact-runtime-journey.test.mjs'
+  ], { encoding: 'utf8' }));
+
+  assert.equal(feedback.reason, 'objective_apply_rejected_before_write');
+  assert.equal(feedback.repair_mode, 'structured_candidate_repair');
+  assert.equal(feedback.selected_target_path, 'package.json');
+  assert.equal(feedback.selected_target_path_source, 'runtime_objective_apply');
+  assert.equal(feedback.objective_apply.reason, applyReason);
+  assert.deepEqual(feedback.objective_apply.failed_checks, ['structured_content_parseable']);
+  assert(feedback.semantic_repair_policy.forbidden_next_actions.includes('retry the same rejected candidate'));
+  assert(feedback.semantic_repair_policy.forbidden_next_actions.includes('redirect repair to an unrelated first Patch-only target'));
+
+  const runtimeRun = controller.indexOf('_run_brownie_once()');
+  const feedbackRoute = controller.indexOf('runtime_stdout_objective_apply_rejection_feedback "$stdout_log" "$active_target_path"', runtimeRun);
+  const integrityRoute = controller.indexOf('validate_phase_loop_progress_integrity_after_runtime_apply "$run_stamp"', runtimeRun);
+  assert.ok(feedbackRoute > runtimeRun);
+  assert.ok(feedbackRoute < integrityRoute);
+});
+
 test('expands optional snapshot arguments safely and rejects incomplete snapshot configuration', () => {
   const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
   const preflightFunction = controller.indexOf('run_phase_loop_preflight()');

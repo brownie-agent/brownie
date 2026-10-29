@@ -189,6 +189,23 @@ fn todo_queue_post_apply_rejection_reason(
     None
 }
 
+// A workspace patch may have valid hunk context yet still leave a structured
+// target invalid. Reject strict JSON candidates before any atomic write so a
+// controller never has to restore a malformed file after the fact. JSONC is
+// deliberately excluded because it is not valid strict JSON and needs its own
+// parser-aware policy.
+fn structured_content_post_apply_rejection_reason(path: &str, candidate: &str) -> Option<String> {
+    if !path.ends_with(".json") {
+        return None;
+    }
+
+    serde_json::from_str::<serde_json::Value>(candidate).err().map(|error| {
+        format!(
+            "Structured content preflight rejected `{path}` because the candidate JSON is not parseable: {error}"
+        )
+    })
+}
+
 fn apply_result_check(
     name: &str,
     status: &str,
@@ -1125,6 +1142,29 @@ fn apply_create_file_proposal(
     }
     apply_result.checklist.push(apply_result_check(
         "approved_diff_matches_absent_target",
+        "Pass",
+        None,
+    ));
+
+    if let Some(reason) =
+        structured_content_post_apply_rejection_reason(&proposal.path, replacement_content)
+    {
+        apply_result.checklist.push(apply_result_check(
+            "structured_content_parseable",
+            "Fail",
+            Some(&reason),
+        ));
+        apply_result.apply_reason = reason;
+        return record_apply_result(
+            store,
+            task,
+            &params.run_id,
+            &params.proposal_id,
+            apply_result,
+        );
+    }
+    apply_result.checklist.push(apply_result_check(
+        "structured_content_parseable",
         "Pass",
         None,
     ));
@@ -2110,6 +2150,25 @@ fn apply_patch_file_proposal(
         None,
     ));
 
+    if let Some(reason) =
+        structured_content_post_apply_rejection_reason(&proposal.path, &replacement_content)
+    {
+        return deny_patch_file_apply(
+            store,
+            task,
+            params,
+            apply_result,
+            "structured_content_parseable",
+            "Fail",
+            &reason,
+        );
+    }
+    apply_result.checklist.push(apply_result_check(
+        "structured_content_parseable",
+        "Pass",
+        None,
+    ));
+
     if let Some(reason) = todo_queue_post_apply_rejection_reason(
         store.workspace_root(),
         &proposal.path,
@@ -3000,6 +3059,16 @@ fn apply_replace_file_transaction_recovery(
                 "Approved diff does not match a current transaction recovery target.",
             );
         }
+        if let Some(reason) = structured_content_post_apply_rejection_reason(
+            &proposal.path,
+            &item.replacement_content,
+        ) {
+            return deny(
+                apply_result,
+                "transaction_recovery_structured_content_parseable",
+                &reason,
+            );
+        }
         if let Some(reason) = todo_queue_post_apply_rejection_reason(
             store.workspace_root(),
             &proposal.path,
@@ -3634,6 +3703,16 @@ fn apply_create_file_transaction_recovery(
                 apply_result,
                 "transaction_recovery_approved_diffs_match_absent_targets",
                 "Approved diff does not match an absent transaction recovery target.",
+            );
+        }
+        if let Some(reason) = structured_content_post_apply_rejection_reason(
+            &proposal.path,
+            &item.replacement_content,
+        ) {
+            return deny(
+                apply_result,
+                "transaction_recovery_structured_content_parseable",
+                &reason,
             );
         }
         let content_chars = item.replacement_content.chars().count();
@@ -4767,6 +4846,16 @@ fn apply_replace_file_transaction(
                 "Approved diff does not match a current transaction target and replacement content.",
             );
         }
+        if let Some(reason) = structured_content_post_apply_rejection_reason(
+            &proposal.path,
+            &item.replacement_content,
+        ) {
+            return deny_item(
+                apply_result,
+                "transaction_structured_content_parseable",
+                &reason,
+            );
+        }
         if let Some(reason) = todo_queue_post_apply_rejection_reason(
             store.workspace_root(),
             &proposal.path,
@@ -5227,6 +5316,16 @@ fn apply_create_file_transaction(
                 apply_result,
                 "transaction_approved_diffs_match_absent_targets",
                 "Approved diff does not match an absent transaction target and replacement content.",
+            );
+        }
+        if let Some(reason) = structured_content_post_apply_rejection_reason(
+            &proposal.path,
+            &item.replacement_content,
+        ) {
+            return deny(
+                apply_result,
+                "transaction_structured_content_parseable",
+                &reason,
             );
         }
         let content_chars = item.replacement_content.chars().count();
@@ -6512,6 +6611,29 @@ pub(super) fn apply_proposal(
         None,
     ));
 
+    if let Some(reason) =
+        structured_content_post_apply_rejection_reason(&proposal.path, replacement_content)
+    {
+        apply_result.checklist.push(apply_result_check(
+            "structured_content_parseable",
+            "Fail",
+            Some(&reason),
+        ));
+        apply_result.apply_reason = reason;
+        return record_apply_result(
+            store,
+            &task,
+            &params.run_id,
+            &params.proposal_id,
+            apply_result,
+        );
+    }
+    apply_result.checklist.push(apply_result_check(
+        "structured_content_parseable",
+        "Pass",
+        None,
+    ));
+
     if let Some(reason) = todo_queue_post_apply_rejection_reason(
         store.workspace_root(),
         &proposal.path,
@@ -6724,5 +6846,40 @@ mod todo_queue_post_apply_tests {
             todo_queue_post_apply_rejection_reason(&root, ".brownie/todo.md", candidate).is_none()
         );
         std::fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+}
+
+#[cfg(test)]
+mod structured_content_post_apply_tests {
+    use super::structured_content_post_apply_rejection_reason;
+
+    #[test]
+    fn rejects_malformed_json_without_treating_it_as_a_write_candidate() {
+        let reason = structured_content_post_apply_rejection_reason(
+            "package.json",
+            "{\n  \"name\": \"brownie\"\n}\n{\n",
+        )
+        .expect("malformed JSON must be rejected before write");
+        assert!(reason.contains("package.json"));
+        assert!(reason.contains("not parseable"));
+    }
+
+    #[test]
+    fn accepts_parseable_json_candidates() {
+        assert!(structured_content_post_apply_rejection_reason(
+            "config/runtime.json",
+            "{\n  \"enabled\": true\n}\n",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn leaves_non_strict_json_paths_to_their_parser_aware_policies() {
+        assert!(structured_content_post_apply_rejection_reason(
+            "config/runtime.jsonc",
+            "{\n  // comment\n  \"enabled\": true,\n}\n",
+        )
+        .is_none());
+        assert!(structured_content_post_apply_rejection_reason("README.md", "not json").is_none());
     }
 }
