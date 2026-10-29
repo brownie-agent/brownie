@@ -6412,14 +6412,16 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 workspace_root = pathlib.Path(sys.argv[1])
 before_status_path = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
 
-def run(args, timeout=240, cwd=None):
+def run(args, timeout=240, cwd=None, env=None):
     completed = subprocess.run(
         args,
         cwd=cwd or workspace_root,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -6486,6 +6488,51 @@ def safe_relative_path(value):
         raise ValueError(f"unsafe changed path: {value!r}")
     return candidate
 
+def initialize_isolated_validation_git(snapshot):
+    """Give the archive a baseline commit so repository-aware guards see the run delta."""
+    commands = (
+        (["git", "init", "--quiet"], 60),
+        (["git", "add", "--force", "--all"], 120),
+        ([
+            "git", "-c", "user.name=Brownie", "-c", "user.email=brownie@example.invalid",
+            "-c", "commit.gpgSign=false", "commit", "--quiet", "-m", "phase-loop quality-gate baseline",
+        ], 120),
+    )
+    for args, timeout in commands:
+        completed = subprocess.run(args, cwd=snapshot, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        if completed.returncode != 0:
+            raise RuntimeError(sanitize(completed.stderr) or f"{' '.join(args)} failed")
+    completed = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=snapshot,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise RuntimeError(sanitize(completed.stderr) or "isolated validation baseline is unavailable")
+    return completed.stdout.strip()
+
+def link_workspace_package_node_modules(snapshot):
+    """Mirror pnpm's package-local dependency links without importing source dirt."""
+    ignored_directory_names = {".git", ".brownie", "node_modules", "target", "dist", "out", "coverage"}
+    package_directories = []
+    for raw_directory, directory_names, file_names in os.walk(workspace_root, topdown=True, followlinks=False):
+        directory_names[:] = [name for name in directory_names if name not in ignored_directory_names]
+        if "package.json" in file_names:
+            package_directories.append(pathlib.Path(raw_directory))
+    for package_directory in package_directories:
+        source_node_modules = package_directory / "node_modules"
+        if not source_node_modules.exists():
+            continue
+        relative_package_directory = package_directory.relative_to(workspace_root)
+        target_node_modules = snapshot.joinpath(*relative_package_directory.parts, "node_modules")
+        if target_node_modules.exists() or target_node_modules.is_symlink():
+            continue
+        target_node_modules.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(source_node_modules, target_node_modules, target_is_directory=True)
+
 def create_isolated_validation_root(paths):
     """Materialize HEAD plus this run's delta without importing baseline dirt."""
     snapshot = pathlib.Path(tempfile.mkdtemp(prefix="brownie-phase-loop-quality-"))
@@ -6509,6 +6556,7 @@ def create_isolated_validation_root(paths):
                 if not (member.isfile() or member.isdir()):
                     raise ValueError(f"unsupported archive member: {member.name!r}")
                 archive.extract(member, snapshot)
+        baseline_ref = initialize_isolated_validation_git(snapshot)
         for path in paths:
             relative = safe_relative_path(path)
             source = workspace_root.joinpath(*relative.parts)
@@ -6517,17 +6565,21 @@ def create_isolated_validation_root(paths):
                 if source.is_dir() or source.is_symlink():
                     raise ValueError(f"changed path is not a regular file: {path!r}")
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target)
+                previous_mtime_ns = target.stat().st_mtime_ns if target.exists() and not target.is_symlink() else 0
+                shutil.copyfile(source, target)
+                os.chmod(target, source.stat().st_mode & 0o777)
+                # A same-size edit made within the filesystem timestamp
+                # granularity can otherwise remain racily clean in this
+                # synthetic Git index. Make the run delta observable.
+                overlay_mtime_ns = max(time.time_ns(), previous_mtime_ns + 1)
+                os.utime(target, ns=(overlay_mtime_ns, overlay_mtime_ns))
             elif target.exists() or target.is_symlink():
                 if target.is_dir() and not target.is_symlink():
                     shutil.rmtree(target)
                 else:
                     target.unlink()
-        source_node_modules = workspace_root / "node_modules"
-        target_node_modules = snapshot / "node_modules"
-        if source_node_modules.exists() and not target_node_modules.exists():
-            os.symlink(source_node_modules, target_node_modules, target_is_directory=True)
-        return snapshot
+        link_workspace_package_node_modules(snapshot)
+        return snapshot, baseline_ref
     except Exception:
         shutil.rmtree(snapshot, ignore_errors=True)
         raise
@@ -6625,14 +6677,20 @@ if any(path.endswith(("package.json", "pnpm-lock.yaml")) for path in changed):
 
 needs_isolated_workspace_check = any(path.endswith(("package.json", "pnpm-lock.yaml")) for path in changed)
 validation_root = None
+validation_environment = None
 validation_context = {
     "baseline_status_sha256": baseline_status_sha256,
     "workspace": "live_workspace",
+    "git_context": "live_workspace",
 }
 if needs_isolated_workspace_check:
     try:
-        validation_root = create_isolated_validation_root(changed)
+        validation_root, validation_base_ref = create_isolated_validation_root(changed)
         validation_context["workspace"] = "isolated_git_archive_with_run_delta"
+        validation_context["git_context"] = "synthetic_baseline_with_run_delta"
+        validation_environment = dict(os.environ)
+        validation_environment["BROWNIE_JS_REACHABILITY_BASE"] = validation_base_ref
+        validation_environment["BROWNIE_PHASE_VALUE_CHANGED_FILES"] = json.dumps(changed)
     except Exception as error:
         print(json.dumps({
             "completed": False,
@@ -6647,7 +6705,8 @@ if needs_isolated_workspace_check:
 try:
     for args, timeout in commands:
         command_root = validation_root if validation_root and args == ["pnpm", "--workspace-root", "check"] else workspace_root
-        result = run(args, timeout=timeout, cwd=command_root)
+        command_environment = validation_environment if validation_root and command_root == validation_root else None
+        result = run(args, timeout=timeout, cwd=command_root, env=command_environment)
         results.append(result)
         if result["exit_code"] != 0:
             print(json.dumps({
@@ -8789,7 +8848,11 @@ try:
                 raise ValueError("target is not a regular file")
             stored = temporary / f"{index}.before"
             shutil.copyfile(absolute, stored)
-            entry.update({"state": "file", "sha256": sha256(stored)})
+            entry.update({
+                "state": "file",
+                "sha256": sha256(stored),
+                "mode": absolute.stat().st_mode & 0o777,
+            })
         else:
             entry["state"] = "absent"
         entries.append(entry)
@@ -8885,9 +8948,16 @@ try:
         expected_sha256 = entry.get("sha256")
         if not stored.is_file() or not isinstance(expected_sha256, str) or sha256(stored) != expected_sha256:
             raise ValueError("snapshot bytes are unavailable or corrupt")
+        mode = entry.get("mode")
+        if type(mode) is not int or mode < 0 or mode > 0o777:
+            # Legacy v1 snapshots did not persist mode. Preserve the stored
+            # file's mode as a compatibility fallback; new snapshots always
+            # carry the exact original mode.
+            mode = stored.stat().st_mode & 0o777
         absolute.parent.mkdir(parents=True, exist_ok=True)
         temporary = absolute.with_name(f".{absolute.name}.phase-loop-restore")
         shutil.copyfile(stored, temporary)
+        os.chmod(temporary, mode)
         os.replace(temporary, absolute)
     (snapshot_dir / "restore-audit.json").write_text(json.dumps({"schema_version": 1, "kind": "phase_loop_pre_runtime_target_restore", "targets": audit}, sort_keys=True) + "\n", encoding="utf-8")
 except Exception as error:
