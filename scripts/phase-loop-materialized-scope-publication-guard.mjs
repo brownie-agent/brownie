@@ -132,7 +132,7 @@ function writeIndexText(repoRoot, relativePath, text) {
 }
 
 function materializedTransitions(records) {
-  const transitions = [];
+  const transitions = new Map();
   for (const record of records) {
     if (record?.schema_version !== 1
       || record?.record_type !== 'todo_contract_rebaseline'
@@ -151,22 +151,54 @@ function materializedTransitions(records) {
         if (!snapshot?.sha256_after) continue;
         targets.push({
           path: target,
-          placeholder_sha256: String(snapshot.sha256_after),
-          target_capture_mode: String(record.target_capture?.mode ?? '')
+          placeholder_sha256: String(snapshot.sha256_after)
         });
       }
       if (targets.length === 0) continue;
-      transitions.push({
-        todo_id: before.id,
-        before_contract: before,
-        after_contract: after,
-        targets,
-        receipt_run_stamp: String(record.cause_run?.run_stamp ?? ''),
-        receipt_event_key: String(record.cause_run?.event_key ?? '')
-      });
+      const captureMode = String(record.target_capture?.mode ?? '');
+      const normalizedTargets = targets.map((target) => ({
+        ...target,
+        target_capture_modes: [captureMode]
+      }));
+      const receiptRunStamp = String(record.cause_run?.run_stamp ?? '');
+      const receiptEventKey = String(record.cause_run?.event_key ?? '');
+      const key = JSON.stringify({ todo_id: before.id, before_contract: before, after_contract: after });
+      const existing = transitions.get(key);
+      if (!existing) {
+        transitions.set(key, {
+          todo_id: before.id,
+          before_contract: before,
+          after_contract: after,
+          targets: normalizedTargets,
+          target_evidence_conflicts: [],
+          receipt_run_stamps: [receiptRunStamp],
+          receipt_event_keys: [receiptEventKey]
+        });
+        continue;
+      }
+      if (!existing.receipt_run_stamps.includes(receiptRunStamp)) existing.receipt_run_stamps.push(receiptRunStamp);
+      if (!existing.receipt_event_keys.includes(receiptEventKey)) existing.receipt_event_keys.push(receiptEventKey);
+      for (const target of normalizedTargets) {
+        const matchingTarget = existing.targets.find((candidate) => candidate.path === target.path);
+        if (!matchingTarget) {
+          existing.targets.push(target);
+          continue;
+        }
+        if (matchingTarget.placeholder_sha256 !== target.placeholder_sha256) {
+          existing.target_evidence_conflicts.push({
+            path: target.path,
+            expected_sha256: matchingTarget.placeholder_sha256,
+            conflicting_sha256: target.placeholder_sha256
+          });
+          continue;
+        }
+        for (const mode of target.target_capture_modes) {
+          if (!matchingTarget.target_capture_modes.includes(mode)) matchingTarget.target_capture_modes.push(mode);
+        }
+      }
     }
   }
-  return transitions;
+  return [...transitions.values()];
 }
 
 function findTransitionPath(transitions, start, target) {
@@ -209,6 +241,9 @@ function findTerminalTransitionPath(transitions, start) {
 }
 
 function validateTargetCandidate(repoRoot, baseRef, transition, errors) {
+  for (const conflict of transition.target_evidence_conflicts ?? []) {
+    errors.push({ code: 'materialized_scope_target_evidence_conflict', todo_id: transition.todo_id, ...conflict });
+  }
   for (const target of transition.targets) {
     if (!safeRelativePath(target.path)) {
       errors.push({ code: 'materialized_scope_target_path_invalid', todo_id: transition.todo_id, path: target.path });
@@ -230,7 +265,7 @@ function validateTargetCandidate(repoRoot, baseRef, transition, errors) {
       continue;
     }
     const rawPlaceholderMatch = sha256File(absolutePath) === target.placeholder_sha256;
-    const legacyTrimmedPlaceholderMatch = target.target_capture_mode === 'legacy_pre_capture_materialization'
+    const legacyTrimmedPlaceholderMatch = target.target_capture_modes?.includes('legacy_pre_capture_materialization')
       && sha256Text(fs.readFileSync(absolutePath, 'utf8').trim()) === target.placeholder_sha256;
     if (rawPlaceholderMatch || legacyTrimmedPlaceholderMatch) {
       errors.push({ code: 'materialized_scope_target_still_placeholder', todo_id: transition.todo_id, path: target.path });
@@ -241,6 +276,17 @@ function validateTargetCandidate(repoRoot, baseRef, transition, errors) {
       errors.push({ code: 'materialized_scope_target_not_in_candidate', todo_id: transition.todo_id, path: target.path });
     }
   }
+}
+
+function targetIsInCandidate(repoRoot, baseRef, target) {
+  if (!safeRelativePath(target.path)) return false;
+  const stagedBlob = indexBlob(repoRoot, target.path);
+  if (!stagedBlob) return false;
+  return revisionBlob(repoRoot, baseRef, target.path) !== stagedBlob;
+}
+
+function receiptRunStamps(pathTransitions) {
+  return [...new Set(pathTransitions.flatMap((transition) => transition.receipt_run_stamps ?? []))];
 }
 
 export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, baseRef = 'HEAD', applyIndex = false } = {}) {
@@ -308,6 +354,13 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
 
     const candidate = contractForTodo(candidateTodoText, todoId);
     const states = [base.contract, ...pathTransitions.map((transition) => transition.after_contract)];
+    const candidateIncludesTarget = pathTransitions.some((transition) => transition.targets.some((target) => targetIsInCandidate(repoRoot, baseRef, target)));
+    const candidateChangesContract = !candidate || !sameContract(base.contract, candidate.contract);
+    // Receipts may outlive the PR that produced them.  A dirty worktree can
+    // therefore contain many rebased TODOs, but publication may only validate
+    // and stage the TODO whose target or contract is actually in this
+    // candidate.  Unrelated receipt history must not block that candidate.
+    if (!candidateIncludesTarget && !candidateChangesContract) continue;
     // A caller may already have staged the exact queue removal before this
     // guard runs.  That is a valid candidate shape, but it must not bypass
     // target validation: otherwise a staged removal plus an unchanged
@@ -319,7 +372,7 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
         todo_id: todoId,
         completion_removed: true,
         completion_removal_already_staged: true,
-        receipt_run_stamps: pathTransitions.map((transition) => transition.receipt_run_stamp),
+        receipt_run_stamps: receiptRunStamps(pathTransitions),
         targets: pathTransitions.flatMap((transition) => transition.targets.map((target) => target.path))
       });
       continue;
@@ -352,7 +405,7 @@ export function guardMaterializedScopePublication({ repoRoot = defaultRepoRoot, 
     checked.push({
       todo_id: todoId,
       completion_removed: completed,
-      receipt_run_stamps: pathTransitions.map((transition) => transition.receipt_run_stamp),
+      receipt_run_stamps: receiptRunStamps(pathTransitions),
       targets: pathTransitions.flatMap((transition) => transition.targets.map((target) => target.path))
     });
   }
