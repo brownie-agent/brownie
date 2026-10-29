@@ -862,6 +862,42 @@ test('places the strict preflight boundary before claim rebaseline and forbids l
   assert.match(staleRebaseline, /--resume-admission/u);
 });
 
+test('writes a parseable current-run active-claim resume-admission receipt', () => {
+  const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
+  const marker = "output=\"$(printf '%s' \"$preflight_output\" | python3 -c '" + '\n';
+  const start = controller.indexOf(marker);
+  const end = controller.indexOf("' \"$receipt_path\" \"$run_stamp\" 2>&1)\"", start);
+  assert.ok(start >= 0);
+  assert.ok(end > start);
+  const writer = controller.slice(start + marker.length, end);
+  const receiptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-resume-admission-'));
+  const receiptPath = path.join(receiptDir, 'receipt.json');
+  const admission = {
+    active_claim_resume_admission: {
+      schema_version: 1,
+      kind: 'phase_loop_active_claim_resume_admission',
+      claim_id: 'claim-fixture',
+      selected_todo_id: 'E-fixture',
+      selected_todo_sha256: 'a'.repeat(64),
+      queue_generation: 1,
+      queue_fingerprint: 'fixture-queue',
+      admitted_targets: [{ target: 'scripts/fixture.mjs' }],
+      materializations: [{ materialized_target: 'scripts/fixture.mjs' }]
+    }
+  };
+  const result = execFileSync('python3', ['-c', writer, receiptPath, '20261029T210410Z'], {
+    input: JSON.stringify(admission),
+    encoding: 'utf8'
+  });
+  assert.equal(result.trim(), 'written');
+  const receiptText = fs.readFileSync(receiptPath, 'utf8');
+  assert.equal(receiptText.endsWith('\n'), true);
+  assert.equal(receiptText.endsWith('\\n'), false);
+  const receipt = JSON.parse(receiptText);
+  assert.equal(receipt.kind, 'phase_loop_active_claim_resume_admission_receipt');
+  assert.equal(receipt.run_stamp, '20261029T210410Z');
+});
+
 test('expands optional snapshot arguments safely and rejects incomplete snapshot configuration', () => {
   const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
   const preflightFunction = controller.indexOf('run_phase_loop_preflight()');
