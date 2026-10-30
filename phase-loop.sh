@@ -14472,6 +14472,43 @@ phase_loop_rebaseline_workspace_to_approved_baseline() {
   return 0
 }
 
+phase_loop_restore_admission_backed_stale_claim() {
+  local run_stamp="$1"
+  local output status restored
+  if [ ! -f "$ROOT_DIR/scripts/phase-loop-claim-rebaseline.mjs" ]; then
+    printf '%s run=%s admission_backed_claim_restore_guard_missing=true\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  set +e
+  output="$(
+    cd "$ROOT_DIR" || exit 70
+    node "$ROOT_DIR/scripts/phase-loop-claim-rebaseline.mjs" restore-admitted-stale-claim \
+      --state-dir "$STATE_DIR" \
+      --claim "$TODO_CLAIM_FILE" \
+      --status "$STATUS_FILE" \
+      --progress "$PROGRESS_STATE_FILE" \
+      --queue "$TODO_QUEUE_STATE_FILE" \
+      --runs "$RUN_DIR" \
+      --todo "$PHASE_LOOP_TODO" \
+      --run-stamp "$run_stamp" 2>&1
+  )"
+  status=$?
+  set -e
+  printf '%s run=%s admission_backed_claim_restore_exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$status" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+  if [ "$status" -ne 0 ]; then
+    return 78
+  fi
+  restored="$(printf '%s' "$output" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("restored") else "0")' 2>/dev/null || true)"
+  if [ "$restored" != "0" ] && [ "$restored" != "1" ]; then
+    printf '%s run=%s admission_backed_claim_restore_result_invalid=true result=%s\n' "$(now_utc)" "$run_stamp" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  if [ "$restored" = "1" ]; then
+    PHASE_LOOP_ADMISSION_BACKED_CLAIM_RESTORED=1
+  fi
+  return 0
+}
+
 phase_loop_rebaseline_stale_claim() {
   local run_stamp="$1"
   local output status rebaselined
@@ -15992,6 +16029,18 @@ _run_brownie_once() {
     if [ -n "${PHASE_LOOP_ACTIVE_STDOUT_LOG:-}" ]; then
       printf '%s\n' "$PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC" >> "$PHASE_LOOP_ACTIVE_STDOUT_LOG"
     fi
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+
+  # A previous controller version could archive an exact, receipt-admitted
+  # claim solely because it had classified a no-actionable Runtime response as
+  # terminal. Restore only the audit-bound shape before the strict boundary so
+  # that boundary can issue a fresh receipt for the same claim; any other
+  # archive remains unavailable to claim selection.
+  if ! phase_loop_restore_admission_backed_stale_claim "$run_stamp"; then
+    detail="An admission-backed stale claim could not be safely restored before the strict boundary; refusing claim selection, task-ledger transition, and Runtime start."
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
     write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
     return 78
   fi
