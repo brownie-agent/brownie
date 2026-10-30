@@ -1702,10 +1702,10 @@ impl BdkExecutionState {
                 "request exactly one workspace.read for the already-read selected target with input.offset_bytes equal to required_workspace_read_offset_bytes. This required continuation takes precedence over general workspace.read prohibitions and is not a duplicate. Do not repeat the prior range, infer old_text from omitted content, request workspace.write, or edit `.brownie/todo.md` before this continuation completes. If Runtime denies this exact continuation range, report one concise stable runtime blocker instead of retrying it"
             }
             Self::ImplementPatch if bounded_leaf => {
-                "workspace.read is forbidden for the next output because the target file was already read. Request exactly one tool request total: one bounded workspace.write patch_file for the named target file, and keep the entire fenced JSON under about 1200 characters. Use one hunk only; old_text must be exact complete lines copied from completed Tool Execution and must cover a complete syntactic region for the requested replacement. For JavaScript/TypeScript function changes, old_text must include the complete function body being replaced, not only the `function ... {` signature line. new_text must be the smallest complete syntactic replacement needed for this pass. Do not patch unrelated large setup/parsing functions unless the selected TODO names them. Do not emit unrelated helper blocks, multiple function additions, or multiple tool_requests in one response. If the change needs multiple hunks or multiple writes, patch one complete syntactic hunk only and leave the remaining work for a later loop. If the needed old_text is not visible or the complete hunk would exceed the fenced JSON budget, report a concrete external/owner blocker naming the missing fact; never patch `.brownie/todo.md` to re-split this bounded leaf and do not request workspace.read to copy old_text again"
+                "workspace.read is forbidden for the next output because the target file was already read. Request exactly one tool request total: one bounded workspace.write patch_file for the named target file, and keep the entire fenced JSON comfortably below the Runtime parser limit. Use one hunk only; old_text must be exact complete lines copied from completed Tool Execution and must cover the smallest complete syntactic region for the requested replacement. Prefer one statement, declaration, or object entry over a whole function or file. If replacing a function signature, include that function body too; never replace only a signature with a large body. new_text must be the smallest complete syntactic replacement needed for this pass. Do not patch unrelated large setup/parsing functions unless the selected TODO names them. Do not emit unrelated helper blocks, multiple function additions, or multiple tool_requests in one response. If the change needs multiple hunks or multiple writes, patch one complete syntactic hunk only and leave the remaining work for a later loop. If the needed old_text is not visible or the complete hunk would exceed the fenced JSON budget, report a concrete external/owner blocker naming the missing fact; never patch `.brownie/todo.md` to re-split this bounded leaf and do not request workspace.read to copy old_text again"
             }
             Self::ImplementPatch => {
-                "workspace.read is forbidden for the next output because the target file was already read. Request exactly one tool request total: one bounded workspace.write patch_file for the named target file, and keep the entire fenced JSON under about 1200 characters. Use one hunk only; old_text must be exact complete lines copied from completed Tool Execution and must cover a complete syntactic region for the requested replacement. For JavaScript/TypeScript function changes, old_text must include the complete function body being replaced, not only the `function ... {` signature line. new_text must be the smallest complete syntactic replacement needed for this pass. Do not patch unrelated large setup/parsing functions unless the selected TODO names them. Do not emit unrelated helper blocks, multiple function additions, or multiple tool_requests in one response. If the change needs multiple hunks or multiple writes, patch one complete syntactic hunk only and leave the remaining work for a later loop. If the needed old_text is not visible or the complete hunk would exceed the fenced JSON budget, patch `.brownie/todo.md` with a smaller context-bounded follow-up TODO; do not request workspace.read to copy old_text again"
+                "workspace.read is forbidden for the next output because the target file was already read. Request exactly one tool request total: one bounded workspace.write patch_file for the named target file, and keep the entire fenced JSON comfortably below the Runtime parser limit. Use one hunk only; old_text must be exact complete lines copied from completed Tool Execution and must cover the smallest complete syntactic region for the requested replacement. Prefer one statement, declaration, or object entry over a whole function or file. If replacing a function signature, include that function body too; never replace only a signature with a large body. new_text must be the smallest complete syntactic replacement needed for this pass. Do not patch unrelated large setup/parsing functions unless the selected TODO names them. Do not emit unrelated helper blocks, multiple function additions, or multiple tool_requests in one response. If the change needs multiple hunks or multiple writes, patch one complete syntactic hunk only and leave the remaining work for a later loop. If the needed old_text is not visible or the complete hunk would exceed the fenced JSON budget, patch `.brownie/todo.md` with a smaller context-bounded follow-up TODO; do not request workspace.read to copy old_text again"
             }
             Self::RepairPatch => {
                 "request a bounded workspace.write repair to the target file that directly addresses the latest verification failure evidence. Do not patch `.brownie/todo.md` merely to avoid a concrete syntax/test failure after an implementation patch"
@@ -1714,10 +1714,10 @@ impl BdkExecutionState {
                 "request exactly one workspace.write patch_file for `.brownie/todo.md` using top-level `old_text` and `new_text` input fields; do not use `hunks` or `occurrence`. For self-source repair use one tiny complete-line replacement. For duplicate-only repair, use the exact duplicate block supplied by the focused repair context as old_text and an empty new_text; the runtime selects the duplicate occurrence after validating the top-level contract. Do not invent TODO block text or include Queue protocol, Base Phase Loop Prompt, unrelated headings, or implementation files"
             }
             Self::OversizedWriteRecovery if bounded_leaf => {
-                "do not repeat the oversized workspace.write. Reuse completed workspace.read evidence and request exactly one smaller complete workspace.write patch_file for the named target with one complete hunk; keep the whole fenced JSON under about 1200 characters and the input below the parser limit. If no complete bounded target hunk is visible, report a concrete external/owner blocker naming the missing fact. Never patch `.brownie/todo.md` to re-split this bounded leaf"
+                "do not repeat the oversized or unfinished workspace.write. This is the one materially different recovery attempt: emit only one minimal fenced JSON tool intent, with no explanation, no whole-file/function replacement, and one small complete statement/declaration/object-entry hunk for the named target. Reuse completed workspace.read evidence and keep the input comfortably below the parser limit. If no complete bounded target hunk is visible, report a concrete external/owner blocker naming the missing fact. A second same-class parser rejection stops this task with durable diagnostics; never patch `.brownie/todo.md` to re-split this bounded leaf"
             }
             Self::OversizedWriteRecovery => {
-                "do not repeat the oversized workspace.write. Reuse completed workspace.read evidence and request exactly one workspace.write patch_file for the named target with one complete hunk; keep the whole fenced JSON under about 1200 characters and the input below the parser limit. If no complete bounded target hunk is visible, request exactly one workspace.write patch_file for `.brownie/todo.md`: old_text must be the full selected TODO block, and new_text must contain exactly one smaller unchecked leaf TODO under 1200 characters. The leaf must use a new unique TODO id and include `Route:`, `Source TODO:` referencing the selected TODO id, `Depends on:`, `Completion condition:`, `Forbidden changes:`, and `Verification:`. The leaf must name at most one target file and one verification command. new_text must not contain the selected TODO first line, selected TODO id, the original broad TODO title, multiple TODO items, or implementation patch content"
+                "do not repeat the oversized or unfinished workspace.write. This is the one materially different recovery attempt: emit only one minimal fenced JSON tool intent, with no explanation, no whole-file/function replacement, and one small complete statement/declaration/object-entry hunk for the named target. Reuse completed workspace.read evidence and keep the input comfortably below the parser limit. If no complete bounded target hunk is visible, request exactly one workspace.write patch_file for `.brownie/todo.md`: old_text must be the full selected TODO block, and new_text must contain exactly one smaller unchecked leaf TODO under the parser limit. The leaf must use a new unique TODO id and include `Route:`, `Source TODO:` referencing the selected TODO id, `Depends on:`, `Completion condition:`, `Forbidden changes:`, and `Verification:`. The leaf must name at most one target file and one verification command. new_text must not contain the selected TODO first line, selected TODO id, the original broad TODO title, multiple TODO items, or implementation patch content. A second same-class parser rejection stops this task with durable diagnostics"
             }
             Self::DecomposeTodo => {
                 "request exactly one workspace.write patch_file to the live TODO queue (`.brownie/todo.md` unless the selected queue is legacy `todo.md`). old_text must be the full selected TODO block exactly as shown under `## Selected TODO`. new_text must contain only 1-2 short unchecked leaf TODOs under 1800 total characters. Each leaf must use this multi-line shape exactly: first line `- [ ] E-...: Patch only `path` ...:` or `- [ ] E-...: Blocker: ...`, then separate indented lines starting `Route:`, `Source TODO:`, `Depends on:`, `Completion condition:`, `Forbidden changes:`, and `Verification:`. Never copy the selected TODO first line, selected TODO id, `TODO-decompose-...`, or the broad source TODO title into new_text. Do not target any later TODO, do not keep the selected decomposition item pending, and do not use only the first line as old_text"
@@ -2143,7 +2143,7 @@ mod tests {
             .contains("one_complete_syntactic_hunk_only"));
         assert!(prompt.messages[1]
             .content
-            .contains("not only the `function ... {` signature line"));
+            .contains("never replace only a signature with a large body"));
         assert!(prompt.messages[0]
             .content
             .contains("For patch_file after workspace.read, prefer old_text/new_text"));
@@ -2487,7 +2487,7 @@ mod tests {
         let prompt = PromptBuilder::build(PromptBuildInput {
             task_id: "task_1".into(),
             run_id: "run_1".into(),
-            goal: "# Brownie Phase Loop Effective Prompt\n\n## BDK Execution Packet\n\n- state: `verify_or_repair`\n\n## Selected TODO\n\n- [ ] E-15d-soak-section-collector: Patch only `scripts/release-runtime-operational-evidence.mjs`.\n".into(),
+            goal: "# Brownie Phase Loop Effective Prompt\n\n## BDK Execution Packet\n\n- state: `verify_or_repair`\n\n## Selected TODO\n\n- [ ] E-15d-soak-section-collector: Patch only `scripts/release-runtime-operational-evidence.mjs`.\n  Route: implementation.\n".into(),
             mode_id: Some("implementer".into()),
             mode_policy_summary: Some("Mode Policy:\nmode_id: implementer".into()),
             mode_instruction_material: Some("Mode Instructions:\n<none>".into()),
@@ -2516,17 +2516,22 @@ mod tests {
             .contains("state: oversized_write_recovery"));
         assert!(prompt.messages[1]
             .content
-            .contains("do not repeat the oversized workspace.write"));
-        assert!(prompt.messages[1].content.contains("one complete hunk"));
+            .contains("do not repeat the oversized or unfinished workspace.write"));
         assert!(prompt.messages[1]
             .content
-            .contains("under about 1200 characters"));
+            .contains("one materially different recovery attempt"));
+        assert!(prompt.messages[1]
+            .content
+            .contains("one small complete statement/declaration/object-entry hunk"));
         assert!(prompt.messages[1]
             .content
             .contains("If no complete bounded target hunk is visible"));
         assert!(prompt.messages[1]
             .content
-            .contains("Never patch `.brownie/todo.md` to re-split this bounded leaf"));
+            .contains("never patch `.brownie/todo.md` to re-split this bounded leaf"));
+        assert!(prompt.messages[1]
+            .content
+            .contains("A second same-class parser rejection stops this task"));
     }
 
     #[test]

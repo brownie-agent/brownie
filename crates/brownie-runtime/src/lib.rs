@@ -457,6 +457,11 @@ const TASK_RUN_CONTEXT_BUDGET_MAX_PROMPT_CHARS: usize = 1_000_000;
 const TASK_RUN_CONTEXT_BUDGET_MAX_LEDGER_EVENTS: usize = 64;
 const TASK_RUN_CONTEXT_BUDGET_MAX_SELECTED_INDEX_CHARS: usize = MAX_WORKSPACE_READ_BYTES;
 const MAX_WORKSPACE_WRITE_PARSER_REJECTIONS: usize = 3;
+// One recovery request is useful when a provider produced an accidental
+// malformed write intent. Repeating the same parser-failure class after that
+// has not changed the executable state, so stop with durable diagnostics
+// instead of spending another provider request on the same causal chain.
+const MAX_CONSECUTIVE_WORKSPACE_WRITE_PARSER_FAILURES: usize = 2;
 const METHOD_MODE_LIST: &str = "mode.list";
 const METHOD_MODE_GET: &str = "mode.get";
 const METHOD_MODEPACK_ACTIVATE: &str = "modepack.activate";
@@ -2734,6 +2739,34 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
                     ) || is_recoverable_invalid_workspace_patch_proposal_for_followup(event)
                 })
                 .count();
+            if followup_write_missing {
+                if let Some((failure_class, rejection_count)) =
+                    consecutive_workspace_write_parser_failure(
+                        &followup_events,
+                        task_requires_workspace_write,
+                    )
+                {
+                    if rejection_count >= MAX_CONSECUTIVE_WORKSPACE_WRITE_PARSER_FAILURES {
+                        if let Err(error) = store.tasks().append_task_event_with_payload(
+                            &running,
+                            LedgerEventKind::ToolExecutionFailed,
+                            Some(json!({
+                                "tool_id": WORKSPACE_WRITE_TOOL_ID,
+                                "status": "Failed",
+                                "operation": "workspace_write_parser_repair_stalled",
+                                "failure_class": failure_class,
+                                "rejection_count": rejection_count,
+                                "reason": format!(
+                                    "workspace.write recovery stopped after {rejection_count} consecutive {failure_class} rejections; a further unchanged retry is suppressed until the proposal or target context materially changes"
+                                ),
+                            })),
+                        ) {
+                            return error_response(id, -32603, &format!("internal error: {error}"));
+                        }
+                        break;
+                    }
+                }
+            }
             if followup_write_missing
                 && workspace_write_parser_rejection_count >= MAX_WORKSPACE_WRITE_PARSER_REJECTIONS
             {
@@ -3044,9 +3077,13 @@ fn handle_task_run(id: Value, params: Option<Value>) -> JsonRpcResponse<Value> {
             .any(is_valid_workspace_patch_proposal_event)
     {
         agent_loop_final_state = AgentLoopState::Failed;
-        agent_loop_completion_summary =
+        agent_loop_completion_summary = workspace_write_parser_repair_stall_summary(
+            &completion_gate_events,
+        )
+        .unwrap_or_else(|| {
             "LLM tool intent did not produce a valid workspace.write proposal for a workspace edit task"
-                .to_string();
+                .to_string()
+        });
         agent_loop_final_response_content.clear();
     }
 
@@ -3297,6 +3334,70 @@ fn is_recoverable_workspace_write_rejection_for_followup(
         // required even when the natural-language goal omits the word "write".
         || (code == Some("todo_md_write_denied_for_implementation_todo")
             && tool_id == Some(WORKSPACE_WRITE_TOOL_ID))
+}
+
+fn workspace_write_parser_failure_class(
+    event: &LedgerEvent,
+    task_requires_workspace_write: bool,
+) -> Option<&'static str> {
+    if event.kind != LedgerEventKind::ToolIntentRejected || !task_requires_workspace_write {
+        return None;
+    }
+    let payload = event.payload.as_ref()?;
+    let code = payload.get("code").and_then(Value::as_str);
+    let tool_id = payload.get("tool_id").and_then(Value::as_str);
+    match (tool_id, code) {
+        (Some(WORKSPACE_WRITE_TOOL_ID), Some("input_too_large"))
+        | (Some("<parse-error>"), Some("block_too_large" | "missing_closing_fence")) => {
+            Some("oversized_or_truncated_workspace_write")
+        }
+        _ => None,
+    }
+}
+
+fn consecutive_workspace_write_parser_failure(
+    events: &[LedgerEvent],
+    task_requires_workspace_write: bool,
+) -> Option<(&'static str, usize)> {
+    // A completed workspace read gives the model new target material, so failures
+    // before that read are not the same unchanged recovery attempt.
+    let events_since_latest_workspace_read = events
+        .iter()
+        .rposition(|event| {
+            event.kind == LedgerEventKind::ToolExecutionCompleted
+                && event.payload.as_ref().is_some_and(|payload| {
+                    payload.get("tool_id").and_then(Value::as_str) == Some(WORKSPACE_READ_TOOL_ID)
+                })
+        })
+        .and_then(|index| events.get(index.saturating_add(1)..))
+        .unwrap_or(events);
+    let classes = events_since_latest_workspace_read
+        .iter()
+        .filter_map(|event| {
+            workspace_write_parser_failure_class(event, task_requires_workspace_write)
+        })
+        .collect::<Vec<_>>();
+    let failure_class = *classes.last()?;
+    let rejection_count = classes
+        .iter()
+        .rev()
+        .take_while(|class| **class == failure_class)
+        .count();
+    Some((failure_class, rejection_count))
+}
+
+fn workspace_write_parser_repair_stall_summary(events: &[LedgerEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        (event.kind == LedgerEventKind::ToolExecutionFailed)
+            .then_some(event.payload.as_ref())
+            .flatten()
+            .filter(|payload| {
+                payload.get("operation").and_then(Value::as_str)
+                    == Some("workspace_write_parser_repair_stalled")
+            })
+            .and_then(|payload| payload.get("reason").and_then(Value::as_str))
+            .map(|reason| format!("workspace.write parser recovery stalled: {reason}"))
+    })
 }
 
 fn run_has_workspace_read_failure(events: &[LedgerEvent]) -> bool {
@@ -13195,6 +13296,7 @@ fn sanitize_ledger_payload_with_options(
         "recovery_run_id",
         "failure_fingerprint",
         "failure_class",
+        "rejection_count",
         "recovery_running_enabled",
         "queue_position",
         "execution_enabled",
@@ -64916,8 +65018,8 @@ content-length: {}
             .and_then(|message| message["content"].as_str())
             .expect("retry prompt");
         assert!(retry_prompt.contains("state: oversized_write_recovery"));
-        assert!(retry_prompt.contains("one complete hunk"));
-        assert!(retry_prompt.contains("under about 1200 characters"));
+        assert!(retry_prompt.contains("one small complete statement/declaration/object-entry hunk"));
+        assert!(retry_prompt.contains("comfortably below the parser limit"));
 
         let events = parse_line(&format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"run.events","params":{{"run_id":"{run_id}"}}}}"#
@@ -65047,7 +65149,6 @@ content-length: {}
             ),
             oversized_write(),
             oversized_write(),
-            oversized_write(),
         ]);
         write_mock_config(temp.path(), &base_url);
         std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
@@ -65070,7 +65171,7 @@ content-length: {}
         assert_eq!(run_result["agent_loop"]["final_state"], "Failed");
 
         let observed = handle.join().unwrap();
-        assert_eq!(observed.len(), 4);
+        assert_eq!(observed.len(), 3);
         let events = parse_line(&format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"run.events","params":{{"run_id":"{run_id}"}}}}"#
         ))
@@ -65086,23 +65187,161 @@ content-length: {}
                         && event["payload"]["code"] == "input_too_large"
                 })
                 .count(),
-            MAX_WORKSPACE_WRITE_PARSER_REJECTIONS
+            MAX_CONSECUTIVE_WORKSPACE_WRITE_PARSER_FAILURES
         );
-        let exhaustion = event_list
+        let stall = event_list
             .iter()
             .find(|event| {
                 event["kind"] == "ToolExecutionFailed"
-                    && event["payload"]["operation"] == "workspace_write_parser_repair_exhausted"
+                    && event["payload"]["operation"] == "workspace_write_parser_repair_stalled"
             })
-            .expect("parser repair exhaustion event");
-        assert!(exhaustion["payload"]["reason"]
+            .expect("parser repair stalled event");
+        assert_eq!(
+            stall["payload"]["failure_class"],
+            "oversized_or_truncated_workspace_write"
+        );
+        assert_eq!(
+            stall["payload"]["rejection_count"],
+            MAX_CONSECUTIVE_WORKSPACE_WRITE_PARSER_FAILURES
+        );
+        assert!(stall["payload"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains(&format!(
-                "{MAX_WORKSPACE_WRITE_PARSER_REJECTIONS}/{MAX_WORKSPACE_WRITE_PARSER_REJECTIONS}"
+                "{} consecutive oversized_or_truncated_workspace_write rejections",
+                MAX_CONSECUTIVE_WORKSPACE_WRITE_PARSER_FAILURES
             ))));
+        let completion = event_list
+            .iter()
+            .find(|event| event["kind"] == "AgentLoopCompleted")
+            .expect("agent loop completion event");
+        assert!(completion["payload"]["completion_summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("workspace.write parser recovery stalled")));
         assert!(!event_list
             .iter()
             .any(|event| event["kind"] == "WorkspacePatchProposed"));
+    }
+
+    #[test]
+    fn openai_task_run_stops_after_repeated_unclosed_workspace_write_intents() {
+        let _lock = super::tests::lock_env();
+        let _guard = EnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).expect("scripts dir");
+        std::fs::write(
+            temp.path().join("scripts/release-gate.mjs"),
+            "export const gate = true;\n",
+        )
+        .expect("release gate");
+        let (base_url, handle) = spawn_mock_many_owned(vec![
+            mock_tool_intent_response(
+                WORKSPACE_READ_TOOL_ID,
+                "Read the named target before patching.",
+                json!({ "path": "scripts/release-gate.mjs" }),
+            ),
+            mock_unclosed_tool_intent_response(),
+            mock_unclosed_tool_intent_response(),
+        ]);
+        write_mock_config(temp.path(), &base_url);
+        std::env::set_var("BROWNIE_WORKSPACE_ROOT", temp.path());
+        std::env::set_var("BROWNIE_TEST_LLM_API_KEY", "test-key");
+        std::env::set_var("BROWNIE_LLM_ALLOW_PROVIDER_ACCESS", "true");
+
+        let start = parse_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"goal":"Patch scripts/release-gate.mjs by changing gate to false.","mode_id":"implementer"}}"#,
+        )
+        .result
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap();
+        let run_id = start["run_id"].as_str().unwrap();
+        let run = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"task.run","params":{{"task_id":"{task_id}"}}}}"#
+        ));
+        assert!(run.error.is_none(), "run error: {:?}", run.error);
+        let run_result = run.result.expect("run result");
+        assert_eq!(run_result["status"], "Failed");
+        assert_eq!(run_result["agent_loop"]["final_state"], "Failed");
+
+        let observed = handle.join().unwrap();
+        assert_eq!(observed.len(), 3);
+        let retry_prompt = observed[2]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("retry prompt");
+        assert!(retry_prompt.contains("one materially different recovery attempt"));
+        assert!(retry_prompt.contains("A second same-class parser rejection stops this task"));
+
+        let events = parse_line(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"run.events","params":{{"run_id":"{run_id}"}}}}"#
+        ))
+        .result
+        .unwrap();
+        let event_list = events["events"].as_array().unwrap();
+        assert_eq!(
+            event_list
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "ToolIntentRejected"
+                        && event["payload"]["tool_id"] == "<parse-error>"
+                        && event["payload"]["code"] == "missing_closing_fence"
+                })
+                .count(),
+            MAX_CONSECUTIVE_WORKSPACE_WRITE_PARSER_FAILURES
+        );
+        assert!(event_list.iter().any(|event| {
+            event["kind"] == "ToolExecutionFailed"
+                && event["payload"]["operation"] == "workspace_write_parser_repair_stalled"
+                && event["payload"]["failure_class"] == "oversized_or_truncated_workspace_write"
+        }));
+        assert!(!event_list
+            .iter()
+            .any(|event| event["kind"] == "WorkspacePatchProposed"));
+    }
+
+    #[test]
+    fn workspace_write_parser_failure_counter_resets_after_completed_workspace_read() {
+        let parser_rejection = |event_id: &str| brownie_store::LedgerEvent {
+            event_id: event_id.to_string(),
+            task_id: "task_parser_failure".to_string(),
+            run_id: "run_parser_failure".to_string(),
+            kind: LedgerEventKind::ToolIntentRejected,
+            timestamp: "2026-10-31T00:00:00Z".to_string(),
+            payload: Some(json!({
+                "tool_id": "<parse-error>",
+                "code": "missing_closing_fence",
+                "reason": "missing closing fence"
+            })),
+            payload_envelope: None,
+        };
+        let refreshed_target_context = brownie_store::LedgerEvent {
+            event_id: "event_workspace_read".to_string(),
+            task_id: "task_parser_failure".to_string(),
+            run_id: "run_parser_failure".to_string(),
+            kind: LedgerEventKind::ToolExecutionCompleted,
+            timestamp: "2026-10-31T00:00:01Z".to_string(),
+            payload: Some(json!({
+                "tool_id": WORKSPACE_READ_TOOL_ID,
+                "status": "Completed",
+                "bytes_read": 42,
+                "truncated": false
+            })),
+            payload_envelope: None,
+        };
+
+        assert_eq!(
+            consecutive_workspace_write_parser_failure(
+                &[
+                    parser_rejection("event_before_refresh"),
+                    refreshed_target_context,
+                    parser_rejection("event_after_refresh"),
+                ],
+                true,
+            ),
+            Some(("oversized_or_truncated_workspace_write", 1))
+        );
     }
 
     #[test]
