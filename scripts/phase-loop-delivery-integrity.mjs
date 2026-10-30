@@ -220,6 +220,12 @@ export function validateClaimLifecycleTransition({ previous, next, review = {} }
     if (reviewState.merged !== true) errors.push('completed_requires_merged_pr');
     if (reviewState.approved !== true) errors.push('completed_requires_independent_approval');
     if (reviewState.ci_passed !== true) errors.push('completed_requires_passing_ci');
+    if (typeof reviewState.author !== 'string' || !reviewState.author) errors.push('completed_requires_implementation_author');
+    if (typeof reviewState.reviewer !== 'string' || !reviewState.reviewer) errors.push('completed_requires_independent_reviewer');
+    if (reviewState.author === reviewState.reviewer) errors.push('completed_requires_distinct_reviewer');
+    if (typeof reviewState.merge_actor !== 'string' || reviewState.merge_actor !== reviewState.reviewer) errors.push('completed_requires_observed_reviewer_merge_actor');
+    const semanticEvidence = validateSemanticCompletionEvidence({ claim: after, evidence: reviewState.semantic_completion_evidence });
+    if (!semanticEvidence.valid) errors.push(...semanticEvidence.errors.map((error) => `completed_requires_${error}`));
   }
   if (after.status === 'pr_pending_review' && asObject(review).handoff_allowed !== true) {
     errors.push('pr_pending_review_requires_delivery_handoff');

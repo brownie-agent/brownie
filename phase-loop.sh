@@ -286,6 +286,58 @@ PY
   fi
 }
 
+phase_loop_terminal_delivery_receipt_valid() {
+  local claim_path="${1:-$TODO_CLAIM_FILE}"
+  python3 - "$claim_path" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+try:
+    claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+review = claim.get("delivery_review")
+if not isinstance(review, dict):
+    raise SystemExit(1)
+author = review.get("author")
+reviewer = review.get("reviewer")
+merge_actor = review.get("merge_actor")
+semantic = review.get("semantic_completion_evidence")
+selected = claim.get("selected_todo")
+root_claim_id = claim.get("root_claim_id") or claim.get("claim_id")
+condition_match = re.search(r"^\s*Completion condition:\s*(.+?)\s*$", selected or "", re.MULTILINE)
+completion_condition = condition_match.group(1).strip() if condition_match else ""
+evidence_valid = (
+    isinstance(semantic, dict)
+    and semantic.get("schema_version") == 1
+    and semantic.get("root_claim_id") == root_claim_id
+    and semantic.get("selected_todo_sha256") == hashlib.sha256(str(selected or "").encode("utf-8")).hexdigest()
+    and semantic.get("completion_condition_sha256") == hashlib.sha256(completion_condition.encode("utf-8")).hexdigest()
+    and isinstance(semantic.get("verification_results"), list)
+    and bool(semantic.get("verification_results"))
+    and all(isinstance(item, dict) and isinstance(item.get("command"), str) and item.get("command") and item.get("exit_code") == 0 for item in semantic["verification_results"])
+    and isinstance(semantic.get("observables"), list)
+    and bool(semantic.get("observables"))
+    and all(isinstance(item, dict) and item.get("kind") and item.get("sha256") for item in semantic["observables"])
+)
+raise SystemExit(0 if (
+    review.get("merged") is True
+    and review.get("approved") is True
+    and review.get("ci_passed") is True
+    and isinstance(author, str) and bool(author)
+    and isinstance(reviewer, str) and bool(reviewer)
+    and isinstance(merge_actor, str) and merge_actor == reviewer
+    and author != reviewer
+    and evidence_valid
+) else 1)
+PY
+}
+
 write_bdk_trajectory_event() {
   local run_stamp="$1"
   local event_type="$2"
@@ -299,27 +351,7 @@ write_bdk_trajectory_event() {
   # review/CI/merge boundary as Runtime results so a local patch, green check,
   # or PR creation cannot manufacture completion in the public ledger.
   if [ "$event_type" = "todo.completed" ]; then
-    if ! python3 - "$TODO_CLAIM_FILE" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-try:
-    claim = json.loads(path.read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(1)
-review = claim.get("delivery_review") if isinstance(claim, dict) else None
-if not isinstance(review, dict):
-    raise SystemExit(1)
-raise SystemExit(0 if (
-    claim.get("status") == "completed"
-    and review.get("merged") is True
-    and review.get("approved") is True
-    and review.get("ci_passed") is True
-) else 1)
-PY
-    then
+    if ! phase_loop_terminal_delivery_receipt_valid "$TODO_CLAIM_FILE"; then
       local blocked_claim_id blocked_selected_todo blocked_queue_fingerprint blocked_queue_generation
       blocked_claim_id="$(claim_field claim_id 2>/dev/null || true)"
       blocked_selected_todo="$(claim_field selected_todo 2>/dev/null || true)"
@@ -671,19 +703,7 @@ PY
 record_completion_ledger_transition() {
   local run_stamp="$1"
   local payload_json="${2:-{}}"
-  if ! python3 - "$TODO_CLAIM_FILE" <<'PY'
-import json
-import pathlib
-import sys
-
-try:
-    claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(1)
-review = claim.get("delivery_review") if isinstance(claim, dict) else None
-raise SystemExit(0 if isinstance(review, dict) and review.get("merged") is True and review.get("approved") is True and review.get("ci_passed") is True else 1)
-PY
-  then
+  if ! phase_loop_terminal_delivery_receipt_valid "$TODO_CLAIM_FILE"; then
     PHASE_LOOP_TASK_LEDGER_FAILURE=1
     PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="terminal completion ledger transition requires independent approval, passing CI, and merged PR"
     printf '%s task_ledger_completion_refused=true run=%s reason=independent_review_ci_merge_missing\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
@@ -2846,23 +2866,7 @@ remove_completed_todo_claim_from_queue() {
   # Queue deletion is the irreversible projection of delivery completion.
   # Do not let a successful wrapper, a patch, or a PR creation erase the
   # active TODO before the independent review decision has been merged.
-  if ! python3 - "$TODO_CLAIM_FILE" <<'PY'
-import json
-import pathlib
-import sys
-
-try:
-    claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(1)
-review = claim.get("delivery_review") if isinstance(claim, dict) else None
-if claim.get("status") not in {"completed", "verification_pending", "pr_pending_review"}:
-    raise SystemExit(0)
-if not isinstance(review, dict):
-    raise SystemExit(1)
-raise SystemExit(0 if review.get("merged") is True and review.get("approved") is True and review.get("ci_passed") is True else 1)
-PY
-  then
+  if ! phase_loop_terminal_delivery_receipt_valid "$TODO_CLAIM_FILE"; then
     printf '%s run=%s completed_todo_removal_refused=true reason=independent_review_ci_merge_missing\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
     return 76
   fi
@@ -11966,6 +11970,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -12069,13 +12074,40 @@ requested_status = status
 # a TODO before independent approval, CI, and merge are all recorded.
 if status == "completed":
     review = claim.get("delivery_review") if isinstance(claim.get("delivery_review"), dict) else {}
-    if not (review.get("merged") is True and review.get("approved") is True and review.get("ci_passed") is True):
+    semantic = review.get("semantic_completion_evidence")
+    selected = claim.get("selected_todo")
+    condition_match = re.search(r"^\s*Completion condition:\s*(.+?)\s*$", selected or "", re.MULTILINE)
+    completion_condition = condition_match.group(1).strip() if condition_match else ""
+    semantic_valid = (
+        isinstance(semantic, dict)
+        and semantic.get("schema_version") == 1
+        and semantic.get("root_claim_id") == (claim.get("root_claim_id") or claim.get("claim_id"))
+        and semantic.get("selected_todo_sha256") == hashlib.sha256(str(selected or "").encode("utf-8")).hexdigest()
+        and semantic.get("completion_condition_sha256") == hashlib.sha256(completion_condition.encode("utf-8")).hexdigest()
+        and isinstance(semantic.get("verification_results"), list)
+        and bool(semantic.get("verification_results"))
+        and all(isinstance(item, dict) and isinstance(item.get("command"), str) and item.get("command") and item.get("exit_code") == 0 for item in semantic["verification_results"])
+        and isinstance(semantic.get("observables"), list)
+        and bool(semantic.get("observables"))
+        and all(isinstance(item, dict) and item.get("kind") and item.get("sha256") for item in semantic["observables"])
+    )
+    receipt_valid = (
+        review.get("merged") is True
+        and review.get("approved") is True
+        and review.get("ci_passed") is True
+        and isinstance(review.get("author"), str) and bool(review.get("author"))
+        and isinstance(review.get("reviewer"), str) and bool(review.get("reviewer"))
+        and review.get("author") != review.get("reviewer")
+        and isinstance(review.get("merge_actor"), str) and review.get("merge_actor") == review.get("reviewer")
+        and semantic_valid
+    )
+    if not receipt_valid:
         status = "integrity_blocked"
         claim.setdefault("completion_promotion_rejections", []).append({
             "at": timestamp,
             "run_stamp": sys.argv[8],
             "requested_status": requested_status,
-            "reason": "completed_requires_independent_approval_ci_and_merge",
+            "reason": "completed_requires_claim_bound_semantic_evidence_and_independent_review_ci_merge_receipt",
         })
 if status in {"integrity_blocked", "changes_requested", "failed", "blocked"}:
     claim.setdefault("failure_history", []).append({

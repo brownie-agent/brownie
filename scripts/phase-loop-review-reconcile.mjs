@@ -6,6 +6,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { validateSemanticCompletionEvidence } from './phase-loop-delivery-integrity.mjs';
 
 function object(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -53,6 +54,9 @@ export function reconcileReviewSnapshot({ claim, pullRequest, reviewer, implemen
   if (!reviewActor || !implementationActor) errors.push('configured_actor_missing');
   if (login(pr.author) !== implementationActor) errors.push('implementation_author_mismatch');
   if (reviewActor === implementationActor) errors.push('reviewer_not_independent');
+  const semanticCompletionEvidence = object(before.delivery_review).semantic_completion_evidence;
+  const semanticEvidence = validateSemanticCompletionEvidence({ claim: before, evidence: semanticCompletionEvidence });
+  if (!semanticEvidence.valid) errors.push(...semanticEvidence.errors.map((error) => `semantic_completion_${error}`));
   const ownReviews = reviews.filter((review) => login(review.author) === reviewActor && reviewAtHead(review, headOid));
   // GitHub retains every review. Only the reviewer's latest decision at this
   // head is effective; an old request must not override a later approval.
@@ -86,6 +90,7 @@ export function reconcileReviewSnapshot({ claim, pullRequest, reviewer, implemen
       merged,
       approved,
       ci_passed: ciPassed,
+      semantic_completion_evidence: semanticCompletionEvidence ?? null,
       review_decision: pr.reviewDecision ?? null,
       effective_reviewer_decision: effectiveDecision,
       observed_at: new Date().toISOString()

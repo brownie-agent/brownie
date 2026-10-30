@@ -1,8 +1,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { applyReviewReconciliation, reconcileReviewSnapshot } from './phase-loop-review-reconcile.mjs';
+import { completionConditionSha256, selectedTodoSha256 } from './phase-loop-delivery-integrity.mjs';
 
-const claim = { claim_id: 'claim-1', root_claim_id: 'claim-1', selected_todo: '- [ ] T-1: implementation' };
+const selectedTodo = '- [ ] T-1: implementation\n  Completion condition: the bounded implementation is independently delivered.';
+const claim = {
+  claim_id: 'claim-1',
+  root_claim_id: 'claim-1',
+  selected_todo: selectedTodo,
+  delivery_review: {
+    semantic_completion_evidence: {
+      schema_version: 1,
+      root_claim_id: 'claim-1',
+      selected_todo_sha256: selectedTodoSha256({ selected_todo: selectedTodo }),
+      completion_condition_sha256: completionConditionSha256({ selected_todo: selectedTodo }),
+      verification_results: [{ command: 'node --test scripts/bounded-journey.test.mjs', exit_code: 0 }],
+      observables: [{ kind: 'bounded_journey', sha256: 'a'.repeat(64) }]
+    }
+  }
+};
 
 function pr(overrides = {}) {
   return {
@@ -33,6 +49,7 @@ test('changes requested returns the same immutable claim to rework', () => {
   assert.equal(next.root_claim_id, 'claim-1');
   assert.equal(next.review_rework.required, true);
   assert.equal(next.failure_history.at(-1).reason, 'independent_review_requested_changes');
+  assert.deepEqual(next.delivery_review.semantic_completion_evidence, claim.delivery_review.semantic_completion_evidence);
 });
 
 test('passing CI and a PR do not complete without merge and independent approval', () => {
@@ -105,6 +122,23 @@ test('merged completion refuses a missing or mismatched merge actor', () => {
   });
   assert.equal(mismatched.status, 'pr_pending_review');
   assert(mismatched.errors.includes('merge_actor_not_independent_reviewer'));
+});
+
+test('merged completion refuses absent claim-bound semantic evidence', () => {
+  const withoutEvidence = { ...claim, delivery_review: {} };
+  const reconciliation = reconcileReviewSnapshot({
+    claim: withoutEvidence,
+    pullRequest: pr({
+      state: 'MERGED',
+      mergedAt: '2026-10-30T12:00:00Z',
+      mergedBy: { login: 'globalpocket' },
+      reviews: [{ state: 'APPROVED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) }, submittedAt: '2026-10-30T11:00:00Z' }]
+    }),
+    reviewer: 'globalpocket',
+    implementation: 'brownie-agent'
+  });
+  assert.equal(reconciliation.status, 'pr_pending_review');
+  assert(reconciliation.errors.some((error) => error.startsWith('semantic_completion_')));
 });
 
 test('the author cannot satisfy the independent review role', () => {

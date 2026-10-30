@@ -128,9 +128,34 @@ test('a completed claim requires approved CI-passing merged review', () => {
   const merged = validateClaimLifecycleTransition({
     previous: claim,
     next: { ...claim, status: 'completed' },
-    review: { merged: true, approved: true, ci_passed: true }
+    review: {
+      merged: true,
+      approved: true,
+      ci_passed: true,
+      author: 'brownie-agent',
+      reviewer: 'globalpocket',
+      merge_actor: 'globalpocket',
+      semantic_completion_evidence: validEvidence()
+    }
   });
   assert.equal(merged.valid, true, JSON.stringify(merged.errors));
+});
+
+test('a merged review still cannot complete without an observed independent merge actor', () => {
+  const result = validateClaimLifecycleTransition({
+    previous: claim,
+    next: { ...claim, status: 'completed' },
+    review: {
+      merged: true,
+      approved: true,
+      ci_passed: true,
+      author: 'brownie-agent',
+      reviewer: 'globalpocket',
+      semantic_completion_evidence: validEvidence()
+    }
+  });
+  assert.equal(result.valid, false);
+  assert(result.errors.includes('completed_requires_observed_reviewer_merge_actor'));
 });
 
 test('review-requested changes preserve the immutable root claim and fingerprint', () => {
