@@ -12071,24 +12071,40 @@ selected_id_match = re.match(r"^\s*[-*]\s+\[\s*\]\s+([^:\s]+)", selected_first_l
 if selected_id_match:
     selected_parent_id = selected_id_match.group(1).strip()
 
-def bounded_scope_paths(todo_first_line):
-    """Return every explicitly bounded Patch/Create target in source order.
+def bounded_scope_entries(todo_first_line):
+    """Return every explicit Patch/Create target and operation in source order.
 
     A parent TODO may name several concrete targets (for example a test,
     implementation file, package manifest, and workflow).  Prompt policy must
     retain that complete allowed set rather than silently treating the first
-    backticked target as the whole contract.
+    backticked target as the whole contract or its operation as the operation
+    for every later target. Keep this marker-and-clause grammar aligned with
+    scripts/phase-loop-bounded-scope.mjs so controller policy cannot disagree
+    with admission, rollback, or work-product review.
     """
-    paths = []
-    for scope in re.finditer(
-        r"(?i)\b(?:Patch|Create)\s+only\s+((?:`[^`\n]+`\s*(?:,\s*|and\s+)?)+)",
-        todo_first_line,
-    ):
-        for raw_path in re.findall(r"`([^`\n]+)`", scope.group(1)):
-            path = raw_path.strip()
-            if path and path not in paths:
-                paths.append(path)
-    return paths
+    entries = []
+    seen_paths = set()
+    markers = list(re.finditer(r"(?i)\b(patch|create)\s+only\b", todo_first_line))
+    for index, marker in enumerate(markers):
+        operation = marker.group(1).lower()
+        next_marker_start = markers[index + 1].start() if index + 1 < len(markers) else len(todo_first_line)
+        description_end = todo_first_line.find(":", marker.end())
+        clause_end = description_end if 0 <= description_end < next_marker_start else next_marker_start
+        clause = todo_first_line[marker.end():clause_end].lstrip()
+        while clause.startswith("`"):
+            closing = clause.find("`", 1)
+            if closing < 0:
+                break
+            path = clause[1:closing].strip()
+            if path and path not in seen_paths:
+                seen_paths.add(path)
+                entries.append({"operation": operation, "path": path})
+            clause = clause[closing + 1:].lstrip()
+            separator = re.match(r"(?i)^(?:,\s*(?:and\b)?|and\b|&)\s*", clause)
+            if not separator:
+                break
+            clause = clause[separator.end():].lstrip()
+    return entries
 
 def feedback_selected_target_path(feedback):
     if not isinstance(feedback, dict):
@@ -12100,11 +12116,18 @@ def feedback_selected_target_path(feedback):
         or ""
     ).strip()
 
-selected_leaf_target_paths = bounded_scope_paths(selected_first_line)
+selected_leaf_target_entries = bounded_scope_entries(selected_first_line)
+selected_leaf_target_paths = [entry["path"] for entry in selected_leaf_target_entries]
+selected_leaf_target_operations = {
+    entry["path"]: entry["operation"]
+    for entry in selected_leaf_target_entries
+}
 selected_leaf_target_path = selected_leaf_target_paths[0] if selected_leaf_target_paths else ""
+selected_leaf_target_operation = selected_leaf_target_operations.get(selected_leaf_target_path, "")
 selected_repair_target_path = feedback_selected_target_path(repair_feedback)
 if selected_repair_target_path in selected_leaf_target_paths:
     selected_leaf_target_path = selected_repair_target_path
+    selected_leaf_target_operation = selected_leaf_target_operations.get(selected_leaf_target_path, "")
 else:
     selected_repair_target_path = ""
 if claim and selected_todo:
@@ -12210,9 +12233,11 @@ if repair_feedback and selected_leaf_target_path:
 selected_repair_target_path = feedback_selected_target_path(repair_feedback)
 if selected_repair_target_path in selected_leaf_target_paths:
     selected_leaf_target_path = selected_repair_target_path
+    selected_leaf_target_operation = selected_leaf_target_operations.get(selected_leaf_target_path, "")
 else:
     selected_repair_target_path = ""
     selected_leaf_target_path = selected_leaf_target_paths[0] if selected_leaf_target_paths else ""
+    selected_leaf_target_operation = selected_leaf_target_operations.get(selected_leaf_target_path, "")
 reported_repair_target_path = feedback_selected_target_path(repair_feedback)
 repair_feedback_target_out_of_scope = bool(
     reported_repair_target_path
@@ -12454,13 +12479,18 @@ if leaf_has_oversized_repair and not leaf_has_missing_fence_repair and not (
 if (
     not selected_decomposition_active
     and "Source TODO:" in selected_todo
-    and re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:\s+Patch only\s+`", selected_todo)
+    and selected_leaf_target_operation == "patch"
 ):
     if selected_leaf_has_multiple_targets:
         allowed_targets = ", ".join(f"`{path}`" for path in selected_leaf_target_paths)
+        allowed_target_operations = ", ".join(
+            f"`{entry['path']}`={entry['operation']}"
+            for entry in selected_leaf_target_entries
+        )
         leaf_execution_policy_lines = [
             "- leaf_execution_policy: this selected TODO explicitly permits multiple bounded targets. Preserve that complete allowed set; do not classify it as test-only merely because the first target is a test file.",
             f"- leaf_allowed_targets_policy: the only implementation targets allowed by this TODO are {allowed_targets}. Do not modify a path outside that set and do not create child TODOs merely to choose among them.",
+            f"- leaf_target_operations_policy: declared operations are {allowed_target_operations}. Use the operation declared for the selected target, not the operation of the first clause.",
             "- leaf_no_refinement_policy: use one exact target at a time. A repair feedback target inside the allowed set takes precedence over the first-listed target; after resolving it, continue only within the same allowed set or report a concrete fail-closed blocker.",
             "- leaf_todo_write_forbidden_policy: `workspace.write` to `.brownie/todo.md` is not progress for this bounded implementation TODO. Read and patch only an allowed target, or final-answer a concrete fail-closed blocker.",
         ]
@@ -12548,7 +12578,7 @@ if (
     repair_feedback_target_out_of_scope
     and not selected_decomposition_active
     and "Source TODO:" in selected_todo
-    and re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:\s+(?:Patch|Create) only\s+`", selected_todo)
+    and selected_leaf_target_entries
 ):
     leaf_execution_policy_lines = [
         "- leaf_scope_guard_policy: Runtime repair feedback named a target outside the selected TODO's explicit allowed target set. Do not read or write any implementation target from this feedback.",
@@ -12558,7 +12588,7 @@ if (
 if (
     not repair_feedback_target_out_of_scope
     and "Source TODO:" in selected_todo
-    and re.search(r"^\s*[-*]\s+\[\s*\]\s+[^:\n]+:\s+Create only\s+`", selected_todo)
+    and selected_leaf_target_operation == "create"
 ):
     if leaf_has_contract_replan_feedback:
         leaf_execution_policy_lines = [

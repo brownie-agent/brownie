@@ -5331,7 +5331,7 @@ git -C "$multitarget_repair_workspace" add .
 git -C "$multitarget_repair_workspace" commit -m init >/dev/null
 printf 'base prompt\n' > "$multitarget_repair_prompt"
 cat > "$multitarget_repair_todo" <<'EOF'
-- [ ] E-multitarget: Patch only `scripts/release-artifact-runtime-journey.test.mjs` and `scripts/release-artifact-runtime-journey.mjs`, then patch only `package.json` and `.github/workflows/release.yml` to invoke them:
+- [ ] E-multitarget: Patch only `scripts/release-artifact-runtime-journey.test.mjs`, `scripts/release-artifact-runtime-journey.mjs`, and `package.json`, then patch only `.github/workflows/release.yml` to invoke them:
   Route: implementation.
   Source TODO: E-multitarget-parent.
   Depends on: <none>.
@@ -5350,7 +5350,7 @@ cat > "$multitarget_repair_state/todo-claims/current.json" <<'EOF'
   "queue_generation": 1,
   "run_stamp": "20260913T000002Z",
   "schema_version": 1,
-  "selected_todo": "- [ ] E-multitarget: Patch only `scripts/release-artifact-runtime-journey.test.mjs` and `scripts/release-artifact-runtime-journey.mjs`, then patch only `package.json` and `.github/workflows/release.yml` to invoke them:\n  Route: implementation.\n  Source TODO: E-multitarget-parent.\n  Depends on: <none>.\n  Completion condition: the extracted package runs a bounded runtime journey.\n  Forbidden changes: do not access production credentials.\n  Verification: run `node --test scripts/release-artifact-runtime-journey.test.mjs`.",
+  "selected_todo": "- [ ] E-multitarget: Patch only `scripts/release-artifact-runtime-journey.test.mjs`, `scripts/release-artifact-runtime-journey.mjs`, and `package.json`, then patch only `.github/workflows/release.yml` to invoke them:\n  Route: implementation.\n  Source TODO: E-multitarget-parent.\n  Depends on: <none>.\n  Completion condition: the extracted package runs a bounded runtime journey.\n  Forbidden changes: do not access production credentials.\n  Verification: run `node --test scripts/release-artifact-runtime-journey.test.mjs`.",
   "status": "in_progress"
 }
 EOF
@@ -5396,6 +5396,7 @@ assert "repair_mode: `structured_candidate_repair`" in prompt, prompt
 assert 'objective_apply_failed_checks: ["structured_content_parseable"]' in prompt, prompt
 assert "leaf_allowed_targets_policy" in prompt, prompt
 assert "`scripts/release-artifact-runtime-journey.test.mjs`, `scripts/release-artifact-runtime-journey.mjs`, `package.json`, `.github/workflows/release.yml`" in prompt, prompt
+assert "leaf_target_operations_policy: declared operations are `scripts/release-artifact-runtime-journey.test.mjs`=patch, `scripts/release-artifact-runtime-journey.mjs`=patch, `package.json`=patch, `.github/workflows/release.yml`=patch." in prompt, prompt
 assert "test_leaf_execution_policy" not in prompt, prompt
 assert "leaf_repair_target_policy: the previous Runtime feedback selected `package.json`" in prompt, prompt
 assert "leaf_initial_read_policy: if the target contents are not already embedded in this prompt, the next tool may be exactly one `workspace.read` for `package.json`" in prompt, prompt
@@ -5433,6 +5434,95 @@ assert "repair_selected_target_rejected_as_out_of_scope: `scripts/not-allowed.mj
 assert "leaf_scope_guard_policy" in prompt, prompt
 assert "leaf_scope_guard_required_outcome" in prompt, prompt
 assert "leaf_initial_read_policy" not in prompt, prompt
+PY
+
+# The operation must come from the selected repair target, rather than the
+# first bounded clause. A later Patch-only target remains patchable even when
+# the parent TODO starts by declaring a distinct Create-only target.
+mixed_operation_state="$(mktemp -d)"
+mixed_operation_prompt="$(mktemp)"
+mixed_operation_todo="$(mktemp)"
+mixed_operation_workspace="$(mktemp -d)"
+mixed_operation_argv="$mixed_operation_state/fake-brownie.argv"
+git -C "$mixed_operation_workspace" init -b main >/dev/null
+git -C "$mixed_operation_workspace" config user.name Brownie
+git -C "$mixed_operation_workspace" config user.email brownie@example.invalid
+mkdir -p "$mixed_operation_workspace/scripts"
+cat > "$mixed_operation_workspace/package.json" <<'EOF'
+{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs"}}
+EOF
+printf 'export const existingRuntimeJourney = true;\n' > "$mixed_operation_workspace/scripts/existing-runtime-journey.mjs"
+git -C "$mixed_operation_workspace" add package.json scripts
+git -C "$mixed_operation_workspace" commit -m init >/dev/null
+printf 'base prompt\n' > "$mixed_operation_prompt"
+cat > "$mixed_operation_todo" <<'EOF'
+- [ ] E-mixed-operation: Create only `scripts/new-runtime-journey.mjs` and Patch only `scripts/existing-runtime-journey.mjs`, then patch only `package.json` to invoke it:
+  Route: implementation.
+  Source TODO: E-mixed-operation-parent.
+  Depends on: <none>.
+  Completion condition: package invocation is patched while the new journey file remains a create target.
+  Forbidden changes: do not access production credentials.
+  Verification: run `node --test scripts/release-artifact-runtime-journey.test.mjs`.
+EOF
+mkdir -p "$mixed_operation_state/todo-claims"
+cat > "$mixed_operation_state/progress-state.json" <<'EOF'
+{"schema_version":1,"progress_projection":{"route":"{\"command\":\"resume\",\"arguments\":[]}"}}
+EOF
+cat > "$mixed_operation_state/todo-claims/current.json" <<'EOF'
+{
+  "claim_id": "todo-g1-mixed-operation",
+  "queue_fingerprint": "mixed-operation",
+  "queue_generation": 1,
+  "run_stamp": "20260913T000003Z",
+  "schema_version": 1,
+  "selected_todo": "- [ ] E-mixed-operation: Create only `scripts/new-runtime-journey.mjs` and Patch only `scripts/existing-runtime-journey.mjs`, then patch only `package.json` to invoke it:\n  Route: implementation.\n  Source TODO: E-mixed-operation-parent.\n  Depends on: <none>.\n  Completion condition: package invocation is patched while the new journey file remains a create target.\n  Forbidden changes: do not access production credentials.\n  Verification: run `node --test scripts/release-artifact-runtime-journey.test.mjs`.",
+  "status": "in_progress"
+}
+EOF
+cat > "$mixed_operation_state/todo-claims/repair-feedback.json" <<'EOF'
+{
+  "claim_id": "todo-g1-mixed-operation",
+  "kind": "phase_loop_objective_apply_rejected",
+  "reason": "objective_apply_rejected_before_write",
+  "repair_mode": "structured_candidate_repair",
+  "run_stamp": "20260913T000003Z",
+  "selected_todo_first_line": "- [ ] E-mixed-operation: Create only `scripts/new-runtime-journey.mjs` and Patch only `scripts/existing-runtime-journey.mjs`, then patch only `package.json` to invoke it:",
+  "selected_target_path": "package.json",
+  "objective_apply": {
+    "operation": "replace_file",
+    "reason": "candidate JSON is not parseable",
+    "failed_checks": ["structured_content_parseable"],
+    "applied": false
+  },
+  "verification": {
+    "completed": false,
+    "reason": "objective_apply_rejected_before_write",
+    "repair_hint": "Read the exact target, form one complete replacement/patch candidate, and run the structured parse check."
+  }
+}
+EOF
+PHASE_LOOP_STATE_DIR="$mixed_operation_state" \
+PHASE_LOOP_PROMPT="$mixed_operation_prompt" \
+PHASE_LOOP_TODO="$mixed_operation_todo" \
+PHASE_LOOP_WORKSPACE_ROOT="$mixed_operation_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_ARGV_FILE="$mixed_operation_argv" \
+BROWNIE_BIN="$fake_brownie_repair_feedback" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+mixed_operation_prompt_file="$(find "$mixed_operation_state/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
+python3 - "$mixed_operation_prompt_file" <<'PY'
+import pathlib
+import sys
+
+prompt = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "repair_selected_target_path: `package.json`" in prompt, prompt
+assert "leaf_allowed_targets_policy: the only implementation targets allowed by this TODO are `scripts/new-runtime-journey.mjs`, `scripts/existing-runtime-journey.mjs`, `package.json`." in prompt, prompt
+assert "leaf_target_operations_policy: declared operations are `scripts/new-runtime-journey.mjs`=create, `scripts/existing-runtime-journey.mjs`=patch, `package.json`=patch." in prompt, prompt
+assert "leaf_repair_target_policy: the previous Runtime feedback selected `package.json`" in prompt, prompt
+assert "leaf_initial_read_policy: if the target contents are not already embedded in this prompt, the next tool may be exactly one `workspace.read` for `package.json`" in prompt, prompt
+assert "create_only_policy" not in prompt, prompt
+assert "Create the named target file" not in prompt, prompt
 PY
 
 contract_replan_feedback_state="$(mktemp -d)"

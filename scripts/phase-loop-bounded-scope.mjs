@@ -23,7 +23,7 @@ export function boundedScopeEntries(firstLine) {
       const path = clause.slice(1, closing).trim();
       if (path) entries.push({ operation: marker[1].toLowerCase(), path });
       clause = clause.slice(closing + 1).trimStart();
-      const separator = clause.match(/^(?:,|and\b|&)\s*/iu);
+      const separator = clause.match(/^(?:,\s*(?:and\b)?|and\b|&)\s*/iu);
       if (!separator) break;
       clause = clause.slice(separator[0].length).trimStart();
     }
