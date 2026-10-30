@@ -338,6 +338,7 @@ test('restores an exact dirty bounded patch placeholder from the configured appr
   assert.equal(record.placeholder_target_restorations.length, 1);
   const restoration = record.placeholder_target_restorations[0];
   assert.equal(restoration.path, '.github/workflows/release.yml');
+  assert.equal(restoration.state, 'restored');
   assert.equal(restoration.approved_baseline_ref, 'HEAD');
   assert.equal(restoration.approved_baseline_commit, git(root, ['rev-parse', 'HEAD']).trim());
   assert.equal(fs.readFileSync(path.join(root, restoration.preimage_path), 'utf8'), placeholder);
@@ -419,6 +420,8 @@ test('resumes a persisted target restoration idempotently after interruption', (
   const { recordPath, record: interruptedRecord } = recoveryRecord(root);
   interruptedRecord.status = 'started';
   interruptedRecord.rollback_performed = false;
+  interruptedRecord.placeholder_target_restorations[0].state = 'prepared';
+  delete interruptedRecord.placeholder_target_restorations[0].restored_at;
   fs.writeFileSync(recordPath, `${JSON.stringify(interruptedRecord, null, 2)}\n`);
 
   const resumed = runRecovery(root, diagnostic, '3', 'HEAD');
@@ -427,9 +430,72 @@ test('resumes a persisted target restoration idempotently after interruption', (
   const { record } = recoveryRecord(root);
   assert.equal(record.status, 'applied');
   assert.equal(record.placeholder_target_restorations.length, 1);
+  assert.equal(record.placeholder_target_restorations[0].state, 'restored');
+  assert.ok(record.placeholder_target_restorations[0].reconciled_after_interruption_at);
   assert.equal(record.recovery_resumes.at(-1).rollback_performed, true);
   assert.equal(record.attempts.at(-1).placeholder_recovery.resumed, true);
   assert.equal(record.attempts.at(-1).placeholder_recovery.reason, 'persisted_target_restorations_verified');
+});
+
+test('retries a persisted prepared intent when interruption occurs before replacing its target', () => {
+  const { root, baseline, placeholder } = makeExactPlaceholderFixture();
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const initial = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(initial.status, 0, `${initial.stdout}\n${initial.stderr}`);
+  const { recordPath, record: interruptedRecord } = recoveryRecord(root);
+  interruptedRecord.status = 'started';
+  interruptedRecord.rollback_performed = false;
+  interruptedRecord.placeholder_target_restorations[0].state = 'prepared';
+  delete interruptedRecord.placeholder_target_restorations[0].restored_at;
+  fs.writeFileSync(path.join(root, '.github/workflows/release.yml'), placeholder);
+  fs.writeFileSync(recordPath, `${JSON.stringify(interruptedRecord, null, 2)}\n`);
+
+  const resumed = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(resumed.status, 0, `${resumed.stdout}\n${resumed.stderr}`);
+  assert.equal(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'), baseline);
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'applied');
+  assert.equal(record.placeholder_target_restorations.length, 1);
+  assert.equal(record.placeholder_target_restorations[0].state, 'restored');
+  assert.equal(record.attempts.at(-1).placeholder_recovery.reason, 'exact_bounded_patch_placeholder_restored');
+});
+
+test('rolls back every persisted restoration when a later recovery retry fails', () => {
+  const { root, placeholder } = makeExactPlaceholderFixture();
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const initial = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(initial.status, 0, `${initial.stdout}\n${initial.stderr}`);
+  const { recordPath, record: interruptedRecord } = recoveryRecord(root);
+  interruptedRecord.status = 'started';
+  interruptedRecord.rollback_performed = false;
+  interruptedRecord.placeholder_target_restorations[0].state = 'prepared';
+  delete interruptedRecord.placeholder_target_restorations[0].restored_at;
+  fs.writeFileSync(path.join(root, '.github/workflows/release.yml'), placeholder);
+  fs.writeFileSync(recordPath, `${JSON.stringify(interruptedRecord, null, 2)}\n`);
+
+  fs.writeFileSync(path.join(root, 'scripts/repair-todo-decomposition.mjs'), [
+    'export function repairTodoDecomposition() {',
+    '  return { applied: true, eligible: true };',
+    '}'
+  ].join('\n'));
+  const guardCounterPath = path.join(root, '.brownie/private/phase-loop/guard-counter');
+  fs.writeFileSync(path.join(root, 'scripts/guard-todo-decomposition.mjs'), [
+    "import fs from 'node:fs';",
+    `const counterPath = ${JSON.stringify(guardCounterPath)};`,
+    'export function validateTodoDecomposition() {',
+    "  const attempt = Number.parseInt(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, 'utf8') : '0', 10) + 1;",
+    "  fs.writeFileSync(counterPath, String(attempt));",
+    "  return attempt === 1 ? ['guard-todo-decomposition.mjs: TODO dependencies must not contain cycles'] : ['guard-todo-decomposition.mjs: terminal fixture failure'];",
+    '}'
+  ].join('\n'));
+
+  const failed = runRecovery(root, diagnostic, '2', 'HEAD');
+  assert.equal(failed.status, 1, `${failed.stdout}\n${failed.stderr}`);
+  assert.equal(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'), placeholder);
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'failed_reverted');
+  assert.equal(record.placeholder_target_restorations[0].state, 'rolled_back');
+  assert.equal(record.failure_reason, 'guard_remained_non_reparable');
 });
 
 test('wires recovery into pre-claim boundary and pre-completion failures, deferring completion after a Create-only replan', () => {
