@@ -15278,6 +15278,7 @@ raise SystemExit(0 if payload.get("valid", True) else 1)
           --state-dir "$STATE_DIR" \
           --run-stamp "$run_stamp" \
           --max-retries "$PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES" \
+          --baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE" \
           --diagnostic "$recovery_diagnostic" 2>&1
       )"
       recovery_status=$?

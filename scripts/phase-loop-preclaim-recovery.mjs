@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -36,10 +37,12 @@ function sha256File(filePath) {
     : null;
 }
 
-function atomicWrite(filePath, content) {
+function atomicWrite(filePath, content, mode = 0o600) {
   const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(temporary, content, { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(temporary, content, { encoding: 'utf8', mode });
+  fs.chmodSync(temporary, mode);
   fs.renameSync(temporary, filePath);
+  fs.chmodSync(filePath, mode);
 }
 
 function writeJson(filePath, value) {
@@ -117,6 +120,443 @@ function safeRelativePath(repo, filePath) {
     : null;
 }
 
+function gitOutput(repo, args) {
+  const result = spawnSync('git', args, {
+    cwd: repo,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: 1024 * 1024
+  });
+  return result.status === 0 ? result.stdout : null;
+}
+
+function gitRevision(repo, ref) {
+  const output = gitOutput(repo, ['rev-parse', '--verify', `${ref}^{commit}`]);
+  const revision = output?.trim() ?? '';
+  return /^[0-9a-f]{40}$/iu.test(revision) ? revision : null;
+}
+
+function gitFileAtRevision(repo, revision, relativePath) {
+  return gitOutput(repo, ['show', `${revision}:${relativePath}`]);
+}
+
+function targetPreimagePath(recoveryDir, relativePath) {
+  return path.join(recoveryDir, 'target-preimages', `${sha256Text(relativePath)}.before`);
+}
+
+function recoveryHasEffectiveMutation(record) {
+  if (typeof record?.contract_rebaseline_receipt === 'string' && record.contract_rebaseline_receipt) return true;
+  if (Array.isArray(record?.placeholder_target_restorations)
+    && record.placeholder_target_restorations.some((restoration) => targetRestoreIntentState(restoration) === 'restored')) return true;
+  if (record?.before?.todo_sha256 && Object.hasOwn(record?.after ?? {}, 'todo_sha256') && record.before.todo_sha256 !== record.after.todo_sha256) return true;
+  if (Object.hasOwn(record?.before ?? {}, 'breakdown_sha256')
+    && Object.hasOwn(record?.after ?? {}, 'breakdown_sha256')
+    && record.before.breakdown_sha256 !== record.after.breakdown_sha256) return true;
+  return Array.isArray(record?.target_snapshot) && record.target_snapshot.some((target) => (
+    target.exists_before !== target.exists_after || target.sha256_before !== target.sha256_after
+  ));
+}
+
+function isLegacyNoopAppliedRecovery(record, diagnostic) {
+  return record?.status === 'applied'
+    && String(diagnostic).includes('contract_unsatisfiable_dirty_scope')
+    && !recoveryHasEffectiveMutation(record);
+}
+
+function restoreTargetPreimages(repo, recoveryDir, restorations) {
+  const errors = [];
+  for (const restoration of [...restorations].reverse()) {
+    try {
+      const relativePath = safeRelativePath(repo, restoration.path);
+      if (!relativePath) {
+        throw new Error('target path is outside the repository');
+      }
+      const targetPath = path.resolve(repo, relativePath);
+      const expectedSnapshotPath = targetPreimagePath(recoveryDir, relativePath);
+      const snapshotPath = path.resolve(repo, restoration.preimage_path);
+      if (snapshotPath !== expectedSnapshotPath) {
+        throw new Error('target preimage path does not match the recovery record target');
+      }
+      const content = fs.readFileSync(snapshotPath, 'utf8');
+      const originalMode = Number.isInteger(restoration.original_mode) ? restoration.original_mode : 0o600;
+      atomicWrite(targetPath, content, originalMode);
+    } catch (error) {
+      errors.push(`${restoration.path}: ${String(error?.message ?? error)}`);
+    }
+  }
+  return errors;
+}
+
+function targetRestoreIntentId(restoration) {
+  return sha256Text([
+    restoration.path,
+    restoration.observed_sha256,
+    restoration.restored_sha256,
+    restoration.approved_baseline_commit,
+    restoration.preimage_path,
+    restoration.original_mode
+  ].join('\n'));
+}
+
+function targetRestoreIntentMatches(left, right) {
+  return left?.intent_id === right.intent_id
+    && left.path === right.path
+    && left.observed_sha256 === right.observed_sha256
+    && left.restored_sha256 === right.restored_sha256
+    && left.approved_baseline_commit === right.approved_baseline_commit
+    && left.preimage_path === right.preimage_path
+    && left.original_mode === right.original_mode;
+}
+
+function targetRestoreIntentState(restoration) {
+  return restoration?.state ?? 'restored';
+}
+
+function persistTargetRestoreIntent(recordPath, restoration) {
+  const record = readJson(recordPath);
+  const restorations = Array.isArray(record.placeholder_target_restorations)
+    ? record.placeholder_target_restorations
+    : [];
+  const existing = restorations.find((candidate) => candidate.intent_id === restoration.intent_id);
+  if (existing) {
+    if (!targetRestoreIntentMatches(existing, restoration)) {
+      throw new Error(`${restoration.path}: existing target restoration intent does not match the approved recovery transaction`);
+    }
+    return existing;
+  }
+  if (restorations.some((candidate) => candidate.path === restoration.path && targetRestoreIntentState(candidate) !== 'rolled_back')) {
+    throw new Error(`${restoration.path}: existing target restoration intent conflicts with the current target state`);
+  }
+  const prepared = {
+    ...restoration,
+    state: 'prepared',
+    prepared_at: new Date().toISOString()
+  };
+  record.placeholder_target_restorations = [...restorations, prepared];
+  writeJson(recordPath, record);
+  return prepared;
+}
+
+function markTargetRestoreIntentRestored(recordPath, intentId, { reconciledAfterInterruption = false } = {}) {
+  return markTargetRestoreIntentsRestored(recordPath, [intentId], { reconciledAfterInterruption })[0];
+}
+
+function markTargetRestoreIntentsRestored(recordPath, intentIds, { reconciledAfterInterruption = false } = {}) {
+  const ids = new Set(intentIds.filter(Boolean));
+  if (ids.size === 0) return [];
+  const record = readJson(recordPath);
+  const restorations = Array.isArray(record.placeholder_target_restorations)
+    ? record.placeholder_target_restorations
+    : [];
+  const found = new Set();
+  const restored = [];
+  const nextRestorations = restorations.map((existing) => {
+    if (!ids.has(existing.intent_id)) return existing;
+    found.add(existing.intent_id);
+    const state = targetRestoreIntentState(existing);
+    if (state === 'restored') {
+      restored.push(existing);
+      return existing;
+    }
+    if (state !== 'prepared') {
+      throw new Error(`${existing.path}: target restoration intent is in unsupported state ${state}`);
+    }
+    const finalized = {
+      ...existing,
+      state: 'restored',
+      restored_at: new Date().toISOString(),
+      ...(reconciledAfterInterruption ? { reconciled_after_interruption_at: new Date().toISOString() } : {})
+    };
+    restored.push(finalized);
+    return finalized;
+  });
+  if (found.size !== ids.size) {
+    throw new Error('target restoration intent disappeared before it could be finalized');
+  }
+  record.placeholder_target_restorations = nextRestorations;
+  writeJson(recordPath, record);
+  return restored;
+}
+
+function markTargetRestoreIntentsRolledBack(recordPath, restorations) {
+  const ids = new Set(restorations.map((restoration) => restoration.intent_id).filter(Boolean));
+  if (ids.size === 0) return;
+  const record = readJson(recordPath);
+  const existing = Array.isArray(record.placeholder_target_restorations)
+    ? record.placeholder_target_restorations
+    : [];
+  record.placeholder_target_restorations = existing.map((restoration) => (
+    ids.has(restoration.intent_id)
+      ? { ...restoration, state: 'rolled_back', rolled_back_at: new Date().toISOString() }
+      : restoration
+  ));
+  writeJson(recordPath, record);
+}
+
+function rollbackTargetRestorations({ repo, recoveryDir, recordPath, restorations }) {
+  const errors = restoreTargetPreimages(repo, recoveryDir, restorations);
+  if (errors.length > 0) return errors;
+  try {
+    markTargetRestoreIntentsRolledBack(recordPath, restorations);
+  } catch (error) {
+    errors.push(String(error?.message ?? error));
+  }
+  return errors;
+}
+
+function activeTargetRestorations(recordPath) {
+  const record = readJson(recordPath);
+  const restorations = Array.isArray(record.placeholder_target_restorations)
+    ? record.placeholder_target_restorations
+    : [];
+  return restorations.filter((restoration) => {
+    const state = targetRestoreIntentState(restoration);
+    return state === 'prepared' || state === 'restored';
+  });
+}
+
+function rollbackPersistedTargetRestorations({ repo, recoveryDir, recordPath }) {
+  const restorations = activeTargetRestorations(recordPath);
+  return {
+    restorations,
+    errors: rollbackTargetRestorations({ repo, recoveryDir, recordPath, restorations })
+  };
+}
+
+function verifyPersistedTargetRestorations({ repo, recoveryDir, recordPath, restorations, baselineRef }) {
+  if (!Array.isArray(restorations) || restorations.length === 0) {
+    return { applied: false, reason: 'persisted_target_restorations_missing', restorations: [], errors: [] };
+  }
+  if (typeof baselineRef !== 'string' || baselineRef.trim() === '') {
+    return { applied: false, reason: 'approved_baseline_missing', restorations, errors: [] };
+  }
+  const baselineCommit = gitRevision(repo, baselineRef);
+  if (!baselineCommit) {
+    return { applied: false, reason: 'approved_baseline_unresolvable', restorations, errors: [] };
+  }
+
+  const errors = [];
+  const reconciledRestorations = [];
+  const preparedIntentIds = [];
+  let retryable = false;
+  for (const restoration of restorations) {
+    const relativePath = safeRelativePath(repo, restoration.path);
+    if (!relativePath) {
+      errors.push(`${String(restoration.path)}: target path is outside the repository`);
+      continue;
+    }
+    const targetPath = path.resolve(repo, relativePath);
+    const expectedSnapshotPath = targetPreimagePath(recoveryDir, relativePath);
+    const snapshotPath = path.resolve(repo, restoration.preimage_path);
+    if (snapshotPath !== expectedSnapshotPath || !fs.existsSync(snapshotPath)) {
+      errors.push(`${relativePath}: recorded target preimage is missing or does not match its target`);
+      continue;
+    }
+    const targetSha256 = sha256File(targetPath);
+    if (!targetSha256) {
+      errors.push(`${relativePath}: target disappeared before persisted restoration could be reconciled`);
+      continue;
+    }
+    if (sha256File(snapshotPath) !== restoration.observed_sha256) {
+      errors.push(`${relativePath}: target preimage digest no longer matches the recovery record`);
+      continue;
+    }
+    const targetContent = fs.readFileSync(targetPath, 'utf8');
+    const headContent = gitFileAtRevision(repo, 'HEAD', relativePath);
+    const baselineContent = gitFileAtRevision(repo, baselineCommit, relativePath);
+    if (headContent === null || baselineContent === null) {
+      errors.push(`${relativePath}: checked-out or selected baseline does not contain the restored target`);
+      continue;
+    }
+    if (isBoundedProposalPlaceholder(baselineContent)) {
+      errors.push(`${relativePath}: selected baseline is itself a bounded placeholder`);
+      continue;
+    }
+    const state = targetRestoreIntentState(restoration);
+    if (!['prepared', 'restored'].includes(state)) {
+      errors.push(`${relativePath}: target restoration intent has unsupported state ${state}`);
+      continue;
+    }
+    if (targetSha256 === restoration.restored_sha256) {
+      if (isBoundedProposalPlaceholder(targetContent)) {
+        errors.push(`${relativePath}: persisted restoration still contains a bounded placeholder`);
+        continue;
+      }
+      if (headContent !== targetContent || baselineContent !== targetContent) {
+        errors.push(`${relativePath}: restored target no longer matches both checked-out and selected baseline content`);
+        continue;
+      }
+      reconciledRestorations.push(restoration);
+      if (state === 'prepared') preparedIntentIds.push(restoration.intent_id);
+      continue;
+    }
+    if (state === 'prepared'
+      && targetSha256 === restoration.observed_sha256
+      && isBoundedProposalPlaceholder(targetContent)) {
+      retryable = true;
+      continue;
+    }
+    errors.push(`${relativePath}: target state does not match a prepared or completed restoration`);
+  }
+  if (errors.length > 0) {
+    return {
+      applied: false,
+      retryable: false,
+      reason: 'persisted_target_restorations_invalid',
+      restorations,
+      errors
+    };
+  }
+  let finalizedRestorations = reconciledRestorations;
+  if (preparedIntentIds.length > 0) {
+    try {
+      const finalizedById = new Map(markTargetRestoreIntentsRestored(recordPath, preparedIntentIds, {
+        reconciledAfterInterruption: true
+      }).map((restoration) => [restoration.intent_id, restoration]));
+      finalizedRestorations = reconciledRestorations.map((restoration) => (
+        finalizedById.get(restoration.intent_id) ?? restoration
+      ));
+    } catch (error) {
+      return {
+        applied: false,
+        retryable: false,
+        reason: 'persisted_target_restorations_invalid',
+        restorations,
+        errors: [String(error?.message ?? error)]
+      };
+    }
+  }
+  if (retryable) {
+    return {
+      applied: false,
+      retryable: true,
+      reason: 'persisted_target_restorations_pending',
+      restorations: [],
+      errors: []
+    };
+  }
+  return {
+    applied: true,
+    reason: 'persisted_target_restorations_verified',
+    restorations: finalizedRestorations,
+    resumed: true,
+    errors: []
+  };
+}
+
+function restoreExactBoundedPatchPlaceholders({ repo, recoveryDir, recordPath, targetSnapshot, baselineRef }) {
+  const candidates = [];
+  const errors = [];
+  for (const target of targetSnapshot.filter((entry) => entry.operation === 'Patch')) {
+    const relativePath = safeRelativePath(repo, target.path);
+    if (!relativePath) continue;
+    const targetPath = path.join(repo, relativePath);
+    if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isFile()) continue;
+    const observedContent = fs.readFileSync(targetPath, 'utf8');
+    if (!isBoundedProposalPlaceholder(observedContent)) continue;
+    const observedSha256 = sha256Text(observedContent);
+    if (target.sha256_before && target.sha256_before !== observedSha256) {
+      errors.push(`${relativePath}: observed placeholder digest no longer matches the recovery snapshot`);
+      continue;
+    }
+    candidates.push({
+      relativePath,
+      targetPath,
+      observedContent,
+      observedSha256,
+      originalMode: fs.statSync(targetPath).mode & 0o777
+    });
+  }
+
+  if (candidates.length === 0) {
+    return { applied: false, reason: 'no_exact_bounded_patch_placeholder', restorations: [] };
+  }
+  if (typeof baselineRef !== 'string' || baselineRef.trim() === '') {
+    return { applied: false, reason: 'approved_baseline_missing', restorations: [], errors };
+  }
+  const baselineCommit = gitRevision(repo, baselineRef);
+  if (!baselineCommit) {
+    return { applied: false, reason: 'approved_baseline_unresolvable', restorations: [], errors };
+  }
+
+  for (const candidate of candidates) {
+    const headContent = gitFileAtRevision(repo, 'HEAD', candidate.relativePath);
+    const baselineContent = gitFileAtRevision(repo, baselineCommit, candidate.relativePath);
+    if (headContent === null || baselineContent === null) {
+      errors.push(`${candidate.relativePath}: approved baseline does not contain a tracked recovery target`);
+      continue;
+    }
+    if (headContent !== baselineContent) {
+      errors.push(`${candidate.relativePath}: approved baseline content diverges from the checked-out source baseline`);
+      continue;
+    }
+    if (isBoundedProposalPlaceholder(baselineContent)) {
+      errors.push(`${candidate.relativePath}: approved baseline is itself a bounded placeholder`);
+      continue;
+    }
+    candidate.baselineContent = baselineContent;
+  }
+  if (errors.length > 0) {
+    return { applied: false, reason: 'approved_baseline_not_safe_for_placeholder_restore', restorations: [], errors };
+  }
+
+  const restorations = [];
+  const rollbackRestorations = [];
+  try {
+    for (const candidate of candidates) {
+      const preimagePath = targetPreimagePath(recoveryDir, candidate.relativePath);
+      fs.mkdirSync(path.dirname(preimagePath), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(preimagePath)) {
+        if (fs.readFileSync(preimagePath, 'utf8') !== candidate.observedContent) {
+          throw new Error(`${candidate.relativePath}: existing target preimage does not match the exact placeholder`);
+        }
+      } else {
+        atomicWrite(preimagePath, candidate.observedContent);
+      }
+      const preimageRelativePath = safeRelativePath(repo, preimagePath);
+      if (!preimageRelativePath) {
+        throw new Error(`${candidate.relativePath}: target preimage escaped the repository`);
+      }
+      const intent = {
+        path: candidate.relativePath,
+        mode: 'exact_bounded_patch_placeholder_to_approved_baseline',
+        observed_sha256: candidate.observedSha256,
+        restored_sha256: sha256Text(candidate.baselineContent),
+        approved_baseline_ref: baselineRef,
+        approved_baseline_commit: baselineCommit,
+        preimage_path: preimageRelativePath,
+        original_mode: candidate.originalMode
+      };
+      intent.intent_id = targetRestoreIntentId(intent);
+      const prepared = persistTargetRestoreIntent(recordPath, intent);
+      if (targetRestoreIntentState(prepared) !== 'prepared') {
+        throw new Error(`${candidate.relativePath}: existing target restoration intent is already finalized while the target is still a placeholder`);
+      }
+      rollbackRestorations.push(prepared);
+      atomicWrite(candidate.targetPath, candidate.baselineContent, candidate.originalMode);
+      if (fs.readFileSync(candidate.targetPath, 'utf8') !== candidate.baselineContent) {
+        throw new Error(`${candidate.relativePath}: restored target verification failed`);
+      }
+      restorations.push(markTargetRestoreIntentRestored(recordPath, intent.intent_id));
+    }
+  } catch (error) {
+    const rollbackErrors = rollbackTargetRestorations({ repo, recoveryDir, recordPath, restorations: rollbackRestorations });
+    return {
+      applied: false,
+      reason: 'placeholder_restore_failed',
+      restorations: [],
+      errors: [String(error?.message ?? error), ...rollbackErrors]
+    };
+  }
+  return {
+    applied: true,
+    reason: 'exact_bounded_patch_placeholder_restored',
+    restorations,
+    recorded: true,
+    errors: []
+  };
+}
+
 function legacyAppliedRecoveryRecords(stateDir) {
   const directory = path.join(stateDir, 'preclaim-recovery');
   try {
@@ -134,8 +574,8 @@ function legacyAppliedRecoveryRecords(stateDir) {
 }
 
 function isBoundedProposalPlaceholder(content) {
-  const text = String(content ?? '').trim();
-  return text.length <= 160 && /brownie bounded (?:patch|create)-only proposal\.?/iu.test(text);
+  return String(content ?? '') === '// Brownie bounded Patch-only proposal.\n'
+    || String(content ?? '') === '// Brownie bounded Create-only proposal.\n';
 }
 
 function migrateLegacyTargetCapture({ repo, stateDir, todoPath, breakdownPath, todoText, runStamp, diagnostic }) {
@@ -295,6 +735,7 @@ async function main(rawArgs) {
   const runStamp = String(args['run-stamp'] ?? new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z'));
   const maxRetriesRaw = Number.parseInt(args['max-retries'] ?? '3', 10);
   const maxRetries = Number.isInteger(maxRetriesRaw) && maxRetriesRaw > 0 ? maxRetriesRaw : 3;
+  const approvedBaselineRef = typeof args['baseline-ref'] === 'string' ? args['baseline-ref'] : '';
 
   if (!isReparableDecompositionDiagnostic(diagnostic)) {
     return 2;
@@ -339,10 +780,14 @@ async function main(rawArgs) {
       recoveryRecord = interrupted.record;
     }
   }
+  let reopeningLegacyNoop = false;
+  let resumedInterruptedRecovery = false;
   if (recoveryRecord) {
-    if (recoveryRecord.status !== 'started') {
+    if (recoveryRecord.status !== 'started' && !isLegacyNoopAppliedRecovery(recoveryRecord, diagnostic)) {
       return terminalRecoveryStatuses.has(recoveryRecord.status) ? 2 : 1;
     }
+    reopeningLegacyNoop = recoveryRecord.status === 'applied';
+    resumedInterruptedRecovery = !reopeningLegacyNoop;
     const missingSnapshots = recoverySnapshotMissing({ record: recoveryRecord });
     if (missingSnapshots.length > 0) {
       markRecoveryTerminal({
@@ -354,32 +799,50 @@ async function main(rawArgs) {
       });
       return 1;
     }
-    try {
-      restoreSnapshot({
-        recoveryDir,
-        todoPath,
-        breakdownPath,
-        breakdownExisted: Boolean(recoveryRecord.rollback_snapshot.breakdown)
-      });
-    } catch (error) {
-      markRecoveryTerminal({
-        recordPath,
-        record: recoveryRecord,
-        status: 'failed_recovery_snapshot_missing',
-        reason: 'recovery_snapshot_restore_failed',
-        missing: [String(error?.message ?? error)]
-      });
-      return 1;
+    if (reopeningLegacyNoop) {
+      const liveTodoSha256 = sha256File(todoPath);
+      const liveBreakdownSha256 = breakdownBeforeExists ? sha256File(breakdownPath) : null;
+      if (liveTodoSha256 !== recoveryRecord.after?.todo_sha256 || liveBreakdownSha256 !== recoveryRecord.after?.breakdown_sha256) {
+        markRecoveryTerminal({
+          recordPath,
+          record: recoveryRecord,
+          status: 'failed_recovery_record_invalid',
+          reason: 'legacy_noop_recovery_live_state_changed',
+          missing: []
+        });
+        return 1;
+      }
+    } else {
+      try {
+        restoreSnapshot({
+          recoveryDir,
+          todoPath,
+          breakdownPath,
+          breakdownExisted: Boolean(recoveryRecord.rollback_snapshot.breakdown)
+        });
+      } catch (error) {
+        markRecoveryTerminal({
+          recordPath,
+          record: recoveryRecord,
+          status: 'failed_recovery_snapshot_missing',
+          reason: 'recovery_snapshot_restore_failed',
+          missing: [String(error?.message ?? error)]
+        });
+        return 1;
+      }
     }
     recoveryRecord.recovery_resumes = [
       ...(Array.isArray(recoveryRecord.recovery_resumes) ? recoveryRecord.recovery_resumes : []),
       {
         run_stamp: runStamp,
         resumed_at: new Date().toISOString(),
-        rollback_performed: true
+        rollback_performed: !reopeningLegacyNoop,
+        legacy_noop_reopened: reopeningLegacyNoop
       }
     ];
-    recoveryRecord.resumed_after_interruption = true;
+    recoveryRecord.status = 'started';
+    recoveryRecord.resumed_after_interruption = !reopeningLegacyNoop;
+    recoveryRecord.legacy_noop_reopened = reopeningLegacyNoop || recoveryRecord.legacy_noop_reopened === true;
     writeJson(recordPath, recoveryRecord);
   }
 
@@ -454,6 +917,31 @@ async function main(rawArgs) {
   };
   writeJson(recordPath, record);
 
+  const resumedPlaceholderRecovery = resumedInterruptedRecovery
+    && Array.isArray(record.placeholder_target_restorations)
+    && record.placeholder_target_restorations.length > 0
+    ? verifyPersistedTargetRestorations({
+      repo,
+      recoveryDir,
+      recordPath,
+      restorations: record.placeholder_target_restorations,
+      baselineRef: approvedBaselineRef
+    })
+    : null;
+  if (resumedPlaceholderRecovery
+    && !resumedPlaceholderRecovery.applied
+    && resumedPlaceholderRecovery.retryable !== true) {
+    record.status = 'failed_recovery_record_invalid';
+    record.failure_reason = 'persisted_target_restoration_invalid';
+    record.placeholder_target_recovery_error = {
+      reason: resumedPlaceholderRecovery.reason,
+      errors: resumedPlaceholderRecovery.errors ?? []
+    };
+    record.terminal_recorded_at = new Date().toISOString();
+    writeJson(recordPath, record);
+    return 1;
+  }
+
   const repairScript = path.join(repo, 'scripts/repair-todo-decomposition.mjs');
   const guardScript = path.join(repo, 'scripts/guard-todo-decomposition.mjs');
   process.env.BROWNIE_REPAIR_TODO_REPO_ROOT = repo;
@@ -476,6 +964,44 @@ async function main(rawArgs) {
     } catch (error) {
       repair = { exitCode: 1, output: String(error?.stack ?? error) };
     }
+    let placeholderRecovery;
+    if (resumedPlaceholderRecovery?.applied) {
+      // A prior interruption can happen between independently journaled
+      // targets.  Verifying the target(s) already recorded must not skip an
+      // unrecorded exact placeholder that is still present in the same target
+      // snapshot.
+      const remainingPlaceholderRecovery = restoreExactBoundedPatchPlaceholders({
+        repo,
+        recoveryDir,
+        recordPath,
+        targetSnapshot,
+        baselineRef: approvedBaselineRef
+      });
+      if (remainingPlaceholderRecovery.applied) {
+        placeholderRecovery = {
+          applied: true,
+          reason: 'persisted_target_restorations_verified_and_remaining_placeholders_restored',
+          restorations: [...resumedPlaceholderRecovery.restorations, ...remainingPlaceholderRecovery.restorations],
+          resumed: true,
+          recorded: true,
+          errors: []
+        };
+      } else if (remainingPlaceholderRecovery.reason === 'no_exact_bounded_patch_placeholder') {
+        placeholderRecovery = resumedPlaceholderRecovery;
+      } else {
+        placeholderRecovery = remainingPlaceholderRecovery;
+      }
+    } else if (resumedPlaceholderRecovery?.retryable === true || repair.exitCode !== 0) {
+      placeholderRecovery = restoreExactBoundedPatchPlaceholders({
+        repo,
+        recoveryDir,
+        recordPath,
+        targetSnapshot,
+        baselineRef: approvedBaselineRef
+      });
+    } else {
+      placeholderRecovery = { applied: false, reason: 'todo_repair_applied', restorations: [] };
+    }
     const guardErrors = validateTodoDecomposition(repo, path.relative(repo, todoPath));
     const guard = {
       exitCode: guardErrors.length > 0 ? 1 : 0,
@@ -488,6 +1014,12 @@ async function main(rawArgs) {
       repair_output_tail: repair.output.slice(-4000),
       guard_exit: guard.exitCode,
       guard_output_tail: guard.output.slice(-4000),
+      placeholder_recovery: {
+        applied: placeholderRecovery.applied === true,
+        reason: placeholderRecovery.reason,
+        resumed: placeholderRecovery.resumed === true,
+        errors: placeholderRecovery.errors ?? []
+      },
       todo_sha256_after: sha256File(todoPath),
       breakdown_sha256_after: sha256File(breakdownPath)
     });
@@ -503,9 +1035,23 @@ async function main(rawArgs) {
         sha256_after: sha256File(targetPath)
       };
     });
+    if (placeholderRecovery.applied
+      && placeholderRecovery.resumed !== true
+      && placeholderRecovery.recorded !== true) {
+      currentRecord.placeholder_target_restorations = [
+        ...(Array.isArray(currentRecord.placeholder_target_restorations) ? currentRecord.placeholder_target_restorations : []),
+        ...placeholderRecovery.restorations
+      ];
+    }
+    if (!placeholderRecovery.applied && placeholderRecovery.reason !== 'todo_repair_applied') {
+      currentRecord.placeholder_target_recovery_error = {
+        reason: placeholderRecovery.reason,
+        errors: placeholderRecovery.errors ?? []
+      };
+    }
     writeJson(recordPath, currentRecord);
 
-    if (guard.exitCode === 0) {
+    if (guard.exitCode === 0 && (repair.exitCode === 0 || placeholderRecovery.applied)) {
       try {
         const beforeTodoText = fs.readFileSync(currentRecord.rollback_snapshot.todo, 'utf8');
         const afterTodoText = fs.readFileSync(todoPath, 'utf8');
@@ -539,6 +1085,12 @@ async function main(rawArgs) {
         writeJson(recordPath, currentRecord);
         return 0;
       } catch (error) {
+        const targetRollback = rollbackPersistedTargetRestorations({ repo, recoveryDir, recordPath });
+        const targetRollbackErrors = targetRollback.errors;
+        if (targetRollback.restorations.length > 0) {
+          currentRecord.placeholder_target_restorations = readJson(recordPath).placeholder_target_restorations
+            ?? currentRecord.placeholder_target_restorations;
+        }
         restoreSnapshot({ recoveryDir, todoPath, breakdownPath, breakdownExisted: breakdownBeforeExists });
         currentRecord.status = 'failed_reverted';
         currentRecord.rollback_performed = true;
@@ -546,7 +1098,8 @@ async function main(rawArgs) {
         currentRecord.after_rollback = {
           todo_sha256: sha256File(todoPath),
           breakdown_sha256: sha256File(breakdownPath),
-          receipt_error: String(error?.message ?? error)
+          receipt_error: String(error?.message ?? error),
+          target_restore_rollback_errors: targetRollbackErrors
         };
         writeJson(recordPath, currentRecord);
         return 1;
@@ -558,18 +1111,27 @@ async function main(rawArgs) {
       continue;
     }
 
+    const targetRollback = rollbackPersistedTargetRestorations({ repo, recoveryDir, recordPath });
+    const targetRollbackErrors = targetRollback.errors;
+    if (targetRollback.restorations.length > 0) {
+      currentRecord.placeholder_target_restorations = readJson(recordPath).placeholder_target_restorations
+        ?? currentRecord.placeholder_target_restorations;
+    }
     restoreSnapshot({ recoveryDir, todoPath, breakdownPath, breakdownExisted: breakdownBeforeExists });
     currentRecord.status = 'failed_reverted';
     currentRecord.rollback_performed = true;
-    currentRecord.failure_reason = repair.exitCode !== 0
-      ? 'repair_command_failed'
+    currentRecord.failure_reason = repair.exitCode !== 0 && !placeholderRecovery.applied
+      ? placeholderRecovery.reason === 'no_exact_bounded_patch_placeholder'
+        ? 'no_effective_recovery'
+        : 'placeholder_recovery_unavailable'
       : !isReparableDecompositionDiagnostic(guard.output)
         ? 'guard_remained_non_reparable'
         : 'retry_bound_reached';
     currentRecord.after_rollback = {
       todo_sha256: sha256File(todoPath),
       breakdown_sha256: sha256File(breakdownPath),
-      guard_output_tail: guard.output.slice(-4000)
+      guard_output_tail: guard.output.slice(-4000),
+      target_restore_rollback_errors: targetRollbackErrors
     };
     writeJson(recordPath, currentRecord);
     return 1;
