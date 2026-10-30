@@ -8328,6 +8328,8 @@ fn validate_tool_execution_terminal_payload_schema(
     validate_required_payload_string_field(object, "tool_id")?;
     validate_required_payload_string_field(object, "status")?;
     validate_optional_payload_string_field(object, "reason")?;
+    validate_optional_payload_string_field(object, "failure_class")?;
+    validate_optional_payload_u64_field(object, "rejection_count")?;
     if object.get("status").and_then(serde_json::Value::as_str) != Some(expected_status) {
         bail!("{kind:?} ledger payload status must be {expected_status}");
     }
@@ -10520,6 +10522,7 @@ const TOOL_EXECUTION_TERMINAL_KNOWN_PAYLOAD_FIELDS: &[&str] = &[
     "duration_ms",
     "exit_code",
     "expected_parent_head",
+    "failure_class",
     "failed_git_operation",
     "git",
     "git_environment_hardened",
@@ -10551,6 +10554,7 @@ const TOOL_EXECUTION_TERMINAL_KNOWN_PAYLOAD_FIELDS: &[&str] = &[
     "raw_file_content_redacted",
     "raw_message_redacted",
     "reason",
+    "rejection_count",
     "reader_thread_joined",
     "replayed",
     "repository_hooks_bypassed",
