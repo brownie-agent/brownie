@@ -16,7 +16,7 @@ function makeFixture({ repairableCycle = true } = {}) {
   fs.mkdirSync(path.join(root, '.github/workflows'), { recursive: true });
   fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-claims'), { recursive: true });
   fs.mkdirSync(path.join(root, '.brownie/private/phase-loop/todo-replans'), { recursive: true });
-  for (const file of ['guard-todo-decomposition.mjs', 'phase-loop-todo-state.mjs', 'repair-todo-decomposition.mjs']) {
+  for (const file of ['guard-todo-decomposition.mjs', 'phase-loop-todo-state.mjs', 'phase-loop-bounded-scope.mjs', 'repair-todo-decomposition.mjs']) {
     fs.copyFileSync(path.join(repositoryRoot, 'scripts', file), path.join(root, 'scripts', file));
   }
   fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
@@ -75,8 +75,8 @@ function makeFixture({ repairableCycle = true } = {}) {
   return root;
 }
 
-function runRecovery(root, diagnostic, maxRetries = '3') {
-  return spawnSync(process.execPath, [
+function runRecovery(root, diagnostic, maxRetries = '3', baselineRef = null) {
+  const args = [
     recoveryScript,
     '--repo', root,
     '--todo', '.brownie/todo.md',
@@ -86,7 +86,51 @@ function runRecovery(root, diagnostic, maxRetries = '3') {
     '--run-stamp', 'fixture-run',
     '--max-retries', maxRetries,
     '--diagnostic', diagnostic
-  ], { cwd: repositoryRoot, encoding: 'utf8' });
+  ];
+  if (baselineRef) args.push('--baseline-ref', baselineRef);
+  return spawnSync(process.execPath, args, { cwd: repositoryRoot, encoding: 'utf8' });
+}
+
+function git(root, args) {
+  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${args.join(' ')}\n${result.stdout}\n${result.stderr}`);
+  return result.stdout;
+}
+
+function recoveryRecord(root) {
+  const recoveryRoot = path.join(root, '.brownie/private/phase-loop/preclaim-recovery');
+  const directory = fs.readdirSync(recoveryRoot, { withFileTypes: true }).find((entry) => entry.isDirectory());
+  assert.ok(directory, 'expected recovery record directory');
+  const recordPath = path.join(recoveryRoot, directory.name, 'record.json');
+  return { recordPath, record: JSON.parse(fs.readFileSync(recordPath, 'utf8')) };
+}
+
+function makeExactPlaceholderFixture() {
+  const root = makeFixture({ repairableCycle: false });
+  const todo = '- [ ] E-placeholder: Patch only `.github/workflows/release.yml`:\n'
+    + '  Route: implementation.\n'
+    + '  Source TODO: fixture source.\n'
+    + '  Depends on: <none>.\n'
+    + '  Completion condition: Restore only an exact bounded placeholder to the approved tracked release workflow so the selected TODO can be scheduled.\n'
+    + '  Forbidden changes: do not edit unrelated files.\n'
+    + '  Verification: run `pnpm --workspace-root guard:todo-decomposition`.\n';
+  const breakdown = '# TODO breakdown\n\nParent TODO: fixture source.\n\nDependency graph:\n- E-placeholder: <none>.\n\nVerification ledger:\n- E-placeholder: guard.\n\nQuality rubric:\n- One bounded leaf.\n';
+  const baseline = 'name: fixture\n';
+  fs.writeFileSync(path.join(root, '.brownie/todo.md'), todo);
+  fs.writeFileSync(path.join(root, '.brownie/todo-breakdown.md'), breakdown);
+  fs.writeFileSync(path.join(root, '.brownie/private/phase-loop/todo-claims/current.json'), JSON.stringify({
+    claim_id: 'placeholder-claim',
+    selected_todo: todo.trim()
+  }) + '\n');
+  fs.writeFileSync(path.join(root, '.github/workflows/release.yml'), baseline);
+  git(root, ['init', '-q']);
+  git(root, ['config', 'user.name', 'Fixture']);
+  git(root, ['config', 'user.email', 'fixture@example.invalid']);
+  git(root, ['add', '.']);
+  git(root, ['commit', '-qm', 'fixture baseline']);
+  const placeholder = '// Brownie bounded Patch-only proposal.\n';
+  fs.writeFileSync(path.join(root, '.github/workflows/release.yml'), placeholder);
+  return { root, baseline, placeholder };
 }
 
 test('repairs reparable pre-claim decomposition drift and records a reversible transaction', () => {
@@ -280,6 +324,77 @@ test('fails closed and restores the preimage when a reparable diagnosis has no s
   assert.equal(record.rollback_performed, true);
 });
 
+test('restores an exact dirty bounded patch placeholder from the configured approved baseline and archives its preimage', () => {
+  const { root, baseline, placeholder } = makeExactPlaceholderFixture();
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const result = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const targetPath = path.join(root, '.github/workflows/release.yml');
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), baseline);
+  assert.equal(git(root, ['diff', '--', '.github/workflows/release.yml']), '');
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'applied');
+  assert.equal(record.contract_rebaseline_receipt, undefined);
+  assert.equal(record.placeholder_target_restorations.length, 1);
+  const restoration = record.placeholder_target_restorations[0];
+  assert.equal(restoration.path, '.github/workflows/release.yml');
+  assert.equal(restoration.approved_baseline_ref, 'HEAD');
+  assert.equal(restoration.approved_baseline_commit, git(root, ['rev-parse', 'HEAD']).trim());
+  assert.equal(fs.readFileSync(path.join(root, restoration.preimage_path), 'utf8'), placeholder);
+});
+
+test('does not report success when a dirty bounded patch placeholder lacks an approved baseline selection', () => {
+  const { root, placeholder } = makeExactPlaceholderFixture();
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const result = runRecovery(root, diagnostic);
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+  assert.equal(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'), placeholder);
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'failed_reverted');
+  assert.equal(record.failure_reason, 'placeholder_recovery_unavailable');
+  assert.equal(record.placeholder_target_recovery_error.reason, 'approved_baseline_missing');
+});
+
+test('refuses an approved baseline whose target content differs from the checked-out source baseline', () => {
+  const { root, placeholder } = makeExactPlaceholderFixture();
+  const targetPath = path.join(root, '.github/workflows/release.yml');
+  fs.writeFileSync(targetPath, 'name: diverged\n');
+  git(root, ['add', '.github/workflows/release.yml']);
+  git(root, ['commit', '-qm', 'diverged checked-out baseline']);
+  git(root, ['branch', 'approved-baseline', 'HEAD~1']);
+  fs.writeFileSync(targetPath, placeholder);
+
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const result = runRecovery(root, diagnostic, '3', 'approved-baseline');
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), placeholder);
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'failed_reverted');
+  assert.equal(record.failure_reason, 'placeholder_recovery_unavailable');
+  assert.equal(record.placeholder_target_recovery_error.reason, 'approved_baseline_not_safe_for_placeholder_restore');
+});
+
+test('reopens a legacy applied no-op recovery only when its live snapshots still match, then restores the exact placeholder', () => {
+  const { root, baseline } = makeExactPlaceholderFixture();
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const initial = runRecovery(root, diagnostic);
+  assert.equal(initial.status, 1, `${initial.stdout}\n${initial.stderr}`);
+  const { recordPath, record: legacyRecord } = recoveryRecord(root);
+  legacyRecord.status = 'applied';
+  legacyRecord.rollback_performed = false;
+  legacyRecord.failure_reason = null;
+  fs.writeFileSync(recordPath, `${JSON.stringify(legacyRecord, null, 2)}\n`);
+
+  const resumed = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(resumed.status, 0, `${resumed.stdout}\n${resumed.stderr}`);
+  assert.equal(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'), baseline);
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'applied');
+  assert.equal(record.legacy_noop_reopened, true);
+  assert.equal(record.recovery_resumes.at(-1).legacy_noop_reopened, true);
+  assert.equal(record.placeholder_target_restorations.length, 1);
+});
+
 test('wires recovery into pre-claim boundary and pre-completion failures, deferring completion after a Create-only replan', () => {
   const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
   assert.match(controller, /stage.*pre-claim[\s\S]{0,500}phase-loop-preclaim-recovery\.mjs/u);
@@ -288,6 +403,7 @@ test('wires recovery into pre-claim boundary and pre-completion failures, deferr
   assert(controller.includes('--max-retries "$PHASE_LOOP_PRECLAIM_RECOVERY_MAX_RETRIES"'));
   assert(controller.includes('PHASE_LOOP_PRECLAIM_RECOVERY_ACTIVE:-0'));
   assert(controller.includes('PHASE_LOOP_PRECOMPLETION_REPLAN_APPLIED'));
+  assert(controller.includes('--baseline-ref "$PHASE_LOOP_APPROVED_CONTROLLER_BASELINE"'));
   assert(controller.includes('precompletion_create_only_replan_deferred_completion=true'));
   assert(controller.includes('create_only_target_materialized_before_semantic_completion'));
   assert(controller.includes('preclaim_recovery_diagnostic_fallback=true'));

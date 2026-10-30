@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -36,10 +37,12 @@ function sha256File(filePath) {
     : null;
 }
 
-function atomicWrite(filePath, content) {
+function atomicWrite(filePath, content, mode = 0o600) {
   const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(temporary, content, { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(temporary, content, { encoding: 'utf8', mode });
+  fs.chmodSync(temporary, mode);
   fs.renameSync(temporary, filePath);
+  fs.chmodSync(filePath, mode);
 }
 
 function writeJson(filePath, value) {
@@ -115,6 +118,159 @@ function safeRelativePath(repo, filePath) {
   return relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
     ? relative.split(path.sep).join('/')
     : null;
+}
+
+function gitOutput(repo, args) {
+  const result = spawnSync('git', args, {
+    cwd: repo,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: 1024 * 1024
+  });
+  return result.status === 0 ? result.stdout : null;
+}
+
+function gitRevision(repo, ref) {
+  const output = gitOutput(repo, ['rev-parse', '--verify', `${ref}^{commit}`]);
+  const revision = output?.trim() ?? '';
+  return /^[0-9a-f]{40}$/iu.test(revision) ? revision : null;
+}
+
+function gitFileAtRevision(repo, revision, relativePath) {
+  return gitOutput(repo, ['show', `${revision}:${relativePath}`]);
+}
+
+function targetPreimagePath(recoveryDir, relativePath) {
+  return path.join(recoveryDir, 'target-preimages', `${sha256Text(relativePath)}.before`);
+}
+
+function recoveryHasEffectiveMutation(record) {
+  if (typeof record?.contract_rebaseline_receipt === 'string' && record.contract_rebaseline_receipt) return true;
+  if (Array.isArray(record?.placeholder_target_restorations) && record.placeholder_target_restorations.length > 0) return true;
+  if (record?.before?.todo_sha256 && Object.hasOwn(record?.after ?? {}, 'todo_sha256') && record.before.todo_sha256 !== record.after.todo_sha256) return true;
+  if (Object.hasOwn(record?.before ?? {}, 'breakdown_sha256')
+    && Object.hasOwn(record?.after ?? {}, 'breakdown_sha256')
+    && record.before.breakdown_sha256 !== record.after.breakdown_sha256) return true;
+  return Array.isArray(record?.target_snapshot) && record.target_snapshot.some((target) => (
+    target.exists_before !== target.exists_after || target.sha256_before !== target.sha256_after
+  ));
+}
+
+function isLegacyNoopAppliedRecovery(record, diagnostic) {
+  return record?.status === 'applied'
+    && String(diagnostic).includes('contract_unsatisfiable_dirty_scope')
+    && !recoveryHasEffectiveMutation(record);
+}
+
+function restoreTargetPreimages(repo, restorations) {
+  const errors = [];
+  for (const restoration of [...restorations].reverse()) {
+    try {
+      const targetPath = path.resolve(repo, restoration.path);
+      const snapshotPath = path.resolve(repo, restoration.preimage_path);
+      const content = fs.readFileSync(snapshotPath, 'utf8');
+      atomicWrite(targetPath, content, restoration.original_mode);
+    } catch (error) {
+      errors.push(`${restoration.path}: ${String(error?.message ?? error)}`);
+    }
+  }
+  return errors;
+}
+
+function restoreExactBoundedPatchPlaceholders({ repo, recoveryDir, targetSnapshot, baselineRef }) {
+  const candidates = [];
+  const errors = [];
+  for (const target of targetSnapshot.filter((entry) => entry.operation === 'Patch')) {
+    const relativePath = safeRelativePath(repo, target.path);
+    if (!relativePath) continue;
+    const targetPath = path.join(repo, relativePath);
+    if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isFile()) continue;
+    const observedContent = fs.readFileSync(targetPath, 'utf8');
+    if (!isBoundedProposalPlaceholder(observedContent)) continue;
+    const observedSha256 = sha256Text(observedContent);
+    if (target.sha256_before && target.sha256_before !== observedSha256) {
+      errors.push(`${relativePath}: observed placeholder digest no longer matches the recovery snapshot`);
+      continue;
+    }
+    candidates.push({
+      relativePath,
+      targetPath,
+      observedContent,
+      observedSha256,
+      originalMode: fs.statSync(targetPath).mode & 0o777
+    });
+  }
+
+  if (candidates.length === 0) {
+    return { applied: false, reason: 'no_exact_bounded_patch_placeholder', restorations: [] };
+  }
+  if (typeof baselineRef !== 'string' || baselineRef.trim() === '') {
+    return { applied: false, reason: 'approved_baseline_missing', restorations: [], errors };
+  }
+  const baselineCommit = gitRevision(repo, baselineRef);
+  if (!baselineCommit) {
+    return { applied: false, reason: 'approved_baseline_unresolvable', restorations: [], errors };
+  }
+
+  for (const candidate of candidates) {
+    const headContent = gitFileAtRevision(repo, 'HEAD', candidate.relativePath);
+    const baselineContent = gitFileAtRevision(repo, baselineCommit, candidate.relativePath);
+    if (headContent === null || baselineContent === null) {
+      errors.push(`${candidate.relativePath}: approved baseline does not contain a tracked recovery target`);
+      continue;
+    }
+    if (headContent !== baselineContent) {
+      errors.push(`${candidate.relativePath}: approved baseline content diverges from the checked-out source baseline`);
+      continue;
+    }
+    if (isBoundedProposalPlaceholder(baselineContent)) {
+      errors.push(`${candidate.relativePath}: approved baseline is itself a bounded placeholder`);
+      continue;
+    }
+    candidate.baselineContent = baselineContent;
+  }
+  if (errors.length > 0) {
+    return { applied: false, reason: 'approved_baseline_not_safe_for_placeholder_restore', restorations: [], errors };
+  }
+
+  const restorations = [];
+  try {
+    for (const candidate of candidates) {
+      const preimagePath = targetPreimagePath(recoveryDir, candidate.relativePath);
+      fs.mkdirSync(path.dirname(preimagePath), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(preimagePath)) {
+        if (fs.readFileSync(preimagePath, 'utf8') !== candidate.observedContent) {
+          throw new Error(`${candidate.relativePath}: existing target preimage does not match the exact placeholder`);
+        }
+      } else {
+        atomicWrite(preimagePath, candidate.observedContent);
+      }
+      atomicWrite(candidate.targetPath, candidate.baselineContent, candidate.originalMode);
+      if (fs.readFileSync(candidate.targetPath, 'utf8') !== candidate.baselineContent) {
+        throw new Error(`${candidate.relativePath}: restored target verification failed`);
+      }
+      restorations.push({
+        path: candidate.relativePath,
+        mode: 'exact_bounded_patch_placeholder_to_approved_baseline',
+        observed_sha256: candidate.observedSha256,
+        restored_sha256: sha256Text(candidate.baselineContent),
+        approved_baseline_ref: baselineRef,
+        approved_baseline_commit: baselineCommit,
+        preimage_path: safeRelativePath(repo, preimagePath),
+        original_mode: candidate.originalMode,
+        restored_at: new Date().toISOString()
+      });
+    }
+  } catch (error) {
+    const rollbackErrors = restoreTargetPreimages(repo, restorations);
+    return {
+      applied: false,
+      reason: 'placeholder_restore_failed',
+      restorations: [],
+      errors: [String(error?.message ?? error), ...rollbackErrors]
+    };
+  }
+  return { applied: true, reason: 'exact_bounded_patch_placeholder_restored', restorations, errors: [] };
 }
 
 function legacyAppliedRecoveryRecords(stateDir) {
@@ -295,6 +451,7 @@ async function main(rawArgs) {
   const runStamp = String(args['run-stamp'] ?? new Date().toISOString().replace(/[-:]/gu, '').replace(/\.\d{3}Z$/u, 'Z'));
   const maxRetriesRaw = Number.parseInt(args['max-retries'] ?? '3', 10);
   const maxRetries = Number.isInteger(maxRetriesRaw) && maxRetriesRaw > 0 ? maxRetriesRaw : 3;
+  const approvedBaselineRef = typeof args['baseline-ref'] === 'string' ? args['baseline-ref'] : '';
 
   if (!isReparableDecompositionDiagnostic(diagnostic)) {
     return 2;
@@ -339,10 +496,12 @@ async function main(rawArgs) {
       recoveryRecord = interrupted.record;
     }
   }
+  let reopeningLegacyNoop = false;
   if (recoveryRecord) {
-    if (recoveryRecord.status !== 'started') {
+    if (recoveryRecord.status !== 'started' && !isLegacyNoopAppliedRecovery(recoveryRecord, diagnostic)) {
       return terminalRecoveryStatuses.has(recoveryRecord.status) ? 2 : 1;
     }
+    reopeningLegacyNoop = recoveryRecord.status === 'applied';
     const missingSnapshots = recoverySnapshotMissing({ record: recoveryRecord });
     if (missingSnapshots.length > 0) {
       markRecoveryTerminal({
@@ -354,32 +513,50 @@ async function main(rawArgs) {
       });
       return 1;
     }
-    try {
-      restoreSnapshot({
-        recoveryDir,
-        todoPath,
-        breakdownPath,
-        breakdownExisted: Boolean(recoveryRecord.rollback_snapshot.breakdown)
-      });
-    } catch (error) {
-      markRecoveryTerminal({
-        recordPath,
-        record: recoveryRecord,
-        status: 'failed_recovery_snapshot_missing',
-        reason: 'recovery_snapshot_restore_failed',
-        missing: [String(error?.message ?? error)]
-      });
-      return 1;
+    if (reopeningLegacyNoop) {
+      const liveTodoSha256 = sha256File(todoPath);
+      const liveBreakdownSha256 = breakdownBeforeExists ? sha256File(breakdownPath) : null;
+      if (liveTodoSha256 !== recoveryRecord.after?.todo_sha256 || liveBreakdownSha256 !== recoveryRecord.after?.breakdown_sha256) {
+        markRecoveryTerminal({
+          recordPath,
+          record: recoveryRecord,
+          status: 'failed_recovery_record_invalid',
+          reason: 'legacy_noop_recovery_live_state_changed',
+          missing: []
+        });
+        return 1;
+      }
+    } else {
+      try {
+        restoreSnapshot({
+          recoveryDir,
+          todoPath,
+          breakdownPath,
+          breakdownExisted: Boolean(recoveryRecord.rollback_snapshot.breakdown)
+        });
+      } catch (error) {
+        markRecoveryTerminal({
+          recordPath,
+          record: recoveryRecord,
+          status: 'failed_recovery_snapshot_missing',
+          reason: 'recovery_snapshot_restore_failed',
+          missing: [String(error?.message ?? error)]
+        });
+        return 1;
+      }
     }
     recoveryRecord.recovery_resumes = [
       ...(Array.isArray(recoveryRecord.recovery_resumes) ? recoveryRecord.recovery_resumes : []),
       {
         run_stamp: runStamp,
         resumed_at: new Date().toISOString(),
-        rollback_performed: true
+        rollback_performed: !reopeningLegacyNoop,
+        legacy_noop_reopened: reopeningLegacyNoop
       }
     ];
-    recoveryRecord.resumed_after_interruption = true;
+    recoveryRecord.status = 'started';
+    recoveryRecord.resumed_after_interruption = !reopeningLegacyNoop;
+    recoveryRecord.legacy_noop_reopened = reopeningLegacyNoop || recoveryRecord.legacy_noop_reopened === true;
     writeJson(recordPath, recoveryRecord);
   }
 
@@ -476,6 +653,14 @@ async function main(rawArgs) {
     } catch (error) {
       repair = { exitCode: 1, output: String(error?.stack ?? error) };
     }
+    const placeholderRecovery = repair.exitCode === 0
+      ? { applied: false, reason: 'todo_repair_applied', restorations: [] }
+      : restoreExactBoundedPatchPlaceholders({
+        repo,
+        recoveryDir,
+        targetSnapshot,
+        baselineRef: approvedBaselineRef
+      });
     const guardErrors = validateTodoDecomposition(repo, path.relative(repo, todoPath));
     const guard = {
       exitCode: guardErrors.length > 0 ? 1 : 0,
@@ -503,9 +688,21 @@ async function main(rawArgs) {
         sha256_after: sha256File(targetPath)
       };
     });
+    if (placeholderRecovery.applied) {
+      currentRecord.placeholder_target_restorations = [
+        ...(Array.isArray(currentRecord.placeholder_target_restorations) ? currentRecord.placeholder_target_restorations : []),
+        ...placeholderRecovery.restorations
+      ];
+    }
+    if (!placeholderRecovery.applied && placeholderRecovery.reason !== 'todo_repair_applied') {
+      currentRecord.placeholder_target_recovery_error = {
+        reason: placeholderRecovery.reason,
+        errors: placeholderRecovery.errors ?? []
+      };
+    }
     writeJson(recordPath, currentRecord);
 
-    if (guard.exitCode === 0) {
+    if (guard.exitCode === 0 && (repair.exitCode === 0 || placeholderRecovery.applied)) {
       try {
         const beforeTodoText = fs.readFileSync(currentRecord.rollback_snapshot.todo, 'utf8');
         const afterTodoText = fs.readFileSync(todoPath, 'utf8');
@@ -539,6 +736,9 @@ async function main(rawArgs) {
         writeJson(recordPath, currentRecord);
         return 0;
       } catch (error) {
+        const targetRollbackErrors = placeholderRecovery.applied
+          ? restoreTargetPreimages(repo, placeholderRecovery.restorations)
+          : [];
         restoreSnapshot({ recoveryDir, todoPath, breakdownPath, breakdownExisted: breakdownBeforeExists });
         currentRecord.status = 'failed_reverted';
         currentRecord.rollback_performed = true;
@@ -546,7 +746,8 @@ async function main(rawArgs) {
         currentRecord.after_rollback = {
           todo_sha256: sha256File(todoPath),
           breakdown_sha256: sha256File(breakdownPath),
-          receipt_error: String(error?.message ?? error)
+          receipt_error: String(error?.message ?? error),
+          target_restore_rollback_errors: targetRollbackErrors
         };
         writeJson(recordPath, currentRecord);
         return 1;
@@ -558,18 +759,24 @@ async function main(rawArgs) {
       continue;
     }
 
+    const targetRollbackErrors = placeholderRecovery.applied
+      ? restoreTargetPreimages(repo, placeholderRecovery.restorations)
+      : [];
     restoreSnapshot({ recoveryDir, todoPath, breakdownPath, breakdownExisted: breakdownBeforeExists });
     currentRecord.status = 'failed_reverted';
     currentRecord.rollback_performed = true;
-    currentRecord.failure_reason = repair.exitCode !== 0
-      ? 'repair_command_failed'
+    currentRecord.failure_reason = repair.exitCode !== 0 && !placeholderRecovery.applied
+      ? placeholderRecovery.reason === 'no_exact_bounded_patch_placeholder'
+        ? 'no_effective_recovery'
+        : 'placeholder_recovery_unavailable'
       : !isReparableDecompositionDiagnostic(guard.output)
         ? 'guard_remained_non_reparable'
         : 'retry_bound_reached';
     currentRecord.after_rollback = {
       todo_sha256: sha256File(todoPath),
       breakdown_sha256: sha256File(breakdownPath),
-      guard_output_tail: guard.output.slice(-4000)
+      guard_output_tail: guard.output.slice(-4000),
+      target_restore_rollback_errors: targetRollbackErrors
     };
     writeJson(recordPath, currentRecord);
     return 1;
