@@ -644,7 +644,12 @@ function activeClaimMaterializedPlaceholder({ repoRoot, stateRoot, claimPath, st
   // This narrowly proves materialization by the current admitted claim. It is
   // deliberately unavailable to generic/manual preflight calls and to fresh
   // claims, so a future leaf cannot inherit an unproven dirty placeholder.
-  if (!['pre-claim-boundary', 'pre-claim'].includes(stage)) return null;
+  // A verified proposal can leave a bounded placeholder in its declared
+  // target while the same claim reaches pre-completion verification.  Treat
+  // that path as claim-controlled too; otherwise the controller proves the
+  // placeholder belongs to the claim at resume admission, then rejects the
+  // identical evidence before it can verify or repair the proposal.
+  if (!['pre-claim-boundary', 'pre-claim', 'pre-completion'].includes(stage)) return null;
   if (!stateRoot || !claimPath || !isPathInside(stateRoot, claimPath)) return null;
 
   const claim = readJsonInside(stateRoot, claimPath);
