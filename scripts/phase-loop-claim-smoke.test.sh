@@ -5018,6 +5018,14 @@ mkdir -p "$no_eligible_split_workspace/.brownie" "$no_eligible_split_workspace/d
 printf '{"scripts":{"check":"node --check scripts/b.mjs"}}\n' > "$no_eligible_split_workspace/package.json"
 printf 'status: pending\n' > "$no_eligible_split_workspace/docs/a.md"
 printf 'export const ok = true;\n' > "$no_eligible_split_workspace/scripts/b.mjs"
+# The fallback must validate the projected replan with the same canonical
+# TODO-state resolver used after a real write.  Copy its small dependency
+# closure into this clean fixture instead of accepting a text-only split.
+cp "$REPO_ROOT/scripts/guard-todo-decomposition.mjs" "$no_eligible_split_workspace/scripts/guard-todo-decomposition.mjs"
+cp "$REPO_ROOT/scripts/phase-loop-todo-state.mjs" "$no_eligible_split_workspace/scripts/phase-loop-todo-state.mjs"
+cp "$REPO_ROOT/scripts/phase-loop-bounded-scope.mjs" "$no_eligible_split_workspace/scripts/phase-loop-bounded-scope.mjs"
+cp "$REPO_ROOT/scripts/phase-loop-todo-queue-integrity.mjs" "$no_eligible_split_workspace/scripts/phase-loop-todo-queue-integrity.mjs"
+cp "$REPO_ROOT/scripts/phase-loop-todo-contract-rebaseline.mjs" "$no_eligible_split_workspace/scripts/phase-loop-todo-contract-rebaseline.mjs"
 printf 'base prompt\n' > "$no_eligible_split_prompt"
 cat > "$no_eligible_split_workspace/.brownie/todo.md" <<'EOF'
 - [ ] E-20g-final-judgment-sync: Patch only `docs/a.md`, `scripts/b.mjs` to synchronize final judgment and guard coverage:
@@ -5028,15 +5036,31 @@ cat > "$no_eligible_split_workspace/.brownie/todo.md" <<'EOF'
   Forbidden changes: do not edit unrelated files.
   Verification: run `pnpm --workspace-root check`.
 
-- [ ] E-20h-next: Patch only `scripts/next.mjs`:
-  Route: implementation.
-  Source TODO: E-20.
+- [ ] E-20h-next: Patch only `docs/a.md`:
+  Route: documentation.
+  Source TODO: E-20h: fixture downstream dependency.
   Depends on: E-20g-final-judgment-sync.
   Completion condition: the next step runs only after the final-judgment synchronization anchor is closed.
   Forbidden changes: do not edit unrelated files.
   Verification: run `pnpm --workspace-root check`.
 EOF
-printf '# Breakdown\n' > "$no_eligible_split_workspace/.brownie/todo-breakdown.md"
+cat > "$no_eligible_split_workspace/.brownie/todo-breakdown.md" <<'EOF'
+# Breakdown
+
+Parent TODO: E-20h: fixture downstream dependency.
+
+Dependency graph:
+
+- E-20h-next: E-20g-final-judgment-sync
+
+Verification ledger:
+
+- E-20h-next: `pnpm --workspace-root check`
+
+Quality rubric:
+
+- E-20h-next: downstream leaf remains schedulable only after the selected parent or its terminal replacement completes.
+EOF
 git -C "$no_eligible_split_workspace" add .
 git -C "$no_eligible_split_workspace" commit -m init >/dev/null
 
@@ -5057,25 +5081,19 @@ PHASE_LOOP_TODO="$no_eligible_split_workspace/.brownie/todo.md" \
 PHASE_LOOP_TODO_BREAKDOWN="$no_eligible_split_workspace/.brownie/todo-breakdown.md" \
 PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
-PHASE_LOOP_TEST_MUTATE_TODO_AFTER_PROMPT=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
 BROWNIE_BIN="$fake_brownie_terminal_no_eligible" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 75,76 "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 0 "$PHASE_LOOP" run-once >/dev/null
 no_eligible_split_exit="$?"
 set -e
-case "$no_eligible_split_exit" in
-  0|75|76) ;;
-  *)
-    echo "unexpected no-eligible fixture exit=$no_eligible_split_exit" >&2
-    exit 1
-    ;;
-esac
+test "$no_eligible_split_exit" = "0"
 
 if [ "$no_eligible_split_exit" = "0" ]; then
 python3 - "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/.brownie/todo-breakdown.md" "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/private/phase-loop/todo-replans" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
 import re
+import subprocess
 import sys
 
 todo = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
@@ -5090,8 +5108,33 @@ assert "- [ ] E-20g-final-judgment-sync-target-01: Patch only `docs/a.md`" in to
 assert "- [ ] E-20g-final-judgment-sync-target-02: Patch only `scripts/b.mjs`" in todo, todo
 assert "Source TODO: E-20g-final-judgment-sync." in todo, todo
 assert "Depends on: E-20g-final-judgment-sync-target-01." in todo, todo
-assert "Depends on: E-20g-final-judgment-sync." in todo, todo
+assert re.search(
+    r"E-20h-next:.*?Depends on: E-20g-final-judgment-sync-target-02\.",
+    todo,
+    re.S,
+), todo
+assert "Depends on: E-20g-final-judgment-sync." not in todo, todo
 assert "E-20g-final-judgment-sync no-eligible multi-target split" in breakdown, breakdown
+assert "- E-20h-next: E-20g-final-judgment-sync-target-02." in breakdown, breakdown
+guard = subprocess.run(
+    ["node", "scripts/guard-todo-decomposition.mjs", ".brownie/todo.md"],
+    cwd=pathlib.Path(sys.argv[1]).parent.parent,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+assert guard.returncode == 0, (guard.stdout, guard.stderr)
+queue_integrity = subprocess.run(
+    [
+        "node", "scripts/phase-loop-todo-queue-integrity.mjs",
+        "--repo", ".", "--todo", ".brownie/todo.md", "--breakdown", ".brownie/todo-breakdown.md",
+    ],
+    cwd=pathlib.Path(sys.argv[1]).parent.parent,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+assert queue_integrity.returncode == 0, (queue_integrity.stdout, queue_integrity.stderr)
 assert status["status"] == "last_run_succeeded", status
 assert "no_eligible_task multi-target leaf split" in status["detail"], status
 assert records, "missing replan record"
@@ -5099,6 +5142,11 @@ record_text = "\n".join(path.read_text(encoding="utf-8") for path in records)
 assert "deterministic_no_eligible_multitarget_split" in record_text, record_text
 assert '"record_type": "todo_replan"' in record_text, record_text
 assert '"parent_status": "superseded_by_children"' in record_text, record_text
+contract_rebaselines = list((pathlib.Path(sys.argv[1]).parent / "private/phase-loop/todo-claims/contract-rebaselines").glob("*.json"))
+assert contract_rebaselines, "missing downstream dependency contract-rebaseline receipt"
+contract_receipt_text = "\n".join(path.read_text(encoding="utf-8") for path in contract_rebaselines)
+assert '"todo_id": "E-20h-next"' in contract_receipt_text, contract_receipt_text
+assert '"changed_fields": [' in contract_receipt_text and '"depends_on"' in contract_receipt_text, contract_receipt_text
 assert claim_archives, "missing completed no-eligible claim archive"
 archived_claim = json.loads(claim_archives[-1].read_text(encoding="utf-8"))
 selected_first = str(archived_claim["selected_todo"]).splitlines()[0]
@@ -5117,6 +5165,35 @@ for line in ledger_path.read_text(encoding="utf-8").splitlines():
 terminal_events = [event for event in ledger_events if event.get("task_id") == attempt_id and event.get("to_state") in {"completed", "blocked", "failed", "replanned"}]
 assert terminal_events and terminal_events[-1]["to_state"] == "replanned", (attempt_id, ledger_events)
 assert not any(event.get("kind") == "unclaimed_trajectory" and event.get("trajectory_type") == "todo.replanned" for event in ledger_events), ledger_events
+PY
+
+# Liveness regression: after the replan, the next claim must reach a bounded
+# child target and leave a real workspace diff.  A successful split alone is
+# not delivery evidence.
+PHASE_LOOP_STATE_DIR="$no_eligible_split_state" \
+PHASE_LOOP_PROMPT="$no_eligible_split_prompt" \
+PHASE_LOOP_TODO="$no_eligible_split_workspace/.brownie/todo.md" \
+PHASE_LOOP_TODO_BREAKDOWN="$no_eligible_split_workspace/.brownie/todo-breakdown.md" \
+PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_MUTATE_TARGET=1 \
+BROWNIE_BIN="$fake_brownie_completed" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+python3 - "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/docs/a.md" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+target = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+ledger = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
+assert status["status"] in {"last_run_succeeded", "pr_created"}, status
+assert "phaseLoopCompletionFixtureCompleted" in target, target
+assert not re.search(r"^- \[ \] E-20g-final-judgment-sync-target-01:", todo, re.M), todo
+assert '"to_state":"completed"' in ledger or '"to_state": "completed"' in ledger, ledger
 PY
 else
 assert_terminal_failure_claim_archived \

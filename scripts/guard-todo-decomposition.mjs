@@ -2,7 +2,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadTodoState } from './phase-loop-todo-state.mjs';
+import {
+  readAllTodoReplanRecords,
+  readTodoCompletionInvalidationRecords,
+  readTodoCompletionRecords,
+  resolveTodoState
+} from './phase-loop-todo-state.mjs';
 import { boundedScopeEntries, boundedScopeValues, boundedScopes as boundedScopesFromFirstLine } from './phase-loop-bounded-scope.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -898,15 +903,40 @@ function readJsonOrNull(repoRoot, relativePath) {
   }
 }
 
-export function validateTodoDecomposition(repoRoot = defaultRepoRoot, todoPath = defaultTodoPath, breakdownPath = defaultBreakdownPath) {
+/**
+ * Validate an on-disk queue or a projected queue transition with the same
+ * canonical dependency state used by the repository guard.
+ *
+ * The phase-loop uses this before it writes a deterministic replan.  Keeping
+ * the projection here prevents a lightweight text-only preflight from
+ * accepting a queue which the canonical guard will reject after mutation.
+ */
+export function validateTodoDecompositionCandidate(
+  repoRoot = defaultRepoRoot,
+  todoPath = defaultTodoPath,
+  breakdownPath = defaultBreakdownPath,
+  candidate = {}
+) {
   const state = releaseState(repoRoot);
   const resolvedTodoPath = path.resolve(repoRoot, todoPath);
   const resolvedBreakdownPath = path.resolve(repoRoot, breakdownPath);
   const todoDisplayPath = path.relative(repoRoot, resolvedTodoPath) || resolvedTodoPath;
   const breakdownDisplayPath = path.relative(repoRoot, resolvedBreakdownPath) || resolvedBreakdownPath;
-  const todoText = fs.readFileSync(resolvedTodoPath, 'utf8');
-  const todoState = loadTodoState(repoRoot, todoText, {
-    breakdownPath: resolvedBreakdownPath
+  const todoText = candidate.todoText ?? fs.readFileSync(resolvedTodoPath, 'utf8');
+  const breakdownText = candidate.breakdownText ?? (
+    fs.existsSync(resolvedBreakdownPath) ? fs.readFileSync(resolvedBreakdownPath, 'utf8') : null
+  );
+  const additionalReplanRecords = Array.isArray(candidate.additionalReplanRecords)
+    ? candidate.additionalReplanRecords
+    : [];
+  const todoState = resolveTodoState({
+    todoText,
+    replanRecords: [
+      ...readAllTodoReplanRecords(repoRoot, { breakdownPath: resolvedBreakdownPath }),
+      ...additionalReplanRecords
+    ],
+    completionRecords: readTodoCompletionRecords(repoRoot),
+    completionInvalidationRecords: readTodoCompletionInvalidationRecords(repoRoot)
   });
   const unresolvedSupersededIds = new Set(
     [...todoState.supersededIds].filter((id) => !todoState.resolvedIds.has(id))
@@ -916,12 +946,16 @@ export function validateTodoDecomposition(repoRoot = defaultRepoRoot, todoPath =
     repoRoot,
     packageScripts: packageScripts(repoRoot),
     breakdownPath: breakdownDisplayPath,
-    breakdownText: fs.existsSync(resolvedBreakdownPath) ? fs.readFileSync(resolvedBreakdownPath, 'utf8') : null,
+    breakdownText,
     completedTodoIds: todoState.resolvedIds,
     invalidCheckedTodoIds: unresolvedSupersededIds,
     productReady: state.productReady,
     releaseBlockersRemaining: state.releaseBlockersRemaining
   });
+}
+
+export function validateTodoDecomposition(repoRoot = defaultRepoRoot, todoPath = defaultTodoPath, breakdownPath = defaultBreakdownPath) {
+  return validateTodoDecompositionCandidate(repoRoot, todoPath, breakdownPath);
 }
 
 if (process.argv[1] === __filename) {
