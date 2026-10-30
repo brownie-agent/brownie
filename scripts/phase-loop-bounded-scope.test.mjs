@@ -25,3 +25,13 @@ test('keeps patch and create targets distinct without accepting prose paths', ()
   assert.deepEqual(boundedScopeValues(line, 'Patch only'), ['scripts/existing.mjs']);
   assert.deepEqual(boundedScopes(line), ['scripts/new.mjs', 'scripts/existing.mjs']);
 });
+
+test('preserves every Oxford-comma bounded target before the next operation', () => {
+  const line = '- [ ] E-scope: Patch only `scripts/one.mjs`, `scripts/one.test.mjs`, and `package.json`, then patch only `.github/workflows/release.yml`: invoke them.';
+  assert.deepEqual(boundedScopeEntries(line), [
+    { operation: 'patch', path: 'scripts/one.mjs' },
+    { operation: 'patch', path: 'scripts/one.test.mjs' },
+    { operation: 'patch', path: 'package.json' },
+    { operation: 'patch', path: '.github/workflows/release.yml' }
+  ]);
+});
