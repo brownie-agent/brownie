@@ -47,8 +47,9 @@ test('only a merged approved CI-passing PR completes the claim', () => {
     pullRequest: pr({
       state: 'MERGED',
       mergedAt: '2026-10-30T12:00:00Z',
+      mergedBy: { login: 'globalpocket' },
       reviewDecision: 'APPROVED',
-      reviews: [{ state: 'APPROVED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) } }]
+      reviews: [{ state: 'APPROVED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) }, submittedAt: '2026-10-30T11:59:00Z' }]
     }),
     reviewer: 'globalpocket',
     implementation: 'brownie-agent'
@@ -56,24 +57,54 @@ test('only a merged approved CI-passing PR completes the claim', () => {
   assert.equal(reconciliation.status, 'completed');
   assert.equal(reconciliation.delivery_review.merged, true);
   assert.equal(reconciliation.delivery_review.approved, true);
+  assert.equal(reconciliation.delivery_review.merge_actor, 'globalpocket');
 });
 
-test('an old changes-requested review cannot mask a later approval at the new head', () => {
-  const oldHead = 'b'.repeat(40);
+test('the reviewer latest decision at the current head overrides historical requests', () => {
   const reconciliation = reconcileReviewSnapshot({
     claim,
     pullRequest: pr({
       state: 'MERGED',
       mergedAt: '2026-10-30T12:00:00Z',
+      mergedBy: { login: 'globalpocket' },
       reviews: [
-        { state: 'CHANGES_REQUESTED', author: { login: 'globalpocket' }, commit: { oid: oldHead }, body: 'old feedback' },
-        { state: 'APPROVED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) }, body: 'resolved' }
+        { state: 'CHANGES_REQUESTED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) }, body: 'old feedback', submittedAt: '2026-10-30T10:00:00Z' },
+        { state: 'APPROVED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) }, body: 'resolved', submittedAt: '2026-10-30T11:00:00Z' }
       ]
     }),
     reviewer: 'globalpocket',
     implementation: 'brownie-agent'
   });
   assert.equal(reconciliation.status, 'completed');
+});
+
+test('merged completion refuses a missing or mismatched merge actor', () => {
+  const missing = reconcileReviewSnapshot({
+    claim,
+    pullRequest: pr({
+      state: 'MERGED',
+      mergedAt: '2026-10-30T12:00:00Z',
+      reviews: [{ state: 'APPROVED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) }, submittedAt: '2026-10-30T11:00:00Z' }]
+    }),
+    reviewer: 'globalpocket',
+    implementation: 'brownie-agent'
+  });
+  assert.equal(missing.status, 'pr_pending_review');
+  assert(missing.errors.includes('merge_actor_missing'));
+
+  const mismatched = reconcileReviewSnapshot({
+    claim,
+    pullRequest: pr({
+      state: 'MERGED',
+      mergedAt: '2026-10-30T12:00:00Z',
+      mergedBy: { login: 'other-maintainer' },
+      reviews: [{ state: 'APPROVED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) }, submittedAt: '2026-10-30T11:00:00Z' }]
+    }),
+    reviewer: 'globalpocket',
+    implementation: 'brownie-agent'
+  });
+  assert.equal(mismatched.status, 'pr_pending_review');
+  assert(mismatched.errors.includes('merge_actor_not_independent_reviewer'));
 });
 
 test('the author cannot satisfy the independent review role', () => {

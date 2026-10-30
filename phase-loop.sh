@@ -7774,9 +7774,34 @@ if allowed_objective_paths and normalized_applied_path not in allowed_objective_
     }, sort_keys=True))
     raise SystemExit(1)
 
+results = []
+# Every successful controller verification carries at least one executed,
+# reproducible command result. This is later bound to the immutable claim for
+# review handoff; do not create a bare self-attestation for shortcut paths.
+integrity_args = ["git", "diff", "--check"]
+if normalized_applied_path:
+    integrity_args.extend(["--", normalized_applied_path])
+integrity_check = subprocess.run(
+    integrity_args,
+    cwd=workspace_root,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=60,
+)
+results.append({
+    "command": " ".join(shlex.quote(arg) for arg in integrity_args),
+    "exit_code": integrity_check.returncode,
+    "stdout_chars": len(integrity_check.stdout),
+    "stderr_chars": len(integrity_check.stderr),
+})
+if integrity_check.returncode != 0:
+    print(json.dumps({"completed": False, "reason": "workspace_integrity_check_failed", "results": results}, sort_keys=True))
+    raise SystemExit(1)
+
 try:
     if first_line not in todo_path.read_text(encoding="utf-8"):
-        print(json.dumps({"completed": True, "reason": "selected_todo_already_removed"}, sort_keys=True))
+        print(json.dumps({"completed": True, "reason": "selected_todo_already_removed", "results": results}, sort_keys=True))
         raise SystemExit(0)
 except Exception as error:
     print(json.dumps({"completed": False, "reason": f"todo_unreadable:{error}"}, sort_keys=True))
@@ -7856,7 +7881,6 @@ def allowed_args(command):
         return args
     return None
 
-results = []
 def sanitized_process_tail(value):
     text = value[-2000:] if isinstance(value, str) else str(value)[-2000:]
     workspace_text = str(workspace_root)
@@ -11538,12 +11562,17 @@ phase_loop_require_implementation_pr_actor() {
 # every publication path, including cleanup retries.
 phase_loop_require_delivery_handoff() {
   local stdout_log="$1"
+  local verification_payload="${2:-}"
   local integrity_script="$ROOT_DIR/scripts/phase-loop-delivery-integrity.mjs"
   if [ ! -s "$stdout_log" ] || [ ! -f "$integrity_script" ] || [ ! -f "$TODO_CLAIM_FILE" ]; then
     printf '%s delivery_handoff_refused=true reason=integrity_inputs_missing stdout=%s claim=%s\n' "$(now_utc)" "$stdout_log" "$TODO_CLAIM_FILE" >> "$SUPERVISOR_LOG"
     return 76
   fi
-  node "$integrity_script" evaluate --claim "$TODO_CLAIM_FILE" --stdout "$stdout_log"
+  if [ -n "$verification_payload" ]; then
+    node "$integrity_script" evaluate --claim "$TODO_CLAIM_FILE" --stdout "$stdout_log" --verification "$verification_payload"
+  else
+    node "$integrity_script" evaluate --claim "$TODO_CLAIM_FILE" --stdout "$stdout_log"
+  fi
 }
 
 phase_loop_create_pr_for_progress() {
@@ -11552,7 +11581,7 @@ phase_loop_create_pr_for_progress() {
   local stderr_log="$3"
   local workspace_before="$4"
   local workspace_after="$5"
-  local title body pr_url branch push_rc pending_publish="${6:-0}" implementation_gh_config_dir
+  local title body pr_url branch push_rc pending_publish="${6:-0}" verification_payload="${7:-}" implementation_gh_config_dir
   if [ "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" != "1" ]; then
     return 0
   fi
@@ -11564,7 +11593,7 @@ phase_loop_create_pr_for_progress() {
     return 0
   fi
   local delivery_handoff delivery_status
-  if delivery_handoff="$(phase_loop_require_delivery_handoff "$stdout_log" 2>&1)"; then
+  if delivery_handoff="$(phase_loop_require_delivery_handoff "$stdout_log" "$verification_payload" 2>&1)"; then
     delivery_status=0
   else
     delivery_status=$?
@@ -11747,6 +11776,7 @@ claim["delivery_review"] = {
     "approved": False,
     "ci_passed": False,
     "handoff_allowed": integrity.get("pr_handoff_allowed") is True,
+    "semantic_completion_evidence": integrity.get("semantic_completion_evidence"),
     "root_claim_id": claim.get("root_claim_id") or claim.get("claim_id"),
     "selected_todo_sha256": integrity.get("selected_todo_sha256"),
     "observed_at": sys.argv[5],
@@ -11781,7 +11811,7 @@ phase_loop_handoff_verified_completion() {
   # fundamental condition that an outer `ok:true` response has no claim-bound
   # terminal delivery evidence.
   local delivery_handoff delivery_status
-  if delivery_handoff="$(phase_loop_require_delivery_handoff "$stdout_log" 2>&1)"; then
+  if delivery_handoff="$(phase_loop_require_delivery_handoff "$stdout_log" "$verification" 2>&1)"; then
     delivery_status=0
   else
     delivery_status=$?
@@ -11799,7 +11829,7 @@ phase_loop_handoff_verified_completion() {
   fi
   write_todo_claim "$(claim_field claim_id)" "verification_pending" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
   write_bdk_trajectory_event "$run_stamp" "verification.run" "$verification"
-  if ! phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+  if ! phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" "0" "$verification"; then
     # phase_loop_create_pr_for_progress records integrity_blocked with the
     # exact refusal reason and never mutates the queue on failure.
     return 76
@@ -11812,7 +11842,7 @@ phase_loop_handoff_verified_completion() {
 # runtime attempt.  Requested changes are saved on the same immutable claim;
 # an open PR waits; only merged+approved+CI can reach completed.
 phase_loop_reconcile_pending_review() {
-  local status pr_url reviewer implementation reviewer_gh_config_dir review_file result reconciliation_status
+  local status pr_url reviewer implementation reviewer_gh_config_dir review_file result reconciliation_status pr_node_id merge_actor
   [ -f "$TODO_CLAIM_FILE" ] || return 1
   status="$(claim_status 2>/dev/null || true)"
   case "$status" in
@@ -11831,9 +11861,53 @@ phase_loop_reconcile_pending_review() {
     return 78
   }
   review_file="$TODO_CLAIM_DIR/review.$$.json"
-  if ! GH_CONFIG_DIR="$reviewer_gh_config_dir" gh pr view "$pr_url" --json number,url,author,state,mergedAt,headRefOid,reviewDecision,reviews,statusCheckRollup > "$review_file"; then
+  if ! GH_CONFIG_DIR="$reviewer_gh_config_dir" gh pr view "$pr_url" --json id,number,url,author,state,mergedAt,headRefOid,reviewDecision,reviews,statusCheckRollup > "$review_file"; then
     rm -f "$review_file"
     write_status "blocked" "Could not read the configured review PR; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+  pr_node_id="$(python3 - "$review_file" <<'PY'
+import json
+import sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get("id")
+except Exception:
+    value = None
+print(value if isinstance(value, str) else "")
+PY
+  )"
+  if [ -z "$pr_node_id" ]; then
+    rm -f "$review_file"
+    write_status "blocked" "Could not read the immutable PR node identity needed to verify the merge actor; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+  if ! merge_actor="$(GH_CONFIG_DIR="$reviewer_gh_config_dir" gh api graphql \
+      -f 'query($id: ID!) { node(id: $id) { ... on PullRequest { mergedBy { login } } } }' \
+      -F "id=$pr_node_id" --jq '.data.node.mergedBy.login' 2>>"$SUPERVISOR_LOG")"; then
+    rm -f "$review_file"
+    write_status "blocked" "Could not verify the observed merge actor; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+  if ! python3 - "$review_file" "$merge_actor" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+actor = sys.argv[2].strip()
+payload["mergedBy"] = {"login": actor} if actor else None
+temporary = path.with_name(f"{path.name}.{os.getpid()}.merge-actor.tmp")
+temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+os.replace(temporary, path)
+PY
+  then
+    rm -f "$review_file"
+    write_status "blocked" "Could not persist the observed merge actor alongside review facts; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
     return 78
   fi
   if result="$(node "$ROOT_DIR/scripts/phase-loop-review-reconcile.mjs" reconcile --claim "$TODO_CLAIM_FILE" --review "$review_file" --reviewer "$reviewer" --implementation "$implementation" --write --run "review-$(date -u +%Y%m%dT%H%M%SZ)" 2>&1)"; then

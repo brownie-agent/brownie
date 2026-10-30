@@ -31,6 +31,15 @@ function reviewAtHead(review, headOid) {
   return !headOid || !commitOid || commitOid === headOid;
 }
 
+function reviewTimestamp(review) {
+  const submittedAt = object(review).submittedAt;
+  return typeof submittedAt === 'string' ? submittedAt : '';
+}
+
+function latestEffectiveReview(reviews) {
+  return [...reviews].sort((left, right) => reviewTimestamp(left).localeCompare(reviewTimestamp(right))).at(-1) ?? null;
+}
+
 export function reconcileReviewSnapshot({ claim, pullRequest, reviewer, implementation }) {
   const before = object(claim);
   const pr = object(pullRequest);
@@ -45,10 +54,17 @@ export function reconcileReviewSnapshot({ claim, pullRequest, reviewer, implemen
   if (login(pr.author) !== implementationActor) errors.push('implementation_author_mismatch');
   if (reviewActor === implementationActor) errors.push('reviewer_not_independent');
   const ownReviews = reviews.filter((review) => login(review.author) === reviewActor && reviewAtHead(review, headOid));
-  const requested = ownReviews.some((review) => object(review).state === 'CHANGES_REQUESTED');
-  const approved = ownReviews.some((review) => object(review).state === 'APPROVED');
+  // GitHub retains every review. Only the reviewer's latest decision at this
+  // head is effective; an old request must not override a later approval.
+  const effectiveReview = latestEffectiveReview(ownReviews);
+  const effectiveDecision = object(effectiveReview).state ?? null;
+  const requested = effectiveDecision === 'CHANGES_REQUESTED';
+  const approved = effectiveDecision === 'APPROVED';
   const ciPassed = allChecksPassed(pr);
   const merged = pr.state === 'MERGED' && typeof pr.mergedAt === 'string';
+  const mergeActor = login(pr.mergedBy);
+  if (merged && !mergeActor) errors.push('merge_actor_missing');
+  if (merged && mergeActor !== reviewActor) errors.push('merge_actor_not_independent_reviewer');
   let status = 'pr_pending_review';
   if (requested) status = 'changes_requested';
   else if (merged && approved && ciPassed && errors.length === 0) status = 'completed';
@@ -65,11 +81,13 @@ export function reconcileReviewSnapshot({ claim, pullRequest, reviewer, implemen
       pr_number: Number.isInteger(pr.number) ? pr.number : null,
       author: login(pr.author) || null,
       reviewer: reviewActor || null,
+      merge_actor: mergeActor || null,
       head_oid: headOid || null,
       merged,
       approved,
       ci_passed: ciPassed,
       review_decision: pr.reviewDecision ?? null,
+      effective_reviewer_decision: effectiveDecision,
       observed_at: new Date().toISOString()
     },
     feedback

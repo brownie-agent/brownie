@@ -70,6 +70,58 @@ export function runDeliveryView(stdoutPayload) {
   };
 }
 
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]));
+  }
+  return value;
+}
+
+function canonicalJson(value) {
+  return JSON.stringify(canonicalize(value));
+}
+
+/**
+ * The runtime deliberately does not know an owner's controller claim.  The
+ * controller therefore binds the already-executed, selected-TODO verification
+ * result to the runtime's terminal payload before publishing a review handoff.
+ * This is a producer, not a synthetic success: it refuses anything that did
+ * not report `completed:true` and at least one successful executed command.
+ */
+export function produceSemanticCompletionEvidence({ claim, stdoutPayload, verification }) {
+  const verificationPayload = asObject(verification);
+  if (verificationPayload.completed !== true) return null;
+  const verificationResults = asArray(verificationPayload.results)
+    .map((result) => asObject(result))
+    .filter((result) => typeof result.command === 'string' && result.command && result.exit_code === 0)
+    .map((result) => ({ command: result.command, exit_code: result.exit_code }));
+  if (verificationResults.length === 0) return null;
+
+  const runtime = runDeliveryView(stdoutPayload);
+  const payload = asObject(stdoutPayload);
+  const run = asObject(payload.run);
+  const terminalPayload = {
+    completed: runtime.completed,
+    terminal_completion_evidence: run.terminal_completion_evidence
+      ?? payload.terminal_completion_evidence
+      ?? null,
+    stop_reason: run.stop_reason ?? payload.stop_reason ?? null,
+    execution_outcome: run.execution_outcome ?? payload.execution_outcome ?? null
+  };
+  return {
+    schema_version: 1,
+    root_claim_id: rootClaimId(claim),
+    selected_todo_sha256: selectedTodoSha256(claim),
+    completion_condition_sha256: completionConditionSha256(claim),
+    verification_results: verificationResults,
+    observables: [
+      { kind: 'controller_verification_result', sha256: sha256(canonicalJson(verificationPayload)) },
+      { kind: 'runtime_terminal_payload', sha256: sha256(canonicalJson(terminalPayload)) }
+    ]
+  };
+}
+
 /**
  * The evidence contract binds a semantic verification result to the immutable
  * claim.  Passing CI or changing a listed target alone is deliberately not
@@ -101,7 +153,7 @@ export function validateSemanticCompletionEvidence({ claim, evidence }) {
  * means an implementation can be handed to review, never that the TODO is
  * done.  Final completion needs a merged, independently approved PR.
  */
-export function evaluateDeliveryHandoff({ claim, stdoutPayload }) {
+export function evaluateDeliveryHandoff({ claim, stdoutPayload, semanticCompletionEvidence = null }) {
   const run = runDeliveryView(stdoutPayload);
   const reasons = [];
   if (run.trajectory_failed) reasons.push('trajectory_failed');
@@ -123,7 +175,8 @@ export function evaluateDeliveryHandoff({ claim, stdoutPayload }) {
     };
   }
 
-  const evidence = validateSemanticCompletionEvidence({ claim, evidence: run.semantic_completion_evidence });
+  const suppliedEvidence = semanticCompletionEvidence ?? run.semantic_completion_evidence;
+  const evidence = validateSemanticCompletionEvidence({ claim, evidence: suppliedEvidence });
   if (!evidence.valid) {
     return {
       schema_version: 1,
@@ -146,6 +199,7 @@ export function evaluateDeliveryHandoff({ claim, stdoutPayload }) {
     completion_allowed: false,
     root_claim_id: rootClaimId(claim),
     selected_todo_sha256: selectedTodoSha256(claim),
+    semantic_completion_evidence: suppliedEvidence,
     reasons: []
   };
 }
@@ -174,7 +228,7 @@ export function validateClaimLifecycleTransition({ previous, next, review = {} }
 }
 
 function usage() {
-  process.stderr.write('usage: phase-loop-delivery-integrity.mjs evaluate --claim <claim.json> --stdout <run.stdout.json>\n');
+  process.stderr.write('usage: phase-loop-delivery-integrity.mjs evaluate --claim <claim.json> --stdout <run.stdout.json> [--verification <verification.json>]\n');
 }
 
 function parseArgs(argv) {
@@ -193,10 +247,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(64);
   }
   try {
-    const result = evaluateDeliveryHandoff({
-      claim: readJson(args.get('--claim')),
-      stdoutPayload: readJson(args.get('--stdout'))
-    });
+    const claim = readJson(args.get('--claim'));
+    const stdoutPayload = readJson(args.get('--stdout'));
+    let verification = null;
+    if (args.get('--verification')) verification = JSON.parse(args.get('--verification'));
+    const semanticCompletionEvidence = produceSemanticCompletionEvidence({ claim, stdoutPayload, verification });
+    const result = evaluateDeliveryHandoff({ claim, stdoutPayload, semanticCompletionEvidence });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     process.exit(result.pr_handoff_allowed ? 0 : 76);
   } catch (error) {

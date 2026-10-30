@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   completionConditionSha256,
   evaluateDeliveryHandoff,
+  produceSemanticCompletionEvidence,
   selectedTodoSha256,
   validateClaimLifecycleTransition
 } from './phase-loop-delivery-integrity.mjs';
@@ -69,6 +70,42 @@ test('claim-bound semantic evidence permits review handoff but never declares de
   assert.equal(result.delivery_state, 'verification_passed');
   assert.equal(result.pr_handoff_allowed, true);
   assert.equal(result.completion_allowed, false);
+});
+
+test('controller binds executed verification and the CLI terminal payload into durable handoff evidence', () => {
+  const stdoutPayload = {
+    ok: true,
+    run: {
+      completed: true,
+      stop_reason: 'completion finalized',
+      terminal_completion_evidence: { final_state: 'Succeeded', completion_result_fingerprint: 'sha256:terminal' },
+      automation: { continuation_required: false }
+    }
+  };
+  const evidence = produceSemanticCompletionEvidence({
+    claim,
+    stdoutPayload,
+    verification: {
+      completed: true,
+      reason: 'selected_todo_verification_passed',
+      results: [{ command: 'node --test scripts/artifact-journey.test.mjs', exit_code: 0, stdout_tail: 'passed' }]
+    }
+  });
+  assert.ok(evidence);
+  assert.equal(evidence.root_claim_id, 'claim-02');
+  assert.equal(evidence.observables.length, 2);
+  const result = evaluateDeliveryHandoff({ claim, stdoutPayload, semanticCompletionEvidence: evidence });
+  assert.equal(result.pr_handoff_allowed, true);
+  assert.deepEqual(result.semantic_completion_evidence, evidence);
+});
+
+test('the producer cannot manufacture evidence without a successful executed verification', () => {
+  const evidence = produceSemanticCompletionEvidence({
+    claim,
+    stdoutPayload: completedRun(null),
+    verification: { completed: true, results: [] }
+  });
+  assert.equal(evidence, null);
 });
 
 test('irrelevant or stale proof cannot be reused for another TODO fingerprint', () => {
