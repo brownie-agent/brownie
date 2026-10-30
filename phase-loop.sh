@@ -5916,6 +5916,122 @@ if selected_first in updated_todo:
     }, ensure_ascii=False, sort_keys=True))
     raise SystemExit(1)
 
+# A no-eligible split marks its parent superseded.  Every still-pending
+# downstream TODO must therefore wait for the final generated child rather
+# than retain a dependency on an abstract parent that Runtime cannot schedule.
+# Keep this transformation exact and auditable: only a Depends on: token that
+# equals the selected parent is rewritten, and checked historical TODOs are
+# left untouched.
+terminal_leaf_id = leaf_ids[-1]
+
+def split_dependency_ids(value):
+    value = (value or "").strip().rstrip(".")
+    if not value or value.lower() in {"<none>", "none"}:
+        return []
+    return [
+        part.strip().rstrip(".")
+        for part in re.split(r",|\band\b", value)
+        if part.strip() and part.strip().rstrip(".").lower() not in {"<none>", "none"}
+    ]
+
+def replace_dependency_token(line, old_id, new_id):
+    stripped = line.strip()
+    if not stripped.startswith("Depends on:"):
+        return line, False
+    dependencies = split_dependency_ids(stripped[len("Depends on:"):])
+    if old_id not in dependencies:
+        return line, False
+    replaced = []
+    for dependency in dependencies:
+        candidate = new_id if dependency == old_id else dependency
+        if candidate and candidate not in replaced:
+            replaced.append(candidate)
+    prefix = line[:len(line) - len(line.lstrip())]
+    newline = "\n" if line.endswith("\n") else ""
+    rendered = ", ".join(replaced) if replaced else "<none>"
+    return f"{prefix}Depends on: {rendered}.{newline}", True
+
+def todo_id_from_block(block):
+    first_line = block.splitlines()[0].strip() if block.splitlines() else ""
+    match = re.match(r"^[-*]\s+\[[ xX]\]\s+([^:\s]+)", first_line)
+    return match.group(1).strip() if match else ""
+
+def rewrite_live_downstream_dependencies(text, old_id, new_id):
+    starts = [match.start() for match in re.finditer(r"(?m)^[-*]\s+\[[ xX]\]\s+", text)]
+    if not starts:
+        return text, []
+    rebuilt = []
+    cursor = 0
+    rewrites = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(text)
+        rebuilt.append(text[cursor:start])
+        block = text[start:end]
+        first_line = block.splitlines()[0] if block.splitlines() else ""
+        if re.match(r"^[-*]\s+\[\s\]\s+", first_line):
+            lines = block.splitlines(keepends=True)
+            for line_index, line in enumerate(lines):
+                replacement_line, changed = replace_dependency_token(line, old_id, new_id)
+                if not changed:
+                    continue
+                lines[line_index] = replacement_line
+                todo_id = todo_id_from_block(block)
+                rewrites.append({
+                    "todo_id": todo_id,
+                    "replaced_dependency": old_id,
+                    "replacement_dependency": new_id,
+                })
+                break
+            block = "".join(lines)
+        rebuilt.append(block)
+        cursor = end
+    rebuilt.append(text[cursor:])
+    return "".join(rebuilt), rewrites
+
+def rewrite_breakdown_dependency_graph(text, old_id, new_id):
+    lines = text.splitlines(keepends=True)
+    rewritten = []
+    rewrites = []
+    in_dependency_graph = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "Dependency graph:":
+            in_dependency_graph = True
+            rewritten.append(line)
+            continue
+        if in_dependency_graph and (stripped.startswith("## ") or (stripped.endswith(":") and not stripped.startswith("- "))):
+            in_dependency_graph = False
+        if not in_dependency_graph or not stripped.startswith("- "):
+            rewritten.append(line)
+            continue
+        match = re.match(r"^(\s*-\s+([A-Za-z][A-Za-z0-9_.-]*)\s*:\s*)(.*?)(\r?\n)?$", line)
+        if not match:
+            rewritten.append(line)
+            continue
+        prefix, todo_id, raw_dependencies, newline = match.groups()
+        dependencies = split_dependency_ids(raw_dependencies)
+        if old_id not in dependencies:
+            rewritten.append(line)
+            continue
+        replacements = []
+        for dependency in dependencies:
+            candidate = new_id if dependency == old_id else dependency
+            if candidate and candidate not in replacements:
+                replacements.append(candidate)
+        rewritten.append(f"{prefix}{', '.join(replacements) if replacements else '<none>'}.{newline or ''}")
+        rewrites.append({
+            "todo_id": todo_id,
+            "replaced_dependency": old_id,
+            "replacement_dependency": new_id,
+        })
+    return "".join(rewritten), rewrites
+
+updated_todo, downstream_dependency_rewrites = rewrite_live_downstream_dependencies(
+    updated_todo,
+    selected_id,
+    terminal_leaf_id,
+)
+
 section_title = f"## {selected_id} no-eligible multi-target split"
 if section_title not in breakdown_text:
     dependency_lines = "\n".join(
@@ -5945,35 +6061,89 @@ Verification ledger:
 
 History:
 
-- {timestamp}: Applied deterministic no_eligible_task fallback during run {run_stamp}; the checked parent remains in the queue so existing downstream dependencies still have a durable dependency anchor, and the implementation work moves to ordered single-target leaves.
+- {timestamp}: Applied deterministic no_eligible_task fallback during run {run_stamp}; pending downstream TODO dependencies are retargeted to the terminal generated child so Runtime never schedules through the superseded parent.
 """ + "\n"
+
+breakdown_text, breakdown_dependency_rewrites = rewrite_breakdown_dependency_graph(
+    breakdown_text,
+    selected_id,
+    terminal_leaf_id,
+)
 
 guard_path = None
 try:
     guard_path = todo_path.resolve().relative_to(workspace.resolve()).as_posix()
 except Exception:
     guard_path = None
-if guard_path and (workspace / "scripts/guard-todo-decomposition.mjs").exists():
-    guard_script = "\n".join([
+guard_module = workspace / "scripts/guard-todo-decomposition.mjs"
+todo_state_module = workspace / "scripts/phase-loop-todo-state.mjs"
+queue_integrity_module = workspace / "scripts/phase-loop-todo-queue-integrity.mjs"
+contract_rebaseline_module = workspace / "scripts/phase-loop-todo-contract-rebaseline.mjs"
+if not guard_path or not guard_module.exists() or not todo_state_module.exists() or not queue_integrity_module.exists() or not contract_rebaseline_module.exists():
+    print(json.dumps({
+        "applied": False,
+        "eligible": True,
+        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "reason": "canonical_todo_guard_or_integrity_unavailable",
+        "guard_path": str(guard_module),
+        "todo_state_path": str(todo_state_module),
+        "queue_integrity_path": str(queue_integrity_module),
+        "contract_rebaseline_path": str(contract_rebaseline_module),
+    }, ensure_ascii=False, sort_keys=True))
+    raise SystemExit(1)
+
+candidate_replan = {
+    "record_type": "todo_replan",
+    "operation": "split_parent_into_children",
+    "parent_status": "superseded_by_children",
+    "parent_todo_id": selected_id,
+    "generated_child_ids": leaf_ids,
+}
+if guard_path:
+    candidate_validation_script = "\n".join([
         "import fs from 'node:fs';",
-        "import { validateTodoDecompositionText } from './scripts/guard-todo-decomposition.mjs';",
+        "import { validateTodoDecompositionCandidate } from './scripts/guard-todo-decomposition.mjs';",
+        "import { validateTodoQueueIntegrity } from './scripts/phase-loop-todo-queue-integrity.mjs';",
+        "import { buildContractRebaselineReceipt } from './scripts/phase-loop-todo-contract-rebaseline.mjs';",
         "const input = JSON.parse(fs.readFileSync(0, 'utf8'));",
-        "const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));",
-        "const errors = validateTodoDecompositionText(input.todo, {",
-        "  path: input.todo_path, repoRoot: process.cwd(),",
-        "  packageScripts: new Set(Object.keys(pkg.scripts ?? {})),",
-        "  breakdownPath: input.breakdown_path, breakdownText: input.breakdown,",
-        "  productReady: false, releaseBlockersRemaining: true",
+        "const errors = validateTodoDecompositionCandidate(process.cwd(), input.todo_path, input.breakdown_path, {",
+        "  todoText: input.todo, breakdownText: input.breakdown,",
+        "  additionalReplanRecords: [input.candidate_replan]",
         "});",
-        "if (errors.length) { console.error(JSON.stringify(errors)); process.exit(1); }",
+        "if (errors.length) { console.error(JSON.stringify({ stage: 'decomposition', errors })); process.exit(1); }",
+        "const contractReceipt = buildContractRebaselineReceipt({",
+        "  repoRoot: process.cwd(), beforeTodoText: input.original_todo, afterTodoText: input.todo,",
+        "  beforeBreakdownText: input.original_breakdown, afterBreakdownText: input.breakdown,",
+        "  runStamp: input.run_stamp, eventKey: input.event_key, diagnostic: input.diagnostic,",
+        "  verification: input.verification",
+        "});",
+        "const queue = validateTodoQueueIntegrity({",
+        "  todoBefore: input.original_todo, todoAfter: input.todo,",
+        "  beforeBreakdownText: input.original_breakdown, afterBreakdownText: input.breakdown,",
+        "  todoReplanRecords: [input.candidate_replan],",
+        "  contractRebaselineRecords: contractReceipt ? [contractReceipt] : []",
+        "});",
+        "if (!queue.valid) { console.error(JSON.stringify({ stage: 'queue_integrity', errors: queue.errors })); process.exit(1); }",
+        "process.stdout.write(JSON.stringify({ contract_rebaseline_receipt: contractReceipt, queue_warnings: queue.warnings }));",
     ])
     candidate_guard = subprocess.run(
-        ["node", "--input-type=module", "-e", guard_script],
+        ["node", "--input-type=module", "-e", candidate_validation_script],
         cwd=workspace, text=True, input=json.dumps({
             "todo": updated_todo,
             "todo_path": guard_path,
             "breakdown": breakdown_text,
             "breakdown_path": breakdown_path.resolve().relative_to(workspace.resolve()).as_posix(),
+            "candidate_replan": candidate_replan,
+            "original_todo": original_todo_text,
+            "original_breakdown": original_breakdown_text,
+            "run_stamp": run_stamp,
+            "event_key": f"no-eligible-multitarget-split:{claim.get('claim_id') or selected_id}",
+            "diagnostic": "phase-loop no_eligible_task multi-target split retargeted downstream dependencies to the terminal generated child",
+            "verification": {
+                "repair_command": "phase-loop.sh run-once",
+                "guard_command": "node scripts/guard-todo-decomposition.mjs .brownie/todo.md",
+                "integrity_command": "node scripts/phase-loop-todo-queue-integrity.mjs --repo . --todo .brownie/todo.md --breakdown .brownie/todo-breakdown.md",
+            },
         }), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
     )
     if candidate_guard.returncode != 0:
@@ -5986,11 +6156,22 @@ if guard_path and (workspace / "scripts/guard-todo-decomposition.mjs").exists():
             "stderr_tail": candidate_guard.stderr[-4000:],
         }, ensure_ascii=False, sort_keys=True))
         raise SystemExit(1)
+    try:
+        candidate_validation = json.loads(candidate_guard.stdout)
+        contract_rebaseline_receipt = candidate_validation.get("contract_rebaseline_receipt")
+    except Exception:
+        print(json.dumps({
+            "applied": False,
+            "eligible": True,
+            "operation": "no_eligible_multitarget_leaf_split_fallback",
+            "reason": "canonical_todo_guard_preflight_result_invalid",
+            "stdout_tail": candidate_guard.stdout[-4000:],
+        }, ensure_ascii=False, sort_keys=True))
+        raise SystemExit(1)
+else:
+    contract_rebaseline_receipt = None
 
-for path, content, suffix in (
-    (todo_path, updated_todo, "no-eligible-multitarget-todo"),
-    (breakdown_path, breakdown_text, "no-eligible-multitarget-breakdown"),
-):
+def atomic_replace(path, content, suffix):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{suffix}-{run_stamp}.tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
@@ -6007,7 +6188,17 @@ for path, content, suffix in (
     except Exception:
         pass
 
-if guard_path and (workspace / "scripts/guard-todo-decomposition.mjs").exists():
+def rollback_todo_and_breakdown():
+    atomic_replace(todo_path, original_todo_text, "no-eligible-multitarget-rollback-todo")
+    atomic_replace(breakdown_path, original_breakdown_text, "no-eligible-multitarget-rollback-breakdown")
+
+for path, content, suffix in (
+    (todo_path, updated_todo, "no-eligible-multitarget-todo"),
+    (breakdown_path, breakdown_text, "no-eligible-multitarget-breakdown"),
+):
+    atomic_replace(path, content, suffix)
+
+if guard_path and guard_module.exists():
     guard = subprocess.run(
         ["node", "scripts/guard-todo-decomposition.mjs", guard_path],
         cwd=workspace,
@@ -6017,24 +6208,7 @@ if guard_path and (workspace / "scripts/guard-todo-decomposition.mjs").exists():
         timeout=30,
     )
     if guard.returncode != 0:
-        for path, content, suffix in (
-            (todo_path, original_todo_text, "no-eligible-multitarget-rollback-todo"),
-            (breakdown_path, original_breakdown_text, "no-eligible-multitarget-rollback-breakdown"),
-        ):
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.{suffix}-{run_stamp}.tmp")
-            with open(tmp, "w", encoding="utf-8") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-            try:
-                dir_fd = os.open(str(path.parent), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except Exception:
-                pass
+        rollback_todo_and_breakdown()
         print(json.dumps({
             "applied": False,
             "eligible": True,
@@ -6066,16 +6240,132 @@ record = {
     "controller_store": controller_store,
     "generated_leaf_ids": leaf_ids,
     "generated_child_ids": leaf_ids,
+    "downstream_dependency_rewrites": downstream_dependency_rewrites,
+    "breakdown_dependency_rewrites": breakdown_dependency_rewrites,
+    "canonical_guard": "projected_prewrite_and_postwrite_decomposition_and_queue_integrity",
     "written_at": timestamp,
 }
-for name in {claim_id, run_stamp}:
-    record_path = replan_dir / f"{name}.json"
-    with open(record_path, "w", encoding="utf-8") as handle:
-        json.dump(record, handle, ensure_ascii=False, sort_keys=True, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(record_path, 0o600)
+record_paths = []
+try:
+    for name in {claim_id, run_stamp}:
+        record_path = replan_dir / f"{name}.json"
+        atomic_replace(record_path, json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n", "no-eligible-multitarget-replan")
+        os.chmod(record_path, 0o600)
+        record_paths.append(record_path)
+except Exception as error:
+    for path in record_paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    rollback_todo_and_breakdown()
+    print(json.dumps({
+        "applied": False,
+        "eligible": True,
+        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "reason": "todo_replan_record_write_failed",
+        "error": str(error),
+        "rolled_back": True,
+    }, ensure_ascii=False, sort_keys=True))
+    raise SystemExit(1)
+
+contract_receipt_path = None
+contract_receipt_created = False
+if contract_rebaseline_receipt:
+    receipt_directory = workspace / ".brownie/private/phase-loop/todo-claims/contract-rebaselines"
+    existing_receipts = {entry.name for entry in receipt_directory.glob("*.json")} if receipt_directory.exists() else set()
+    receipt_writer_script = "\n".join([
+        "import fs from 'node:fs';",
+        "import { writeContractRebaselineReceipt } from './scripts/phase-loop-todo-contract-rebaseline.mjs';",
+        "const input = JSON.parse(fs.readFileSync(0, 'utf8'));",
+        "process.stdout.write(JSON.stringify({ receipt_path: writeContractRebaselineReceipt(process.cwd(), input.receipt) }));",
+    ])
+    receipt_writer = subprocess.run(
+        ["node", "--input-type=module", "-e", receipt_writer_script],
+        cwd=workspace,
+        text=True,
+        input=json.dumps({"receipt": contract_rebaseline_receipt}),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if receipt_writer.returncode != 0:
+        for path in record_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        rollback_todo_and_breakdown()
+        print(json.dumps({
+            "applied": False,
+            "eligible": True,
+            "operation": "no_eligible_multitarget_leaf_split_fallback",
+            "reason": "contract_rebaseline_receipt_write_failed",
+            "stdout_tail": receipt_writer.stdout[-4000:],
+            "stderr_tail": receipt_writer.stderr[-4000:],
+            "rolled_back": True,
+        }, ensure_ascii=False, sort_keys=True))
+        raise SystemExit(1)
+    try:
+        receipt_result = json.loads(receipt_writer.stdout)
+        receipt_relative = str(receipt_result["receipt_path"])
+        receipt_relative_path = pathlib.PurePosixPath(receipt_relative)
+        if receipt_relative_path.is_absolute() or ".." in receipt_relative_path.parts:
+            raise ValueError("contract receipt path escapes workspace")
+        contract_receipt_path = workspace / pathlib.Path(*receipt_relative_path.parts)
+        contract_receipt_created = contract_receipt_path.name not in existing_receipts
+    except Exception:
+        for path in record_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        rollback_todo_and_breakdown()
+        print(json.dumps({
+            "applied": False,
+            "eligible": True,
+            "operation": "no_eligible_multitarget_leaf_split_fallback",
+            "reason": "contract_rebaseline_receipt_result_invalid",
+            "stdout_tail": receipt_writer.stdout[-4000:],
+            "rolled_back": True,
+        }, ensure_ascii=False, sort_keys=True))
+        raise SystemExit(1)
+
+queue_integrity = subprocess.run(
+    [
+        "node", "scripts/phase-loop-todo-queue-integrity.mjs",
+        "--repo", str(workspace),
+        "--todo", str(todo_path),
+        "--breakdown", str(breakdown_path),
+    ],
+    cwd=workspace,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=30,
+)
+if queue_integrity.returncode != 0:
+    for path in record_paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    if contract_receipt_created and contract_receipt_path:
+        try:
+            contract_receipt_path.unlink()
+        except FileNotFoundError:
+            pass
+    rollback_todo_and_breakdown()
+    print(json.dumps({
+        "applied": False,
+        "eligible": True,
+        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "reason": "todo_queue_integrity_guard_failed_postwrite",
+        "stdout_tail": queue_integrity.stdout[-4000:],
+        "stderr_tail": queue_integrity.stderr[-4000:],
+        "rolled_back": True,
+    }, ensure_ascii=False, sort_keys=True))
+    raise SystemExit(1)
 
 print(json.dumps({
     "applied": True,
@@ -6086,6 +6376,10 @@ print(json.dumps({
     "checked_parent": selected_id,
     "leaf_ids": leaf_ids,
     "targets": targets,
+    "downstream_dependency_rewrites": downstream_dependency_rewrites,
+    "breakdown_dependency_rewrites": breakdown_dependency_rewrites,
+    "contract_rebaseline_receipt": receipt_relative if contract_receipt_path else None,
+    "queue_integrity_guard": "projected_prewrite_and_postwrite",
     "run_stamp": run_stamp,
     "evidence_source": prior_terminal_evidence or {"source": "repair_feedback_or_terminal_progress"},
     "controller_store": controller_store,
