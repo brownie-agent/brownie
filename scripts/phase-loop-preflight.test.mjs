@@ -264,6 +264,22 @@ test('admits an exact active-claim placeholder only for the authenticated resume
   });
 });
 
+test('admits an exact active-claim placeholder during same-claim pre-completion verification', () => {
+  const repo = makeRepo();
+  const fixture = activeClaimPlaceholderFixture(repo);
+  const result = validatePhaseLoopPreflight({
+    repo,
+    stateRoot: fixture.stateRoot,
+    claim: fixture.claimPath,
+    stage: 'pre-completion',
+    expectedActor: 'fixture-implementation',
+    skipCommands: true
+  });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+  assert.equal(result.warnings.filter((warning) => warning.code === 'active_claim_owned_dirty_target_placeholder').length, 1);
+  assert.equal(result.active_claim_resume_admission, undefined);
+});
+
 test('admits an active claim whose selected TODO is followed by a completed TODO entry', () => {
   const repo = makeRepo();
   const fixture = activeClaimPlaceholderFixture(repo, { completedTodoAfterSelected: true });
