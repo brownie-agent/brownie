@@ -37,7 +37,7 @@ export function readTaskLedger(repoRoot) {
         // A replacement set is projected only when its one-line journal
         // record is complete. A torn append therefore exposes no terminal
         // parent without its children.
-        if (record?.kind === 'replan_transaction') {
+        if (record?.kind === 'replan_transaction' || record?.kind === 'terminal_replan_transaction') {
           return Array.isArray(record.events) && record.events.length > 1 && record.events.every((event) => event?.task_id && TASK_STATES.has(event?.to_state))
             ? record.events : [];
         }
@@ -283,6 +283,269 @@ export function replanTaskWithChildren(repoRoot, { task_id, reason, children, ru
   };
   fs.appendFileSync(file, `${JSON.stringify(transaction)}\n`, { encoding: 'utf8', mode: 0o600 });
   return { ok: true, events: [parentEvent, ...childEvents] };
+}
+
+function terminalReplanFingerprint({ sourceTaskId, claimId, sourceSpecHash, reason, evidenceSource, children }) {
+  return crypto.createHash('sha256').update(JSON.stringify(canonicalJson({
+    source_task_id: sourceTaskId,
+    claim_id: claimId ?? null,
+    source_task_spec_sha256: sourceSpecHash,
+    reason,
+    evidence_source: evidenceSource ?? null,
+    children: children.map((child) => ({
+      task_id: child?.task_id ?? null,
+      route: child?.route ?? null,
+      patch_targets: child?.patch_targets ?? [],
+      verification_commands: child?.verification_commands ?? [],
+      task_spec_sha256: child?.task_spec_sha256 ?? null
+    }))
+  }))).digest('hex');
+}
+
+export function terminalReplanTaskId(sourceTaskId, fingerprint) {
+  return `${sourceTaskId}@terminal-replan-${String(fingerprint).slice(0, 24)}`;
+}
+
+function matchingTerminalReplan(events, {
+  replanTaskId,
+  sourceTaskId,
+  sourceSpecHash,
+  claimId,
+  runId,
+  reason,
+  evidenceSource,
+  fingerprint,
+  children
+}) {
+  const candidates = events.filter((event) => (
+    event?.task_id === replanTaskId
+    && event?.to_state === 'replanned'
+    && (event?.run_id ?? null) === (runId ?? null)
+    && (event?.claim_id ?? null) === (claimId ?? null)
+    && (event?.task_spec_sha256 ?? null) === (sourceSpecHash ?? null)
+    && (event?.reason ?? null) === reason
+    && event?.terminal_replan === true
+    && event?.terminal_source_task_id === sourceTaskId
+    && event?.terminal_replan_fingerprint === fingerprint
+    && (event?.evidence_source ?? null) === (evidenceSource ?? null)
+  ));
+  return candidates
+    .map((parentEvent) => exactReplanEvents(events, parentEvent, children, replanTaskId, runId))
+    .find(Boolean) ?? null;
+}
+
+// A Runtime execution can fail after the source task has become terminal, yet
+// still leave a narrowly provable, multi-target TODO that must be split before
+// another implementation attempt.  Do not reopen that source task: create an
+// immutable derived recovery task and atomically replan *that* task with every
+// generated child.  The transaction binds the recovery to the failed source
+// attempt, claim, selected specification, evidence class, and exact children.
+export function recordTerminalReplanWithChildren(repoRoot, {
+  selected_todo,
+  claim_id,
+  run_id = null,
+  reason,
+  evidence_source = null,
+  children,
+  at
+}) {
+  if (typeof selected_todo !== 'string' || !selected_todo.trim()) {
+    return { ok: false, code: 'terminal_replan_selected_todo_missing' };
+  }
+  const sourceTodoId = selectedTodoId(selected_todo);
+  if (!sourceTodoId || !claim_id) {
+    return { ok: false, code: 'terminal_replan_claim_binding_missing' };
+  }
+  if (!reason || !Array.isArray(children) || children.length === 0) {
+    return { ok: false, code: 'terminal_replan_requires_reason_and_children' };
+  }
+  const childIds = children.map((child) => child?.task_id);
+  if (new Set(childIds).size !== childIds.length || childIds.some((id) => !id)) {
+    return { ok: false, code: 'terminal_replan_children_must_have_unique_ids' };
+  }
+  for (const child of children) {
+    const gate = taskIsExecutable(child);
+    if (!gate.ok) return { ok: false, code: 'terminal_replan_child_not_executable', task_id: child?.task_id, missing: gate.missing };
+  }
+
+  const sourceTaskId = taskAttemptId(sourceTodoId, claim_id);
+  const sourceSpecHash = crypto.createHash('sha256').update(selected_todo).digest('hex');
+  const fingerprint = terminalReplanFingerprint({
+    sourceTaskId,
+    claimId: claim_id,
+    sourceSpecHash,
+    reason,
+    evidenceSource: evidence_source,
+    children
+  });
+  const replanTaskId = terminalReplanTaskId(sourceTaskId, fingerprint);
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
+  const projection = taskProjection(events);
+  const source = projection.get(sourceTaskId);
+  if (!source) return { ok: false, code: 'terminal_replan_source_attempt_missing', task_id: sourceTaskId };
+  if (!new Set(['failed', 'blocked']).has(source.to_state)) {
+    return { ok: false, code: 'terminal_replan_source_not_terminal_execution', task_id: sourceTaskId, source_state: source.to_state };
+  }
+  if (source.task_spec_sha256 && source.task_spec_sha256 !== sourceSpecHash) {
+    return { ok: false, code: 'terminal_replan_source_spec_mismatch', task_id: sourceTaskId };
+  }
+  if (source.claim_id && source.claim_id !== claim_id) {
+    return { ok: false, code: 'terminal_replan_source_claim_mismatch', task_id: sourceTaskId };
+  }
+
+  const duplicate = matchingTerminalReplan(events, {
+    replanTaskId,
+    sourceTaskId,
+    sourceSpecHash,
+    claimId: claim_id,
+    runId: run_id,
+    reason,
+    evidenceSource: evidence_source,
+    fingerprint,
+    children
+  });
+  if (duplicate) {
+    return {
+      ok: true,
+      code: 'duplicate_terminal_replan',
+      duplicate: true,
+      task_id: replanTaskId,
+      source_task_id: sourceTaskId,
+      terminal_replan_fingerprint: fingerprint,
+      evidence_source,
+      events: duplicate
+    };
+  }
+  if (projection.has(replanTaskId)) {
+    return { ok: false, code: 'terminal_replan_duplicate_mismatch', task_id: replanTaskId };
+  }
+  const collidingChildren = children.filter((child) => projection.has(child.task_id));
+  if (collidingChildren.length > 0) {
+    return {
+      ok: false,
+      code: 'terminal_replan_child_collision',
+      task_ids: collidingChildren.map((child) => child.task_id)
+    };
+  }
+
+  const timestamp = at ?? new Date().toISOString();
+  const common = {
+    schema_version: 1,
+    run_id,
+    claim_id,
+    task_spec_sha256: sourceSpecHash,
+    terminal_replan: true,
+    terminal_source_task_id: sourceTaskId,
+    terminal_source_state: source.to_state,
+    terminal_replan_fingerprint: fingerprint,
+    evidence_source
+  };
+  const recoveryEvents = [
+    {
+      ...common,
+      event_id: crypto.randomUUID(),
+      task_id: replanTaskId,
+      from_state: null,
+      to_state: 'queued',
+      sequence: 1,
+      at: timestamp,
+      reason: 'terminal_replan_recovery',
+      replaces: [],
+      parent_task_id: sourceTaskId
+    },
+    {
+      ...common,
+      event_id: crypto.randomUUID(),
+      task_id: replanTaskId,
+      from_state: 'queued',
+      to_state: 'claimed',
+      sequence: 2,
+      at: timestamp,
+      reason: 'terminal_replan_recovery',
+      replaces: [],
+      parent_task_id: sourceTaskId
+    },
+    {
+      ...common,
+      event_id: crypto.randomUUID(),
+      task_id: replanTaskId,
+      from_state: 'claimed',
+      to_state: 'running',
+      sequence: 3,
+      at: timestamp,
+      reason: 'terminal_replan_recovery',
+      replaces: [],
+      parent_task_id: sourceTaskId
+    },
+    {
+      ...common,
+      event_id: crypto.randomUUID(),
+      task_id: replanTaskId,
+      from_state: 'running',
+      to_state: 'replanned',
+      sequence: 4,
+      at: timestamp,
+      reason,
+      replaces: childIds,
+      parent_task_id: sourceTaskId
+    }
+  ];
+  const childEvents = children.map((child) => ({
+    schema_version: 1,
+    event_id: crypto.randomUUID(),
+    task_id: child.task_id,
+    from_state: null,
+    to_state: 'queued',
+    sequence: 1,
+    at: timestamp,
+    run_id,
+    claim_id: null,
+    reason: `replacement_for:${replanTaskId}`,
+    replaces: [],
+    task_spec_sha256: child.task_spec_sha256 ?? null,
+    patch_targets: child.patch_targets,
+    verification_commands: child.verification_commands,
+    route: child.route,
+    parent_task_id: replanTaskId,
+    terminal_replan: true,
+    terminal_source_task_id: sourceTaskId,
+    terminal_replan_fingerprint: fingerprint,
+    evidence_source
+  }));
+  const transaction = {
+    schema_version: 1,
+    kind: 'terminal_replan_transaction',
+    transaction_id: crypto.randomUUID(),
+    source_task_id: sourceTaskId,
+    replan_task_id: replanTaskId,
+    claim_id,
+    run_id,
+    reason,
+    evidence_source,
+    terminal_replan_fingerprint: fingerprint,
+    events: [...recoveryEvents, ...childEvents]
+  };
+  try {
+    const file = taskLedgerPath(repoRoot);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(file, `${JSON.stringify(transaction)}\n`, { encoding: 'utf8', mode: 0o600 });
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
+  return {
+    ok: true,
+    code: 'terminal_replan_recorded',
+    task_id: replanTaskId,
+    source_task_id: sourceTaskId,
+    terminal_replan_fingerprint: fingerprint,
+    evidence_source,
+    events: [...recoveryEvents, ...childEvents]
+  };
 }
 
 function selectedTodoId(selectedTodo) {
@@ -585,6 +848,48 @@ export function recordTrajectory(repoRoot, {
     }
   }
   const specHash = crypto.createHash('sha256').update(spec).digest('hex');
+  if (type === 'todo.terminal_replanned') {
+    let payload = {};
+    try { payload = JSON.parse(payloadRaw ?? '{}'); } catch { return { ok: false, code: 'terminal_replan_payload_invalid' }; }
+    const reason = String(payload.reason ?? '');
+    const evidenceSource = payload.evidence_source ?? null;
+    const replanTaskId = String(payload.terminal_replan_task_id ?? '');
+    const sourceAttemptId = taskAttemptId(sourceTaskId, claimId);
+    if (!reason || !replanTaskId) {
+      return { ok: false, code: 'terminal_replan_payload_missing_binding' };
+    }
+    const children = replacementChildren(todoPath, sourceTaskId);
+    if (children.length === 0) {
+      return { ok: false, code: 'terminal_replan_replacement_children_missing', task_id: sourceAttemptId };
+    }
+    const fingerprint = String(payload.terminal_replan_fingerprint ?? '');
+    const exact = matchingTerminalReplan(events, {
+      replanTaskId,
+      sourceTaskId: sourceAttemptId,
+      sourceSpecHash: specHash,
+      claimId,
+      runId,
+      reason,
+      evidenceSource,
+      fingerprint,
+      children
+    });
+    if (!exact) {
+      return {
+        ok: false,
+        code: 'terminal_replan_transaction_missing_or_mismatched',
+        task_id: replanTaskId,
+        source_task_id: sourceAttemptId
+      };
+    }
+    return {
+      ok: true,
+      code: 'terminal_replan_trajectory_recorded',
+      task_id: replanTaskId,
+      source_task_id: sourceAttemptId,
+      events: exact
+    };
+  }
   if (type === 'todo.replanned') {
     let payload = {};
     try { payload = JSON.parse(payloadRaw ?? '{}'); } catch { /* use the event name below */ }
@@ -684,6 +989,44 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
     type,
     runId,
     payloadRaw
+  });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (!result.ok) process.exit(78);
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname) && process.argv[2] === 'record-terminal-replan') {
+  const args = new Map(process.argv.slice(3).reduce((pairs, value, index, values) => (
+    value.startsWith('--') ? [...pairs, [value.slice(2), values[index + 1]]] : pairs
+  ), []));
+  const repo = args.get('repo');
+  const claimPath = args.get('claim');
+  const todoPath = args.get('todo');
+  const reason = args.get('reason');
+  if (!repo || !claimPath || !todoPath || !reason) process.exit(2);
+  let snapshot;
+  try {
+    snapshot = readClaimSnapshot(claimPath);
+  } catch (error) {
+    snapshot = { ok: false, state: error?.code === 'ENOENT' ? 'absent' : 'unreadable', error };
+  }
+  if (!snapshot?.ok) {
+    process.stdout.write(`${JSON.stringify({
+      ok: false,
+      code: snapshot?.state === 'absent' ? 'terminal_replan_claim_absent' : 'terminal_replan_claim_unreadable',
+      claim_state: snapshot?.state ?? 'unreadable'
+    })}\n`);
+    process.exit(78);
+  }
+  const selectedTodo = String(snapshot.claim?.selected_todo ?? '');
+  const sourceTodoId = selectedTodoId(selectedTodo);
+  const children = replacementChildren(todoPath, sourceTodoId);
+  const result = recordTerminalReplanWithChildren(repo, {
+    selected_todo: selectedTodo,
+    claim_id: snapshot.claim?.claim_id ?? null,
+    run_id: args.get('run') || null,
+    reason,
+    evidence_source: args.get('evidence-source') || null,
+    children
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (!result.ok) process.exit(78);

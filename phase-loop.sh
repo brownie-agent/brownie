@@ -293,7 +293,17 @@ write_bdk_trajectory_event() {
     payload_json="{}"
   fi
   case "$event_type" in
-    todo.completed|todo.replanned|todo.blocked|todo.repair_feedback)
+    todo.replanned)
+      # A terminal replan has already committed its derived recovery task and
+      # replacement children to the private task ledger.  Replaying the
+      # ordinary public prefix would try to transition the immutable failed
+      # source attempt again, so validate the dedicated transaction below
+      # instead of synthesizing a new source trajectory.
+      if [ "$ledger_event_type" != "todo.terminal_replanned" ]; then
+        ensure_bdk_trajectory_state_machine_prefix "$run_stamp" || return $?
+      fi
+      ;;
+    todo.completed|todo.blocked|todo.repair_feedback)
       ensure_bdk_trajectory_state_machine_prefix "$run_stamp" || return $?
       ;;
   esac
@@ -431,6 +441,83 @@ PY
       evaluate_bdk_public_harness_feedback "$run_stamp" "$event_type" || true
       ;;
   esac
+}
+
+# Commit the derived recovery graph before archiving the source claim.  A
+# source attempt that Runtime already terminalized must remain immutable; this
+# command records a distinct queued→claimed→running→replanned recovery parent
+# and all generated children in one task-ledger transaction.
+record_terminal_multitarget_replan_transition() {
+  local run_stamp="$1"
+  local fallback_result="$2"
+  local evidence_source transition_output transition_status
+  if ! evidence_source="$(python3 - "$fallback_result" <<'PY'
+import json
+import re
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+source = value.get("evidence_source")
+if isinstance(source, dict):
+    source = source.get("source")
+if not isinstance(source, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", source):
+    raise SystemExit(1)
+print(source)
+PY
+)"; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="terminal multi-target replan evidence source was missing or malformed"
+    return 78
+  fi
+  if transition_output="$(node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" record-terminal-replan --repo "$PHASE_LOOP_WORKSPACE_ROOT" --claim "$TODO_CLAIM_FILE" --todo "$PHASE_LOOP_TODO" --run "$run_stamp" --reason "terminal_multitarget_leaf_split" --evidence-source "$evidence_source" 2>&1)"; then
+    printf '%s task_ledger_terminal_replan_result run=%s result=%s\n' "$(now_utc)" "$run_stamp" "$transition_output" >> "$SUPERVISOR_LOG"
+    printf '%s\n' "$transition_output"
+    return 0
+  else
+    transition_status=$?
+  fi
+  PHASE_LOOP_TASK_LEDGER_FAILURE=1
+  PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="terminal multi-target replan ledger transaction failed: exit=$transition_status result=${transition_output:-<no output>} claim=$TODO_CLAIM_FILE"
+  printf '%s task_ledger_terminal_replan_failed run=%s %s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL" >> "$SUPERVISOR_LOG"
+  return 78
+}
+
+terminal_multitarget_replan_public_payload() {
+  local transition_result="$1"
+  python3 - "$transition_result" <<'PY'
+import json
+import re
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+task_id = value.get("task_id")
+fingerprint = value.get("terminal_replan_fingerprint")
+source_task_id = value.get("source_task_id")
+evidence_source = value.get("evidence_source")
+if not all(isinstance(item, str) and item for item in (task_id, fingerprint, source_task_id, evidence_source)):
+    raise SystemExit(1)
+if not re.fullmatch(r"[A-Za-z0-9@._-]{1,512}", task_id):
+    raise SystemExit(1)
+if not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+    raise SystemExit(1)
+if not re.fullmatch(r"[A-Za-z0-9@._-]{1,512}", source_task_id):
+    raise SystemExit(1)
+if not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", evidence_source):
+    raise SystemExit(1)
+print(json.dumps({
+    "reason": "terminal_multitarget_leaf_split",
+    "evidence_source": evidence_source,
+    "terminal_replan_task_id": task_id,
+    "terminal_replan_fingerprint": fingerprint,
+    "terminal_source_task_id": source_task_id,
+}, sort_keys=True))
+PY
 }
 
 record_completion_ledger_transition() {
@@ -5620,13 +5707,14 @@ print(json.dumps({
 PY
 }
 
-try_no_eligible_multitarget_leaf_split_fallback() {
+try_terminal_multitarget_leaf_split_fallback() {
   local run_stamp="$1"
   if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$PROGRESS_STATE_FILE" ]; then
-    printf '%s\n' '{"applied":false,"eligible":false,"operation":"no_eligible_multitarget_leaf_split_fallback","reason":"claim_or_progress_state_missing"}'
+    printf '%s\n' '{"applied":false,"eligible":false,"operation":"terminal_multitarget_leaf_split_fallback","reason":"claim_or_progress_state_missing"}'
     return 2
   fi
-  python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$PROGRESS_STATE_FILE" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$PHASE_LOOP_WORKSPACE_ROOT" "$STATE_DIR" "$RUN_DIR" "$run_stamp" "$(now_utc)" <<'PY'
+  python3 - "$TODO_CLAIM_FILE" "$TODO_REPAIR_FEEDBACK_FILE" "$PROGRESS_STATE_FILE" "$PHASE_LOOP_TODO" "$PHASE_LOOP_TODO_BREAKDOWN" "$PHASE_LOOP_WORKSPACE_ROOT" "$STATE_DIR" "$RUN_DIR" "$PHASE_LOOP_BROWNIE_STORE_ROOT" "$run_stamp" "$(now_utc)" <<'PY'
+import hashlib
 import json
 import os
 import pathlib
@@ -5642,8 +5730,9 @@ breakdown_path = pathlib.Path(sys.argv[5])
 workspace = pathlib.Path(sys.argv[6])
 state_dir = pathlib.Path(sys.argv[7])
 runs_dir = pathlib.Path(sys.argv[8])
-run_stamp = sys.argv[9]
-timestamp = sys.argv[10]
+store_root = pathlib.Path(sys.argv[9])
+run_stamp = sys.argv[10]
+timestamp = sys.argv[11]
 
 def read_json(path):
     try:
@@ -5670,13 +5759,80 @@ def safe_leaf_id(parent_id, index):
     suffix = f"-target-{index:02d}"
     return f"{parent_id[:96-len(suffix)].rstrip('-')}{suffix}"
 
-def prior_terminal_no_eligible_evidence(expected_claim_id, expected_selected_first):
-    """Return the newest earlier terminal no-eligible stdout for this state dir.
+TERMINAL_UNPROPOSED_WORKSPACE_WRITE_SUMMARY = (
+    "LLM tool intent did not produce a valid workspace.write proposal for a workspace edit task"
+)
+
+def terminal_unproposed_workspace_write_evidence(run, expected_claim_id, expected_selected_first, stamp, candidate):
+    """Return only a claim-bound, Runtime-authored terminal write failure.
+
+    The public headless envelope may say ``task_executed`` plus ``resume`` even
+    when the Runtime ledger has already terminalized the agent loop.  Do not
+    infer this from a generic failed run: require the exact Runtime completion
+    invariant, a matching admitted claim store, and the selected TODO snapshot.
+    """
+    if not expected_claim_id or run.get("status") != "task_executed":
+        return None
+    if run.get("phase_loop_selected_todo_first_line") != expected_selected_first:
+        return None
+    run_id = str(run.get("run_id") or (run.get("automation") or {}).get("run_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+        return None
+    try:
+        root = store_root.resolve()
+        claim_digest = hashlib.sha256(expected_claim_id.encode("utf-8")).hexdigest()
+        ledger_path = root / "phase-loop-claims" / claim_digest / "runs" / run_id / "ledger.jsonl"
+        resolved_ledger = ledger_path.resolve()
+        if not resolved_ledger.is_relative_to(root) or not ledger_path.is_file() or ledger_path.is_symlink():
+            return None
+        if ledger_path.stat().st_size > 2 * 1024 * 1024:
+            return None
+    except Exception:
+        return None
+
+    agent_loop_failed = False
+    task_failed = False
+    try:
+        for raw_line in ledger_path.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            event = json.loads(raw_line)
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if event.get("kind") == "AgentLoopCompleted":
+                agent_loop_failed = (
+                    payload.get("completion_summary") == TERMINAL_UNPROPOSED_WORKSPACE_WRITE_SUMMARY
+                    and payload.get("final_state") == "Failed"
+                ) or agent_loop_failed
+            elif event.get("kind") == "TaskFailed":
+                completion = payload.get("completion_evidence") if isinstance(payload.get("completion_evidence"), dict) else {}
+                task_failed = (
+                    completion.get("completion_summary_preview") == TERMINAL_UNPROPOSED_WORKSPACE_WRITE_SUMMARY
+                    and completion.get("final_state") == "Failed"
+                    and completion.get("task_status") == "Failed"
+                    and completion.get("final_response_present") is False
+                ) or task_failed
+    except Exception:
+        return None
+    if not (agent_loop_failed and task_failed):
+        return None
+    return {
+        "source": "prior_terminal_unproposed_workspace_write_ledger",
+        "run_stamp": stamp,
+        "run_id": run_id,
+        "path": str(candidate),
+        "ledger_path": str(ledger_path),
+        "terminal_summary_sha256": hashlib.sha256(
+            TERMINAL_UNPROPOSED_WORKSPACE_WRITE_SUMMARY.encode("utf-8")
+        ).hexdigest(),
+    }
+
+def prior_terminal_multitarget_split_evidence(expected_claim_id, expected_selected_first):
+    """Return the newest earlier, auditable split cause for this exact claim.
 
     The current invocation has already retained its claim, while terminal repair
-    feedback is written only after the runtime returns.  A previous terminal
-    result is therefore the durable, auditable evidence that permits this
-    narrowly-scoped queue replan before another identical invocation.
+    feedback is normally written only after Runtime returns.  A prior result can
+    therefore justify a narrowly-scoped queue replan, but only if it proves one
+    of the two stable causes below rather than merely reporting no progress.
     """
     candidates = []
     try:
@@ -5694,7 +5850,7 @@ def prior_terminal_no_eligible_evidence(expected_claim_id, expected_selected_fir
         except Exception:
             continue
         run = payload.get("run") if isinstance(payload, dict) else None
-        if not isinstance(run, dict) or run.get("status") != "no_eligible_task":
+        if not isinstance(run, dict):
             continue
         if run.get("phase_loop_selected_todo_first_line") != expected_selected_first:
             continue
@@ -5707,8 +5863,17 @@ def prior_terminal_no_eligible_evidence(expected_claim_id, expected_selected_fir
             or run.get("stop_reason") == "terminal_task_failed"
             or automation.get("stop_reason") == "terminal_task_failed"
         )
-        if terminal:
+        if run.get("status") == "no_eligible_task" and terminal:
             return {"source": "prior_terminal_no_eligible_stdout", "run_stamp": stamp, "path": str(candidate)}
+        evidence = terminal_unproposed_workspace_write_evidence(
+            run,
+            expected_claim_id,
+            expected_selected_first,
+            stamp,
+            candidate,
+        )
+        if evidence:
+            return evidence
     return None
 
 def controller_replan_dir():
@@ -5734,7 +5899,7 @@ def skip(reason):
     print(json.dumps({
         "applied": False,
         "eligible": False,
-        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "operation": "terminal_multitarget_leaf_split_fallback",
         "reason": reason,
     }, ensure_ascii=False, sort_keys=True))
     raise SystemExit(2)
@@ -5749,7 +5914,7 @@ selected_first = selected.splitlines()[0] if selected.splitlines() else ""
 selected_id = todo_id_from_first_line(selected_first)
 if not selected_id:
     skip("selected_todo_id_missing")
-prior_terminal_evidence = prior_terminal_no_eligible_evidence(claim.get("claim_id"), selected_first)
+prior_terminal_evidence = prior_terminal_multitarget_split_evidence(claim.get("claim_id"), selected_first)
 feedback_claim_id = feedback.get("claim_id")
 feedback_first_line = feedback.get("selected_todo_first_line")
 if feedback and (not feedback_claim_id or not feedback_first_line):
@@ -5791,14 +5956,34 @@ combined = " ".join(
         prior_terminal_evidence.get("source") if prior_terminal_evidence else "",
     ]
 )
-if "no_eligible_task" not in combined and "split_multitarget_leaf" not in combined:
-    skip("no_eligible_recovery_evidence_missing")
+terminal_unproposed_workspace_write = (
+    isinstance(prior_terminal_evidence, dict)
+    and prior_terminal_evidence.get("source") == "prior_terminal_unproposed_workspace_write_ledger"
+)
+if (
+    not terminal_unproposed_workspace_write
+    and "no_eligible_task" not in combined
+    and "split_multitarget_leaf" not in combined
+):
+    skip("terminal_multitarget_split_evidence_missing")
 if (
     progress.get("classification") not in {"no_progress", "non_progress_success"}
     and not feedback
     and not prior_terminal_evidence
 ):
     skip("progress_not_terminal_non_progress_without_feedback")
+
+evidence_source = prior_terminal_evidence or {"source": "repair_feedback_or_terminal_progress"}
+if terminal_unproposed_workspace_write:
+    replan_record_reason = "terminal_unproposed_workspace_write_multitarget_split"
+    split_heading = "terminal-unproposed-workspace-write multi-target split"
+    split_history = (
+        "Applied the claim-bound terminal workspace.write proposal failure fallback"
+    )
+else:
+    replan_record_reason = "deterministic_no_eligible_multitarget_split"
+    split_heading = "no-eligible multi-target split"
+    split_history = "Applied the deterministic no_eligible_task fallback"
 
 def bounded_scope_clauses(first_line):
     clauses = []
@@ -5836,7 +6021,7 @@ if len(set(targets)) != len(targets):
     print(json.dumps({
         "applied": False,
         "eligible": True,
-        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "operation": "terminal_multitarget_leaf_split_fallback",
         "reason": "duplicate_targets",
         "targets": targets,
     }, ensure_ascii=False, sort_keys=True))
@@ -5866,7 +6051,7 @@ if not original_verification:
     print(json.dumps({
         "applied": False,
         "eligible": True,
-        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "operation": "terminal_multitarget_leaf_split_fallback",
         "reason": "missing_verification",
         "selected_todo_id": selected_id,
     }, ensure_ascii=False, sort_keys=True))
@@ -5910,13 +6095,13 @@ if selected_first in updated_todo:
     print(json.dumps({
         "applied": False,
         "eligible": True,
-        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "operation": "terminal_multitarget_leaf_split_fallback",
         "reason": "selected_unchecked_parent_still_pending",
         "selected_todo_id": selected_id,
     }, ensure_ascii=False, sort_keys=True))
     raise SystemExit(1)
 
-# A no-eligible split marks its parent superseded.  Every still-pending
+# A terminal multi-target split marks its parent superseded. Every still-pending
 # downstream TODO must therefore wait for the final generated child rather
 # than retain a dependency on an abstract parent that Runtime cannot schedule.
 # Keep this transformation exact and auditable: only a Depends on: token that
@@ -6032,7 +6217,7 @@ updated_todo, downstream_dependency_rewrites = rewrite_live_downstream_dependenc
     terminal_leaf_id,
 )
 
-section_title = f"## {selected_id} no-eligible multi-target split"
+section_title = f"## {selected_id} {split_heading}"
 if section_title not in breakdown_text:
     dependency_lines = "\n".join(
         f"- {leaf_id}: {original_depends if idx == 0 else leaf_ids[idx - 1]}"
@@ -6061,7 +6246,7 @@ Verification ledger:
 
 History:
 
-- {timestamp}: Applied deterministic no_eligible_task fallback during run {run_stamp}; pending downstream TODO dependencies are retargeted to the terminal generated child so Runtime never schedules through the superseded parent.
+- {timestamp}: {split_history} during run {run_stamp}; pending downstream TODO dependencies are retargeted to the terminal generated child so Runtime never schedules through the superseded parent.
 """ + "\n"
 
 breakdown_text, breakdown_dependency_rewrites = rewrite_breakdown_dependency_graph(
@@ -6083,7 +6268,7 @@ if not guard_path or not guard_module.exists() or not todo_state_module.exists()
     print(json.dumps({
         "applied": False,
         "eligible": True,
-        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "operation": "terminal_multitarget_leaf_split_fallback",
         "reason": "canonical_todo_guard_or_integrity_unavailable",
         "guard_path": str(guard_module),
         "todo_state_path": str(todo_state_module),
@@ -6137,8 +6322,8 @@ if guard_path:
             "original_todo": original_todo_text,
             "original_breakdown": original_breakdown_text,
             "run_stamp": run_stamp,
-            "event_key": f"no-eligible-multitarget-split:{claim.get('claim_id') or selected_id}",
-            "diagnostic": "phase-loop no_eligible_task multi-target split retargeted downstream dependencies to the terminal generated child",
+            "event_key": f"terminal-multitarget-split:{claim.get('claim_id') or selected_id}",
+            "diagnostic": f"phase-loop {split_heading} retargeted downstream dependencies to the terminal generated child",
             "verification": {
                 "repair_command": "phase-loop.sh run-once",
                 "guard_command": "node scripts/guard-todo-decomposition.mjs .brownie/todo.md",
@@ -6150,7 +6335,7 @@ if guard_path:
         print(json.dumps({
             "applied": False,
             "eligible": True,
-            "operation": "no_eligible_multitarget_leaf_split_fallback",
+            "operation": "terminal_multitarget_leaf_split_fallback",
             "reason": "todo_decomposition_guard_failed_preflight",
             "stdout_tail": candidate_guard.stdout[-4000:],
             "stderr_tail": candidate_guard.stderr[-4000:],
@@ -6163,7 +6348,7 @@ if guard_path:
         print(json.dumps({
             "applied": False,
             "eligible": True,
-            "operation": "no_eligible_multitarget_leaf_split_fallback",
+            "operation": "terminal_multitarget_leaf_split_fallback",
             "reason": "canonical_todo_guard_preflight_result_invalid",
             "stdout_tail": candidate_guard.stdout[-4000:],
         }, ensure_ascii=False, sort_keys=True))
@@ -6189,12 +6374,12 @@ def atomic_replace(path, content, suffix):
         pass
 
 def rollback_todo_and_breakdown():
-    atomic_replace(todo_path, original_todo_text, "no-eligible-multitarget-rollback-todo")
-    atomic_replace(breakdown_path, original_breakdown_text, "no-eligible-multitarget-rollback-breakdown")
+    atomic_replace(todo_path, original_todo_text, "terminal-multitarget-rollback-todo")
+    atomic_replace(breakdown_path, original_breakdown_text, "terminal-multitarget-rollback-breakdown")
 
 for path, content, suffix in (
-    (todo_path, updated_todo, "no-eligible-multitarget-todo"),
-    (breakdown_path, breakdown_text, "no-eligible-multitarget-breakdown"),
+    (todo_path, updated_todo, "terminal-multitarget-todo"),
+    (breakdown_path, breakdown_text, "terminal-multitarget-breakdown"),
 ):
     atomic_replace(path, content, suffix)
 
@@ -6212,7 +6397,7 @@ if guard_path and guard_module.exists():
         print(json.dumps({
             "applied": False,
             "eligible": True,
-            "operation": "no_eligible_multitarget_leaf_split_fallback",
+            "operation": "terminal_multitarget_leaf_split_fallback",
             "reason": "todo_decomposition_guard_failed",
             "stdout_tail": guard.stdout[-4000:],
             "stderr_tail": guard.stderr[-4000:],
@@ -6235,8 +6420,8 @@ record = {
     "changed_files": [".brownie/todo.md", ".brownie/todo-breakdown.md"],
     "workspace_changed_files": [".brownie/todo.md", ".brownie/todo-breakdown.md"],
     "selected_scopes": targets,
-    "replan_record_reason": "deterministic_no_eligible_multitarget_split",
-    "evidence_source": prior_terminal_evidence or {"source": "repair_feedback_or_terminal_progress"},
+    "replan_record_reason": replan_record_reason,
+    "evidence_source": evidence_source,
     "controller_store": controller_store,
     "generated_leaf_ids": leaf_ids,
     "generated_child_ids": leaf_ids,
@@ -6249,7 +6434,7 @@ record_paths = []
 try:
     for name in {claim_id, run_stamp}:
         record_path = replan_dir / f"{name}.json"
-        atomic_replace(record_path, json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n", "no-eligible-multitarget-replan")
+        atomic_replace(record_path, json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n", "terminal-multitarget-replan")
         os.chmod(record_path, 0o600)
         record_paths.append(record_path)
 except Exception as error:
@@ -6262,7 +6447,7 @@ except Exception as error:
     print(json.dumps({
         "applied": False,
         "eligible": True,
-        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "operation": "terminal_multitarget_leaf_split_fallback",
         "reason": "todo_replan_record_write_failed",
         "error": str(error),
         "rolled_back": True,
@@ -6299,7 +6484,7 @@ if contract_rebaseline_receipt:
         print(json.dumps({
             "applied": False,
             "eligible": True,
-            "operation": "no_eligible_multitarget_leaf_split_fallback",
+            "operation": "terminal_multitarget_leaf_split_fallback",
             "reason": "contract_rebaseline_receipt_write_failed",
             "stdout_tail": receipt_writer.stdout[-4000:],
             "stderr_tail": receipt_writer.stderr[-4000:],
@@ -6324,7 +6509,7 @@ if contract_rebaseline_receipt:
         print(json.dumps({
             "applied": False,
             "eligible": True,
-            "operation": "no_eligible_multitarget_leaf_split_fallback",
+            "operation": "terminal_multitarget_leaf_split_fallback",
             "reason": "contract_rebaseline_receipt_result_invalid",
             "stdout_tail": receipt_writer.stdout[-4000:],
             "rolled_back": True,
@@ -6359,7 +6544,7 @@ if queue_integrity.returncode != 0:
     print(json.dumps({
         "applied": False,
         "eligible": True,
-        "operation": "no_eligible_multitarget_leaf_split_fallback",
+        "operation": "terminal_multitarget_leaf_split_fallback",
         "reason": "todo_queue_integrity_guard_failed_postwrite",
         "stdout_tail": queue_integrity.stdout[-4000:],
         "stderr_tail": queue_integrity.stderr[-4000:],
@@ -6370,7 +6555,7 @@ if queue_integrity.returncode != 0:
 print(json.dumps({
     "applied": True,
     "applied_at": timestamp,
-    "operation": "no_eligible_multitarget_leaf_split_fallback",
+    "operation": "terminal_multitarget_leaf_split_fallback",
     "path": str(todo_path),
     "breakdown_path": str(breakdown_path),
     "checked_parent": selected_id,
@@ -6381,7 +6566,8 @@ print(json.dumps({
     "contract_rebaseline_receipt": receipt_relative if contract_receipt_path else None,
     "queue_integrity_guard": "projected_prewrite_and_postwrite",
     "run_stamp": run_stamp,
-    "evidence_source": prior_terminal_evidence or {"source": "repair_feedback_or_terminal_progress"},
+    "replan_record_reason": replan_record_reason,
+    "evidence_source": evidence_source,
     "controller_store": controller_store,
 }, ensure_ascii=False, sort_keys=True))
 PY
@@ -16592,6 +16778,62 @@ PY
     publish_pending_completed_todo_pr "$run_stamp"
     return $?
   fi
+  # A Runtime result can leave a claim durably blocked even when its public
+  # envelope says `task_executed`/`resume`.  Resolve only the claim-bound,
+  # ledger-proven multi-target split before attempting to acquire that blocked
+  # claim again; claim_first_pending_todo deliberately rejects such a claim.
+  local pre_claim_terminal_multitarget_output pre_claim_terminal_multitarget_status
+  if pre_claim_terminal_multitarget_output="$(try_terminal_multitarget_leaf_split_fallback "$run_stamp" 2>&1)"; then
+    pre_claim_terminal_multitarget_status=0
+  else
+    pre_claim_terminal_multitarget_status=$?
+  fi
+  printf '%s run=%s terminal_multitarget_leaf_split_pre_claim_exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$pre_claim_terminal_multitarget_status" "$pre_claim_terminal_multitarget_output" >> "$SUPERVISOR_LOG"
+  if [ "$pre_claim_terminal_multitarget_status" -eq 0 ]; then
+    local pre_claim_terminal_replan_output pre_claim_terminal_replan_payload
+    if ! pre_claim_terminal_replan_output="$(record_terminal_multitarget_replan_transition "$run_stamp" "$pre_claim_terminal_multitarget_output" 2>&1)"; then
+      detail="Terminal multi-target split changed the queue but its derived task-ledger recovery transaction was not durable; preserving the source claim and refusing Runtime restart. ledger=${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL:-$pre_claim_terminal_replan_output}"
+      printf '%s run=%s terminal_multitarget_replan_transaction_failed=true result=%s\n' "$(now_utc)" "$run_stamp" "$pre_claim_terminal_replan_output" >> "$SUPERVISOR_LOG"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
+    if ! pre_claim_terminal_replan_payload="$(terminal_multitarget_replan_public_payload "$pre_claim_terminal_replan_output")"; then
+      PHASE_LOOP_TASK_LEDGER_FAILURE=1
+      PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="terminal multi-target replan transaction returned an invalid public binding: $pre_claim_terminal_replan_output"
+      detail="Terminal multi-target split recovery transaction could not be bound to its public trajectory; preserving the source claim and refusing Runtime restart. ledger=$PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL"
+      printf '%s run=%s terminal_multitarget_replan_public_binding_failed=true result=%s\n' "$(now_utc)" "$run_stamp" "$pre_claim_terminal_replan_output" >> "$SUPERVISOR_LOG"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
+    workspace_after="$(git_workspace_fingerprint)"
+    printf '%s\n' "$pre_claim_terminal_multitarget_output" > "$stdout_log"
+    : > "$stderr_log"
+    clear_repair_feedback
+    write_todo_claim "$(claim_field claim_id)" "replanned" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    if [ -f "$TODO_CLAIM_FILE" ]; then
+      PHASE_LOOP_LAST_CLAIM_ARCHIVE="$TODO_CLAIM_DIR/replanned-terminal-multitarget-split-$run_stamp.json"
+      mv "$TODO_CLAIM_FILE" "$PHASE_LOOP_LAST_CLAIM_ARCHIVE"
+      sync_parent_dir "$TODO_CLAIM_DIR"
+    fi
+    detail="Applied deterministic terminal multi-target leaf split before attempting another claim; the parent was replanned, not completed: $pre_claim_terminal_multitarget_output"
+    printf '%s run=%s terminal_multitarget_leaf_split=true phase=pre_claim result=%s\n' "$(now_utc)" "todo-terminal-multitarget-split-$run_stamp" "$pre_claim_terminal_multitarget_output" >> "$SUPERVISOR_LOG"
+    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"terminal_multitarget_leaf_split"}'
+    write_bdk_trajectory_event "$run_stamp" "todo.replanned" "$pre_claim_terminal_replan_payload" "todo.terminal_replanned"
+    if [ "${PHASE_LOOP_TASK_LEDGER_FAILURE:-0}" -eq 1 ]; then
+      detail="Terminal multi-target split recovery was committed, but its public trajectory could not be verified against the task ledger; refusing Runtime restart. ledger=${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL}"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
+    write_status "last_run_succeeded" "$detail" "todo-terminal-multitarget-split-$run_stamp" "0" "0"
+    phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
+    return 0
+  elif [ "$pre_claim_terminal_multitarget_status" -eq 1 ]; then
+    detail="Terminal multi-target leaf split fallback was eligible but failed safely before attempting another claim: $pre_claim_terminal_multitarget_output"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "74" "${CONSECUTIVE_FAILURES:-0}"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"terminal_multitarget_leaf_split_failed"}'
+    return 74
+  fi
   if phase_loop_should_resume_active_claim; then
     # Resume is execution, not a read-only status refresh.  Validate the
     # current queue projection before reusing a claim so a completed leaf or
@@ -16925,38 +17167,6 @@ PY
     printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
     write_status "blocked" "$detail" "$run_stamp" "74" "${CONSECUTIVE_FAILURES:-0}"
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"todo_decomposition_fallback_failed"}'
-    return 74
-  fi
-  local pre_guard_no_eligible_multitarget_output pre_guard_no_eligible_multitarget_status
-  if pre_guard_no_eligible_multitarget_output="$(try_no_eligible_multitarget_leaf_split_fallback "$run_stamp" 2>&1)"; then
-    pre_guard_no_eligible_multitarget_status=0
-  else
-    pre_guard_no_eligible_multitarget_status=$?
-  fi
-  printf '%s run=%s no_eligible_multitarget_leaf_split_pre_guard_exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$pre_guard_no_eligible_multitarget_status" "$pre_guard_no_eligible_multitarget_output" >> "$SUPERVISOR_LOG"
-  if [ "$pre_guard_no_eligible_multitarget_status" -eq 0 ]; then
-    workspace_after="$(git_workspace_fingerprint)"
-    printf '%s\n' "$pre_guard_no_eligible_multitarget_output" > "$stdout_log"
-    : > "$stderr_log"
-    clear_repair_feedback
-    write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
-    if [ -f "$TODO_CLAIM_FILE" ]; then
-      PHASE_LOOP_LAST_CLAIM_ARCHIVE="$TODO_CLAIM_DIR/completed-no-eligible-multitarget-split-$run_stamp.json"
-      mv "$TODO_CLAIM_FILE" "$PHASE_LOOP_LAST_CLAIM_ARCHIVE"
-      sync_parent_dir "$TODO_CLAIM_DIR"
-    fi
-    detail="Applied deterministic fallback for no_eligible_task multi-target leaf split before invoking Brownie: $pre_guard_no_eligible_multitarget_output"
-    write_status "last_run_succeeded" "$detail" "todo-no-eligible-multitarget-split-$run_stamp" "0" "0"
-    printf '%s run=%s no_eligible_multitarget_leaf_split=true phase=pre_guard result=%s\n' "$(now_utc)" "todo-no-eligible-multitarget-split-$run_stamp" "$pre_guard_no_eligible_multitarget_output" >> "$SUPERVISOR_LOG"
-    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"no_eligible_multitarget_leaf_split"}'
-    write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"no_eligible_multitarget_leaf_split"}'
-    phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
-    return 0
-  elif [ "$pre_guard_no_eligible_multitarget_status" -eq 1 ]; then
-    detail="No-eligible multi-target leaf split fallback was eligible but failed safely before invoking Brownie: $pre_guard_no_eligible_multitarget_output"
-    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
-    write_status "blocked" "$detail" "$run_stamp" "74" "${CONSECUTIVE_FAILURES:-0}"
-    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"no_eligible_multitarget_leaf_split_failed"}'
     return 74
   fi
   local pre_guard_multifile_split_output pre_guard_multifile_split_status
