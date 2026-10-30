@@ -745,14 +745,14 @@ async function main(rawArgs) {
     } catch (error) {
       repair = { exitCode: 1, output: String(error?.stack ?? error) };
     }
-    const placeholderRecovery = repair.exitCode === 0
+    const placeholderRecovery = resumedPlaceholderRecovery ?? (repair.exitCode === 0
       ? { applied: false, reason: 'todo_repair_applied', restorations: [] }
-      : resumedPlaceholderRecovery ?? restoreExactBoundedPatchPlaceholders({
+      : restoreExactBoundedPatchPlaceholders({
         repo,
         recoveryDir,
         targetSnapshot,
         baselineRef: approvedBaselineRef
-      });
+      }));
     const guardErrors = validateTodoDecomposition(repo, path.relative(repo, todoPath));
     const guard = {
       exitCode: guardErrors.length > 0 ? 1 : 0,
