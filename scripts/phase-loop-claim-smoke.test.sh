@@ -979,6 +979,62 @@ chmod +x "$fake_brownie_terminal_no_eligible"
 fake_brownie_terminal_task_executed="$(mktemp)"
 sed 's/"status": "no_eligible_task"/"status": "task_executed"/' "$fake_brownie_terminal_no_eligible" > "$fake_brownie_terminal_task_executed"
 chmod +x "$fake_brownie_terminal_task_executed"
+fake_brownie_terminal_unproposed_workspace_write="$(mktemp)"
+cat > "$fake_brownie_terminal_unproposed_workspace_write" <<'SH'
+#!/usr/bin/env bash
+set -eu
+run_id="run-terminal-unproposed-workspace-write"
+mkdir -p "$BROWNIE_STORE_ROOT/runs/$run_id"
+if [ "${PHASE_LOOP_TEST_TERMINAL_UNPROPOSED_MODE:-matching}" = "matching" ]; then
+  cat > "$BROWNIE_STORE_ROOT/runs/$run_id/ledger.jsonl" <<'JSON'
+{"kind":"AgentLoopCompleted","payload":{"completion_summary":"LLM tool intent did not produce a valid workspace.write proposal for a workspace edit task","final_state":"Failed"}}
+{"kind":"TaskFailed","payload":{"completion_evidence":{"completion_summary_preview":"LLM tool intent did not produce a valid workspace.write proposal for a workspace edit task","final_state":"Failed","task_status":"Failed","final_response_present":false}}}
+JSON
+else
+  cat > "$BROWNIE_STORE_ROOT/runs/$run_id/ledger.jsonl" <<'JSON'
+{"kind":"AgentLoopCompleted","payload":{"completion_summary":"verification command failed before a workspace edit","final_state":"Failed"}}
+{"kind":"TaskFailed","payload":{"completion_evidence":{"completion_summary_preview":"verification command failed before a workspace edit","final_state":"Failed","task_status":"Failed","final_response_present":false}}}
+JSON
+fi
+cat <<JSON
+{
+  "command": "run",
+  "ok": true,
+  "run": {
+    "automation": {
+      "schema_version": 1,
+      "status": "continuation_required",
+      "controller_action": "resume",
+      "stop_class": "continuation_required",
+      "stop_reason": "terminal_completion_evidence_missing",
+      "completed": false,
+      "blocked": true,
+      "retryable": false,
+      "terminal_failure": false,
+      "task_id": "task-terminal-unproposed",
+      "run_id": "$run_id",
+      "next_action": "inspect_progress_overview",
+      "next_invocation": {"command": "resume", "arguments": []}
+    },
+    "status": "task_executed",
+    "task_id": "task-terminal-unproposed",
+    "run_id": "$run_id",
+    "completion_closure_status": "unknown_nonterminal",
+    "task_execution_confirmed": true,
+    "completed": false,
+    "blocked": true,
+    "retryable": false,
+    "terminal_failure": false,
+    "controller_action": "resume",
+    "stop_class": "continuation_required",
+    "stop_reason": "terminal_completion_evidence_missing",
+    "next_action": "inspect_progress_overview",
+    "next_invocation": {"command": "resume", "arguments": []}
+  }
+}
+JSON
+SH
+chmod +x "$fake_brownie_terminal_unproposed_workspace_write"
 fake_brownie_runtime_authorization_expired="$(mktemp)"
 cat > "$fake_brownie_runtime_authorization_expired" <<'SH'
 #!/usr/bin/env bash
@@ -4741,7 +4797,7 @@ records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").split
 events = [
     event
     for record in records
-    for event in (record.get("events", []) if record.get("kind") in ("replan_transaction", "terminal_failure_transaction") else [record])
+    for event in (record.get("events", []) if record.get("kind") in ("replan_transaction", "terminal_failure_transaction", "terminal_replan_transaction") else [record])
 ]
 source_attempt = [event for event in events if event.get("task_id") == f"E-empty-queue-exact@{claim_id}"]
 assert source_attempt, events
@@ -5064,6 +5120,22 @@ EOF
 git -C "$no_eligible_split_workspace" add .
 git -C "$no_eligible_split_workspace" commit -m init >/dev/null
 
+# Preserve a clean copy of the same queue for the real regression: Runtime
+# reports a resumable outer envelope, but its claim-scoped ledger records the
+# exact terminal "no valid workspace.write" invariant.
+terminal_write_split_state="$(mktemp -d)"
+terminal_write_split_prompt="$(mktemp)"
+terminal_write_split_workspace="$(mktemp -d)"
+cp -R "$no_eligible_split_workspace/." "$terminal_write_split_workspace/"
+printf 'base prompt\n' > "$terminal_write_split_prompt"
+
+# A different terminal Runtime failure must never authorize a queue rewrite.
+terminal_write_unrelated_state="$(mktemp -d)"
+terminal_write_unrelated_prompt="$(mktemp)"
+terminal_write_unrelated_workspace="$(mktemp -d)"
+cp -R "$no_eligible_split_workspace/." "$terminal_write_unrelated_workspace/"
+printf 'base prompt\n' > "$terminal_write_unrelated_prompt"
+
 set +e
 PHASE_LOOP_STATE_DIR="$no_eligible_split_state" \
 PHASE_LOOP_PROMPT="$no_eligible_split_prompt" \
@@ -5102,7 +5174,7 @@ status = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
 replan_dir = pathlib.Path(sys.argv[4])
 ledger_path = pathlib.Path(sys.argv[5])
 records = list(replan_dir.glob("*.json"))
-claim_archives = list(pathlib.Path(sys.argv[3]).parent.glob("todo-claims/completed-no-eligible-multitarget-split-*.json"))
+claim_archives = list(pathlib.Path(sys.argv[3]).parent.glob("todo-claims/replanned-terminal-multitarget-split-*.json"))
 assert "- [x] E-20g-final-judgment-sync:" in todo, todo
 assert "- [ ] E-20g-final-judgment-sync-target-01: Patch only `docs/a.md`" in todo, todo
 assert "- [ ] E-20g-final-judgment-sync-target-02: Patch only `scripts/b.mjs`" in todo, todo
@@ -5136,7 +5208,7 @@ queue_integrity = subprocess.run(
 )
 assert queue_integrity.returncode == 0, (queue_integrity.stdout, queue_integrity.stderr)
 assert status["status"] == "last_run_succeeded", status
-assert "no_eligible_task multi-target leaf split" in status["detail"], status
+assert "terminal multi-target leaf split" in status["detail"], status
 assert records, "missing replan record"
 record_text = "\n".join(path.read_text(encoding="utf-8") for path in records)
 assert "deterministic_no_eligible_multitarget_split" in record_text, record_text
@@ -5149,21 +5221,36 @@ assert '"todo_id": "E-20h-next"' in contract_receipt_text, contract_receipt_text
 assert '"changed_fields": [' in contract_receipt_text and '"depends_on"' in contract_receipt_text, contract_receipt_text
 assert claim_archives, "missing completed no-eligible claim archive"
 archived_claim = json.loads(claim_archives[-1].read_text(encoding="utf-8"))
+assert archived_claim["status"] == "replanned", archived_claim
 selected_first = str(archived_claim["selected_todo"]).splitlines()[0]
 task_match = re.match(r"^\s*- \[ \]\s+([^:\s]+)", selected_first)
 assert task_match, archived_claim
 attempt_id = f"{task_match.group(1)}@{archived_claim['claim_id']}"
 ledger_events = []
+terminal_replan_transactions = []
 for line in ledger_path.read_text(encoding="utf-8").splitlines():
     if not line.strip():
         continue
     record = json.loads(line)
-    if record.get("kind") == "replan_transaction":
+    if record.get("kind") == "terminal_replan_transaction":
+        terminal_replan_transactions.append(record)
+    if record.get("kind") in {"replan_transaction", "terminal_replan_transaction"}:
         ledger_events.extend(record.get("events", []))
     else:
         ledger_events.append(record)
-terminal_events = [event for event in ledger_events if event.get("task_id") == attempt_id and event.get("to_state") in {"completed", "blocked", "failed", "replanned"}]
-assert terminal_events and terminal_events[-1]["to_state"] == "replanned", (attempt_id, ledger_events)
+source_terminal_events = [event for event in ledger_events if event.get("task_id") == attempt_id and event.get("to_state") in {"completed", "blocked", "failed", "replanned"}]
+assert source_terminal_events and source_terminal_events[-1]["to_state"] == "failed", (attempt_id, ledger_events)
+matching_transactions = [
+    record for record in terminal_replan_transactions
+    if record.get("source_task_id") == attempt_id
+    and record.get("claim_id") == archived_claim["claim_id"]
+    and record.get("reason") == "terminal_multitarget_leaf_split"
+]
+assert len(matching_transactions) == 1, matching_transactions
+derived_id = matching_transactions[0].get("replan_task_id")
+derived_events = [event for event in ledger_events if event.get("task_id") == derived_id]
+assert [event.get("to_state") for event in derived_events] == ["queued", "claimed", "running", "replanned"], derived_events
+assert all(event.get("terminal_source_task_id") == attempt_id for event in derived_events), derived_events
 assert not any(event.get("kind") == "unclaimed_trajectory" and event.get("trajectory_type") == "todo.replanned" for event in ledger_events), ledger_events
 PY
 
@@ -5224,6 +5311,143 @@ assert blocked[-1]["block_reason"] == "terminal_runtime_failure", blocked
 assert "terminal_failure_transaction" in ledger, ledger
 PY
 fi
+
+# Regression for the production failure class: the headless response says
+# `task_executed`/`resume`, while the claim-isolated Runtime ledger proves the
+# selected multi-target task ended without any valid workspace.write proposal.
+# The next controller run must perform exactly one audited replan, then the
+# first child must be capable of producing a real target diff.
+PHASE_LOOP_STATE_DIR="$terminal_write_split_state" \
+PHASE_LOOP_PROMPT="$terminal_write_split_prompt" \
+PHASE_LOOP_TODO="$terminal_write_split_workspace/.brownie/todo.md" \
+PHASE_LOOP_TODO_BREAKDOWN="$terminal_write_split_workspace/.brownie/todo-breakdown.md" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_write_split_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+BROWNIE_BIN="$fake_brownie_terminal_unproposed_workspace_write" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
+
+python3 - "$terminal_write_split_state/status.json" "$terminal_write_split_workspace/.brownie/todo.md" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+assert status["status"] == "blocked_todo_recorded", status
+assert "- [ ] E-20g-final-judgment-sync:" in todo, todo
+assert "E-20g-final-judgment-sync-target-01" not in todo, todo
+PY
+
+PHASE_LOOP_STATE_DIR="$terminal_write_split_state" \
+PHASE_LOOP_PROMPT="$terminal_write_split_prompt" \
+PHASE_LOOP_TODO="$terminal_write_split_workspace/.brownie/todo.md" \
+PHASE_LOOP_TODO_BREAKDOWN="$terminal_write_split_workspace/.brownie/todo-breakdown.md" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_write_split_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+BROWNIE_BIN="$fake_brownie_terminal_unproposed_workspace_write" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 0 "$PHASE_LOOP" run-once >/dev/null
+
+python3 - "$terminal_write_split_state/status.json" "$terminal_write_split_workspace/.brownie/todo.md" "$terminal_write_split_workspace/.brownie/todo-breakdown.md" "$terminal_write_split_workspace/.brownie/private/phase-loop/todo-replans" "$terminal_write_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+breakdown = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+records = list(pathlib.Path(sys.argv[4]).glob("*.json"))
+ledger_path = pathlib.Path(sys.argv[5])
+archives = list(pathlib.Path(sys.argv[1]).parent.glob("todo-claims/replanned-terminal-multitarget-split-*.json"))
+assert status["status"] == "last_run_succeeded", status
+assert "replanned, not completed" in status["detail"], status
+assert "- [x] E-20g-final-judgment-sync:" in todo, todo
+assert "- [ ] E-20g-final-judgment-sync-target-01: Patch only `docs/a.md`" in todo, todo
+assert "- [ ] E-20g-final-judgment-sync-target-02: Patch only `scripts/b.mjs`" in todo, todo
+assert re.search(r"E-20h-next:.*?Depends on: E-20g-final-judgment-sync-target-02\.", todo, re.S), todo
+assert "terminal-unproposed-workspace-write multi-target split" in breakdown, breakdown
+assert records, "missing terminal-write replan record"
+record_text = "\n".join(path.read_text(encoding="utf-8") for path in records)
+assert "terminal_unproposed_workspace_write_multitarget_split" in record_text, record_text
+assert "prior_terminal_unproposed_workspace_write_ledger" in record_text, record_text
+assert archives, "missing replanned terminal-write claim archive"
+archived_claim = json.loads(archives[-1].read_text(encoding="utf-8"))
+assert archived_claim["status"] == "replanned"
+todo_id = re.match(r"^\s*- \[ \]\s+([^:\s]+)", str(archived_claim["selected_todo"]).splitlines()[0]).group(1)
+source_attempt = f"{todo_id}@{archived_claim['claim_id']}"
+ledger_records = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+terminal_replans = [
+    record for record in ledger_records
+    if record.get("kind") == "terminal_replan_transaction"
+    and record.get("source_task_id") == source_attempt
+    and record.get("evidence_source") == "prior_terminal_unproposed_workspace_write_ledger"
+]
+assert len(terminal_replans) == 1, terminal_replans
+events = terminal_replans[0].get("events", [])
+derived_id = terminal_replans[0].get("replan_task_id")
+derived_events = [event for event in events if event.get("task_id") == derived_id]
+assert [event.get("to_state") for event in derived_events] == ["queued", "claimed", "running", "replanned"], derived_events
+assert all(event.get("terminal_source_task_id") == source_attempt for event in derived_events), derived_events
+PY
+
+PHASE_LOOP_STATE_DIR="$terminal_write_split_state" \
+PHASE_LOOP_PROMPT="$terminal_write_split_prompt" \
+PHASE_LOOP_TODO="$terminal_write_split_workspace/.brownie/todo.md" \
+PHASE_LOOP_TODO_BREAKDOWN="$terminal_write_split_workspace/.brownie/todo-breakdown.md" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_write_split_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_MUTATE_TARGET=1 \
+BROWNIE_BIN="$fake_brownie_completed" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+python3 - "$terminal_write_split_workspace/.brownie/todo.md" "$terminal_write_split_workspace/docs/a.md" <<'PY'
+import pathlib
+import re
+import sys
+
+todo = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+target = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+assert "phaseLoopCompletionFixtureCompleted" in target, target
+assert not re.search(r"^- \[ \] E-20g-final-judgment-sync-target-01:", todo, re.M), todo
+PY
+
+# Negative regression: a differently worded terminal Runtime failure is not
+# sufficient evidence to rewrite even a multi-target TODO.
+PHASE_LOOP_STATE_DIR="$terminal_write_unrelated_state" \
+PHASE_LOOP_PROMPT="$terminal_write_unrelated_prompt" \
+PHASE_LOOP_TODO="$terminal_write_unrelated_workspace/.brownie/todo.md" \
+PHASE_LOOP_TODO_BREAKDOWN="$terminal_write_unrelated_workspace/.brownie/todo-breakdown.md" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_write_unrelated_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_TERMINAL_UNPROPOSED_MODE=unrelated \
+BROWNIE_BIN="$fake_brownie_terminal_unproposed_workspace_write" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+PHASE_LOOP_STATE_DIR="$terminal_write_unrelated_state" \
+PHASE_LOOP_PROMPT="$terminal_write_unrelated_prompt" \
+PHASE_LOOP_TODO="$terminal_write_unrelated_workspace/.brownie/todo.md" \
+PHASE_LOOP_TODO_BREAKDOWN="$terminal_write_unrelated_workspace/.brownie/todo-breakdown.md" \
+PHASE_LOOP_WORKSPACE_ROOT="$terminal_write_unrelated_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+PHASE_LOOP_TEST_TERMINAL_UNPROPOSED_MODE=unrelated \
+BROWNIE_BIN="$fake_brownie_terminal_unproposed_workspace_write" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
+
+python3 - "$terminal_write_unrelated_state/status.json" "$terminal_write_unrelated_workspace/.brownie/todo.md" "$terminal_write_unrelated_workspace/.brownie/private/phase-loop/todo-replans" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+replan_dir = pathlib.Path(sys.argv[3])
+assert status["status"] == "blocked", status
+assert status["exit_code"] in {"75", "76"}, status
+assert "- [ ] E-20g-final-judgment-sync:" in todo, todo
+assert "E-20g-final-judgment-sync-target-01" not in todo, todo
+if replan_dir.exists():
+    assert not list(replan_dir.glob("*.json")), list(replan_dir.glob("*.json"))
+PY
 fi
 
 if claim_smoke_section_enabled feedback; then
@@ -5755,7 +5979,7 @@ else:
                 if not line.strip():
                     continue
                 record = json.loads(line)
-                events = record.get("events", []) if record.get("kind") in {"replan_transaction", "terminal_failure_transaction"} else [record]
+                events = record.get("events", []) if record.get("kind") in {"replan_transaction", "terminal_failure_transaction", "terminal_replan_transaction"} else [record]
                 for event in events:
                     task_id = str(event.get("task_id", ""))
                     if event.get("claim_id") != expected_claim_id:
@@ -5828,9 +6052,10 @@ assert "todo_refinement_requires_todo_decomposition_route" in phase_loop, phase_
 assert "only Route: todo-decomposition may replace a parent TODO with decomposition leaves" in phase_loop, phase_loop
 assert "must_not_complete_by_todo_refinement_only" in phase_loop, phase_loop
 assert "selected_target_implementation_required" in phase_loop, phase_loop
-assert "try_no_eligible_multitarget_leaf_split_fallback" in phase_loop, phase_loop
+assert "try_terminal_multitarget_leaf_split_fallback" in phase_loop, phase_loop
 assert "deterministic_no_eligible_multitarget_split" in phase_loop, phase_loop
-assert "no_eligible_multitarget_leaf_split_pre_guard_exit" in phase_loop, phase_loop
+assert "terminal_unproposed_workspace_write_multitarget_split" in phase_loop, phase_loop
+assert "terminal_multitarget_leaf_split_pre_claim_exit" in phase_loop, phase_loop
 # `skip` is the single formatter for structured fallback rejections; assert the
 # branch rather than a whitespace-sensitive rendering of its JSON output.
 assert 'skip("selected_todo_not_in_queue")' in phase_loop, phase_loop
@@ -5839,7 +6064,10 @@ assert 'progress_projection.get("cli_status")' in phase_loop, phase_loop
 assert '"non_progress_success"' in phase_loop, phase_loop
 assert 'progress_not_terminal_non_progress_without_feedback' in phase_loop, phase_loop
 assert 'prior_terminal_no_eligible_stdout' in phase_loop, phase_loop
+assert 'prior_terminal_multitarget_split_evidence' in phase_loop, phase_loop
+assert 'prior_terminal_unproposed_workspace_write_ledger' in phase_loop, phase_loop
 assert 'evidence_source' in phase_loop, phase_loop
+assert phase_loop.index("terminal_multitarget_leaf_split_pre_claim_exit") < phase_loop.index('if ! claim_first_pending_todo "$run_stamp"; then'), phase_loop
 assert 'isolated_external_todo_state' in phase_loop, phase_loop
 assert '"rolled_back": True' in phase_loop, phase_loop
 assert "split_multitarget_or_force_bounded_workspace_write" in phase_loop, phase_loop

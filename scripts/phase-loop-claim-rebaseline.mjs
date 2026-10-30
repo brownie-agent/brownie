@@ -91,7 +91,7 @@ function selectedContract(selectedTodo) {
 }
 
 function flattenLedger(value) {
-  if (value?.kind === 'terminal_failure_transaction' || value?.kind === 'replan_transaction') {
+  if (value?.kind === 'terminal_failure_transaction' || value?.kind === 'replan_transaction' || value?.kind === 'terminal_replan_transaction') {
     return Array.isArray(value.events) ? value.events : [];
   }
   return value ? [value] : [];

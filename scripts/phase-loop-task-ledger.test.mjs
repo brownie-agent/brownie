@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { appendTaskTransition, readTaskLedger, recordTerminalFailureRecovery, recordTrajectory, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
+import { appendTaskTransition, readTaskLedger, recordTerminalFailureRecovery, recordTerminalReplanWithChildren, recordTrajectory, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
 
 function terminalEvidence(selectedTodo, claimId) {
   return {
@@ -55,6 +55,158 @@ test('replan atomically records a terminal parent and executable queued children
   assert.equal(projection.get('T-5').to_state, 'replanned');
   assert.equal(projection.get('T-5a').to_state, 'queued');
   assert.equal(projection.get('T-5b').parent_task_id, 'T-5');
+});
+
+test('terminal replan preserves the failed source attempt and atomically records a derived recovery', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const selectedTodo = [
+    '- [ ] T-terminal: multi-target implementation leaf',
+    '  Route: implementation.',
+    '  Patch only `scripts/a.mjs` and `scripts/b.mjs`.',
+    '  Verification: run `node --test scripts/a.test.mjs`.'
+  ].join('\n');
+  const claimId = 'claim-terminal';
+  const sourceTaskId = taskAttemptId('T-terminal', claimId);
+  const specHash = crypto.createHash('sha256').update(selectedTodo).digest('hex');
+  for (const to_state of ['queued', 'claimed', 'running', 'failed']) {
+    assert.equal(appendTaskTransition(repo, {
+      task_id: sourceTaskId,
+      to_state,
+      claim_id: claimId,
+      run_id: 'run-terminal',
+      task_spec_sha256: specHash,
+      reason: to_state === 'failed' ? 'trajectory_failed' : undefined
+    }).ok, true);
+  }
+  const children = [
+    { task_id: 'T-terminal-target-01', route: 'implementation', patch_targets: ['scripts/a.mjs'], verification_commands: ['node --test scripts/a.test.mjs'] },
+    { task_id: 'T-terminal-target-02', route: 'implementation', patch_targets: ['scripts/b.mjs'], verification_commands: ['node --test scripts/a.test.mjs'] }
+  ];
+  const input = {
+    selected_todo: selectedTodo,
+    claim_id: claimId,
+    run_id: 'run-terminal-replan',
+    reason: 'terminal_multitarget_leaf_split',
+    evidence_source: 'prior_terminal_unproposed_workspace_write_ledger',
+    children
+  };
+  const result = recordTerminalReplanWithChildren(repo, input);
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 'terminal_replan_recorded');
+  const events = readTaskLedger(repo);
+  const projection = taskProjection(events);
+  assert.equal(projection.get(sourceTaskId).to_state, 'failed');
+  assert.equal(projection.get(result.task_id).to_state, 'replanned');
+  assert.equal(projection.get('T-terminal-target-01').parent_task_id, result.task_id);
+  assert.equal(projection.get('T-terminal-target-02').to_state, 'queued');
+  assert.equal(validateTaskLedger(events).ok, true);
+
+  const ledger = path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl');
+  const before = fs.readFileSync(ledger, 'utf8');
+  const duplicate = recordTerminalReplanWithChildren(repo, input);
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.code, 'duplicate_terminal_replan');
+  assert.equal(fs.readFileSync(ledger, 'utf8'), before);
+});
+
+test('terminal replan accepts a blocked execution source without reopening it', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const selectedTodo = '- [ ] T-terminal-blocked: bounded task\n  Route: implementation.\n  Patch only `scripts/a.mjs`, `scripts/b.mjs`.\n  Verification: run `node --test scripts/a.test.mjs`.';
+  const claimId = 'claim-terminal-blocked';
+  const sourceTaskId = taskAttemptId('T-terminal-blocked', claimId);
+  const specHash = crypto.createHash('sha256').update(selectedTodo).digest('hex');
+  for (const to_state of ['queued', 'claimed', 'blocked']) {
+    assert.equal(appendTaskTransition(repo, {
+      task_id: sourceTaskId,
+      to_state,
+      claim_id: claimId,
+      run_id: 'run-terminal-blocked',
+      task_spec_sha256: specHash,
+      reason: to_state === 'blocked' ? 'trajectory_blocked' : undefined
+    }).ok, true);
+  }
+  const result = recordTerminalReplanWithChildren(repo, {
+    selected_todo: selectedTodo,
+    claim_id: claimId,
+    run_id: 'run-terminal-blocked-replan',
+    reason: 'terminal_multitarget_leaf_split',
+    evidence_source: 'prior_terminal_unproposed_workspace_write_ledger',
+    children: [
+      { task_id: 'T-terminal-blocked-target-01', route: 'implementation', patch_targets: ['scripts/a.mjs'], verification_commands: ['node --test scripts/a.test.mjs'] },
+      { task_id: 'T-terminal-blocked-target-02', route: 'implementation', patch_targets: ['scripts/b.mjs'], verification_commands: ['node --test scripts/a.test.mjs'] }
+    ]
+  });
+  assert.equal(result.ok, true);
+  assert.equal(taskProjection(readTaskLedger(repo)).get(sourceTaskId).to_state, 'blocked');
+  assert.equal(result.events.find((event) => event.to_state === 'replanned').terminal_source_state, 'blocked');
+});
+
+test('terminal replan trajectory validates the prior atomic recovery rather than reopening the failed source', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  const selectedTodo = [
+    '- [ ] T-terminal-trajectory: multi-target implementation leaf',
+    '  Route: implementation.',
+    '  Patch only `scripts/a.mjs` and `scripts/b.mjs`.',
+    '  Verification: run `node --test scripts/a.test.mjs`.'
+  ].join('\n');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, [
+    '- [ ] T-terminal-trajectory-target-01: first replacement',
+    '  Route: implementation.',
+    '  Source TODO: T-terminal-trajectory.',
+    '  Patch only `scripts/a.mjs`.',
+    '  Verification: run `node --test scripts/a.test.mjs`.',
+    '',
+    '- [ ] T-terminal-trajectory-target-02: second replacement',
+    '  Route: implementation.',
+    '  Source TODO: T-terminal-trajectory.',
+    '  Patch only `scripts/b.mjs`.',
+    '  Verification: run `node --test scripts/a.test.mjs`.',
+    ''
+  ].join('\n'));
+  const claim = path.join(repo, 'claim.json');
+  const claimId = 'claim-terminal-trajectory';
+  fs.writeFileSync(claim, JSON.stringify({ claim_id: claimId, selected_todo: selectedTodo }));
+  const sourceTaskId = taskAttemptId('T-terminal-trajectory', claimId);
+  const specHash = crypto.createHash('sha256').update(selectedTodo).digest('hex');
+  for (const to_state of ['queued', 'claimed', 'running', 'failed']) {
+    appendTaskTransition(repo, {
+      task_id: sourceTaskId,
+      to_state,
+      claim_id: claimId,
+      run_id: 'run-terminal-trajectory',
+      task_spec_sha256: specHash,
+      reason: to_state === 'failed' ? 'trajectory_failed' : undefined
+    });
+  }
+  const result = recordTerminalReplanWithChildren(repo, {
+    selected_todo: selectedTodo,
+    claim_id: claimId,
+    run_id: 'run-terminal-trajectory-replan',
+    reason: 'terminal_multitarget_leaf_split',
+    evidence_source: 'prior_terminal_unproposed_workspace_write_ledger',
+    children: [
+      { task_id: 'T-terminal-trajectory-target-01', route: 'implementation', patch_targets: ['scripts/a.mjs', 'node --test scripts/a.test.mjs'], verification_commands: ['node --test scripts/a.test.mjs'] },
+      { task_id: 'T-terminal-trajectory-target-02', route: 'implementation', patch_targets: ['scripts/b.mjs', 'node --test scripts/a.test.mjs'], verification_commands: ['node --test scripts/a.test.mjs'] }
+    ]
+  });
+  assert.equal(result.ok, true);
+  const trajectory = recordTrajectory(repo, {
+    claimPath: claim,
+    todoPath: todo,
+    type: 'todo.terminal_replanned',
+    runId: 'run-terminal-trajectory-replan',
+    payloadRaw: JSON.stringify({
+      reason: 'terminal_multitarget_leaf_split',
+      evidence_source: 'prior_terminal_unproposed_workspace_write_ledger',
+      terminal_replan_task_id: result.task_id,
+      terminal_replan_fingerprint: result.terminal_replan_fingerprint
+    })
+  });
+  assert.equal(trajectory.ok, true, JSON.stringify(trajectory));
+  assert.equal(trajectory.code, 'terminal_replan_trajectory_recorded');
+  assert.equal(taskProjection(readTaskLedger(repo)).get(sourceTaskId).to_state, 'failed');
 });
 
 test('accepts only an exact duplicate replan transaction', () => {
