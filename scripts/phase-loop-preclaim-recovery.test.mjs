@@ -460,6 +460,57 @@ test('retries a persisted prepared intent when interruption occurs before replac
   assert.equal(record.attempts.at(-1).placeholder_recovery.reason, 'exact_bounded_patch_placeholder_restored');
 });
 
+test('restores remaining placeholder targets after an interruption between journaled targets', () => {
+  const { root, baseline, placeholder } = makeExactPlaceholderFixture();
+  const secondTarget = 'scripts/second-placeholder-target.mjs';
+  const secondBaseline = 'export const secondTarget = true;\n';
+  const secondTodo = '- [ ] E-placeholder-second: Patch only `scripts/second-placeholder-target.mjs`:\n'
+    + '  Route: implementation.\n'
+    + '  Source TODO: fixture source.\n'
+    + '  Depends on: <none>.\n'
+    + '  Completion condition: Restore only an exact bounded placeholder to the approved tracked second target.\n'
+    + '  Forbidden changes: do not edit unrelated files.\n'
+    + '  Verification: run `pnpm --workspace-root guard:todo-decomposition`.\n';
+  const todoPath = path.join(root, '.brownie/todo.md');
+  const breakdownPath = path.join(root, '.brownie/todo-breakdown.md');
+  fs.writeFileSync(path.join(root, secondTarget), secondBaseline);
+  fs.appendFileSync(todoPath, `\n${secondTodo}`);
+  fs.writeFileSync(breakdownPath, fs.readFileSync(breakdownPath, 'utf8')
+    .replace('- E-placeholder: <none>.', '- E-placeholder: <none>.\n- E-placeholder-second: <none>.')
+    .replace('- E-placeholder: guard.', '- E-placeholder: guard.\n- E-placeholder-second: guard.'));
+  git(root, ['add', '.brownie/todo.md', '.brownie/todo-breakdown.md', secondTarget]);
+  git(root, ['commit', '-qm', 'add second placeholder fixture target']);
+  fs.writeFileSync(path.join(root, secondTarget), placeholder);
+
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const initial = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(initial.status, 0, `${initial.stdout}\n${initial.stderr}`);
+  const { recordPath, record: interruptedRecord } = recoveryRecord(root);
+  const firstRestoration = interruptedRecord.placeholder_target_restorations.find((restoration) => restoration.path === '.github/workflows/release.yml');
+  const secondRestoration = interruptedRecord.placeholder_target_restorations.find((restoration) => restoration.path === secondTarget);
+  assert.ok(firstRestoration, 'fixture must record the first restoration');
+  assert.ok(secondRestoration, 'fixture must record the second restoration');
+  interruptedRecord.status = 'started';
+  interruptedRecord.rollback_performed = false;
+  interruptedRecord.placeholder_target_restorations = [firstRestoration];
+  fs.writeFileSync(path.join(root, secondTarget), placeholder);
+  fs.unlinkSync(path.join(root, secondRestoration.preimage_path));
+  fs.writeFileSync(recordPath, `${JSON.stringify(interruptedRecord, null, 2)}\n`);
+
+  const resumed = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(resumed.status, 0, `${resumed.stdout}\n${resumed.stderr}`);
+  assert.equal(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'), baseline);
+  assert.equal(fs.readFileSync(path.join(root, secondTarget), 'utf8'), secondBaseline);
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'applied');
+  assert.deepEqual(record.placeholder_target_restorations.map((restoration) => restoration.path).sort(), [
+    '.github/workflows/release.yml',
+    secondTarget
+  ]);
+  assert.equal(record.placeholder_target_restorations.every((restoration) => restoration.state === 'restored'), true);
+  assert.equal(record.attempts.at(-1).placeholder_recovery.reason, 'persisted_target_restorations_verified_and_remaining_placeholders_restored');
+});
+
 test('rolls back every persisted restoration when a later recovery retry fails', () => {
   const { root, placeholder } = makeExactPlaceholderFixture();
   const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';

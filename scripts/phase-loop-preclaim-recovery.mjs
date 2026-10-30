@@ -964,17 +964,44 @@ async function main(rawArgs) {
     } catch (error) {
       repair = { exitCode: 1, output: String(error?.stack ?? error) };
     }
-    const placeholderRecovery = resumedPlaceholderRecovery?.applied
-      ? resumedPlaceholderRecovery
-      : resumedPlaceholderRecovery?.retryable === true || repair.exitCode !== 0
-        ? restoreExactBoundedPatchPlaceholders({
+    let placeholderRecovery;
+    if (resumedPlaceholderRecovery?.applied) {
+      // A prior interruption can happen between independently journaled
+      // targets.  Verifying the target(s) already recorded must not skip an
+      // unrecorded exact placeholder that is still present in the same target
+      // snapshot.
+      const remainingPlaceholderRecovery = restoreExactBoundedPatchPlaceholders({
         repo,
         recoveryDir,
         recordPath,
         targetSnapshot,
         baselineRef: approvedBaselineRef
-      })
-        : { applied: false, reason: 'todo_repair_applied', restorations: [] };
+      });
+      if (remainingPlaceholderRecovery.applied) {
+        placeholderRecovery = {
+          applied: true,
+          reason: 'persisted_target_restorations_verified_and_remaining_placeholders_restored',
+          restorations: [...resumedPlaceholderRecovery.restorations, ...remainingPlaceholderRecovery.restorations],
+          resumed: true,
+          recorded: true,
+          errors: []
+        };
+      } else if (remainingPlaceholderRecovery.reason === 'no_exact_bounded_patch_placeholder') {
+        placeholderRecovery = resumedPlaceholderRecovery;
+      } else {
+        placeholderRecovery = remainingPlaceholderRecovery;
+      }
+    } else if (resumedPlaceholderRecovery?.retryable === true || repair.exitCode !== 0) {
+      placeholderRecovery = restoreExactBoundedPatchPlaceholders({
+        repo,
+        recoveryDir,
+        recordPath,
+        targetSnapshot,
+        baselineRef: approvedBaselineRef
+      });
+    } else {
+      placeholderRecovery = { applied: false, reason: 'todo_repair_applied', restorations: [] };
+    }
     const guardErrors = validateTodoDecomposition(repo, path.relative(repo, todoPath));
     const guard = {
       exitCode: guardErrors.length > 0 ? 1 : 0,
