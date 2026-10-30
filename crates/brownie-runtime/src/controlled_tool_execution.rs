@@ -6686,9 +6686,14 @@ pub(super) fn tool_execution_ledger_payload(result: &brownie_tools::ToolExecutio
                 .get("content_sha256")
                 .and_then(Value::as_str)
                 .unwrap_or("<unknown>");
+            let range_truncated = result
+                .output
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             format!(
                 "[workspace.read path={path} offset_bytes={offset_bytes} bytes_total={bytes_total} content_sha256={content_sha256}]\n{}",
-                preview_workspace_read_output(content)
+                preview_workspace_read_output(content, range_truncated)
             )
         } else {
             preview_tool_output(content)
