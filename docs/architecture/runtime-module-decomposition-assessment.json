@@ -31,10 +31,10 @@
   "metrics": {
     "files": {
       "crates/brownie-runtime/src/lib.rs": {
-        "line_count": 70067,
+        "line_count": 70040,
         "public_items": 3,
-        "private_items": 537,
-        "production_line_count": 16106,
+        "private_items": 536,
+        "production_line_count": 16079,
         "test_line_count": 53961,
         "state_mutation_mentions": 316,
         "durable_write_mentions": 234,
@@ -61,8 +61,8 @@
         "diagnostics_mentions": 0
       },
       "crates/brownie-runtime/src/controlled_tool_execution.rs": {
-        "line_count": 8434,
-        "public_items": 74,
+        "line_count": 8460,
+        "public_items": 75,
         "private_items": 123,
         "state_mutation_mentions": 49,
         "durable_write_mentions": 49,

@@ -11,6 +11,32 @@ use std::{fs, io, io::Write, thread, time::Duration};
 const MCP_APPROVAL_CLAIM_LOCK_RETRIES: usize = 40;
 const MCP_APPROVAL_CLAIM_LOCK_SLEEP: Duration = Duration::from_millis(25);
 
+// Keep workspace-read presentation next to the controlled execution boundary:
+// complete bounded reads stay patch-ready, while tool-truncated ranges stay
+// navigational and are continued by an explicit offset.
+pub(super) fn preview_workspace_read_output(content: &str, range_truncated: bool) -> String {
+    const TRUNCATED_RANGE_PREVIEW_BYTES: usize = 900;
+    const TRUNCATION_MARKER: &str = "\n[truncated: head and tail retained]\n";
+    let max_bytes = if range_truncated {
+        TRUNCATED_RANGE_PREVIEW_BYTES
+    } else {
+        MAX_WORKSPACE_READ_BYTES
+    };
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+
+    let retained_bytes = max_bytes.saturating_sub(TRUNCATION_MARKER.len());
+    let head_budget = retained_bytes / 2;
+    let tail_budget = retained_bytes - head_budget;
+    format!(
+        "{}{}{}",
+        utf8_prefix_within_bytes(content, head_budget),
+        TRUNCATION_MARKER,
+        utf8_suffix_within_bytes(content, tail_budget),
+    )
+}
+
 pub(super) fn handle_tool_list(id: Value) -> JsonRpcResponse<Value> {
     let tools = BuiltinToolRegistry::list()
         .into_iter()

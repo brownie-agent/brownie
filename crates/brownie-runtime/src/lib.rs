@@ -15657,33 +15657,6 @@ fn preview_tool_output(content: &str) -> String {
     preview_tool_output_with_limit(content, 2 * 1024)
 }
 
-fn preview_workspace_read_output(content: &str, range_truncated: bool) -> String {
-    // A complete bounded read must remain complete in the model-visible
-    // ledger preview. A source range that the tool itself truncated remains a
-    // compact navigation preview; the BDK then requires an explicit next
-    // offset rather than treating this as patch-ready source.
-    const TRUNCATED_RANGE_PREVIEW_BYTES: usize = 900;
-    const TRUNCATION_MARKER: &str = "\n[truncated: head and tail retained]\n";
-    let max_bytes = if range_truncated {
-        TRUNCATED_RANGE_PREVIEW_BYTES
-    } else {
-        MAX_WORKSPACE_READ_BYTES
-    };
-    if content.len() <= max_bytes {
-        return content.to_string();
-    }
-
-    let retained_bytes = max_bytes.saturating_sub(TRUNCATION_MARKER.len());
-    let head_budget = retained_bytes / 2;
-    let tail_budget = retained_bytes - head_budget;
-    format!(
-        "{}{}{}",
-        utf8_prefix_within_bytes(content, head_budget),
-        TRUNCATION_MARKER,
-        utf8_suffix_within_bytes(content, tail_budget),
-    )
-}
-
 fn utf8_prefix_within_bytes(content: &str, max_bytes: usize) -> &str {
     if content.len() <= max_bytes {
         return content;
@@ -16178,7 +16151,7 @@ mod tests {
     #[test]
     fn keeps_complete_workspace_read_context_for_bounded_patch() {
         let content = format!("head\n{}\ntail\n", "界".repeat(1_500));
-        let preview = preview_workspace_read_output(&content, false);
+        let preview = controlled_tool_execution::preview_workspace_read_output(&content, false);
 
         assert_eq!(preview, content);
         assert!(!preview.contains("[truncated: head and tail retained]"));
@@ -16187,7 +16160,7 @@ mod tests {
     #[test]
     fn bounds_truncated_workspace_read_context_for_range_continuation() {
         let content = format!("head\n{}\ntail\n", "界".repeat(MAX_WORKSPACE_READ_BYTES));
-        let preview = preview_workspace_read_output(&content, true);
+        let preview = controlled_tool_execution::preview_workspace_read_output(&content, true);
 
         assert!(preview.len() <= 900);
         assert!(preview.starts_with("head\n"));
