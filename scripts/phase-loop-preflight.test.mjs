@@ -843,15 +843,19 @@ test('rejects a workspace TODO snapshot whose source fingerprint changed', () =>
 test('places the strict preflight boundary before claim rebaseline and forbids ledger/runtime continuation', () => {
   const controller = fs.readFileSync(path.join(repositoryRoot, 'phase-loop.sh'), 'utf8');
   const runOnce = controller.indexOf('_run_brownie_once()');
+  const admissionBackedRestore = controller.indexOf('phase_loop_restore_admission_backed_stale_claim "$run_stamp"', runOnce);
   const boundary = controller.indexOf('run_phase_loop_preflight "$run_stamp" "pre-claim-boundary"', runOnce);
   const rebaseline = controller.indexOf('phase_loop_rebaseline_stale_claim "$run_stamp"', runOnce);
   const restoreTransition = controller.indexOf('restore_terminal_failure_source_transition_obligation', boundary);
+  assert.ok(admissionBackedRestore >= 0);
   assert.ok(boundary >= 0);
+  assert.ok(admissionBackedRestore < boundary);
   assert.ok(boundary < rebaseline);
   assert.ok(boundary < restoreTransition);
   assert.match(controller, /phase_loop_preflight_boundary_failed=true claim_reuse=forbidden ledger_transition=forbidden runtime_start=forbidden/u);
   assert.ok(controller.includes('if [ "$stage" = "pre-claim-boundary" ]; then'));
   assert.ok(controller.indexOf('return 78', boundary) < rebaseline);
+  assert.doesNotMatch(controller.slice(admissionBackedRestore, boundary), /run_brownie_runtime|write_bdk_trajectory_event/u);
   assert.doesNotMatch(controller.slice(boundary, restoreTransition), /write_bdk_trajectory_event/u);
   const preflightFunction = controller.indexOf('run_phase_loop_preflight()');
   const preflightCommand = controller.indexOf('node "$ROOT_DIR/scripts/phase-loop-preflight.mjs"', preflightFunction);

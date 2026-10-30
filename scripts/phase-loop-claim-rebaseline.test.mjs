@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { rebaselineStaleClaim, writeTerminalExecutionEvidence } from './phase-loop-claim-rebaseline.mjs';
+import { rebaselineStaleClaim, restoreAdmissionBackedStaleClaim, writeTerminalExecutionEvidence } from './phase-loop-claim-rebaseline.mjs';
 import { recordTerminalFailureRecovery } from './phase-loop-task-ledger.mjs';
 
 const repositoryRoot = path.resolve(new URL('..', import.meta.url).pathname);
@@ -78,6 +78,74 @@ function writeResumeAdmission(f, runStamp, overrides = {}) {
   const receiptPath = path.join(f.runs, `${runStamp}.active-claim-resume-admission.json`);
   writeJson(receiptPath, receipt);
   return receiptPath;
+}
+
+function writeBoundaryOnlyTerminalProjection(f) {
+  writeJson(path.join(f.stateDir, 'status.json'), {
+    status: 'blocked',
+    detail: 'Phase-loop preflight failed before continuing; code=contract_unsatisfiable_dirty_scope.',
+  });
+  writeJson(path.join(f.stateDir, 'progress-state.json'), {
+    classification: 'terminal_failure',
+    progress_projection: {
+      claim_id: 'todo-g541-roundtrip-r3',
+      controller_action: 'stop',
+      stop_class: 'no_actionable_work',
+      stop_reason: 'no_actionable_work',
+      cli_status: 'no_eligible_task',
+      terminal_final_state: '',
+      terminal_task_status: '',
+      blocked_by_terminal_task_failure: false,
+      objective_apply_terminal_failure: false,
+    },
+  });
+  writeJson(path.join(f.claims, 'todo-queue-state.json'), { generation: 541, fingerprint: 'old-queue' });
+}
+
+function archiveAdmissionBackedBoundaryClaim(f, rebaselineRunStamp, receiptOverrides = {}) {
+  writeBoundaryOnlyTerminalProjection(f);
+  const receiptPath = writeResumeAdmission(f, rebaselineRunStamp, receiptOverrides);
+  const claim = JSON.parse(fs.readFileSync(f.claimPath, 'utf8'));
+  const rebaselineId = `rebaseline-${rebaselineRunStamp}-${crypto.createHash('sha256').update(claim.claim_id).digest('hex').slice(0, 12)}`;
+  const auditName = `${rebaselineId}.json`;
+  const archiveName = `stale-rebaseline-${rebaselineRunStamp}.json`;
+  const audit = {
+    schema_version: 1,
+    kind: 'phase_loop_claim_rebaseline',
+    rebaseline_id: rebaselineId,
+    run_stamp: rebaselineRunStamp,
+    source_claim: {
+      claim_id: claim.claim_id,
+      run_stamp: claim.run_stamp,
+      queue_generation: claim.queue_generation,
+      queue_fingerprint: claim.queue_fingerprint,
+    },
+    selected_todo_id: 'E-23b-roundtrip-target-02',
+    selected_todo_sha256: crypto.createHash('sha256').update(f.selected).digest('hex'),
+    reasons: {
+      stale_materialized_scope_boundary: true,
+      terminal_projection: true,
+      ledger_terminal_events: [],
+      prior_terminal_runs: [],
+      resume_admission: { valid: true, path: receiptPath },
+    },
+  };
+  const archived = {
+    ...claim,
+    status: 'stale_snapshot_rejected',
+    archive_reason: 'stale_claim_rebaseline',
+    recovery_state: 'redelegatable',
+    retry_eligible: true,
+    rebaseline_id: rebaselineId,
+    rebaseline_audit: path.join('todo-claims', auditName),
+    rebaselined_at: '2026-10-20T09:00:00.000Z',
+  };
+  const auditPath = path.join(f.claims, auditName);
+  const archivePath = path.join(f.claims, archiveName);
+  writeJson(auditPath, audit);
+  writeJson(archivePath, archived);
+  fs.unlinkSync(f.claimPath);
+  return { archivePath, auditPath, receiptPath, rebaselineId };
 }
 
 test('isolates stale running r3 claim and records source/queue rebaseline before fresh delegation', () => {
@@ -224,6 +292,153 @@ test('preserves a stale boundary claim only when this run attests its exact mate
   assert.equal(result.reason, 'boundary_admitted_materialized_claim_preserved_for_resume');
   assert.deepEqual(result.admitted_targets, ['scripts/roundtrip.test.mjs']);
   assert.equal(fs.existsSync(f.claimPath), true);
+});
+
+test('preserves a receipt-admitted boundary claim when only controller routing classified a zero-candidate result as terminal', () => {
+  const f = fixture();
+  const runStamp = '20261020T090000Z';
+  writeBoundaryOnlyTerminalProjection(f);
+  const receiptPath = writeResumeAdmission(f, runStamp);
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp,
+    baselineRef: 'origin/main',
+    resumeAdmissionPath: receiptPath,
+  });
+  assert.equal(result.rebaselined, false, JSON.stringify(result));
+  assert.equal(result.reason, 'boundary_admitted_materialized_claim_preserved_for_resume');
+  assert.equal(result.boundary_only_no_actionable_terminal_projection, true);
+  assert.equal(fs.existsSync(f.claimPath), true);
+});
+
+test('does not preserve a receipt-admitted boundary claim when Runtime terminal fields are present', () => {
+  const f = fixture();
+  const runStamp = '20261020T090000Z';
+  writeJson(path.join(f.stateDir, 'status.json'), {
+    status: 'blocked',
+    detail: 'Phase-loop preflight failed before continuing; code=contract_unsatisfiable_dirty_scope.',
+  });
+  writeJson(path.join(f.stateDir, 'progress-state.json'), {
+    classification: 'terminal_failure',
+    progress_projection: {
+      claim_id: 'todo-g541-roundtrip-r3',
+      stop_class: 'terminal_failure',
+      stop_reason: 'terminal_task_failed',
+      terminal_final_state: 'Failed',
+      terminal_task_status: 'Failed',
+      blocked_by_terminal_task_failure: true,
+    },
+  });
+  writeJson(path.join(f.claims, 'todo-queue-state.json'), { generation: 541, fingerprint: 'old-queue' });
+  const receiptPath = writeResumeAdmission(f, runStamp);
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp,
+    baselineRef: 'origin/main',
+    resumeAdmissionPath: receiptPath,
+  });
+  assert.equal(result.rebaselined, true, JSON.stringify(result));
+  const audit = JSON.parse(fs.readFileSync(result.audit_path, 'utf8'));
+  assert.equal(audit.reasons.boundary_only_no_actionable_terminal_projection, false);
+  assert.equal(fs.existsSync(f.claimPath), false);
+});
+
+test('restores only an audited admission-backed claim that was archived by the boundary-only terminal classification', () => {
+  const f = fixture();
+  const archive = archiveAdmissionBackedBoundaryClaim(f, '20261020T090000Z');
+  const result = restoreAdmissionBackedStaleClaim({
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp: '20261020T091500Z',
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.restored, true, JSON.stringify(result));
+  assert.equal(result.reason, 'admission_backed_stale_claim_restored');
+  assert.equal(result.archive_path, archive.archivePath);
+  assert.equal(fs.existsSync(archive.archivePath), true);
+  const restored = JSON.parse(fs.readFileSync(f.claimPath, 'utf8'));
+  assert.equal(restored.status, 'in_progress');
+  assert.equal(restored.run_stamp, '20261020T091500Z');
+  assert.equal(restored.admission_backed_restore_id, result.restore_id);
+  const restoreAudit = JSON.parse(fs.readFileSync(result.restore_audit_path, 'utf8'));
+  assert.equal(restoreAudit.source_rebaseline_audit, path.relative(f.stateDir, archive.auditPath));
+  assert.deepEqual(restoreAudit.historical_resume_admission.admitted_targets, ['scripts/roundtrip.test.mjs']);
+});
+
+test('restored admission-backed claim survives the next exact boundary receipt through the rebaseline gate', () => {
+  const f = fixture();
+  archiveAdmissionBackedBoundaryClaim(f, '20261020T090000Z');
+  const restoreRunStamp = '20261020T091500Z';
+  const restored = restoreAdmissionBackedStaleClaim({
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp: restoreRunStamp,
+  });
+  assert.equal(restored.restored, true, JSON.stringify(restored));
+  const freshRunStamp = '20261020T092000Z';
+  const freshReceiptPath = writeResumeAdmission(f, freshRunStamp);
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp: freshRunStamp,
+    baselineRef: 'origin/main',
+    resumeAdmissionPath: freshReceiptPath,
+  });
+  assert.equal(result.rebaselined, false, JSON.stringify(result));
+  assert.equal(result.reason, 'boundary_admitted_materialized_claim_preserved_for_resume');
+  assert.equal(fs.existsSync(f.claimPath), true);
+});
+
+test('does not restore an archived claim when its historical admission receipt cannot be revalidated', () => {
+  const f = fixture();
+  archiveAdmissionBackedBoundaryClaim(f, '20261020T090000Z', { run_stamp: '20261019T071825Z' });
+  const result = restoreAdmissionBackedStaleClaim({
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp: '20261020T091500Z',
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.restored, false, JSON.stringify(result));
+  assert.equal(result.reason, 'no_admission_backed_stale_claim');
+  assert.equal(fs.existsSync(f.claimPath), false);
 });
 
 test('isolates a stale boundary claim when the purported current-run admission is stale or malformed', () => {

@@ -143,6 +143,56 @@ function validRunStamp(value) {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value);
 }
 
+function isPathInside(root, candidate) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative !== ''
+    && relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative);
+}
+
+function progressProjection(progress) {
+  return progress?.progress_projection && typeof progress.progress_projection === 'object'
+    ? progress.progress_projection : {};
+}
+
+// A no-candidate response is intentionally routed through the terminal
+// recovery path so it cannot be silently retried forever.  That controller
+// classification is not, by itself, evidence that Runtime reported a
+// terminal task failure.  Keep the distinction explicit: a fresh,
+// hash-bound admission may repair a stale materialized-scope boundary only
+// when the projection still says that Runtime stopped without an actionable
+// task and contains no terminal task evidence.
+function isBoundaryOnlyNoActionableTerminalProjection(progress, claimId) {
+  const projection = progressProjection(progress);
+  return projection.claim_id === claimId
+    && progress?.classification === 'terminal_failure'
+    && projection.stop_class === 'no_actionable_work'
+    && projection.stop_reason === 'no_actionable_work'
+    && String(projection.terminal_final_state ?? '') === ''
+    && String(projection.terminal_task_status ?? '') === ''
+    && projection.blocked_by_terminal_task_failure !== true
+    && projection.objective_apply_terminal_failure !== true;
+}
+
+function queueMatchesClaim(claim, queue) {
+  return claim?.queue_generation != null
+    && queue?.generation != null
+    && String(claim.queue_generation) === String(queue.generation)
+    && typeof claim.queue_fingerprint === 'string'
+    && claim.queue_fingerprint.length > 0
+    && typeof queue.fingerprint === 'string'
+    && queue.fingerprint.length > 0
+    && claim.queue_fingerprint === queue.fingerprint;
+}
+
+function isMaterializedScopeBoundary(status, claimMatchesProjection) {
+  const blockedDetail = String(status?.detail ?? '');
+  return claimMatchesProjection
+    && status?.status === 'blocked'
+    && /contract_unsatisfiable_dirty_scope|materialized[_ -]scope|pre-claim-boundary/iu.test(blockedDetail);
+}
+
 function validateActiveClaimResumeAdmission({
   resumeAdmissionPath,
   stateDir,
@@ -251,8 +301,7 @@ export function rebaselineStaleClaim({
   if (claim.terminal_failure_recovery_pending === true || claim.terminal_failure_source_transition_pending === true) {
     return { ok: true, rebaselined: false, reason: 'durable_recovery_pending', claim_id: claim.claim_id };
   }
-  const projection = progress.progress_projection && typeof progress.progress_projection === 'object'
-    ? progress.progress_projection : {};
+  const projection = progressProjection(progress);
   const claimMatchesProjection = projection.claim_id === claim.claim_id;
   let selectedTodoStillPending = false;
   try {
@@ -268,10 +317,7 @@ export function rebaselineStaleClaim({
   // known invalid.  Treat only the explicit materialized-scope boundary and
   // an applied projection whose selected TODO was removed as durable stale
   // evidence; ordinary preflight failures remain fail-closed for repair.
-  const blockedDetail = String(status.detail ?? '');
-  const staleMaterializedScopeBoundary = claimMatchesProjection
-    && status.status === 'blocked'
-    && /contract_unsatisfiable_dirty_scope|materialized[_ -]scope|pre-claim-boundary/iu.test(blockedDetail);
+  const staleMaterializedScopeBoundary = isMaterializedScopeBoundary(status, claimMatchesProjection);
   const staleAppliedProjection = claimMatchesProjection
     && String(projection.applied ?? '').toLowerCase() === 'true'
     && projection.selected_todo_first_line_still_pending_after_todo_md_apply === false
@@ -293,6 +339,8 @@ export function rebaselineStaleClaim({
     || projection.stop_class === 'terminal_failure'
     || projection.stop_reason === 'terminal_task_failed'
   );
+  const boundaryOnlyNoActionableTerminalProjection = terminalProjection
+    && isBoundaryOnlyNoActionableTerminalProjection(progress, claim.claim_id);
   const queueMismatch = (
     claim.queue_generation != null && queue.generation != null && String(claim.queue_generation) !== String(queue.generation)
   ) || (
@@ -311,14 +359,18 @@ export function rebaselineStaleClaim({
   });
   // A stale status can describe the boundary failure that was just repaired
   // by this run's preflight.  Preserve only a receipt issued by that exact
-  // preflight, for this exact claim and queue, and only absent any terminal
-  // projection or terminal evidence.  A missing, stale, or malformed receipt
-  // remains fail-closed and follows the ordinary stale-claim isolation path.
+  // preflight, for this exact claim and queue, and only absent a Runtime
+  // terminal projection or terminal evidence. A `terminal_failure`
+  // classification synthesized solely for a no-actionable-work response is
+  // controller routing, not Runtime terminal evidence, and is safe to repair
+  // only through this current-run receipt. A missing, stale, or malformed
+  // receipt remains fail-closed and follows the ordinary stale-claim
+  // isolation path.
   const boundaryAdmittedResume = resumeAdmission.valid
     && staleMaterializedScopeBoundary
     && !queueMismatch
     && selectedTodoStillPending
-    && !terminalProjection
+    && (!terminalProjection || boundaryOnlyNoActionableTerminalProjection)
     && ledgerEvidence.length === 0
     && priorRuns.length === 0;
   if (boundaryAdmittedResume) {
@@ -329,6 +381,7 @@ export function rebaselineStaleClaim({
       claim_id: claim.claim_id,
       resume_admission_path: resumeAdmission.path,
       admitted_targets: resumeAdmission.admitted_targets,
+      boundary_only_no_actionable_terminal_projection: boundaryOnlyNoActionableTerminalProjection,
     };
   }
   if (resumableContinuation && !queueMismatch && !staleClaimSnapshot) {
@@ -361,6 +414,7 @@ export function rebaselineStaleClaim({
       queue_mismatch: queueMismatch,
       selected_todo_still_pending: selectedTodoStillPending,
       terminal_projection: terminalProjection,
+      boundary_only_no_actionable_terminal_projection: boundaryOnlyNoActionableTerminalProjection,
       ledger_terminal_events: ledgerEvidence.length,
       prior_terminal_runs: priorRuns.length,
     };
@@ -398,6 +452,7 @@ export function rebaselineStaleClaim({
       owner_stopped: ownerStopped,
       queue_mismatch: queueMismatch,
       terminal_projection: terminalProjection,
+      boundary_only_no_actionable_terminal_projection: boundaryOnlyNoActionableTerminalProjection,
       stale_materialized_scope_boundary: staleMaterializedScopeBoundary,
       stale_applied_projection: staleAppliedProjection,
       selected_todo_still_pending: selectedTodoStillPending,
@@ -448,6 +503,162 @@ export function rebaselineStaleClaim({
     queue_fingerprint: queue.fingerprint ?? null,
     recovery_state: audit.recovery_state,
   };
+}
+
+// A controller bug can isolate an otherwise valid claim before the repaired
+// boundary admission is allowed to resume it.  Recover only the very narrow
+// archival shape created by that bug.  This is deliberately not a generic
+// stale-claim restore: every identity, queue, target attestation, and the
+// non-Runtime terminal classification must still match before current.json is
+// recreated.
+export function restoreAdmissionBackedStaleClaim({
+  stateDir,
+  claimPath,
+  statusPath,
+  progressPath,
+  queuePath,
+  runsDir,
+  todoPath,
+  runStamp,
+}) {
+  if (!validRunStamp(runStamp)) {
+    return { ok: false, restored: false, reason: 'invalid_run_stamp' };
+  }
+  if (fs.existsSync(claimPath)) {
+    return { ok: true, restored: false, reason: 'active_claim_present' };
+  }
+  const status = readJson(statusPath) ?? {};
+  const progress = readJson(progressPath) ?? {};
+  const queue = readJson(queuePath) ?? {};
+  const claimDir = path.dirname(claimPath);
+  let todoText = '';
+  try { todoText = fs.readFileSync(todoPath, 'utf8'); } catch {
+    return { ok: false, restored: false, reason: 'todo_unreadable' };
+  }
+
+  let candidateNames = [];
+  try {
+    candidateNames = fs.readdirSync(claimDir)
+      .filter((name) => /^stale-rebaseline-[A-Za-z0-9._-]+\.json$/u.test(name))
+      .sort()
+      .reverse();
+  } catch {
+    return { ok: true, restored: false, reason: 'no_admission_backed_stale_claim' };
+  }
+
+  for (const name of candidateNames) {
+    const archivePath = path.join(claimDir, name);
+    let archiveStat;
+    try { archiveStat = fs.lstatSync(archivePath); } catch { continue; }
+    if (!archiveStat.isFile()) continue;
+    const archived = readJson(archivePath);
+    if (!archived
+      || archived.status !== 'stale_snapshot_rejected'
+      || archived.archive_reason !== 'stale_claim_rebaseline'
+      || !archivePath.endsWith('.json')
+      || !queueMatchesClaim(archived, queue)
+      || !hasExactPendingTodo(todoText, String(archived.selected_todo ?? ''))) {
+      continue;
+    }
+
+    const auditRelativePath = archived.rebaseline_audit;
+    if (typeof auditRelativePath !== 'string' || path.isAbsolute(auditRelativePath)) continue;
+    const auditPath = path.resolve(stateDir, auditRelativePath);
+    if (!isPathInside(stateDir, auditPath)) continue;
+    const audit = readJson(auditPath);
+    const reasons = audit?.reasons && typeof audit.reasons === 'object' ? audit.reasons : {};
+    if (!audit
+      || audit.kind !== 'phase_loop_claim_rebaseline'
+      || audit.rebaseline_id !== archived.rebaseline_id
+      || !validRunStamp(audit.run_stamp)
+      || audit.source_claim?.claim_id !== archived.claim_id
+      || audit.source_claim?.run_stamp !== archived.run_stamp
+      || !queueMatchesClaim(audit.source_claim, queue)
+      || audit.selected_todo_id !== selectedTodoId(archived.selected_todo)
+      || audit.selected_todo_sha256 !== sha256(String(archived.selected_todo ?? ''))
+      || reasons.stale_materialized_scope_boundary !== true
+      || reasons.terminal_projection !== true
+      || !Array.isArray(reasons.ledger_terminal_events)
+      || reasons.ledger_terminal_events.length !== 0
+      || !Array.isArray(reasons.prior_terminal_runs)
+      || reasons.prior_terminal_runs.length !== 0
+      || reasons.resume_admission?.valid !== true
+      || typeof reasons.resume_admission?.path !== 'string') {
+      continue;
+    }
+
+    const projection = progressProjection(progress);
+    if (!isMaterializedScopeBoundary(status, projection.claim_id === archived.claim_id)
+      || !isBoundaryOnlyNoActionableTerminalProjection(progress, archived.claim_id)) {
+      continue;
+    }
+
+    const historicalAdmission = validateActiveClaimResumeAdmission({
+      resumeAdmissionPath: reasons.resume_admission.path,
+      stateDir,
+      runsDir,
+      claim: archived,
+      queue,
+      runStamp: audit.run_stamp,
+      selectedTodo: String(archived.selected_todo ?? ''),
+    });
+    if (!historicalAdmission.valid) continue;
+
+    const restoredAt = new Date().toISOString();
+    const restoreId = `active-claim-restore-${runStamp}-${sha256(`${archived.claim_id}\u0000${archived.rebaseline_id}`).slice(0, 12)}`;
+    const restoreAuditPath = path.join(claimDir, `${restoreId}.json`);
+    const restored = { ...archived };
+    for (const key of ['archive_reason', 'recovery_state', 'retry_eligible', 'rebaseline_id', 'rebaseline_audit', 'rebaselined_at']) {
+      delete restored[key];
+    }
+    restored.status = 'in_progress';
+    restored.run_stamp = runStamp;
+    restored.updated_at = restoredAt;
+    restored.admission_backed_restore_id = restoreId;
+    restored.status_history = [...(Array.isArray(archived.status_history) ? archived.status_history : []), {
+      status: 'in_progress',
+      run_stamp: runStamp,
+      updated_at: restoredAt,
+      note: `admission_backed_stale_claim_restored:${restoreId}`,
+    }];
+    const restoreAudit = {
+      schema_version: 1,
+      kind: 'phase_loop_admission_backed_claim_restore',
+      restore_id: restoreId,
+      run_stamp: runStamp,
+      recorded_at: restoredAt,
+      source_archive: path.relative(stateDir, archivePath),
+      source_rebaseline_audit: auditRelativePath,
+      source_claim_id: archived.claim_id,
+      selected_todo_id: selectedTodoId(archived.selected_todo),
+      selected_todo_sha256: sha256(String(archived.selected_todo ?? '')),
+      queue_generation: queue.generation,
+      queue_fingerprint: queue.fingerprint,
+      historical_resume_admission: {
+        path: historicalAdmission.path,
+        admitted_targets: historicalAdmission.admitted_targets,
+      },
+      guard: 'boundary_only_no_actionable_terminal_projection',
+    };
+    try {
+      if (fs.existsSync(claimPath)) return { ok: true, restored: false, reason: 'active_claim_present' };
+      writeJson(restoreAuditPath, restoreAudit);
+      writeJson(claimPath, restored);
+    } catch {
+      return { ok: false, restored: false, reason: 'restore_write_failed' };
+    }
+    return {
+      ok: true,
+      restored: true,
+      reason: 'admission_backed_stale_claim_restored',
+      restore_id: restoreId,
+      restore_audit_path: restoreAuditPath,
+      archive_path: archivePath,
+      claim_id: archived.claim_id,
+      admitted_targets: historicalAdmission.admitted_targets,
+    };
+  }
+  return { ok: true, restored: false, reason: 'no_admission_backed_stale_claim' };
 }
 
 function payloadFromFile(file) {
@@ -571,6 +782,20 @@ function main() {
       runStamp: args.get('run-stamp'),
       baselineRef: args.get('baseline-ref') ?? 'origin/main',
       resumeAdmissionPath: args.get('resume-admission') ?? '',
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exit(result.ok ? 0 : 78);
+  }
+  if (command === 'restore-admitted-stale-claim') {
+    const result = restoreAdmissionBackedStaleClaim({
+      stateDir: path.resolve(args.get('state-dir')),
+      claimPath: path.resolve(args.get('claim')),
+      statusPath: path.resolve(args.get('status')),
+      progressPath: path.resolve(args.get('progress')),
+      queuePath: path.resolve(args.get('queue')),
+      runsDir: path.resolve(args.get('runs')),
+      todoPath: path.resolve(args.get('todo')),
+      runStamp: args.get('run-stamp'),
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     process.exit(result.ok ? 0 : 78);
