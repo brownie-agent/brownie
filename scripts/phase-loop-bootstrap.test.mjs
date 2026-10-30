@@ -16,9 +16,70 @@ function executableFixture(directory, name) {
   return filePath;
 }
 
+function runtimeStatusFixture(directory, name, status) {
+  const filePath = path.join(directory, name);
+  const response = `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: status })}\n`;
+  fs.writeFileSync(filePath, [
+    '#!/usr/bin/env node',
+    'process.stdin.resume();',
+    "process.stdin.on('end', () => {",
+    `  process.stdout.write(${JSON.stringify(response)});`,
+    '});'
+  ].join('\n'), { mode: 0o755 });
+  fs.chmodSync(filePath, 0o755);
+  return filePath;
+}
+
+const readyProviderStatus = {
+  provider: 'OpenAICompatible',
+  enabled: true,
+  strict: true,
+  will_fallback_to_fake: false,
+  llm_provider_access_allowed: true,
+  task_run_network_allowed: true
+};
+
+function workspaceAwareRuntimeStatusFixture(directory, name, workspace) {
+  const filePath = path.join(directory, name);
+  const expectedWorkspace = fs.realpathSync(workspace);
+  const unavailableStatus = {
+    ...readyProviderStatus,
+    provider: 'Fake',
+    strict: false,
+    llm_provider_access_allowed: false,
+    task_run_network_allowed: false
+  };
+  fs.writeFileSync(filePath, [
+    '#!/usr/bin/env node',
+    "const fs = require('node:fs');",
+    `const expectedWorkspace = ${JSON.stringify(expectedWorkspace)};`,
+    `const expectedWorkspaceEnvironment = ${JSON.stringify(workspace)};`,
+    `const readyStatus = ${JSON.stringify(readyProviderStatus)};`,
+    `const unavailableStatus = ${JSON.stringify(unavailableStatus)};`,
+    'process.stdin.resume();',
+    "process.stdin.on('end', () => {",
+    '  const status = fs.realpathSync(process.cwd()) === expectedWorkspace && process.env.BROWNIE_WORKSPACE_ROOT === expectedWorkspaceEnvironment',
+    '    ? readyStatus',
+    '    : unavailableStatus;',
+    '  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: status }) + "\\n");',
+    '});'
+  ].join('\n'), { mode: 0o755 });
+  fs.chmodSync(filePath, 0o755);
+  return filePath;
+}
+
 function baseEnvironment() {
   const environment = { ...process.env };
-  for (const name of ['BROWNIE_BIN', 'BROWNIE_RUNTIME_PATH', 'PHASE_LOOP_ENV_FILE', 'PHASE_LOOP_WORKSPACE_ROOT', 'PHASE_LOOP_STATE_DIR']) delete environment[name];
+  for (const name of [
+    'BROWNIE_BIN',
+    'BROWNIE_RUNTIME_PATH',
+    'BROWNIE_WORKSPACE_ROOT',
+    'PHASE_LOOP_ENV_FILE',
+    'PHASE_LOOP_WORKSPACE_ROOT',
+    'PHASE_LOOP_STATE_DIR',
+    'PHASE_LOOP_PREFLIGHT_PROFILE',
+    'PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY'
+  ]) delete environment[name];
   return environment;
 }
 
@@ -59,10 +120,30 @@ test('accepts explicit CLI and Runtime paths without a workspace default', () =>
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-explicit-'));
   try {
     const cli = executableFixture(fixture, 'custom-cli');
-    const runtime = executableFixture(fixture, 'custom-runtime');
+    const runtime = runtimeStatusFixture(fixture, 'custom-runtime', readyProviderStatus);
     const result = runBootstrapCheck({
       BROWNIE_BIN: cli,
       BROWNIE_RUNTIME_PATH: runtime,
+      PHASE_LOOP_STATE_DIR: path.join(fixture, 'state')
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { ok: true, code: 'phase_loop_bootstrap_ready' });
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('probes the provider from the implementation workspace context', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-workspace-context-'));
+  try {
+    const workspace = path.join(fixture, 'implementation-workspace');
+    fs.mkdirSync(workspace);
+    const cli = executableFixture(fixture, 'cli');
+    const runtime = workspaceAwareRuntimeStatusFixture(fixture, 'runtime', workspace);
+    const result = runBootstrapCheck({
+      BROWNIE_BIN: cli,
+      BROWNIE_RUNTIME_PATH: runtime,
+      PHASE_LOOP_WORKSPACE_ROOT: workspace,
       PHASE_LOOP_STATE_DIR: path.join(fixture, 'state')
     });
     assert.equal(result.status, 0, result.stderr);
@@ -76,7 +157,7 @@ test('loads only an explicitly selected environment file', () => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-env-file-'));
   try {
     const cli = executableFixture(fixture, 'cli');
-    const runtime = executableFixture(fixture, 'runtime');
+    const runtime = runtimeStatusFixture(fixture, 'runtime', readyProviderStatus);
     const environmentFile = path.join(fixture, 'deployment.env');
     fs.writeFileSync(environmentFile, [
       `BROWNIE_BIN=${JSON.stringify(cli)}`,
@@ -86,6 +167,88 @@ test('loads only an explicitly selected environment file', () => {
     const result = runBootstrapCheck({ PHASE_LOOP_ENV_FILE: environmentFile });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), { ok: true, code: 'phase_loop_bootstrap_ready' });
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('rejects a Fake implementation provider before a phase claim can start', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-fake-provider-'));
+  try {
+    const cli = executableFixture(fixture, 'cli');
+    const runtime = runtimeStatusFixture(fixture, 'runtime', {
+      ...readyProviderStatus,
+      provider: 'Fake',
+      strict: false,
+      llm_provider_access_allowed: false,
+      task_run_network_allowed: false
+    });
+    const result = runBootstrapCheck({
+      BROWNIE_BIN: cli,
+      BROWNIE_RUNTIME_PATH: runtime,
+      PHASE_LOOP_STATE_DIR: path.join(fixture, 'state')
+    });
+    assert.equal(result.status, 78, result.stderr);
+    const diagnostic = JSON.parse(result.stdout);
+    assert.equal(diagnostic.code, 'phase_loop_implementation_provider_unavailable');
+    assert.equal(diagnostic.provider_reason, 'fake_provider_forbidden');
+    assert.equal(diagnostic.provider_status.provider, 'Fake');
+    assert.match(diagnostic.repair, /never searches for, enables, or invents a provider endpoint/u);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('requires both claim-smoke fixture markers before allowing its Fake runtime', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-fixture-marker-'));
+  try {
+    const cli = executableFixture(fixture, 'cli');
+    const runtime = runtimeStatusFixture(fixture, 'runtime', {
+      ...readyProviderStatus,
+      provider: 'Fake',
+      strict: false,
+      llm_provider_access_allowed: false,
+      task_run_network_allowed: false
+    });
+    for (const testOnlyEnvironment of [
+      { PHASE_LOOP_PREFLIGHT_PROFILE: 'claim-smoke-fixture' },
+      { PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY: '1' }
+    ]) {
+      const result = runBootstrapCheck({
+        BROWNIE_BIN: cli,
+        BROWNIE_RUNTIME_PATH: runtime,
+        PHASE_LOOP_STATE_DIR: path.join(fixture, `state-${Object.keys(testOnlyEnvironment)[0]}`),
+        ...testOnlyEnvironment
+      });
+      assert.equal(result.status, 78, result.stderr);
+      const diagnostic = JSON.parse(result.stdout);
+      assert.equal(diagnostic.code, 'phase_loop_implementation_provider_unavailable');
+      assert.equal(diagnostic.provider_reason, 'fake_provider_forbidden');
+    }
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('rejects a provider that lacks strict network authority', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-bootstrap-provider-permission-'));
+  try {
+    const cli = executableFixture(fixture, 'cli');
+    const runtime = runtimeStatusFixture(fixture, 'runtime', {
+      ...readyProviderStatus,
+      llm_provider_access_allowed: false,
+      task_run_network_allowed: false
+    });
+    const result = runBootstrapCheck({
+      BROWNIE_BIN: cli,
+      BROWNIE_RUNTIME_PATH: runtime,
+      PHASE_LOOP_STATE_DIR: path.join(fixture, 'state')
+    });
+    assert.equal(result.status, 78, result.stderr);
+    const diagnostic = JSON.parse(result.stdout);
+    assert.equal(diagnostic.code, 'phase_loop_implementation_provider_unavailable');
+    assert.equal(diagnostic.provider_reason, 'provider_not_permitted_for_implementation');
+    assert.equal(diagnostic.provider_status.provider, 'OpenAICompatible');
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });
   }

@@ -14087,6 +14087,114 @@ PY
   fi
 }
 
+validate_phase_loop_implementation_provider() {
+  local run_stamp="$1"
+  local runtime_path="$2"
+  local implementation_workspace runtime_status_output runtime_status_exit provider_ready
+
+  # The claim-smoke harness deliberately uses deterministic fake Runtime
+  # binaries.  Its profile is accepted only with the paired test-only marker;
+  # no production deployment can silently inherit this escape hatch.
+  if [ "${PHASE_LOOP_PREFLIGHT_PROFILE:-}" = "claim-smoke-fixture" ] && [ "${PHASE_LOOP_CLAIM_SMOKE_TEST_ONLY:-0}" = "1" ]; then
+    PHASE_LOOP_IMPLEMENTATION_PROVIDER_DIAGNOSTIC=""
+    return 0
+  fi
+
+  # Probe under the exact workspace context used by the Runtime dispatch
+  # below. `llm.status` resolves workspace configuration, so running it from
+  # the controller process directory could otherwise admit or reject a claim
+  # based on a different workspace's provider settings.
+  implementation_workspace="${PHASE_LOOP_WORKSPACE_ROOT:-$ROOT_DIR}"
+  set +e
+  runtime_status_output="$(
+    cd "$implementation_workspace" || exit 70
+    export BROWNIE_WORKSPACE_ROOT="${BROWNIE_WORKSPACE_ROOT:-"$implementation_workspace"}"
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"llm.status"}' | "$runtime_path" 2>&1
+  )"
+  runtime_status_exit=$?
+  set -e
+
+  PHASE_LOOP_IMPLEMENTATION_PROVIDER_DIAGNOSTIC="$(python3 - "$run_stamp" "$PHASE_LOOP_ENV_SOURCES" "$runtime_path" "$runtime_status_exit" "$implementation_workspace" "$runtime_status_output" <<'PY'
+import json
+import sys
+
+run_stamp, sources, runtime_path, exit_code_text, workspace_path, raw_output = sys.argv[1:]
+try:
+    exit_code = int(exit_code_text)
+except ValueError:
+    exit_code = 1
+
+detail = {
+    "provider": None,
+    "enabled": False,
+    "strict": False,
+    "will_fallback_to_fake": False,
+    "llm_provider_access_allowed": False,
+    "task_run_network_allowed": False,
+}
+reason = None
+
+if exit_code != 0:
+    reason = "runtime_status_unavailable"
+else:
+    try:
+        root = json.loads(raw_output.strip())
+        status = root.get("result") if isinstance(root, dict) else None
+    except Exception:
+        status = None
+    if not isinstance(status, dict):
+        reason = "runtime_status_invalid"
+    else:
+        provider = status.get("provider")
+        detail = {
+            "provider": provider if isinstance(provider, str) else None,
+            "enabled": status.get("enabled") is True,
+            "strict": status.get("strict") is True,
+            "will_fallback_to_fake": status.get("will_fallback_to_fake") is True,
+            "llm_provider_access_allowed": status.get("llm_provider_access_allowed") is True,
+            "task_run_network_allowed": status.get("task_run_network_allowed") is True,
+        }
+        if detail["provider"] is None or detail["provider"].lower() == "fake":
+            reason = "fake_provider_forbidden"
+        elif (
+            not detail["enabled"]
+            or not detail["strict"]
+            or detail["will_fallback_to_fake"]
+            or not detail["llm_provider_access_allowed"]
+            or not detail["task_run_network_allowed"]
+        ):
+            reason = "provider_not_permitted_for_implementation"
+
+if reason is None:
+    print(json.dumps({
+        "ok": True,
+        "code": "phase_loop_implementation_provider_ready",
+        "run_stamp": run_stamp,
+        "runtime_path": runtime_path,
+        "workspace_path": workspace_path,
+        "provider_status": detail,
+    }, sort_keys=True))
+else:
+    print(json.dumps({
+        "ok": False,
+        "code": "phase_loop_implementation_provider_unavailable",
+        "run_stamp": run_stamp,
+        "configuration_sources": sources,
+        "runtime_path": runtime_path,
+        "workspace_path": workspace_path,
+        "provider_reason": reason,
+        "provider_status": detail,
+        "repair": "Supply a non-Fake strict implementation provider through process configuration or PHASE_LOOP_ENV_FILE, including explicit provider selection, endpoint/model/API-key environment reference, and BROWNIE_LLM_ALLOW_PROVIDER_ACCESS=true. The framework never searches for, enables, or invents a provider endpoint, model, account, or credential.",
+    }, sort_keys=True))
+PY
+)"
+
+  if provider_ready="$(printf '%s' "$PHASE_LOOP_IMPLEMENTATION_PROVIDER_DIAGNOSTIC" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("ok") is True else "0")' 2>/dev/null)" && [ "$provider_ready" = "1" ]; then
+    return 0
+  fi
+  return 78
+}
+
 validate_phase_loop_bootstrap() {
   local run_stamp="${1:-bootstrap-check}"
   local configured_cli="${BROWNIE_BIN:-}"
@@ -14126,6 +14234,10 @@ validate_phase_loop_bootstrap() {
       BROWNIE_RUNTIME_PATH="$resolved_runtime"
     fi
     PHASE_LOOP_RUNTIME_PATH_SOURCE="$runtime_path_source"
+    if ! validate_phase_loop_implementation_provider "$run_stamp" "$BROWNIE_RUNTIME_PATH"; then
+      PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC="$PHASE_LOOP_IMPLEMENTATION_PROVIDER_DIAGNOSTIC"
+      return 78
+    fi
     PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC=""
     return 0
   fi
