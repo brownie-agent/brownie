@@ -11882,7 +11882,7 @@ PY
     return 78
   fi
   if ! merge_actor="$(GH_CONFIG_DIR="$reviewer_gh_config_dir" gh api graphql \
-      -f 'query($id: ID!) { node(id: $id) { ... on PullRequest { mergedBy { login } } } }' \
+      -f query='query($id: ID!) { node(id: $id) { ... on PullRequest { mergedBy { login } } } }' \
       -F "id=$pr_node_id" --jq '.data.node.mergedBy.login' 2>>"$SUPERVISOR_LOG")"; then
     rm -f "$review_file"
     write_status "blocked" "Could not verify the observed merge actor; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
