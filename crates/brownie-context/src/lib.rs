@@ -32,7 +32,11 @@ pub struct PromptView {
 
 pub const MAX_LEDGER_CONTEXT_EVENTS: usize = 12;
 pub const DEFAULT_MAX_SELECTED_INDEX_CONTEXT_CHARS: usize = usize::MAX;
-const MAX_WORKSPACE_READ_OUTPUT_PREVIEW_CHARS: usize = 2 * 1024;
+// A completed workspace.read is capped by the runtime at 64 KiB. Keep one
+// complete, non-truncated range visible to the model, including its bounded
+// metadata envelope, so the BDK never asks it to construct a patch from a
+// presentation-truncated result.
+const MAX_WORKSPACE_READ_OUTPUT_PREVIEW_CHARS: usize = 72 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextWindowSummary {
@@ -708,6 +712,13 @@ fn format_tool_execution_summary(events: &[LedgerEvent]) -> Vec<String> {
                         return format_mcp_tool_execution_summary(tool_id, status, mcp);
                     }
                     let bytes_read = payload.get("bytes_read").and_then(|value| value.as_u64());
+                    let offset_bytes = payload
+                        .get("offset_bytes")
+                        .and_then(|value| value.as_u64());
+                    let bytes_end = payload.get("bytes_end").and_then(|value| value.as_u64());
+                    let bytes_total = payload
+                        .get("bytes_total")
+                        .and_then(|value| value.as_u64());
                     let truncated = payload.get("truncated").and_then(|value| value.as_bool());
                     if tool_id == "workspace.read" {
                         if let Some(output_preview) =
@@ -717,9 +728,29 @@ fn format_tool_execution_summary(events: &[LedgerEvent]) -> Vec<String> {
                                 .chars()
                                 .take(MAX_WORKSPACE_READ_OUTPUT_PREVIEW_CHARS)
                                 .collect::<String>();
+                            if truncated != Some(true) {
+                                return Some(format!(
+                                    "{tool_id}: {status} bytes_read={} truncated={} output_preview={bounded_preview:?}",
+                                    bytes_read
+                                        .map(|value| value.to_string())
+                                        .unwrap_or_else(|| "<unknown>".to_string()),
+                                    truncated
+                                        .map(|value| value.to_string())
+                                        .unwrap_or_else(|| "<unknown>".to_string())
+                                ));
+                            }
                             return Some(format!(
-                                "{tool_id}: {status} bytes_read={} truncated={} output_preview={bounded_preview:?}",
+                                "{tool_id}: {status} offset_bytes={} bytes_read={} bytes_end={} bytes_total={} truncated={} output_preview={bounded_preview:?}",
+                                offset_bytes
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string()),
                                 bytes_read
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string()),
+                                bytes_end
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string()),
+                                bytes_total
                                     .map(|value| value.to_string())
                                     .unwrap_or_else(|| "<unknown>".to_string()),
                                 truncated
@@ -1567,6 +1598,8 @@ fn format_bdk_control_packet(
     tool_intent_summary: &[String],
     verification_recovery_diagnostics_summary: &[String],
 ) -> String {
+    let required_workspace_read_offset =
+        required_workspace_read_continuation_offset(tool_execution_summary);
     let state = infer_bdk_execution_state(
         goal,
         tool_execution_summary,
@@ -1574,8 +1607,13 @@ fn format_bdk_control_packet(
         verification_recovery_diagnostics_summary,
     );
     let completed_reads = completed_workspace_read_count(tool_execution_summary);
+    let range_continuation = matches!(state, BdkExecutionState::ContinueWorkspaceReadRange)
+        .then_some(required_workspace_read_offset)
+        .flatten()
+        .map(|offset| format!("- required_workspace_read_offset_bytes: {offset}\n"))
+        .unwrap_or_default();
     format!(
-        "- state: {}\n- completed_workspace_reads: {}\n- next_output: {}\n- efficiency_rule: {}",
+        "- state: {}\n- completed_workspace_reads: {}\n{range_continuation}- next_output: {}\n- efficiency_rule: {}",
         state.name(),
         completed_reads,
         state.next_output_contract(goal_selects_bounded_patch_leaf(goal)),
@@ -1599,6 +1637,7 @@ fn goal_selects_bounded_patch_leaf(goal: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BdkExecutionState {
     ContextPlan,
+    ContinueWorkspaceReadRange,
     ImplementPatch,
     RepairPatch,
     TodoQueueRepair,
@@ -1612,6 +1651,7 @@ impl BdkExecutionState {
     fn name(self) -> &'static str {
         match self {
             Self::ContextPlan => "context_plan",
+            Self::ContinueWorkspaceReadRange => "continue_workspace_read_range",
             Self::ImplementPatch => "implement_patch",
             Self::RepairPatch => "repair_patch",
             Self::TodoQueueRepair => "todo_queue_repair",
@@ -1626,6 +1666,9 @@ impl BdkExecutionState {
         match self {
             Self::ContextPlan => {
                 "request one smallest exact workspace.read/git inspection step; avoid overview files unless named by the TODO"
+            }
+            Self::ContinueWorkspaceReadRange => {
+                "request exactly one workspace.read for the already-read selected target with input.offset_bytes equal to required_workspace_read_offset_bytes. This required continuation takes precedence over general workspace.read prohibitions and is not a duplicate. Do not repeat the prior range, infer old_text from omitted content, request workspace.write, or edit `.brownie/todo.md` before this continuation completes. If Runtime denies this exact continuation range, report one concise stable runtime blocker instead of retrying it"
             }
             Self::ImplementPatch if bounded_leaf => {
                 "workspace.read is forbidden for the next output because the target file was already read. Request exactly one tool request total: one bounded workspace.write patch_file for the named target file, and keep the entire fenced JSON under about 1200 characters. Use one hunk only; old_text must be exact complete lines copied from completed Tool Execution and must cover a complete syntactic region for the requested replacement. For JavaScript/TypeScript function changes, old_text must include the complete function body being replaced, not only the `function ... {` signature line. new_text must be the smallest complete syntactic replacement needed for this pass. Do not patch unrelated large setup/parsing functions unless the selected TODO names them. Do not emit unrelated helper blocks, multiple function additions, or multiple tool_requests in one response. If the change needs multiple hunks or multiple writes, patch one complete syntactic hunk only and leave the remaining work for a later loop. If the needed old_text is not visible or the complete hunk would exceed the fenced JSON budget, report a concrete external/owner blocker naming the missing fact; never patch `.brownie/todo.md` to re-split this bounded leaf and do not request workspace.read to copy old_text again"
@@ -1659,6 +1702,9 @@ impl BdkExecutionState {
         match self {
             Self::ContextPlan => {
                 "read one exact file first; move to implement_patch or a narrower follow-up instead of batching broad reads"
+            }
+            Self::ContinueWorkspaceReadRange => {
+                "one non-repeated continuation range using required_workspace_read_offset_bytes is the only valid next step. Repeating the prior offset, emitting a patch from omitted content, or retrying a denied continuation is no progress"
             }
             Self::ImplementPatch => {
                 "forbidden_next_tool=workspace.read; one_complete_syntactic_hunk_only; never replace only a function signature line with a multi-line function body; reuse completed read evidence; repeated read-only output, oversized JSON, or multi-hunk implementation output is no progress and must be replaced by one bounded workspace.write or one narrower TODO refinement"
@@ -1723,6 +1769,9 @@ fn infer_bdk_execution_state(
         || goal_lower.contains("create only `.brownie/")
     {
         return BdkExecutionState::BlockerOrWrite;
+    }
+    if required_workspace_read_continuation_offset(tool_execution_summary).is_some() {
+        return BdkExecutionState::ContinueWorkspaceReadRange;
     }
     if goal_lower.contains("read_budget_repair_policy")
         || goal_lower.contains("workspace.read content is embedded below")
@@ -1838,6 +1887,22 @@ fn completed_workspace_read_count(tool_execution_summary: &[String]) -> usize {
         .iter()
         .filter(|entry| entry.starts_with("workspace.read: Completed"))
         .count()
+}
+
+fn required_workspace_read_continuation_offset(tool_execution_summary: &[String]) -> Option<u64> {
+    let latest_read = tool_execution_summary
+        .iter()
+        .rev()
+        .find(|entry| entry.starts_with("workspace.read: Completed"))?;
+    if !latest_read.contains("truncated=true") {
+        return None;
+    }
+
+    latest_read.split_whitespace().find_map(|field| {
+        field
+            .strip_prefix("bytes_end=")
+            .and_then(|value| value.parse::<u64>().ok())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2047,6 +2112,22 @@ mod tests {
         assert!(prompt.messages[0]
             .content
             .contains("Never infer or invent patch_file old_text"));
+    }
+
+    #[test]
+    fn bdk_control_packet_requires_the_next_offset_after_a_truncated_read() {
+        let packet = format_bdk_control_packet(
+            "# Brownie Phase Loop Effective Prompt\n\n## Selected TODO\n\n- [ ] E-range: Patch only `scripts/target.mjs`.\n  Route: implementation.\n",
+            &["workspace.read: Completed offset_bytes=0 bytes_read=65536 bytes_end=65536 bytes_total=131072 truncated=true output_preview=\"bounded\"".into()],
+            &[],
+            &[],
+        );
+
+        assert!(packet.contains("state: continue_workspace_read_range"));
+        assert!(packet.contains("required_workspace_read_offset_bytes: 65536"));
+        assert!(packet.contains("input.offset_bytes equal to required_workspace_read_offset_bytes"));
+        assert!(packet.contains("Repeating the prior offset"));
+        assert!(!packet.contains("workspace.read is forbidden"));
     }
 
     #[test]
@@ -3058,6 +3139,53 @@ mod tests {
         let prompt = PromptBuilder::build(materialized);
         assert!(prompt.messages[1].content.contains("Tool Execution:"));
         assert!(prompt.messages[1].content.contains("content_sha256=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn context_materializer_requires_range_continuation_for_truncated_workspace_read() {
+        let mut task = task_record();
+        task.goal = "Implement a bounded patch to README.md".into();
+        let input = ContextMaterializerInput {
+            task,
+            ledger_events: vec![LedgerEvent {
+                event_id: "event_1".into(),
+                task_id: "task_1".into(),
+                run_id: "run_1".into(),
+                kind: LedgerEventKind::ToolExecutionCompleted,
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                payload: Some(serde_json::json!({
+                    "tool_id": "workspace.read",
+                    "status": "Completed",
+                    "offset_bytes": 0,
+                    "bytes_read": 65536,
+                    "bytes_end": 65536,
+                    "bytes_total": 131072,
+                    "truncated": true,
+                    "output_preview": "[workspace.read path=README.md offset_bytes=0 bytes_total=131072 content_sha256=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]\\nhead"
+                })),
+                payload_envelope: None,
+            }],
+            child_completion_summaries: vec![],
+            selected_index_context: None,
+            verification_recovery_context: None,
+            context_budget: None,
+        };
+
+        let materialized = ContextMaterializer::materialize(input);
+        assert!(materialized.tool_execution_summary[0].contains(
+            "offset_bytes=0 bytes_read=65536 bytes_end=65536 bytes_total=131072 truncated=true"
+        ));
+
+        let prompt = PromptBuilder::build(materialized);
+        assert!(prompt.messages[1]
+            .content
+            .contains("state: continue_workspace_read_range"));
+        assert!(prompt.messages[1]
+            .content
+            .contains("required_workspace_read_offset_bytes: 65536"));
+        assert!(!prompt.messages[1]
+            .content
+            .contains("workspace.read is forbidden for the next output"));
     }
 
     #[test]

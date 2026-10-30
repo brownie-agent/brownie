@@ -15657,24 +15657,6 @@ fn preview_tool_output(content: &str) -> String {
     preview_tool_output_with_limit(content, 2 * 1024)
 }
 
-fn preview_workspace_read_output(content: &str) -> String {
-    const MAX_BYTES: usize = 900;
-    const TRUNCATION_MARKER: &str = "\n[truncated: head and tail retained]\n";
-    if content.len() <= MAX_BYTES {
-        return content.to_string();
-    }
-
-    let retained_bytes = MAX_BYTES.saturating_sub(TRUNCATION_MARKER.len());
-    let head_budget = retained_bytes / 2;
-    let tail_budget = retained_bytes - head_budget;
-    format!(
-        "{}{}{}",
-        utf8_prefix_within_bytes(content, head_budget),
-        TRUNCATION_MARKER,
-        utf8_suffix_within_bytes(content, tail_budget),
-    )
-}
-
 fn utf8_prefix_within_bytes(content: &str, max_bytes: usize) -> &str {
     if content.len() <= max_bytes {
         return content;
@@ -16167,9 +16149,18 @@ mod tests {
     }
 
     #[test]
-    fn bounds_workspace_read_context_for_followup_writes() {
-        let content = format!("head\n{}\ntail\n", "界".repeat(8 * 1024));
-        let preview = preview_workspace_read_output(&content);
+    fn keeps_complete_workspace_read_context_for_bounded_patch() {
+        let content = format!("head\n{}\ntail\n", "界".repeat(1_500));
+        let preview = controlled_tool_execution::preview_workspace_read_output(&content, false);
+
+        assert_eq!(preview, content);
+        assert!(!preview.contains("[truncated: head and tail retained]"));
+    }
+
+    #[test]
+    fn bounds_truncated_workspace_read_context_for_range_continuation() {
+        let content = format!("head\n{}\ntail\n", "界".repeat(MAX_WORKSPACE_READ_BYTES));
+        let preview = controlled_tool_execution::preview_workspace_read_output(&content, true);
 
         assert!(preview.len() <= 900);
         assert!(preview.starts_with("head\n"));
