@@ -4,6 +4,11 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { loadTodoState } from './phase-loop-todo-state.mjs';
 import { boundedScopes } from './phase-loop-bounded-scope.mjs';
+import {
+  rootClaimId,
+  selectedTodoSha256,
+  validateTerminalDeliveryReceipt
+} from './phase-loop-delivery-integrity.mjs';
 
 const defaultTodoPath = '.brownie/todo.md';
 
@@ -367,16 +372,44 @@ export function validatePhaseLoopProgressIntegrity(input) {
   };
 }
 
-function writeCompletionRecord(repoRoot, claim, runStamp, validation) {
+export function durableDeliveryReceiptForClaim(claim) {
+  const receipt = validateTerminalDeliveryReceipt({ claim });
+  if (!receipt.valid) {
+    return { valid: false, errors: receipt.errors };
+  }
+  const review = claim.delivery_review;
+  return {
+    valid: true,
+    receipt: {
+      schema_version: 1,
+      claim_id: String(claim.claim_id ?? ''),
+      root_claim_id: rootClaimId(claim),
+      selected_todo_sha256: selectedTodoSha256(claim),
+      author: review.author,
+      reviewer: review.reviewer,
+      merge_actor: review.merge_actor,
+      approved: true,
+      ci_passed: true,
+      merged: true,
+      ...(typeof review.pr_url === 'string' && review.pr_url ? { pr_url: review.pr_url } : {}),
+      semantic_completion_evidence: review.semantic_completion_evidence
+    }
+  };
+}
+
+function writeCompletionRecord(repoRoot, claim, runStamp, validation, deliveryReceipt) {
   const claimId = claim.claim_id || `run-${runStamp || Date.now()}`;
   const dir = path.join(repoRoot, '.brownie/private/phase-loop/todo-completions');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const record = {
-    schema_version: 1,
+    schema_version: 2,
     claim_id: claimId,
+    root_claim_id: rootClaimId(claim),
     run_stamp: runStamp,
     selected_todo_id: validation.selected_todo_id,
     selected_todo_first_line: String(claim.selected_todo ?? '').split('\n')[0] ?? '',
+    selected_todo_sha256: selectedTodoSha256(claim),
+    delivery_receipt: deliveryReceipt,
     changed_files: validation.claim_changed_files,
     workspace_changed_files: validation.changed_files,
     baseline_diff_files: validation.baseline_diff_files,
@@ -429,6 +462,21 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
     let validation = validatePhaseLoopProgressIntegrity(input);
     let record = null;
     if (args.writeRecord) {
+      const durableReceipt = durableDeliveryReceiptForClaim(input.claim);
+      if (!durableReceipt.valid) {
+        validation = {
+          ...validation,
+          valid: false,
+          errors: [
+            ...validation.errors,
+            {
+              code: 'completion_record_delivery_receipt_invalid',
+              message: 'Refusing to write a TODO completion record without independent review approval, passing CI, merged delivery, and claim-bound semantic evidence.',
+              receipt_errors: durableReceipt.errors
+            }
+          ]
+        };
+      }
       if (
         ['implementation', 'documentation'].includes(validation.selected_route) &&
         validation.selected_scopes.length > 0 &&
@@ -472,7 +520,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
         console.error(JSON.stringify(validation, null, 2));
         process.exit(1);
       }
-      record = writeCompletionRecord(input.repoRoot, input.claim, args.runStamp, validation);
+      record = writeCompletionRecord(input.repoRoot, input.claim, args.runStamp, validation, durableReceipt.receipt);
       validation = {
         ...validation,
         completion_record_present: true,

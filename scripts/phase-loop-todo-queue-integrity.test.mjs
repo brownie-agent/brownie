@@ -79,6 +79,25 @@ test('allows a TODO checked in the live queue to serve as durable completion evi
   assert(result.completed_todo_ids.includes('E-20a-golden-journey-workspace-mutation'));
 });
 
+test('blocks a descendant when its erased dependency has only a legacy completion record', () => {
+  const dependent = e20b;
+  const result = validateTodoQueueIntegrity({
+    todoBefore: queue(dependent),
+    todoAfter: queue(dependent),
+    completedTodoIds: ['E-20a-golden-journey-workspace-mutation'],
+    unverifiedArchivedCompletionRecords: [{
+      claim_id: 'legacy-claim',
+      selected_todo_id: 'E-20a-golden-journey-workspace-mutation',
+      reason: 'legacy_completion_record_without_delivery_receipt'
+    }]
+  });
+
+  assert.equal(result.valid, false);
+  assert.deepEqual(result.errors.find((error) => error.code === 'legacy_completion_dependency_requires_recovery')?.dependency_todo_ids, [
+    'E-20a-golden-journey-workspace-mutation'
+  ]);
+});
+
 test('rejects a live TODO dependency that conflicts with its durable breakdown graph', () => {
   const result = validateTodoQueueIntegrity({
     todoBefore: queue(e20a, e20b),

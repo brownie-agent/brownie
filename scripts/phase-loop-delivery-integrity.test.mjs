@@ -5,6 +5,7 @@ import {
   evaluateDeliveryHandoff,
   produceSemanticCompletionEvidence,
   selectedTodoSha256,
+  validateTerminalDeliveryReceipt,
   validateClaimLifecycleTransition
 } from './phase-loop-delivery-integrity.mjs';
 
@@ -156,6 +157,31 @@ test('a merged review still cannot complete without an observed independent merg
   });
   assert.equal(result.valid, false);
   assert(result.errors.includes('completed_requires_observed_reviewer_merge_actor'));
+});
+
+test('a durable completion receipt requires the same independent review boundary as a completed claim', () => {
+  const valid = validateTerminalDeliveryReceipt({
+    claim: {
+      ...claim,
+      status: 'completed',
+      delivery_review: {
+        merged: true,
+        approved: true,
+        ci_passed: true,
+        author: 'brownie-agent',
+        reviewer: 'globalpocket',
+        merge_actor: 'globalpocket',
+        semantic_completion_evidence: validEvidence()
+      }
+    }
+  });
+  assert.equal(valid.valid, true, JSON.stringify(valid.errors));
+
+  const rejected = validateTerminalDeliveryReceipt({
+    claim: { ...claim, status: 'completed', delivery_review: { merged: true, approved: true, ci_passed: true } }
+  });
+  assert.equal(rejected.valid, false);
+  assert(rejected.errors.includes('completed_requires_independent_reviewer'));
 });
 
 test('review-requested changes preserve the immutable root claim and fingerprint', () => {
