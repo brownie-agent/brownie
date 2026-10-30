@@ -162,19 +162,87 @@ function isLegacyNoopAppliedRecovery(record, diagnostic) {
     && !recoveryHasEffectiveMutation(record);
 }
 
-function restoreTargetPreimages(repo, restorations) {
+function restoreTargetPreimages(repo, recoveryDir, restorations) {
   const errors = [];
   for (const restoration of [...restorations].reverse()) {
     try {
-      const targetPath = path.resolve(repo, restoration.path);
+      const relativePath = safeRelativePath(repo, restoration.path);
+      if (!relativePath) {
+        throw new Error('target path is outside the repository');
+      }
+      const targetPath = path.resolve(repo, relativePath);
+      const expectedSnapshotPath = targetPreimagePath(recoveryDir, relativePath);
       const snapshotPath = path.resolve(repo, restoration.preimage_path);
+      if (snapshotPath !== expectedSnapshotPath) {
+        throw new Error('target preimage path does not match the recovery record target');
+      }
       const content = fs.readFileSync(snapshotPath, 'utf8');
-      atomicWrite(targetPath, content, restoration.original_mode);
+      const originalMode = Number.isInteger(restoration.original_mode) ? restoration.original_mode : 0o600;
+      atomicWrite(targetPath, content, originalMode);
     } catch (error) {
       errors.push(`${restoration.path}: ${String(error?.message ?? error)}`);
     }
   }
   return errors;
+}
+
+function verifyPersistedTargetRestorations({ repo, recoveryDir, restorations, baselineRef }) {
+  if (!Array.isArray(restorations) || restorations.length === 0) {
+    return { applied: false, reason: 'persisted_target_restorations_missing', restorations: [], errors: [] };
+  }
+  if (typeof baselineRef !== 'string' || baselineRef.trim() === '') {
+    return { applied: false, reason: 'approved_baseline_missing', restorations, errors: [] };
+  }
+  const baselineCommit = gitRevision(repo, baselineRef);
+  if (!baselineCommit) {
+    return { applied: false, reason: 'approved_baseline_unresolvable', restorations, errors: [] };
+  }
+
+  const errors = [];
+  for (const restoration of restorations) {
+    const relativePath = safeRelativePath(repo, restoration.path);
+    if (!relativePath) {
+      errors.push(`${String(restoration.path)}: target path is outside the repository`);
+      continue;
+    }
+    const targetPath = path.resolve(repo, relativePath);
+    const expectedSnapshotPath = targetPreimagePath(recoveryDir, relativePath);
+    const snapshotPath = path.resolve(repo, restoration.preimage_path);
+    if (snapshotPath !== expectedSnapshotPath || !fs.existsSync(snapshotPath)) {
+      errors.push(`${relativePath}: recorded target preimage is missing or does not match its target`);
+      continue;
+    }
+    const targetSha256 = sha256File(targetPath);
+    if (!targetSha256 || targetSha256 !== restoration.restored_sha256) {
+      errors.push(`${relativePath}: restored target digest no longer matches the recovery record`);
+      continue;
+    }
+    if (sha256File(snapshotPath) !== restoration.observed_sha256) {
+      errors.push(`${relativePath}: target preimage digest no longer matches the recovery record`);
+      continue;
+    }
+    const targetContent = fs.readFileSync(targetPath, 'utf8');
+    const headContent = gitFileAtRevision(repo, 'HEAD', relativePath);
+    const baselineContent = gitFileAtRevision(repo, baselineCommit, relativePath);
+    if (headContent === null || baselineContent === null) {
+      errors.push(`${relativePath}: checked-out or selected baseline does not contain the restored target`);
+      continue;
+    }
+    if (isBoundedProposalPlaceholder(targetContent)) {
+      errors.push(`${relativePath}: persisted restoration still contains a bounded placeholder`);
+      continue;
+    }
+    if (headContent !== targetContent || baselineContent !== targetContent) {
+      errors.push(`${relativePath}: restored target no longer matches both checked-out and selected baseline content`);
+    }
+  }
+  return {
+    applied: errors.length === 0,
+    reason: errors.length === 0 ? 'persisted_target_restorations_verified' : 'persisted_target_restorations_invalid',
+    restorations,
+    resumed: true,
+    errors
+  };
 }
 
 function restoreExactBoundedPatchPlaceholders({ repo, recoveryDir, targetSnapshot, baselineRef }) {
@@ -262,7 +330,7 @@ function restoreExactBoundedPatchPlaceholders({ repo, recoveryDir, targetSnapsho
       });
     }
   } catch (error) {
-    const rollbackErrors = restoreTargetPreimages(repo, restorations);
+    const rollbackErrors = restoreTargetPreimages(repo, recoveryDir, restorations);
     return {
       applied: false,
       reason: 'placeholder_restore_failed',
@@ -290,8 +358,8 @@ function legacyAppliedRecoveryRecords(stateDir) {
 }
 
 function isBoundedProposalPlaceholder(content) {
-  const text = String(content ?? '').trim();
-  return text.length <= 160 && /brownie bounded (?:patch|create)-only proposal\.?/iu.test(text);
+  return String(content ?? '') === '// Brownie bounded Patch-only proposal.\n'
+    || String(content ?? '') === '// Brownie bounded Create-only proposal.\n';
 }
 
 function migrateLegacyTargetCapture({ repo, stateDir, todoPath, breakdownPath, todoText, runStamp, diagnostic }) {
@@ -497,11 +565,13 @@ async function main(rawArgs) {
     }
   }
   let reopeningLegacyNoop = false;
+  let resumedInterruptedRecovery = false;
   if (recoveryRecord) {
     if (recoveryRecord.status !== 'started' && !isLegacyNoopAppliedRecovery(recoveryRecord, diagnostic)) {
       return terminalRecoveryStatuses.has(recoveryRecord.status) ? 2 : 1;
     }
     reopeningLegacyNoop = recoveryRecord.status === 'applied';
+    resumedInterruptedRecovery = !reopeningLegacyNoop;
     const missingSnapshots = recoverySnapshotMissing({ record: recoveryRecord });
     if (missingSnapshots.length > 0) {
       markRecoveryTerminal({
@@ -631,6 +701,28 @@ async function main(rawArgs) {
   };
   writeJson(recordPath, record);
 
+  const resumedPlaceholderRecovery = resumedInterruptedRecovery
+    && Array.isArray(record.placeholder_target_restorations)
+    && record.placeholder_target_restorations.length > 0
+    ? verifyPersistedTargetRestorations({
+      repo,
+      recoveryDir,
+      restorations: record.placeholder_target_restorations,
+      baselineRef: approvedBaselineRef
+    })
+    : null;
+  if (resumedPlaceholderRecovery && !resumedPlaceholderRecovery.applied) {
+    record.status = 'failed_recovery_record_invalid';
+    record.failure_reason = 'persisted_target_restoration_invalid';
+    record.placeholder_target_recovery_error = {
+      reason: resumedPlaceholderRecovery.reason,
+      errors: resumedPlaceholderRecovery.errors ?? []
+    };
+    record.terminal_recorded_at = new Date().toISOString();
+    writeJson(recordPath, record);
+    return 1;
+  }
+
   const repairScript = path.join(repo, 'scripts/repair-todo-decomposition.mjs');
   const guardScript = path.join(repo, 'scripts/guard-todo-decomposition.mjs');
   process.env.BROWNIE_REPAIR_TODO_REPO_ROOT = repo;
@@ -655,7 +747,7 @@ async function main(rawArgs) {
     }
     const placeholderRecovery = repair.exitCode === 0
       ? { applied: false, reason: 'todo_repair_applied', restorations: [] }
-      : restoreExactBoundedPatchPlaceholders({
+      : resumedPlaceholderRecovery ?? restoreExactBoundedPatchPlaceholders({
         repo,
         recoveryDir,
         targetSnapshot,
@@ -673,6 +765,12 @@ async function main(rawArgs) {
       repair_output_tail: repair.output.slice(-4000),
       guard_exit: guard.exitCode,
       guard_output_tail: guard.output.slice(-4000),
+      placeholder_recovery: {
+        applied: placeholderRecovery.applied === true,
+        reason: placeholderRecovery.reason,
+        resumed: placeholderRecovery.resumed === true,
+        errors: placeholderRecovery.errors ?? []
+      },
       todo_sha256_after: sha256File(todoPath),
       breakdown_sha256_after: sha256File(breakdownPath)
     });
@@ -688,7 +786,7 @@ async function main(rawArgs) {
         sha256_after: sha256File(targetPath)
       };
     });
-    if (placeholderRecovery.applied) {
+    if (placeholderRecovery.applied && placeholderRecovery.resumed !== true) {
       currentRecord.placeholder_target_restorations = [
         ...(Array.isArray(currentRecord.placeholder_target_restorations) ? currentRecord.placeholder_target_restorations : []),
         ...placeholderRecovery.restorations
@@ -737,7 +835,7 @@ async function main(rawArgs) {
         return 0;
       } catch (error) {
         const targetRollbackErrors = placeholderRecovery.applied
-          ? restoreTargetPreimages(repo, placeholderRecovery.restorations)
+          ? restoreTargetPreimages(repo, recoveryDir, placeholderRecovery.restorations)
           : [];
         restoreSnapshot({ recoveryDir, todoPath, breakdownPath, breakdownExisted: breakdownBeforeExists });
         currentRecord.status = 'failed_reverted';
@@ -760,7 +858,7 @@ async function main(rawArgs) {
     }
 
     const targetRollbackErrors = placeholderRecovery.applied
-      ? restoreTargetPreimages(repo, placeholderRecovery.restorations)
+      ? restoreTargetPreimages(repo, recoveryDir, placeholderRecovery.restorations)
       : [];
     restoreSnapshot({ recoveryDir, todoPath, breakdownPath, breakdownExisted: breakdownBeforeExists });
     currentRecord.status = 'failed_reverted';

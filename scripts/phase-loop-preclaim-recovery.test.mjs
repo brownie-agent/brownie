@@ -343,6 +343,22 @@ test('restores an exact dirty bounded patch placeholder from the configured appr
   assert.equal(fs.readFileSync(path.join(root, restoration.preimage_path), 'utf8'), placeholder);
 });
 
+test('does not replace a short proposal marker that contains substantive edits', () => {
+  const { root, placeholder } = makeExactPlaceholderFixture();
+  const targetPath = path.join(root, '.github/workflows/release.yml');
+  const substantiveContent = `${placeholder}name: actual-user-edits\n`;
+  fs.writeFileSync(targetPath, substantiveContent);
+
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const result = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), substantiveContent);
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'failed_reverted');
+  assert.equal(record.failure_reason, 'no_effective_recovery');
+  assert.equal(record.placeholder_target_recovery_error.reason, 'no_exact_bounded_patch_placeholder');
+});
+
 test('does not report success when a dirty bounded patch placeholder lacks an approved baseline selection', () => {
   const { root, placeholder } = makeExactPlaceholderFixture();
   const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
@@ -393,6 +409,27 @@ test('reopens a legacy applied no-op recovery only when its live snapshots still
   assert.equal(record.legacy_noop_reopened, true);
   assert.equal(record.recovery_resumes.at(-1).legacy_noop_reopened, true);
   assert.equal(record.placeholder_target_restorations.length, 1);
+});
+
+test('resumes a persisted target restoration idempotently after interruption', () => {
+  const { root, baseline } = makeExactPlaceholderFixture();
+  const diagnostic = 'phase-loop-preflight.mjs: contract_unsatisfiable_dirty_scope';
+  const initial = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(initial.status, 0, `${initial.stdout}\n${initial.stderr}`);
+  const { recordPath, record: interruptedRecord } = recoveryRecord(root);
+  interruptedRecord.status = 'started';
+  interruptedRecord.rollback_performed = false;
+  fs.writeFileSync(recordPath, `${JSON.stringify(interruptedRecord, null, 2)}\n`);
+
+  const resumed = runRecovery(root, diagnostic, '3', 'HEAD');
+  assert.equal(resumed.status, 0, `${resumed.stdout}\n${resumed.stderr}`);
+  assert.equal(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'), baseline);
+  const { record } = recoveryRecord(root);
+  assert.equal(record.status, 'applied');
+  assert.equal(record.placeholder_target_restorations.length, 1);
+  assert.equal(record.recovery_resumes.at(-1).rollback_performed, true);
+  assert.equal(record.attempts.at(-1).placeholder_recovery.resumed, true);
+  assert.equal(record.attempts.at(-1).placeholder_recovery.reason, 'persisted_target_restorations_verified');
 });
 
 test('wires recovery into pre-claim boundary and pre-completion failures, deferring completion after a Create-only replan', () => {
