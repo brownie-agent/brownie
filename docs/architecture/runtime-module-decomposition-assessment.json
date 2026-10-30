@@ -25,8 +25,8 @@
     "crates/brownie-runtime/src/verification_recovery.rs"
   ],
   "thresholds": {
-    "lib_rs_production_line_ceiling": 16097,
-    "lib_rs_test_line_ceiling": 54000
+    "lib_rs_production_line_ceiling": 16181,
+    "lib_rs_test_line_ceiling": 54098
   },
   "metrics": {
     "files": {
@@ -408,7 +408,8 @@
     "PR #602 refreshes measured Runtime metrics and bounded lib.rs ceilings after bounded workspace.write follow-up recovery following read-only LLM turns; ownership boundaries and Runtime authority remain unchanged.",
     "PR pending refreshes measured Runtime metrics and bounded lib.rs ceilings after rejected TODO decomposition writes are returned to the bounded Runtime repair loop; ownership boundaries and Runtime authority remain unchanged.",
     "PR #616 resynchronizes controlled_tool_execution metrics after removing the oversized bounded-leaf TODO-rewrite exception; module-decomposition closure status remains unchanged.",
-    "PR pending: resynchronized lib.rs test metrics and headless_continue metrics after continuation lock preflight and concurrency recovery regression coverage; production boundary and Runtime authority remain unchanged."
+    "PR pending: resynchronized lib.rs test metrics and headless_continue metrics after continuation lock preflight and concurrency recovery regression coverage; production boundary and Runtime authority remain unchanged.",
+    "PR pending: bounded lib.rs ceilings are synchronized to the measured workspace.write parser-repair liveness implementation; the guard remains fail-closed for any subsequent growth."
   ],
   "history": [
     "PR #462 updated runtime-module-decomposition metrics after Brownie loop harness and protected-read recovery hardening; closure status remains unchanged."
