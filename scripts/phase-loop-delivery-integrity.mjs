@@ -1,0 +1,268 @@
+#!/usr/bin/env node
+/**
+ * Delivery integrity is intentionally stricter than process success.
+ *
+ * A runtime may return a syntactically valid response (and the wrapper may
+ * therefore exit 0) while explicitly asking the controller to continue.
+ * That is not a completed TODO, and it is not eligible for PR publication.
+ */
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex');
+}
+
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function asObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function lineValue(todo, label) {
+  const match = String(todo ?? '').match(new RegExp(`^\\s*${label}:\\s*(.+?)\\s*$`, 'mi'));
+  return match?.[1]?.trim() ?? '';
+}
+
+export function selectedTodoSha256(claim) {
+  return sha256(asObject(claim).selected_todo ?? '');
+}
+
+export function completionConditionSha256(claim) {
+  return sha256(lineValue(asObject(claim).selected_todo, 'Completion condition'));
+}
+
+export function rootClaimId(claim) {
+  const input = asObject(claim);
+  return input.root_claim_id ?? input.claim_id ?? null;
+}
+
+export function runDeliveryView(stdoutPayload) {
+  const root = asObject(stdoutPayload);
+  const run = asObject(root.run);
+  const automation = { ...asObject(root.automation), ...asObject(run.automation) };
+  const completed = run.completed === true || (Object.keys(run).length === 0 && root.completed === true);
+  const continuationRequired = run.continuation_required === true
+    || root.continuation_required === true
+    || automation.continuation_required === true;
+  const terminalEvidenceMissing = run.terminal_completion_evidence_missing === true
+    || root.terminal_completion_evidence_missing === true
+    || automation.terminal_completion_evidence_missing === true;
+  const failure = run.trajectory_failed === true
+    || root.trajectory_failed === true
+    || automation.trajectory_failed === true;
+  return {
+    process_ok: root.ok === true,
+    completed,
+    continuation_required: continuationRequired,
+    terminal_completion_evidence_missing: terminalEvidenceMissing,
+    trajectory_failed: failure,
+    semantic_completion_evidence: run.semantic_completion_evidence
+      ?? root.semantic_completion_evidence
+      ?? automation.semantic_completion_evidence
+      ?? null
+  };
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]));
+  }
+  return value;
+}
+
+function canonicalJson(value) {
+  return JSON.stringify(canonicalize(value));
+}
+
+/**
+ * The runtime deliberately does not know an owner's controller claim.  The
+ * controller therefore binds the already-executed, selected-TODO verification
+ * result to the runtime's terminal payload before publishing a review handoff.
+ * This is a producer, not a synthetic success: it refuses anything that did
+ * not report `completed:true` and at least one successful executed command.
+ */
+export function produceSemanticCompletionEvidence({ claim, stdoutPayload, verification }) {
+  const verificationPayload = asObject(verification);
+  if (verificationPayload.completed !== true) return null;
+  const verificationResults = asArray(verificationPayload.results)
+    .map((result) => asObject(result))
+    .filter((result) => typeof result.command === 'string' && result.command && result.exit_code === 0)
+    .map((result) => ({ command: result.command, exit_code: result.exit_code }));
+  if (verificationResults.length === 0) return null;
+
+  const runtime = runDeliveryView(stdoutPayload);
+  const payload = asObject(stdoutPayload);
+  const run = asObject(payload.run);
+  const terminalPayload = {
+    completed: runtime.completed,
+    terminal_completion_evidence: run.terminal_completion_evidence
+      ?? payload.terminal_completion_evidence
+      ?? null,
+    stop_reason: run.stop_reason ?? payload.stop_reason ?? null,
+    execution_outcome: run.execution_outcome ?? payload.execution_outcome ?? null
+  };
+  return {
+    schema_version: 1,
+    root_claim_id: rootClaimId(claim),
+    selected_todo_sha256: selectedTodoSha256(claim),
+    completion_condition_sha256: completionConditionSha256(claim),
+    verification_results: verificationResults,
+    observables: [
+      { kind: 'controller_verification_result', sha256: sha256(canonicalJson(verificationPayload)) },
+      { kind: 'runtime_terminal_payload', sha256: sha256(canonicalJson(terminalPayload)) }
+    ]
+  };
+}
+
+/**
+ * The evidence contract binds a semantic verification result to the immutable
+ * claim.  Passing CI or changing a listed target alone is deliberately not
+ * evidence: both can be unrelated to the requested completion condition.
+ */
+export function validateSemanticCompletionEvidence({ claim, evidence }) {
+  const proof = asObject(evidence);
+  const expectedClaimId = rootClaimId(claim);
+  const expectedTodoHash = selectedTodoSha256(claim);
+  const expectedConditionHash = completionConditionSha256(claim);
+  const errors = [];
+  if (proof.schema_version !== 1) errors.push('semantic_evidence_schema_invalid');
+  if (!expectedClaimId || proof.root_claim_id !== expectedClaimId) errors.push('semantic_evidence_root_claim_mismatch');
+  if (proof.selected_todo_sha256 !== expectedTodoHash) errors.push('semantic_evidence_todo_mismatch');
+  if (proof.completion_condition_sha256 !== expectedConditionHash) errors.push('semantic_evidence_completion_condition_mismatch');
+  const verifications = asArray(proof.verification_results);
+  if (verifications.length === 0 || verifications.some((result) => asObject(result).exit_code !== 0 || !asObject(result).command)) {
+    errors.push('semantic_evidence_verification_missing_or_failed');
+  }
+  const observables = asArray(proof.observables);
+  if (observables.length === 0 || observables.some((observable) => !asObject(observable).kind || !asObject(observable).sha256)) {
+    errors.push('semantic_evidence_observable_missing');
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Evaluate only what can be safely inferred from a run.  "allowed" here
+ * means an implementation can be handed to review, never that the TODO is
+ * done.  Final completion needs a merged, independently approved PR.
+ */
+export function evaluateDeliveryHandoff({ claim, stdoutPayload, semanticCompletionEvidence = null }) {
+  const run = runDeliveryView(stdoutPayload);
+  const reasons = [];
+  if (run.trajectory_failed) reasons.push('trajectory_failed');
+  if (run.continuation_required) reasons.push('continuation_required');
+  if (run.terminal_completion_evidence_missing) reasons.push('terminal_completion_evidence_missing');
+  if (!run.completed) reasons.push('run_not_completed');
+
+  if (reasons.length > 0) {
+    return {
+      schema_version: 1,
+      process_ok: run.process_ok,
+      delivery_state: run.trajectory_failed ? 'failed' : 'nonterminal',
+      terminal: false,
+      pr_handoff_allowed: false,
+      completion_allowed: false,
+      root_claim_id: rootClaimId(claim),
+      selected_todo_sha256: selectedTodoSha256(claim),
+      reasons
+    };
+  }
+
+  const suppliedEvidence = semanticCompletionEvidence ?? run.semantic_completion_evidence;
+  const evidence = validateSemanticCompletionEvidence({ claim, evidence: suppliedEvidence });
+  if (!evidence.valid) {
+    return {
+      schema_version: 1,
+      process_ok: run.process_ok,
+      delivery_state: 'integrity_blocked',
+      terminal: false,
+      pr_handoff_allowed: false,
+      completion_allowed: false,
+      root_claim_id: rootClaimId(claim),
+      selected_todo_sha256: selectedTodoSha256(claim),
+      reasons: evidence.errors
+    };
+  }
+  return {
+    schema_version: 1,
+    process_ok: run.process_ok,
+    delivery_state: 'verification_passed',
+    terminal: false,
+    pr_handoff_allowed: true,
+    completion_allowed: false,
+    root_claim_id: rootClaimId(claim),
+    selected_todo_sha256: selectedTodoSha256(claim),
+    semantic_completion_evidence: suppliedEvidence,
+    reasons: []
+  };
+}
+
+/**
+ * Claims are append-only causally.  Retry/review transitions must retain the
+ * same root claim and immutable TODO fingerprint; only a merged review can
+ * enter completed.
+ */
+export function validateClaimLifecycleTransition({ previous, next, review = {} }) {
+  const before = asObject(previous);
+  const after = asObject(next);
+  const errors = [];
+  if (rootClaimId(before) && rootClaimId(after) && rootClaimId(before) !== rootClaimId(after)) errors.push('root_claim_id_changed');
+  if (before.selected_todo && after.selected_todo && selectedTodoSha256(before) !== selectedTodoSha256(after)) errors.push('selected_todo_fingerprint_changed');
+  if (after.status === 'completed') {
+    const reviewState = asObject(review);
+    if (reviewState.merged !== true) errors.push('completed_requires_merged_pr');
+    if (reviewState.approved !== true) errors.push('completed_requires_independent_approval');
+    if (reviewState.ci_passed !== true) errors.push('completed_requires_passing_ci');
+    if (typeof reviewState.author !== 'string' || !reviewState.author) errors.push('completed_requires_implementation_author');
+    if (typeof reviewState.reviewer !== 'string' || !reviewState.reviewer) errors.push('completed_requires_independent_reviewer');
+    if (reviewState.author === reviewState.reviewer) errors.push('completed_requires_distinct_reviewer');
+    if (typeof reviewState.merge_actor !== 'string' || reviewState.merge_actor !== reviewState.reviewer) errors.push('completed_requires_observed_reviewer_merge_actor');
+    const semanticEvidence = validateSemanticCompletionEvidence({ claim: after, evidence: reviewState.semantic_completion_evidence });
+    if (!semanticEvidence.valid) errors.push(...semanticEvidence.errors.map((error) => `completed_requires_${error}`));
+  }
+  if (after.status === 'pr_pending_review' && asObject(review).handoff_allowed !== true) {
+    errors.push('pr_pending_review_requires_delivery_handoff');
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function usage() {
+  process.stderr.write('usage: phase-loop-delivery-integrity.mjs evaluate --claim <claim.json> --stdout <run.stdout.json> [--verification <verification.json>]\n');
+}
+
+function parseArgs(argv) {
+  const args = new Map();
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index].startsWith('--')) args.set(argv[index], argv[index + 1]);
+  }
+  return args;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const [command] = process.argv.slice(2);
+  const args = parseArgs(process.argv.slice(3));
+  if (command !== 'evaluate' || !args.get('--claim') || !args.get('--stdout')) {
+    usage();
+    process.exit(64);
+  }
+  try {
+    const claim = readJson(args.get('--claim'));
+    const stdoutPayload = readJson(args.get('--stdout'));
+    let verification = null;
+    if (args.get('--verification')) verification = JSON.parse(args.get('--verification'));
+    const semanticCompletionEvidence = produceSemanticCompletionEvidence({ claim, stdoutPayload, verification });
+    const result = evaluateDeliveryHandoff({ claim, stdoutPayload, semanticCompletionEvidence });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exit(result.pr_handoff_allowed ? 0 : 76);
+  } catch (error) {
+    process.stderr.write(`delivery_integrity_evaluation_failed: ${error.message}\n`);
+    process.exit(70);
+  }
+}

@@ -63,6 +63,8 @@ if [ -n "$STATE_DIR" ]; then
 fi
 PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED=0
 PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL=""
+PHASE_LOOP_COMPLETION_PROMOTION_REFUSED=0
+PHASE_LOOP_COMPLETION_PROMOTION_REFUSED_DETAIL=""
 PHASE_LOOP_TASK_LEDGER_FAILURE=0
 PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL=""
 PHASE_LOOP_ACTIVE_RUN_STAMP=""
@@ -284,6 +286,58 @@ PY
   fi
 }
 
+phase_loop_terminal_delivery_receipt_valid() {
+  local claim_path="${1:-$TODO_CLAIM_FILE}"
+  python3 - "$claim_path" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+try:
+    claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "completed":
+    raise SystemExit(1)
+review = claim.get("delivery_review")
+if not isinstance(review, dict):
+    raise SystemExit(1)
+author = review.get("author")
+reviewer = review.get("reviewer")
+merge_actor = review.get("merge_actor")
+semantic = review.get("semantic_completion_evidence")
+selected = claim.get("selected_todo")
+root_claim_id = claim.get("root_claim_id") or claim.get("claim_id")
+condition_match = re.search(r"^\s*Completion condition:\s*(.+?)\s*$", selected or "", re.MULTILINE)
+completion_condition = condition_match.group(1).strip() if condition_match else ""
+evidence_valid = (
+    isinstance(semantic, dict)
+    and semantic.get("schema_version") == 1
+    and semantic.get("root_claim_id") == root_claim_id
+    and semantic.get("selected_todo_sha256") == hashlib.sha256(str(selected or "").encode("utf-8")).hexdigest()
+    and semantic.get("completion_condition_sha256") == hashlib.sha256(completion_condition.encode("utf-8")).hexdigest()
+    and isinstance(semantic.get("verification_results"), list)
+    and bool(semantic.get("verification_results"))
+    and all(isinstance(item, dict) and isinstance(item.get("command"), str) and item.get("command") and item.get("exit_code") == 0 for item in semantic["verification_results"])
+    and isinstance(semantic.get("observables"), list)
+    and bool(semantic.get("observables"))
+    and all(isinstance(item, dict) and item.get("kind") and item.get("sha256") for item in semantic["observables"])
+)
+raise SystemExit(0 if (
+    review.get("merged") is True
+    and review.get("approved") is True
+    and review.get("ci_passed") is True
+    and isinstance(author, str) and bool(author)
+    and isinstance(reviewer, str) and bool(reviewer)
+    and isinstance(merge_actor, str) and merge_actor == reviewer
+    and author != reviewer
+    and evidence_valid
+) else 1)
+PY
+}
+
 write_bdk_trajectory_event() {
   local run_stamp="$1"
   local event_type="$2"
@@ -291,6 +345,25 @@ write_bdk_trajectory_event() {
   local ledger_event_type="${4:-$event_type}"
   if [ -z "$payload_json" ]; then
     payload_json="{}"
+  fi
+  # Public `todo.completed` is a terminal delivery assertion, not a progress
+  # marker.  Keep every controller fallback behind the same independent
+  # review/CI/merge boundary as Runtime results so a local patch, green check,
+  # or PR creation cannot manufacture completion in the public ledger.
+  if [ "$event_type" = "todo.completed" ]; then
+    if ! phase_loop_terminal_delivery_receipt_valid "$TODO_CLAIM_FILE"; then
+      local blocked_claim_id blocked_selected_todo blocked_queue_fingerprint blocked_queue_generation
+      blocked_claim_id="$(claim_field claim_id 2>/dev/null || true)"
+      blocked_selected_todo="$(claim_field selected_todo 2>/dev/null || true)"
+      blocked_queue_fingerprint="$(claim_field queue_fingerprint 2>/dev/null || true)"
+      blocked_queue_generation="$(active_claim_queue_generation 2>/dev/null || true)"
+      if [ -n "$blocked_claim_id" ] && [ -n "$blocked_selected_todo" ] && [ -n "$blocked_queue_fingerprint" ]; then
+        write_todo_claim "$blocked_claim_id" "integrity_blocked" "$blocked_selected_todo" "$blocked_queue_fingerprint" "$blocked_queue_generation" "$run_stamp"
+      fi
+      write_status "integrity_blocked" "Refused public todo.completed before independent review approval, required CI, and merge. event=$event_type run=$run_stamp" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
+      printf '%s public_completion_refused=true event=%s run=%s reason=independent_review_ci_merge_missing\n' "$(now_utc)" "$event_type" "$run_stamp" >> "$SUPERVISOR_LOG"
+      return 76
+    fi
   fi
   case "$event_type" in
     todo.replanned)
@@ -630,6 +703,12 @@ PY
 record_completion_ledger_transition() {
   local run_stamp="$1"
   local payload_json="${2:-{}}"
+  if ! phase_loop_terminal_delivery_receipt_valid "$TODO_CLAIM_FILE"; then
+    PHASE_LOOP_TASK_LEDGER_FAILURE=1
+    PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="terminal completion ledger transition requires independent approval, passing CI, and merged PR"
+    printf '%s task_ledger_completion_refused=true run=%s reason=independent_review_ci_merge_missing\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
   write_bdk_trajectory_event "$run_stamp" "todo.completed" "$payload_json"
   if [ "${PHASE_LOOP_TASK_LEDGER_FAILURE:-0}" -eq 1 ]; then
     return 78
@@ -697,6 +776,7 @@ PY
 
 write_status() {
   local status="$1"
+  local requested_status="$status"
   local detail="${2:-}"
   local run_id="${3:-}"
   local exit_code="${4:-}"
@@ -706,6 +786,20 @@ write_status() {
   if [ "${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED:-0}" = "1" ] && [ "$status" = "last_run_succeeded" ]; then
     status="no_progress"
     detail="Completed TODO removal was reverted because the resulting TODO queue failed guard validation; keeping the completed claim for cleanup retry. guard=${PHASE_LOOP_COMPLETED_TODO_REMOVAL_REVERTED_DETAIL:-unknown} previous_success_detail=$detail"
+    exit_code="76"
+    force_status_exit_code="76"
+    if [ "$consecutive_failures" = "0" ]; then
+      consecutive_failures="${CONSECUTIVE_FAILURES:-1}"
+    fi
+  fi
+  # A caller may have performed product work successfully, but completion is
+  # still prohibited until the independently observed review, CI, and merge
+  # receipt exists.  Force the *process* outcome as well as the claim state:
+  # otherwise a legacy fallback could return exit 0 after its completed claim
+  # was rejected as an integrity violation.
+  if [ "${PHASE_LOOP_COMPLETION_PROMOTION_REFUSED:-0}" = "1" ] && [ "$status" != "integrity_blocked" ]; then
+    status="integrity_blocked"
+    detail="Refused to promote TODO completion before independent review approval, required CI, and merge. ${PHASE_LOOP_COMPLETION_PROMOTION_REFUSED_DETAIL:-completion_promotion_refused} previous_status=$requested_status previous_detail=$detail"
     exit_code="76"
     force_status_exit_code="76"
     if [ "$consecutive_failures" = "0" ]; then
@@ -1871,7 +1965,12 @@ import sys
 
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
-        value = json.load(handle).get(sys.argv[2], "")
+        value = json.load(handle)
+    for component in sys.argv[2].split("."):
+        if not isinstance(value, dict):
+            value = ""
+            break
+        value = value.get(component, "")
 except Exception:
     sys.exit(1)
 if isinstance(value, str):
@@ -2763,6 +2862,13 @@ remove_completed_todo_claim_from_queue() {
   fi
   if [ ! -f "$TODO_CLAIM_FILE" ] || [ ! -f "$PHASE_LOOP_TODO" ]; then
     return 0
+  fi
+  # Queue deletion is the irreversible projection of delivery completion.
+  # Do not let a successful wrapper, a patch, or a PR creation erase the
+  # active TODO before the independent review decision has been merged.
+  if ! phase_loop_terminal_delivery_receipt_valid "$TODO_CLAIM_FILE"; then
+    printf '%s run=%s completed_todo_removal_refused=true reason=independent_review_ci_merge_missing\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+    return 76
   fi
   local stale_claim_status stale_claim_exit
   set +e
@@ -7672,9 +7778,34 @@ if allowed_objective_paths and normalized_applied_path not in allowed_objective_
     }, sort_keys=True))
     raise SystemExit(1)
 
+results = []
+# Every successful controller verification carries at least one executed,
+# reproducible command result. This is later bound to the immutable claim for
+# review handoff; do not create a bare self-attestation for shortcut paths.
+integrity_args = ["git", "diff", "--check"]
+if normalized_applied_path:
+    integrity_args.extend(["--", normalized_applied_path])
+integrity_check = subprocess.run(
+    integrity_args,
+    cwd=workspace_root,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=60,
+)
+results.append({
+    "command": " ".join(shlex.quote(arg) for arg in integrity_args),
+    "exit_code": integrity_check.returncode,
+    "stdout_chars": len(integrity_check.stdout),
+    "stderr_chars": len(integrity_check.stderr),
+})
+if integrity_check.returncode != 0:
+    print(json.dumps({"completed": False, "reason": "workspace_integrity_check_failed", "results": results}, sort_keys=True))
+    raise SystemExit(1)
+
 try:
     if first_line not in todo_path.read_text(encoding="utf-8"):
-        print(json.dumps({"completed": True, "reason": "selected_todo_already_removed"}, sort_keys=True))
+        print(json.dumps({"completed": True, "reason": "selected_todo_already_removed", "results": results}, sort_keys=True))
         raise SystemExit(0)
 except Exception as error:
     print(json.dumps({"completed": False, "reason": f"todo_unreadable:{error}"}, sort_keys=True))
@@ -7754,7 +7885,6 @@ def allowed_args(command):
         return args
     return None
 
-results = []
 def sanitized_process_tail(value):
     text = value[-2000:] if isinstance(value, str) else str(value)[-2000:]
     workspace_text = str(workspace_root)
@@ -11431,13 +11561,31 @@ phase_loop_require_implementation_pr_actor() {
   node "$guard_script" --expected-actor "$PHASE_LOOP_EXPECTED_ACTOR"
 }
 
+# A zero process exit only says that the protocol wrapper ran. It must never
+# be used as a proxy for terminal TODO delivery. This shared boundary covers
+# every publication path, including cleanup retries.
+phase_loop_require_delivery_handoff() {
+  local stdout_log="$1"
+  local verification_payload="${2:-}"
+  local integrity_script="$ROOT_DIR/scripts/phase-loop-delivery-integrity.mjs"
+  if [ ! -s "$stdout_log" ] || [ ! -f "$integrity_script" ] || [ ! -f "$TODO_CLAIM_FILE" ]; then
+    printf '%s delivery_handoff_refused=true reason=integrity_inputs_missing stdout=%s claim=%s\n' "$(now_utc)" "$stdout_log" "$TODO_CLAIM_FILE" >> "$SUPERVISOR_LOG"
+    return 76
+  fi
+  if [ -n "$verification_payload" ]; then
+    node "$integrity_script" evaluate --claim "$TODO_CLAIM_FILE" --stdout "$stdout_log" --verification "$verification_payload"
+  else
+    node "$integrity_script" evaluate --claim "$TODO_CLAIM_FILE" --stdout "$stdout_log"
+  fi
+}
+
 phase_loop_create_pr_for_progress() {
   local run_stamp="$1"
   local stdout_log="$2"
   local stderr_log="$3"
   local workspace_before="$4"
   local workspace_after="$5"
-  local title body pr_url branch push_rc pending_publish="${6:-0}" implementation_gh_config_dir
+  local title body pr_url branch push_rc pending_publish="${6:-0}" verification_payload="${7:-}" implementation_gh_config_dir
   if [ "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" != "1" ]; then
     return 0
   fi
@@ -11447,6 +11595,20 @@ phase_loop_create_pr_for_progress() {
   fi
   if [ "$pending_publish" != "1" ] && ! tracked_workspace_diff_exists && ! staged_workspace_diff_exists; then
     return 0
+  fi
+  local delivery_handoff delivery_status
+  if delivery_handoff="$(phase_loop_require_delivery_handoff "$stdout_log" "$verification_payload" 2>&1)"; then
+    delivery_status=0
+  else
+    delivery_status=$?
+  fi
+  if [ "$delivery_status" -ne 0 ]; then
+    # Keep the same claim lineage: a retry repairs this work rather than
+    # replacing its failure with a fresh-looking claim.
+    write_todo_claim "$(claim_field claim_id)" "integrity_blocked" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    write_status "integrity_blocked" "PR publication refused: process/protocol success is not delivery completion. delivery_integrity=${delivery_handoff:-<no output>} stdout=$stdout_log" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
+    printf '%s pr_create_refused=true reason=delivery_integrity run=%s result=%s\n' "$(now_utc)" "$run_stamp" "${delivery_handoff:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 76
   fi
   implementation_gh_config_dir="$(
     node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" \
@@ -11489,7 +11651,10 @@ phase_loop_create_pr_for_progress() {
 - Brownie stdout: $stdout_log
 - Brownie stderr: $stderr_log
 
-This PR was created by the external phase-loop controller after Brownie produced tracked workspace changes."
+This PR was created by the external phase-loop controller after Brownie produced tracked workspace changes.
+
+This is a review-pending implementation handoff, not a completed TODO. The
+claim can be completed only after independent approval, required CI, and merge."
 
   if tracked_workspace_diff_exists; then
     if ! stage_runtime_applied_paths "$stdout_log"; then
@@ -11576,13 +11741,217 @@ This PR was created by the external phase-loop controller after Brownie produced
       fi
     fi
   fi
-  printf '%s pr_created branch=%s url=%s\n' "$(now_utc)" "$branch" "$pr_url" >> "$SUPERVISOR_LOG"
-  write_status "pr_created" "Brownie changes were committed, pushed, and opened as PR: $pr_url" "$run_stamp" "0" 0
+  write_todo_claim "$(claim_field claim_id)" "pr_pending_review" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+  if ! phase_loop_record_delivery_pr_handoff "$pr_url" "$delivery_handoff" "$run_stamp"; then
+    write_status "blocked" "PR was created but its durable review-handoff receipt could not be recorded; refusing to treat the claim as pending review. PR=$pr_url" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+  printf '%s pr_pending_review branch=%s url=%s delivery_integrity=%s\n' "$(now_utc)" "$branch" "$pr_url" "$delivery_handoff" >> "$SUPERVISOR_LOG"
+  write_status "pr_pending_review" "Brownie changes were committed, pushed, and opened for independent review: $pr_url. The TODO remains pending approval, CI, and merge." "$run_stamp" "0" "${CONSECUTIVE_FAILURES:-0}"
   return 0
 }
 
 phase_loop_pr_created() {
-  [ "$(status_field status 2>/dev/null || true)" = "pr_created" ]
+  [ "$(status_field status 2>/dev/null || true)" = "pr_pending_review" ]
+}
+
+phase_loop_record_delivery_pr_handoff() {
+  local pr_url="$1" delivery_handoff="$2" run_stamp="$3"
+  python3 - "$TODO_CLAIM_FILE" "$pr_url" "$delivery_handoff" "$run_stamp" "$(now_utc)" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    claim = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(claim, dict) or claim.get("status") != "pr_pending_review":
+    raise SystemExit(1)
+try:
+    integrity = json.loads(sys.argv[3])
+except Exception:
+    raise SystemExit(1)
+claim["delivery_review"] = {
+    "pr_url": sys.argv[2],
+    "merged": False,
+    "approved": False,
+    "ci_passed": False,
+    "handoff_allowed": integrity.get("pr_handoff_allowed") is True,
+    "semantic_completion_evidence": integrity.get("semantic_completion_evidence"),
+    "root_claim_id": claim.get("root_claim_id") or claim.get("claim_id"),
+    "selected_todo_sha256": integrity.get("selected_todo_sha256"),
+    "observed_at": sys.argv[5],
+}
+claim["updated_at"] = sys.argv[5]
+claim.setdefault("status_history", []).append({
+    "status": "pr_pending_review",
+    "run_stamp": sys.argv[4],
+    "updated_at": sys.argv[5],
+    "note": "pr_handoff_recorded",
+})
+tmp = path.with_name(f"{path.name}.{os.getpid()}.pr-handoff.tmp")
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+  sync_parent_dir "$TODO_CLAIM_DIR"
+}
+
+# A verified implementation result is only eligible for review handoff. The
+# queue and terminal ledger deliberately remain unchanged here: their single
+# writer is the merged-review reconciliation path above.
+phase_loop_handoff_verified_completion() {
+  local run_stamp="$1" stdout_log="$2" stderr_log="$3" workspace_before="$4" workspace_after="$5" verification="$6"
+  # Validate the actual Runtime payload before considering whether a review PR
+  # can be published.  Otherwise a disabled PR setting would mask the more
+  # fundamental condition that an outer `ok:true` response has no claim-bound
+  # terminal delivery evidence.
+  local delivery_handoff delivery_status
+  if delivery_handoff="$(phase_loop_require_delivery_handoff "$stdout_log" "$verification" 2>&1)"; then
+    delivery_status=0
+  else
+    delivery_status=$?
+  fi
+  if [ "$delivery_status" -ne 0 ]; then
+    write_todo_claim "$(claim_field claim_id)" "integrity_blocked" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    write_status "integrity_blocked" "Completion handoff refused: Runtime protocol/process success is not claim-bound delivery evidence. delivery_integrity=${delivery_handoff:-<no output>} verification=$verification stdout=$stdout_log stderr=$stderr_log" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
+    printf '%s completion_handoff_refused=true reason=delivery_integrity run=%s result=%s\n' "$(now_utc)" "$run_stamp" "${delivery_handoff:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 76
+  fi
+  if [ "$PHASE_LOOP_CREATE_PR_AFTER_PROGRESS" != "1" ]; then
+    write_todo_claim "$(claim_field claim_id)" "integrity_blocked" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    write_status "integrity_blocked" "A verified implementation cannot be declared complete while PR review publication is disabled. verification=$verification stdout=$stdout_log stderr=$stderr_log" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
+    return 76
+  fi
+  write_todo_claim "$(claim_field claim_id)" "verification_pending" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+  write_bdk_trajectory_event "$run_stamp" "verification.run" "$verification"
+  if ! phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" "0" "$verification"; then
+    # phase_loop_create_pr_for_progress records integrity_blocked with the
+    # exact refusal reason and never mutates the queue on failure.
+    return 76
+  fi
+  printf '%s run=%s verification_handed_to_independent_review=true stdout=%s stderr=%s\n' "$(now_utc)" "$run_stamp" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+  return 0
+}
+
+# Reconcile independently observed review facts before executing another
+# runtime attempt.  Requested changes are saved on the same immutable claim;
+# an open PR waits; only merged+approved+CI can reach completed.
+phase_loop_reconcile_pending_review() {
+  local status pr_url reviewer implementation reviewer_gh_config_dir review_file result reconciliation_status pr_node_id merge_actor
+  [ -f "$TODO_CLAIM_FILE" ] || return 1
+  status="$(claim_status 2>/dev/null || true)"
+  case "$status" in
+    pr_pending_review|changes_requested) ;;
+    *) return 1 ;;
+  esac
+  pr_url="$(claim_field delivery_review.pr_url 2>/dev/null || true)"
+  [ -n "$pr_url" ] || {
+    write_status "integrity_blocked" "Review-pending claim has no durable PR URL; refusing to run a replacement claim." "review-reconcile" "76" "${CONSECUTIVE_FAILURES:-0}"
+    return 76
+  }
+  reviewer="$(node "$ROOT_DIR/scripts/phase-loop-actor-deployment.mjs" --repo-root "$ROOT_DIR" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role review --field github-login 2>/dev/null || true)"
+  implementation="$(node "$ROOT_DIR/scripts/phase-loop-actor-deployment.mjs" --repo-root "$ROOT_DIR" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --role implementation --field github-login 2>/dev/null || true)"
+  reviewer_gh_config_dir="$(node "$ROOT_DIR/scripts/phase-loop-actor-preflight.mjs" --role review --repo-root "$PHASE_LOOP_WORKSPACE_ROOT" --deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" --credentials "$PHASE_LOOP_ACTOR_CREDENTIALS" --credentials-root "$PHASE_LOOP_CONTROL_ROOT" --print-gh-config-dir 2>>"$SUPERVISOR_LOG")" || {
+    write_status "blocked" "Could not resolve the configured independent-review profile; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  }
+  review_file="$TODO_CLAIM_DIR/review.$$.json"
+  if ! GH_CONFIG_DIR="$reviewer_gh_config_dir" gh pr view "$pr_url" --json id,number,url,author,state,mergedAt,headRefOid,reviewDecision,reviews,statusCheckRollup > "$review_file"; then
+    rm -f "$review_file"
+    write_status "blocked" "Could not read the configured review PR; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+  pr_node_id="$(python3 - "$review_file" <<'PY'
+import json
+import sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get("id")
+except Exception:
+    value = None
+print(value if isinstance(value, str) else "")
+PY
+  )"
+  if [ -z "$pr_node_id" ]; then
+    rm -f "$review_file"
+    write_status "blocked" "Could not read the immutable PR node identity needed to verify the merge actor; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+  if ! merge_actor="$(GH_CONFIG_DIR="$reviewer_gh_config_dir" gh api graphql \
+      -f query='query($id: ID!) { node(id: $id) { ... on PullRequest { mergedBy { login } } } }' \
+      -F "id=$pr_node_id" --jq '.data.node.mergedBy.login' 2>>"$SUPERVISOR_LOG")"; then
+    rm -f "$review_file"
+    write_status "blocked" "Could not verify the observed merge actor; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+  if ! python3 - "$review_file" "$merge_actor" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+actor = sys.argv[2].strip()
+payload["mergedBy"] = {"login": actor} if actor else None
+temporary = path.with_name(f"{path.name}.{os.getpid()}.merge-actor.tmp")
+temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+os.replace(temporary, path)
+PY
+  then
+    rm -f "$review_file"
+    write_status "blocked" "Could not persist the observed merge actor alongside review facts; preserving review-pending claim." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+  if result="$(node "$ROOT_DIR/scripts/phase-loop-review-reconcile.mjs" reconcile --claim "$TODO_CLAIM_FILE" --review "$review_file" --reviewer "$reviewer" --implementation "$implementation" --write --run "review-$(date -u +%Y%m%dT%H%M%SZ)" 2>&1)"; then
+    reconciliation_status=0
+  else
+    reconciliation_status=$?
+  fi
+  rm -f "$review_file"
+  if [ "$reconciliation_status" -ne 0 ]; then
+    write_status "integrity_blocked" "Review reconciliation rejected provenance; preserving claim. result=${result:-<no output>}" "review-reconcile" "76" "${CONSECUTIVE_FAILURES:-0}"
+    return 76
+  fi
+  status="$(claim_status 2>/dev/null || true)"
+  case "$status" in
+    pr_pending_review)
+      write_status "pr_pending_review" "Implementation PR remains awaiting independent review, CI, and merge: $pr_url" "review-reconcile" "0" "${CONSECUTIVE_FAILURES:-0}"
+      return 75
+      ;;
+    changes_requested)
+      write_repair_feedback "review-$(date -u +%Y%m%dT%H%M%SZ)" "$result" "" "" || true
+      write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "review-rework"
+      printf '%s review_changes_requested_rework_same_claim=true claim=%s pr=%s\n' "$(now_utc)" "$(claim_field root_claim_id)" "$pr_url" >> "$SUPERVISOR_LOG"
+      return 0
+      ;;
+    completed)
+      if ! record_completion_ledger_transition "review-merge-$(date -u +%Y%m%dT%H%M%SZ)" '{"completion":"independent_review_ci_merge_verified"}'; then
+        return 78
+      fi
+      if ! remove_completed_todo_claim_from_queue "review-merge-$(date -u +%Y%m%dT%H%M%SZ)"; then
+        write_status "blocked" "PR is merged and reviewed, but durable TODO removal was refused; preserving completion claim for reconciliation." "review-reconcile" "78" "${CONSECUTIVE_FAILURES:-0}"
+        return 78
+      fi
+      write_status "last_run_succeeded" "Selected TODO was independently approved, CI-verified, merged, and removed from the queue: $pr_url" "review-reconcile" "0" "0"
+      return 75
+      ;;
+    *)
+      write_status "integrity_blocked" "Review reconciliation produced an invalid claim state: $status" "review-reconcile" "76" "${CONSECUTIVE_FAILURES:-0}"
+      return 76
+      ;;
+  esac
 }
 
 write_todo_claim() {
@@ -11592,7 +11961,8 @@ write_todo_claim() {
   local queue_fingerprint="$4"
   local queue_generation="$5"
   local run_stamp="${6:-}"
-  local timestamp tmp_claim
+  local timestamp tmp_claim requested_status
+  requested_status="$status"
   timestamp="$(now_utc)"
   tmp_claim="$TODO_CLAIM_FILE.$$.$RANDOM.tmp"
   python3 - "$tmp_claim" "$claim_id" "$status" "$selected_todo" "$queue_fingerprint" "$queue_generation" "$PHASE_LOOP_TODO" "$run_stamp" "$PHASE_LOOP_WORKSPACE_ROOT" "$timestamp" <<'PY'
@@ -11600,6 +11970,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -11670,6 +12041,7 @@ if not claim:
     claim = {
         "schema_version": 1,
         "claim_id": claim_id,
+        "root_claim_id": claim_id,
         "selected_todo": sys.argv[4],
         "queue_fingerprint": sys.argv[5],
         "queue_generation": queue_generation or 1,
@@ -11694,12 +12066,62 @@ if queue_generation is not None:
     claim["queue_generation"] = queue_generation
 else:
     claim.setdefault("queue_generation", 1)
+claim.setdefault("root_claim_id", claim.get("claim_id"))
 claim["queue_fingerprint"] = sys.argv[5]
+requested_status = status
+# Completion is a review outcome, not an implementation-side state. Keeping
+# this gate at the common writer prevents an overlooked caller from removing
+# a TODO before independent approval, CI, and merge are all recorded.
+if status == "completed":
+    review = claim.get("delivery_review") if isinstance(claim.get("delivery_review"), dict) else {}
+    semantic = review.get("semantic_completion_evidence")
+    selected = claim.get("selected_todo")
+    condition_match = re.search(r"^\s*Completion condition:\s*(.+?)\s*$", selected or "", re.MULTILINE)
+    completion_condition = condition_match.group(1).strip() if condition_match else ""
+    semantic_valid = (
+        isinstance(semantic, dict)
+        and semantic.get("schema_version") == 1
+        and semantic.get("root_claim_id") == (claim.get("root_claim_id") or claim.get("claim_id"))
+        and semantic.get("selected_todo_sha256") == hashlib.sha256(str(selected or "").encode("utf-8")).hexdigest()
+        and semantic.get("completion_condition_sha256") == hashlib.sha256(completion_condition.encode("utf-8")).hexdigest()
+        and isinstance(semantic.get("verification_results"), list)
+        and bool(semantic.get("verification_results"))
+        and all(isinstance(item, dict) and isinstance(item.get("command"), str) and item.get("command") and item.get("exit_code") == 0 for item in semantic["verification_results"])
+        and isinstance(semantic.get("observables"), list)
+        and bool(semantic.get("observables"))
+        and all(isinstance(item, dict) and item.get("kind") and item.get("sha256") for item in semantic["observables"])
+    )
+    receipt_valid = (
+        review.get("merged") is True
+        and review.get("approved") is True
+        and review.get("ci_passed") is True
+        and isinstance(review.get("author"), str) and bool(review.get("author"))
+        and isinstance(review.get("reviewer"), str) and bool(review.get("reviewer"))
+        and review.get("author") != review.get("reviewer")
+        and isinstance(review.get("merge_actor"), str) and review.get("merge_actor") == review.get("reviewer")
+        and semantic_valid
+    )
+    if not receipt_valid:
+        status = "integrity_blocked"
+        claim.setdefault("completion_promotion_rejections", []).append({
+            "at": timestamp,
+            "run_stamp": sys.argv[8],
+            "requested_status": requested_status,
+            "reason": "completed_requires_claim_bound_semantic_evidence_and_independent_review_ci_merge_receipt",
+        })
+if status in {"integrity_blocked", "changes_requested", "failed", "blocked"}:
+    claim.setdefault("failure_history", []).append({
+        "at": timestamp,
+        "run_stamp": sys.argv[8],
+        "status": status,
+        "root_claim_id": claim.get("root_claim_id"),
+        "selected_todo_sha256": hashlib.sha256(str(claim.get("selected_todo") or "").encode("utf-8")).hexdigest(),
+    })
 claim["status"] = status
 claim["run_stamp"] = sys.argv[8]
 claim["updated_at"] = timestamp
 claim.setdefault("status_history", []).append(
-    {"status": status, "run_stamp": sys.argv[8], "updated_at": timestamp}
+    {"status": status, "requested_status": requested_status, "run_stamp": sys.argv[8], "updated_at": timestamp}
 )
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(claim, handle, ensure_ascii=False, sort_keys=True, indent=2)
@@ -11711,6 +12133,19 @@ PY
   mv "$tmp_claim" "$TODO_CLAIM_FILE"
   chmod 600 "$TODO_CLAIM_FILE"
   sync_parent_dir "$TODO_CLAIM_DIR"
+  if [ "$requested_status" = "completed" ] && [ "$(claim_field status 2>/dev/null || true)" != "completed" ]; then
+    PHASE_LOOP_COMPLETION_PROMOTION_REFUSED=1
+    PHASE_LOOP_COMPLETION_PROMOTION_REFUSED_DETAIL="claim=$claim_id requested_status=completed actual_status=$(claim_field status 2>/dev/null || true) run=$run_stamp"
+    printf '%s completion_promotion_refused=true claim=%s requested=completed actual=%s run=%s reason=independent_review_ci_merge_missing\n' \
+      "$(now_utc)" "$claim_id" "$(claim_field status 2>/dev/null || true)" "$run_stamp" >> "$SUPERVISOR_LOG"
+    # This is the universal terminal gate for legacy/fallback callers.  Write
+    # the observable failed outcome here, before any caller can archive a
+    # claim, publish a PR, or replace the status with a success-shaped value.
+    # write_status exits 76 when the promotion flag is set, so this function
+    # cannot be accidentally ignored by a future caller.
+    write_status "integrity_blocked" "Refused TODO completion before independent review approval, required CI, and merge. ${PHASE_LOOP_COMPLETION_PROMOTION_REFUSED_DETAIL}" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
+    return 76
+  fi
 }
 
 restore_claim_snapshot_before_runtime() {
@@ -17264,23 +17699,35 @@ PY
     deterministic_todo_decomposition_status=$?
   fi
   if [ "$deterministic_todo_decomposition_status" -eq 0 ]; then
-    workspace_after="$(git_workspace_fingerprint)"
     printf '%s\n' "$deterministic_todo_decomposition_output" > "$stdout_log"
     : > "$stderr_log"
-    clear_repair_feedback
-    write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+    # A deterministic queue repair only replaces an unsafe/broad request with
+    # an executable leaf.  It is not product delivery and must never archive
+    # the source as completed, publish a PR, or reset the failure causality.
+    if ! write_todo_claim "$(claim_field claim_id)" "replanned" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"; then
+      detail="Deterministic TODO decomposition repaired the queue but could not persist the source claim as replanned; preserving the claim for recovery. repair=$deterministic_todo_decomposition_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
+    if ! write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"todo_decomposition_repair"}'; then
+      detail="Deterministic TODO decomposition repaired the queue but could not record its workspace-write evidence; preserving the replanned source claim. repair=$deterministic_todo_decomposition_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
+    if ! write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"deterministic_todo_decomposition_repair","delivery_outcome":"replanned_not_completed"}'; then
+      detail="Deterministic TODO decomposition repaired the queue but could not record the source-to-leaf replan transition; preserving the replanned source claim. repair=$deterministic_todo_decomposition_output"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      return 78
+    fi
     if [ -f "$TODO_CLAIM_FILE" ]; then
-      PHASE_LOOP_LAST_CLAIM_ARCHIVE="$TODO_CLAIM_DIR/completed-deterministic-decomposition-$run_stamp.json"
+      PHASE_LOOP_LAST_CLAIM_ARCHIVE="$TODO_CLAIM_DIR/replanned-deterministic-decomposition-$run_stamp.json"
       mv "$TODO_CLAIM_FILE" "$PHASE_LOOP_LAST_CLAIM_ARCHIVE"
       sync_parent_dir "$TODO_CLAIM_DIR"
     fi
-    detail="Applied deterministic TODO decomposition repair before invoking Brownie: $deterministic_todo_decomposition_output"
-    write_status "last_run_succeeded" "$detail" "todo-deterministic-decomposition-$run_stamp" "0" "0"
-    printf '%s run=%s deterministic_todo_decomposition_repair=true phase=pre_guard result=%s\n' "$(now_utc)" "todo-deterministic-decomposition-$run_stamp" "$deterministic_todo_decomposition_output" >> "$SUPERVISOR_LOG"
-    write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"deterministic_fallback","kind":"todo_decomposition_repair"}'
-    write_bdk_trajectory_event "$run_stamp" "todo.completed" '{"completion":"deterministic_todo_decomposition_repair"}'
-    phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
-    return 0
+    detail="Applied deterministic TODO decomposition repair before invoking Brownie; source TODO is replanned, not completed, and the new leaf still requires implementation, verification, independent review, CI, and merge. repair=$deterministic_todo_decomposition_output"
+    write_status "no_progress" "$detail" "todo-deterministic-decomposition-$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
+    printf '%s run=%s deterministic_todo_decomposition_repair=true delivery_outcome=replanned_not_completed result=%s\n' "$(now_utc)" "todo-deterministic-decomposition-$run_stamp" "$deterministic_todo_decomposition_output" >> "$SUPERVISOR_LOG"
+    return 76
   elif [ "$deterministic_todo_decomposition_status" -eq 1 ]; then
     detail="Deterministic TODO decomposition repair was eligible but failed safely before invoking Brownie: $deterministic_todo_decomposition_output"
     printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
@@ -18597,6 +19044,13 @@ PY
     if verification_completion="$(complete_applied_todo_after_verification "$stdout_log" "$run_stamp" 2>&1)"; then
       save_active_target_known_good "selected_todo_verification_passed" || true
       clear_repair_feedback
+      local objective_handoff_status
+      if phase_loop_handoff_verified_completion "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" "$verification_completion"; then
+        return 0
+      else
+        objective_handoff_status=$?
+      fi
+      return "$objective_handoff_status"
       # Record the terminal ledger event while the claim and TODO are still
       # live. If the append fails, leave the claim in progress so retry can
       # close the same attempt instead of silently removing the TODO first.
@@ -18655,7 +19109,7 @@ PY
         write_status "blocked" "$detail" "$run_id" "78" "$CONSECUTIVE_FAILURES"
         return 78
       fi
-      if [ "$(status_field status 2>/dev/null || true)" != "pr_created" ]; then
+      if [ "$(status_field status 2>/dev/null || true)" != "pr_pending_review" ]; then
         write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
       fi
       printf '%s run=%s objective_apply_verified=true verification=%s removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$verification_completion" "$objective_completion_removal_output" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
@@ -18937,12 +19391,12 @@ sys.exit(0 if applied and todo_path and selected_removed else 1)
 PY
     then
       clear_repair_feedback
-      write_todo_claim "$(claim_field claim_id)" "completed" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
-      detail="Brownie refined the selected TODO into smaller queue items; marked TODO claim completed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
-      write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
-      printf '%s run=%s todo_refinement_completed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$progress_summary" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
+      write_todo_claim "$(claim_field claim_id)" "verification_pending" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
+      detail="Brownie refined the selected TODO into smaller queue items; it is awaiting semantic-evidence validation and independent review, not completed. stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
       write_bdk_trajectory_event "$run_stamp" "todo.replanned" '{"reason":"todo_refinement_completed"}'
-      phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" || true
+      if ! phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
+        return 76
+      fi
       return 0
     fi
 
@@ -18969,6 +19423,13 @@ except Exception:
 sys.exit(0 if payload.get("completed") is True or completed_by_no_actionable_after_apply else 1)
 PY
     then
+      local runtime_handoff_status
+      if phase_loop_handoff_verified_completion "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after" '{"completion":"runtime_reported_completed"}'; then
+        return 0
+      else
+        runtime_handoff_status=$?
+      fi
+      return "$runtime_handoff_status"
       if ! record_completion_ledger_transition "$run_stamp" '{"completion":"runtime_reported_completed"}'; then
         detail="Brownie reported completion but the terminal ledger transition failed; keeping the TODO and claim in progress for retry. ${PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL} stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
         write_todo_claim "$(claim_field claim_id)" "in_progress" "$(claim_field selected_todo)" "$(claim_field queue_fingerprint)" "$(active_claim_queue_generation)" "$run_stamp"
@@ -19026,7 +19487,7 @@ PY
         printf '%s run=%s runtime_completion_cleanup_marker_clear_failed=true progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
         return 78
       fi
-      if [ "$(status_field status 2>/dev/null || true)" != "pr_created" ]; then
+      if [ "$(status_field status 2>/dev/null || true)" != "pr_pending_review" ]; then
         write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" "0"
       fi
       printf '%s run=%s runtime_completion_recorded=true removal=%s progress=%s stdout=%s stderr=%s\n' "$(now_utc)" "$run_id" "$runtime_completion_removal_output" "$PROGRESS_STATE_FILE" "$stdout_log" "$stderr_log" >> "$SUPERVISOR_LOG"
@@ -19524,15 +19985,24 @@ PY
         write_bdk_trajectory_event "$run_stamp" "workflow.routed" '{"source":"runtime","bdk_state":"continuation_required","llm_route":"resume"}'
         ;;
       *)
+        local progress_pr_status
         if phase_loop_create_pr_for_progress "$run_stamp" "$stdout_log" "$stderr_log" "$workspace_before" "$workspace_after"; then
-          :
+          progress_pr_status=0
         else
+          progress_pr_status=$?
+        fi
+        if [ "$progress_pr_status" -ne 0 ]; then
+          if [ "$progress_pr_status" -eq 76 ]; then
+            # Delivery-integrity refusal already wrote a precise status and
+            # claim history. Do not obscure it as a generic PR failure.
+            return 76
+          fi
           detail="Brownie run made progress but PR creation failed; stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
           write_status "blocked" "$detail" "$run_id" "78" "${CONSECUTIVE_FAILURES:-1}"
           return 78
         fi
         detail="Brownie run made progress; stdout=$stdout_log stderr=$stderr_log progress=$PROGRESS_STATE_FILE"
-        if [ "$(status_field status 2>/dev/null || true)" != "pr_created" ]; then
+        if [ "$(status_field status 2>/dev/null || true)" != "pr_pending_review" ]; then
           write_status "last_run_succeeded" "$detail" "$run_id" "$exit_code" 0
         fi
         write_bdk_trajectory_event "$run_stamp" "tool.write_applied" '{"source":"runtime","kind":"workspace_progress"}'
@@ -19573,6 +20043,20 @@ run_brownie_once() {
   if ! validate_runtime_authorization_rebaseline_cap; then
     return 78
   fi
+  # Review state is authoritative over further implementation attempts.  A
+  # pending PR waits; requested changes are returned to this exact claim with
+  # durable feedback; merged review is the only completion path.
+  local review_reconcile_status
+  if phase_loop_reconcile_pending_review; then
+    review_reconcile_status=0
+  else
+    review_reconcile_status=$?
+  fi
+  case "$review_reconcile_status" in
+    0|1) ;;
+    75) return 0 ;;
+    *) return "$review_reconcile_status" ;;
+  esac
   PHASE_LOOP_TASK_LEDGER_FAILURE=0
   PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL=""
   PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUESTED=0
