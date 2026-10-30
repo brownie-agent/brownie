@@ -1146,9 +1146,17 @@ export function watchdogContinuationLiveness({
     getProcessCommand,
     listSupervisors
   });
+  // The PID/owner/generation tuple and the direct owner command are the
+  // durable ownership proof.  A process-table scan is intentionally only
+  // diagnostic here: launchers such as screen and shell wrappers retain the
+  // `phase-loop.sh supervise` arguments and therefore look like additional
+  // supervisors even though they do not own this state directory.  Treating
+  // those wrapper PIDs as a competing owner makes a valid continuation fail
+  // before it can be resumed.  Concurrent supervisors are serialized by the
+  // durable lock, while a mismatched owner or direct owner command remains a
+  // fail-closed condition below.
   if (!ownership.matching_owner
-    || (ownership.live_pid && !ownership.command_looks_like_supervisor)
-    || ownership.live_supervisors.some((pid) => pid !== ownership.pid)) {
+    || (ownership.live_pid && !ownership.command_looks_like_supervisor)) {
     return {
       ok: false,
       code: 'continuation_ownership_unproven',
