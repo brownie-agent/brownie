@@ -54,6 +54,77 @@ test('pending claims with zero runtime candidates are terminal even when legacy 
   assert.match(controller, /classification = \(\n    "terminal_failure"\n    if terminal_non_progress/);
 });
 
+test('a task-executed terminal-evidence gap cannot be recorded as an external blocked TODO', () => {
+  const marker = 'terminal_completion_evidence_missing_without_objective_apply = (';
+  const classification = controller.indexOf(marker);
+  const externalBoundaryDetail = controller.indexOf(
+    'Brownie run reached a blocked external-control boundary',
+  );
+  const terminalBranch = controller.indexOf('case "$progress_classification"');
+  assert.ok(
+    classification >= 0 && externalBoundaryDetail > classification && terminalBranch > externalBoundaryDetail,
+    'terminal-evidence gaps must be classified before either blocked-boundary return and then reach terminal recovery',
+  );
+
+  const externalBoundaryStart = controller.lastIndexOf('elif python3 - "$stdout_log"', externalBoundaryDetail);
+  const externalBoundary = controller.slice(externalBoundaryStart, externalBoundaryDetail);
+  assert.match(externalBoundary, /stop_reason == "terminal_completion_evidence_missing"/);
+  assert.match(externalBoundary, /and not objective_apply_applied/);
+  assert.match(externalBoundary, /sys\.exit\(1\)/);
+  assert.match(
+    controller,
+    /\) or terminal_completion_evidence_missing_without_objective_apply\ncontinuation_required = \(/,
+  );
+});
+
+test('terminal recovery resolves a rebaselined claim through its immutable selected-TODO snapshot', () => {
+  const recoveryStart = controller.indexOf('def admitted_claim_snapshot_for_prior_run(');
+  const recoveryEnd = controller.indexOf('def controller_replan_dir()', recoveryStart);
+  const recovery = controller.slice(recoveryStart, recoveryEnd);
+  assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart);
+  assert.match(recovery, /snapshot_selected != expected_selected/);
+  assert.match(recovery, /phase_loop_selected_todo_sha256/);
+  assert.match(recovery, /claim_digest = hashlib\.sha256\(run_claim_id\.encode\("utf-8"\)\)\.hexdigest\(\)/);
+  assert.match(recovery, /admitted_claim_snapshot_for_prior_run\(/);
+  assert.doesNotMatch(recovery, /expected_claim_id/);
+  assert.match(
+    controller,
+    /payload\["phase_loop_selected_todo_sha256"\] = hashlib\.sha256\(selected\.encode\("utf-8"\)\)\.hexdigest\(\)/,
+  );
+});
+
+test('terminal evidence gaps terminalize the immutable source before any retry-cap recovery', () => {
+  const branchStart = controller.indexOf('terminal_completion_evidence_gap_source_terminalized=true');
+  const genericRetry = controller.indexOf('terminal_failure_retry_cap_zero_redelegation_required');
+  assert(branchStart >= 0 && genericRetry > branchStart, 'source-terminalization must precede generic retry-cap handling');
+
+  const sourceRecovery = controller.slice(
+    controller.indexOf('record_terminal_multitarget_replan_transition()'),
+    controller.indexOf('\nterminal_multitarget_replan_public_payload()', controller.indexOf('record_terminal_multitarget_replan_transition()')),
+  );
+  assert.match(sourceRecovery, /evidence\.get\("claim_snapshot_path"\)/);
+  assert.match(sourceRecovery, /record-trajectory[^\n]+--type "todo\.failed"/);
+  assert.match(sourceRecovery, /record-terminal-replan[^\n]+--claim "\$ledger_claim_path"/);
+
+  const terminalGapBranch = controller.slice(
+    controller.lastIndexOf('if python3 - "$PROGRESS_STATE_FILE"', branchStart),
+    genericRetry,
+  );
+  assert.match(terminalGapBranch, /write_bdk_trajectory_event[^\n]+"todo\.blocked"[^\n]+"todo\.failed"/);
+  assert.match(terminalGapBranch, /write_todo_claim[^\n]+"failed"/);
+  assert.match(terminalGapBranch, /return 76/);
+
+  const fallbackStart = controller.indexOf('if restoring_prior_claim:');
+  const fallbackEnd = controller.indexOf('\nfor path, content, suffix in (', fallbackStart);
+  assert(fallbackStart >= 0 && fallbackEnd > fallbackStart, 'fallback must restore only a validated canonical claim path');
+  const fallback = controller.slice(fallbackStart, fallbackEnd);
+  assert.match(fallback, /expected_claim_path = \(claim_root \/ "current\.json"\)\.resolve\(\)/);
+  assert.match(fallback, /resolved_claim_path != expected_claim_path/);
+  assert.match(controller, /terminal_completion_evidence_missing_without_objective_apply/);
+  assert.match(controller, /claim_missing_without_terminal_evidence_gap/);
+  assert.match(controller, /"reason":"claim_or_progress_state_missing"/);
+});
+
 test('objective-apply replay budget follows the selected TODO across replacement claims', () => {
   assert.match(controller, /objective_apply_target_scope = json\.dumps/);
   assert.match(controller, /same_objective_apply_target_scope = \(/);
