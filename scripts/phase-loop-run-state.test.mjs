@@ -286,6 +286,43 @@ test('fails closed on an unowned fresh continuation before the deadline', () => 
   assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
 });
 
+test('keeps an owned continuation live when launcher wrappers resemble supervisors', () => {
+  const { stateDir, statusPath, pidPath, ownerPath } = fixture();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    status: 'running',
+    run_id: 'continuation-wrapper-topology',
+    updated_at: '2026-10-18T01:19:59.000Z',
+    continuation_required: true,
+    controller_action: 'resume',
+    supervisor_pid: 1234,
+    supervisor_generation: 'generation-1'
+  }));
+  fs.writeFileSync(pidPath, '1234');
+  writeOwner(ownerPath);
+
+  const result = watchdogContinuationLiveness({
+    stateDir,
+    pidFile: pidPath,
+    ownerFile: ownerPath,
+    rootDir: '/repo',
+    now: '2026-10-18T01:20:01.000Z',
+    maxAgeSeconds: 900,
+    processExists: () => true,
+    getProcessCommand: () => 'bash /repo/phase-loop.sh supervise',
+    // screen and shell launchers can retain the same command-line suffix;
+    // they are not independent state owners.
+    listSupervisors: () => [1234, 2234, 3234]
+  });
+
+  assert.deepEqual(result, {
+    ok: true,
+    expired: false,
+    age_seconds: 2,
+    reason: 'continuation_within_deadline'
+  });
+  assert.equal(JSON.parse(fs.readFileSync(statusPath, 'utf8')).status, 'running');
+});
+
 test('rejects an invalid watchdog duration without expiring a continuation', () => {
   const { stateDir, statusPath } = fixture();
   fs.writeFileSync(statusPath, JSON.stringify({
