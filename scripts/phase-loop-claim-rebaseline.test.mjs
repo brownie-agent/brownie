@@ -379,11 +379,47 @@ test('restores only an audited admission-backed claim that was archived by the b
   assert.equal(fs.existsSync(archive.archivePath), true);
   const restored = JSON.parse(fs.readFileSync(f.claimPath, 'utf8'));
   assert.equal(restored.status, 'in_progress');
-  assert.equal(restored.run_stamp, '20261020T091500Z');
+  assert.equal(restored.run_stamp, '20261019T071825Z');
   assert.equal(restored.admission_backed_restore_id, result.restore_id);
   const restoreAudit = JSON.parse(fs.readFileSync(result.restore_audit_path, 'utf8'));
   assert.equal(restoreAudit.source_rebaseline_audit, path.relative(f.stateDir, archive.auditPath));
   assert.deepEqual(restoreAudit.historical_resume_admission.admitted_targets, ['scripts/roundtrip.test.mjs']);
+});
+
+test('re-isolates a restored admission-backed claim when this invocation has no fresh boundary receipt', () => {
+  const f = fixture();
+  archiveAdmissionBackedBoundaryClaim(f, '20261020T090000Z');
+  const runStamp = '20261020T091500Z';
+  const restored = restoreAdmissionBackedStaleClaim({
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp,
+  });
+  assert.equal(restored.restored, true, JSON.stringify(restored));
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp,
+    baselineRef: 'origin/main',
+  });
+  assert.equal(result.rebaselined, true, JSON.stringify(result));
+  assert.equal(result.reason, 'stale_claim_isolated_before_new_run');
+  assert.equal(fs.existsSync(f.claimPath), false);
+  const audit = JSON.parse(fs.readFileSync(result.audit_path, 'utf8'));
+  assert.equal(audit.reasons.resume_admission.valid, false);
+  assert.equal(audit.reasons.resume_admission.reason, 'not_supplied');
 });
 
 test('restored admission-backed claim survives the next exact boundary receipt through the rebaseline gate', () => {

@@ -612,7 +612,10 @@ export function restoreAdmissionBackedStaleClaim({
       delete restored[key];
     }
     restored.status = 'in_progress';
-    restored.run_stamp = runStamp;
+    // Keep the original claim run stamp until pre-claim-boundary has issued
+    // a fresh receipt for this invocation.  Treating the restored claim as
+    // current before that proof exists would let it bypass stale isolation
+    // when the boundary has nothing to admit.
     restored.updated_at = restoredAt;
     restored.admission_backed_restore_id = restoreId;
     restored.status_history = [...(Array.isArray(archived.status_history) ? archived.status_history : []), {
