@@ -1839,8 +1839,11 @@ else:
     assert progress['classification'] == 'terminal_failure', progress
 PY
 
-# A retry-cap allowance must permit the next execution to complete with a
-# fresh claim/attempt rather than colliding with the failed terminal attempt.
+# A retry-cap allowance may create a fresh claim/attempt, but an outer Runtime
+# `completed:true` without claim-bound semantic evidence must still be refused.
+# This is the regression for protocol success being mistaken for delivered
+# work: the failed first attempt remains auditable and the selected TODO stays
+# pending for a properly evidenced rework.
 state_terminal_retry_success="$(mktemp -d)"
 prompt_terminal_retry_success="$(mktemp)"
 todo_terminal_retry_success="$(mktemp)"
@@ -1900,11 +1903,11 @@ PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_success_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_REMOVE_CLAIM=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 retry_success_second_exit="$?"
 set -e
-test "$retry_success_second_exit" = "0"
-python3 - "$terminal_retry_success_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_success/todo-claims" "$todo_terminal_retry_success" <<'PY'
+test "$retry_success_second_exit" = "76"
+python3 - "$terminal_retry_success_workspace/.brownie/private/phase-loop/task-ledger.jsonl" "$state_terminal_retry_success/todo-claims" "$todo_terminal_retry_success" "$state_terminal_retry_success/status.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -1932,14 +1935,22 @@ attempts = [event for event in ledger if str(event.get('task_id', '')).startswit
 completed = [event for event in attempts if event.get('to_state') == 'completed']
 failed_claim_ids = {event.get('claim_id') for event in terminal_failure_events}
 assert terminal_failure_events, terminal_failure_events
-assert completed, attempts
-assert completed[-1]['claim_id'] not in failed_claim_ids, (completed, terminal_failure_events)
+assert not completed, attempts
 assert len({event.get('claim_id') for event in attempts if event.get('claim_id')}) >= 2, attempts
-assert '- [ ] E-retry-success:' not in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'), pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+current = json.loads((claim_dir / 'current.json').read_text(encoding='utf-8'))
+status = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding='utf-8'))
+assert current['status'] == 'integrity_blocked', current
+assert current['root_claim_id'] == current['claim_id'], current
+assert status['status'] == 'integrity_blocked', status
+assert 'delivery_state' in status['detail'], status
+assert 'semantic_evidence_' in status['detail'], status
+assert '- [ ] E-retry-success:' in pathlib.Path(sys.argv[3]).read_text(encoding='utf-8'), pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
 PY
 
 # A retryable terminal failure for a generated leaf must bypass the legacy
-# stable-ID/controller short circuit and invoke Runtime while cap remains.
+# stable-ID/controller short circuit and invoke Runtime while cap remains. A
+# later outer `completed:true` still cannot consume that leaf without semantic
+# delivery evidence and independent review.
 state_terminal_retry_leaf="$(mktemp -d)"
 prompt_terminal_retry_leaf="$(mktemp)"
 todo_terminal_retry_leaf="$(mktemp)"
@@ -1973,12 +1984,23 @@ BROWNIE_BIN="$fake_brownie_terminal_retry_then_success" \
 PHASE_LOOP_WORKSPACE_ROOT="$terminal_retry_leaf_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=1 \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
 retry_leaf_second_exit="$?"
 set -e
-test "$retry_leaf_second_exit" = "0"
+test "$retry_leaf_second_exit" = "76"
 test "$(cat "$state_terminal_retry_leaf/terminal-retry-then-success.attempt")" = "2"
-assert_not_contains "$todo_terminal_retry_leaf" '- \[ \] E-retry-leaf:'
+assert_contains "$todo_terminal_retry_leaf" '- \[ \] E-retry-leaf:'
+python3 - "$state_terminal_retry_leaf/status.json" "$state_terminal_retry_leaf/todo-claims/current.json" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+assert status['status'] == 'integrity_blocked', status
+assert claim['status'] == 'integrity_blocked', claim
+assert 'semantic_evidence_' in status['detail'], status
+PY
 
 # Invalid retry caps must fail before claim, ledger, archive, or blocked-state
 # writes, and must never invoke the runtime.
@@ -2160,7 +2182,57 @@ esac
 test "$(cat "$blocked_append_failure_state/terminal-no-eligible-count" 2>/dev/null || printf '0')" = "0"
 fi
 
+# Completion protocol: an outer Runtime success must not write a terminal
+# ledger transition, delete the TODO, or manufacture a completion state before
+# it supplies claim-bound semantic evidence and reaches independent review.
 if claim_smoke_section_enabled completion; then
+completion_integrity_state="$(mktemp -d)"
+completion_integrity_workspace="$(mktemp -d)"
+completion_integrity_prompt="$(mktemp)"
+completion_integrity_todo="$(mktemp)"
+git -C "$completion_integrity_workspace" init -b main >/dev/null
+git -C "$completion_integrity_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit --allow-empty -m init >/dev/null
+mkdir -p "$completion_integrity_workspace/scripts"
+printf 'export const completionIntegrity = true;\n' > "$completion_integrity_workspace/scripts/completion-integrity.mjs"
+git -C "$completion_integrity_workspace" add .
+git -C "$completion_integrity_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m fixture >/dev/null
+printf 'base prompt\n' > "$completion_integrity_prompt"
+printf -- '- [ ] E-completion-integrity: Patch only `scripts/completion-integrity.mjs`:\n  Route: implementation.\n  Verification: run `node --check scripts/completion-integrity.mjs`.\n' > "$completion_integrity_todo"
+set +e
+PHASE_LOOP_STATE_DIR="$completion_integrity_state" \
+PHASE_LOOP_PROMPT="$completion_integrity_prompt" \
+PHASE_LOOP_TODO="$completion_integrity_todo" \
+BROWNIE_BIN="$fake_brownie_completed" \
+PHASE_LOOP_WORKSPACE_ROOT="$completion_integrity_workspace" \
+PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+completion_integrity_exit="$?"
+set -e
+test "$completion_integrity_exit" = "76"
+python3 - "$completion_integrity_state/status.json" "$completion_integrity_state/todo-claims/current.json" "$completion_integrity_todo" "$completion_integrity_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+ledger = pathlib.Path(sys.argv[4]).read_text(encoding='utf-8')
+assert status['status'] == 'integrity_blocked', status
+assert status['exit_code'] == '76', status
+assert 'semantic_evidence_' in status['detail'], status
+assert claim['status'] == 'integrity_blocked', claim
+assert '- [ ] E-completion-integrity:' in todo, todo
+assert '"to_state":"completed"' not in ledger and '"to_state": "completed"' not in ledger, ledger
+PY
+fi
+
+# These historical tests modelled pre-review queue deletion and were therefore
+# assertions of a behavior now prohibited by the delivery contract above.
+# Keep them available only for archaeology while the new completion-integrity
+# fixture, delivery-integrity unit tests, and review-reconcile unit tests are
+# the executable contract used by CI.
+if claim_smoke_section_enabled completion && [ "${PHASE_LOOP_CLAIM_SMOKE_RETIRED_PREMERGE_COMPLETION_TESTS:-0}" = "1" ]; then
 # Completion must record the terminal ledger transition before mutating the
 # live TODO queue. An unwritable ledger keeps both queue and claim retryable.
 completion_ledger_failure_state="$(mktemp -d)"
@@ -3815,10 +3887,9 @@ assert claim["status"] == "in_progress", claim
 assert "E-08b-next" in todo, todo
 PY
 
-# A proposal applied to a product target does not make the selected queue item
-# complete. If the next resume reports zero candidates, the controller must
-# retain the TODO and route the no-execution result through terminal recovery
-# instead of inheriting the previous apply as a completion signal.
+# A deterministic decomposition is planning work, not implementation delivery.
+# The controller must retain the newly created leaf and stop with no_progress;
+# it must not invoke Runtime merely to manufacture a patch/PR/completion signal.
 state_non_todo_no_eligible="$(mktemp -d)"
 prompt_non_todo_no_eligible="$(mktemp)"
 todo_non_todo_no_eligible="$(mktemp)"
@@ -3833,51 +3904,43 @@ git -C "$workspace_non_todo_no_eligible" -c user.name=Brownie -c user.email=brow
 printf 'base prompt\n' > "$prompt_non_todo_no_eligible"
 printf -- '- [ ] E-08c-next: Preserve this implementation TODO until Runtime proves completion:\n  Route: implementation.\n  Completion condition: a current Runtime task execution proves the selected work complete.\n  Forbidden changes: do not infer completion from a prior objective proposal.\n  Verification: inspect terminal recovery evidence.\n' > "$todo_non_todo_no_eligible"
 
-PHASE_LOOP_STATE_DIR="$state_non_todo_no_eligible" \
-PHASE_LOOP_PROMPT="$prompt_non_todo_no_eligible" \
-PHASE_LOOP_TODO="$todo_non_todo_no_eligible" \
-BROWNIE_BIN="$fake_brownie_todo_md_only_apply" \
-PHASE_LOOP_TEST_OBJECTIVE_APPLY_PATH="phase-loop-smoke-non-todo.txt" \
-PHASE_LOOP_WORKSPACE_ROOT="$workspace_non_todo_no_eligible" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
-
+non_todo_no_eligible_exit=0
 PHASE_LOOP_STATE_DIR="$state_non_todo_no_eligible" \
 PHASE_LOOP_PROMPT="$prompt_non_todo_no_eligible" \
 PHASE_LOOP_TODO="$todo_non_todo_no_eligible" \
 BROWNIE_BIN="$fake_brownie_no_actionable" \
 PHASE_LOOP_WORKSPACE_ROOT="$workspace_non_todo_no_eligible" \
 PHASE_LOOP_TERMINAL_FAILURE_RETRY_CAP=0 \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || non_todo_no_eligible_exit="$?"
+test "$non_todo_no_eligible_exit" = "76"
 
-python3 - "$state_non_todo_no_eligible/status.json" "$state_non_todo_no_eligible/todo-claims/current.json" "$state_non_todo_no_eligible/todo-claims/blocked.jsonl" "$todo_non_todo_no_eligible" "$state_non_todo_no_eligible/bdk-harness-feedback.json" "$state_non_todo_no_eligible/trajectories" <<'PY'
+python3 - "$state_non_todo_no_eligible/status.json" "$state_non_todo_no_eligible/todo-claims" "$todo_non_todo_no_eligible" "$state_non_todo_no_eligible/trajectories" <<'PY'
 import json
 import pathlib
 import sys
 
 status = json.load(open(sys.argv[1], encoding="utf-8"))
-claim = json.load(open(sys.argv[2], encoding="utf-8"))
-blocked = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
-todo = open(sys.argv[4], encoding="utf-8").read()
-feedback = json.load(open(sys.argv[5], encoding="utf-8"))
+claim_dir = pathlib.Path(sys.argv[2])
+archives = sorted(claim_dir.glob("replanned-deterministic-decomposition-*.json"))
+assert archives, list(claim_dir.iterdir())
+claim = json.loads(archives[-1].read_text(encoding="utf-8"))
+todo = open(sys.argv[3], encoding="utf-8").read()
 events = []
-for trajectory_path in pathlib.Path(sys.argv[6]).glob("*.jsonl"):
+for trajectory_path in pathlib.Path(sys.argv[4]).glob("*.jsonl"):
     for line in trajectory_path.read_text(encoding="utf-8").splitlines():
         record = json.loads(line)
         if record.get("claim_id") == claim["claim_id"]:
             events.extend(record.get("events", []))
 types = [event["type"] for event in events]
-assert status["status"] == "blocked_todo_recorded", status
-assert status["exit_code"] == "0", status
-assert claim["status"] == "blocked", claim
-assert claim["selected_todo"].startswith("- [ ] E-08c-next-blocker:"), claim
-assert "E-08c-next-blocker" in blocked, blocked
+assert status["status"] == "no_progress", status
+assert status["exit_code"] == "76", status
+assert "replanned, not completed" in status["detail"], status
+assert claim["status"] == "replanned", claim
+assert claim["selected_todo"].startswith("- [ ] TODO-decompose-broad-todo-"), claim
 assert "- [ ] E-08c-next-blocker:" in todo, todo
 assert "Source TODO: E-08c-next." in todo, todo
 assert "- [ ] E-08c-next:" not in todo, todo
-assert feedback["ok"] is True, feedback
-assert feedback["terminal_event_count"] == 1, feedback
-assert types == ["todo.claimed", "workflow.routed", "skill.selected", "todo.blocked"], types
-assert events[-1]["payload"]["owner_blocked"] is True, events[-1]
+assert types[-1] == "todo.replanned", types
 assert "todo.completed" not in types, types
 PY
 
@@ -3915,7 +3978,64 @@ PY
 test_workspace="$queue_original_workspace"
 fi
 
+# PR publication protocol: a nonterminal Runtime result may have touched the
+# workspace, but it must never be committed or opened as a delivery PR. The
+# integrity refusal must survive its caller rather than being recast as a
+# generic PR error.
 if claim_smoke_section_enabled pr; then
+pr_integrity_state="$(mktemp -d)"
+pr_integrity_prompt="$(mktemp)"
+pr_integrity_todo="$(mktemp)"
+pr_integrity_workspace="$(mktemp -d)"
+pr_integrity_remote="$(mktemp -d)"
+git -C "$pr_integrity_workspace" init -b main >/dev/null
+mkdir -p "$pr_integrity_workspace/scripts"
+cp "$REPO_ROOT/scripts/phase-loop-pr-actor-guard.mjs" "$pr_integrity_workspace/scripts/phase-loop-pr-actor-guard.mjs"
+printf 'base\n' > "$pr_integrity_workspace/README.md"
+git -C "$pr_integrity_workspace" add .
+git -C "$pr_integrity_workspace" -c user.name=Brownie -c user.email=brownie@example.invalid commit -m init >/dev/null
+git -C "$pr_integrity_remote" init --bare >/dev/null
+git -C "$pr_integrity_workspace" remote add origin "$pr_integrity_remote"
+git -C "$pr_integrity_workspace" push -u origin main >/dev/null
+git -C "$pr_integrity_workspace" switch -c "${PHASE_LOOP_TEST_IMPLEMENTATION_BRANCH_PREFIX}smoke-pr-integrity" >/dev/null
+phase_loop_prepare_pr_fixture_workspace "$pr_integrity_workspace" "$pr_integrity_remote"
+printf 'base prompt\n' > "$pr_integrity_prompt"
+printf -- '- [ ] B-pr-integrity: Patch only `README.md` without terminal evidence.\n  Route: implementation.\n  Completion condition: a semantic evidence contract is supplied for the README change.\n  Verification: run `node --check scripts/phase-loop-pr-actor-guard.mjs`.\n' > "$pr_integrity_todo"
+set +e
+PHASE_LOOP_STATE_DIR="$pr_integrity_state" \
+PHASE_LOOP_PROMPT="$pr_integrity_prompt" \
+PHASE_LOOP_TODO="$pr_integrity_todo" \
+PHASE_LOOP_WORKSPACE_ROOT="$pr_integrity_workspace" \
+PHASE_LOOP_CREATE_PR_AFTER_PROGRESS=1 \
+BROWNIE_BIN="$fake_brownie_tracked_workspace_change" \
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+pr_integrity_exit="$?"
+set -e
+test "$pr_integrity_exit" = "76"
+python3 - "$pr_integrity_state/status.json" "$pr_integrity_state/todo-claims/current.json" "$pr_integrity_todo" "$pr_integrity_workspace" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')
+workspace = sys.argv[4]
+assert status['status'] == 'integrity_blocked', status
+assert status['exit_code'] == '76', status
+assert claim['status'] == 'integrity_blocked', claim
+assert 'run_not_completed' in status['detail'], status
+assert '- [ ] B-pr-integrity:' in todo, todo
+assert subprocess.check_output(['git', '-C', workspace, 'log', '-1', '--format=%s'], text=True).strip() == 'fixture actor policy baseline'
+assert 'README.md' in subprocess.check_output(['git', '-C', workspace, 'status', '--porcelain'], text=True)
+PY
+fi
+
+# The remainder is an archived pre-integrity publication fixture. It asserted
+# that nonterminal progress and pre-merge completion could create/finish a
+# PR, which is deliberately no longer an executable behavior.
+if claim_smoke_section_enabled pr && [ "${PHASE_LOOP_CLAIM_SMOKE_RETIRED_PREMERGE_PR_TESTS:-0}" = "1" ]; then
 # Keep the pre-claim delivery boundary independently covered: a separated
 # controller-root fixture with only dirty scripts and no implementable TODO
 # must be rejected, while the same fixture becomes admissible once an
@@ -4690,12 +4810,14 @@ cat > "$todo_exact_fast_path" <<'EOF'
   any other line.
 EOF
 
+exact_fast_path_exit=0
 PHASE_LOOP_STATE_DIR="$state_exact_fast_path" \
 PHASE_LOOP_PROMPT="$prompt_exact_fast_path" \
 PHASE_LOOP_TODO="$todo_exact_fast_path" \
 BROWNIE_BIN="$fake_brownie_should_not_run" \
 PHASE_LOOP_WORKSPACE_ROOT="$exact_workspace" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || exact_fast_path_exit="$?"
+test "$exact_fast_path_exit" = "76"
 
 python3 - "$state_exact_fast_path/status.json" "$state_exact_fast_path/todo-claims/current.json" "$todo_exact_fast_path" "$exact_workspace/docs/golden.js" <<'PY'
 import json
@@ -4706,10 +4828,10 @@ status = json.load(open(sys.argv[1], encoding="utf-8"))
 claim = json.load(open(sys.argv[2], encoding="utf-8"))
 todo = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 target = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
-assert status["status"] == "last_run_succeeded", status
-assert "deterministic exact-line TODO fast path" in status["detail"], status
-assert claim["status"] == "completed", claim
-assert "E-exact" not in todo, todo
+assert status["status"] == "integrity_blocked", status
+assert "independent review approval, required CI, and merge" in status["detail"], status
+assert claim["status"] == "integrity_blocked", claim
+assert "E-exact" in todo, todo
 assert "  fixture_path: fixtureRoot,\n  lifecycle_evidence: lifecycleEvidence,\n  commands," in target, target
 PY
 
@@ -4773,6 +4895,7 @@ cat > "$tree_equivalent_liveness_todo" <<'EOF'
   any other line.
 EOF
 
+tree_equivalent_liveness_exit=0
 (
   export PHASE_LOOP_APPROVED_CONTROLLER_BASELINE=origin/main
   export PHASE_LOOP_STATE_DIR="$tree_equivalent_liveness_state"
@@ -4780,8 +4903,9 @@ EOF
   export PHASE_LOOP_TODO="$tree_equivalent_liveness_todo"
   export BROWNIE_BIN="$fake_brownie_should_not_run"
   export PHASE_LOOP_WORKSPACE_ROOT="$tree_equivalent_liveness_workspace"
-  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
-)
+  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null
+) || tree_equivalent_liveness_exit="$?"
+test "$tree_equivalent_liveness_exit" = "76"
 
 if git -C "$tree_equivalent_liveness_workspace" diff --quiet -- docs/golden.js; then
   echo "tree-equivalent rebaseline liveness did not produce the selected TODO diff" >&2
@@ -4797,9 +4921,10 @@ claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 audits = sorted(pathlib.Path(sys.argv[3]).glob("*.json"))
 todo = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
 target = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
-assert status["status"] == "last_run_succeeded", status
-assert claim["status"] == "completed", claim
-assert "E-tree-equivalent-liveness" not in todo, todo
+assert status["status"] == "integrity_blocked", status
+assert "independent review approval, required CI, and merge" in status["detail"], status
+assert claim["status"] == "integrity_blocked", claim
+assert "E-tree-equivalent-liveness" in todo, todo
 assert "  fixture_path: fixtureRoot,\n  lifecycle_evidence: lifecycleEvidence,\n  commands," in target, target
 assert len(audits) == 1, audits
 audit = json.loads(audits[0].read_text(encoding="utf-8"))
@@ -4855,15 +4980,13 @@ exit 99
 SH
 chmod +x "$fake_brownie_empty_queue_cleanup_must_not_run"
 
-set +e
+empty_queue_guard_exit=0
 PHASE_LOOP_STATE_DIR="$state_empty_queue_guard" \
 PHASE_LOOP_PROMPT="$prompt_empty_queue_guard" \
 PHASE_LOOP_TODO="$todo_empty_queue_guard" \
 BROWNIE_BIN="$fake_brownie_should_not_run" \
 PHASE_LOOP_WORKSPACE_ROOT="$empty_queue_guard_workspace" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
-empty_queue_guard_exit="$?"
-set -e
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || empty_queue_guard_exit="$?"
 test "$empty_queue_guard_exit" = "76"
 
 python3 - "$state_empty_queue_guard/todo-claims/current.json" "$todo_empty_queue_guard" "$state_empty_queue_guard/logs/supervisor.log" "$empty_queue_guard_workspace/docs/golden.js" <<'PY'
@@ -4875,11 +4998,10 @@ claim = json.load(open(sys.argv[1], encoding="utf-8"))
 todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 supervisor_log = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 target = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
-assert claim["status"] == "completed", claim
-assert claim["completion_cleanup_pending"] is True, claim
+assert claim["status"] == "integrity_blocked", claim
+assert claim.get("completion_cleanup_pending") is not True, claim
 assert "E-empty-queue-exact" in todo, todo
-assert "completed_todo_removal_reverted=true" in supervisor_log, supervisor_log
-assert "Empty or non-executable TODO queue" in supervisor_log, supervisor_log
+assert "completion_promotion_refused=true" in supervisor_log, supervisor_log
 assert "  fixture_path: fixtureRoot,\n  lifecycle_evidence: lifecycleEvidence,\n  commands," in target, target
 PY
 
@@ -4899,10 +5021,14 @@ events = [
 ]
 source_attempt = [event for event in events if event.get("task_id") == f"E-empty-queue-exact@{claim_id}"]
 assert source_attempt, events
-assert source_attempt[-1]["to_state"] == "completed", source_attempt
-assert all(event["to_state"] in ("queued", "claimed", "running", "completed") for event in source_attempt), source_attempt
+assert source_attempt[-1]["to_state"] != "completed", source_attempt
+assert all(event["to_state"] in ("queued", "claimed", "running") for event in source_attempt), source_attempt
 PY
 
+# Historical cleanup behavior below documents the unsafe pre-merge completion
+# path.  It remains opt-in only for archaeology: a blocked claim cannot enter
+# cleanup or remove the selected TODO until independent review, CI, and merge.
+if [ "${PHASE_LOOP_CLAIM_SMOKE_RETIRED_PREMERGE_COMPLETION_TESTS:-0}" = "1" ]; then
 # Once the decomposition guard condition is repaired, the next invocation must
 # retry only queue cleanup. It must not restart Runtime for the completed
 # source claim, and it must clear the cleanup marker after successful removal.
@@ -4932,6 +5058,7 @@ assert claim["completion_cleanup_pending"] is False, claim
 assert "E-empty-queue-exact" not in todo, todo
 assert "completed_todo_cleanup_retry_succeeded=true" in supervisor_log, supervisor_log
 PY
+fi
 
 verified_noop_e19_workspace="$(mktemp -d)"
 git -C "$verified_noop_e19_workspace" init -b main >/dev/null
@@ -4978,13 +5105,15 @@ exit 91
 SH
 chmod +x "$fake_verified_noop_bin_dir/pnpm"
 
+verified_noop_e19_exit=0
 PATH="$fake_verified_noop_bin_dir:$PATH" \
 PHASE_LOOP_STATE_DIR="$state_verified_noop_e19" \
 PHASE_LOOP_PROMPT="$prompt_verified_noop_e19" \
 PHASE_LOOP_TODO="$verified_noop_e19_workspace/.brownie/todo.md" \
 BROWNIE_BIN="$fake_brownie_should_not_run" \
 PHASE_LOOP_WORKSPACE_ROOT="$verified_noop_e19_workspace" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || verified_noop_e19_exit="$?"
+test "$verified_noop_e19_exit" = "76"
 
 python3 - "$state_verified_noop_e19/status.json" "$state_verified_noop_e19/todo-claims/current.json" "$verified_noop_e19_workspace/.brownie/todo.md" <<'PY'
 import json
@@ -4994,11 +5123,10 @@ import sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 claim = json.load(open(sys.argv[2], encoding="utf-8"))
 todo = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
-assert status["status"] == "last_run_succeeded", status
-assert "Selected bounded TODO verification already passed" in status["detail"], status
-assert "semantic_wiring_already_present_without_verification_commands" in status["detail"], status
-assert claim["status"] == "completed", claim
-assert "E-19a-prevent-empty-queue-completion" not in todo, todo
+assert status["status"] == "no_progress", status
+assert "semantic_noop_verification_failed" in status["detail"], status
+assert claim["status"] != "completed", claim
+assert "E-19a-prevent-empty-queue-completion" in todo, todo
 assert "E-19b-refresh-owner-governance-evidence-after-stable-ci" in todo, todo
 assert "E-19c-queue-cleanup-follow-up" in todo, todo
 PY
@@ -5078,13 +5206,15 @@ cat > "$release_ops_workspace/.brownie/todo.md" <<'EOF'
   Verification: inspect latest main CI completion and fail-closed owner governance evidence, then keep the blocker if release readiness remains unavailable.
 EOF
 
+release_ops_exit=0
 PATH="$fake_verified_noop_bin_dir:$PATH" \
 PHASE_LOOP_STATE_DIR="$release_ops_state" \
 PHASE_LOOP_PROMPT="$release_ops_prompt" \
 PHASE_LOOP_TODO="$release_ops_workspace/.brownie/todo.md" \
 BROWNIE_BIN="$fake_brownie_should_not_run" \
 PHASE_LOOP_WORKSPACE_ROOT="$release_ops_workspace" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || release_ops_exit="$?"
+test "$release_ops_exit" = "76"
 
 python3 - "$release_ops_state/status.json" "$release_ops_state/todo-claims/current.json" "$release_ops_workspace/.brownie/todo.md" <<'PY'
 import json
@@ -5094,12 +5224,10 @@ import sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 claim = json.load(open(sys.argv[2], encoding="utf-8"))
 todo = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
-assert status["status"] == "last_run_succeeded", status
-assert "release-ops evidence refresh" in status["detail"], status
-assert claim["status"] == "completed", claim
-assert "E-release-ops-refresh-remaining-blocker" in todo, todo
-assert "Patch only `.brownie/release-evidence/owner-governance-evidence.json`" not in todo, todo
-assert "Verification: blocker:" in todo, todo
+assert status["status"] == "integrity_blocked", status
+assert "independent review approval, required CI, and merge" in status["detail"], status
+assert claim["status"] == "integrity_blocked", claim
+assert "E-release-ops-refresh" in todo, todo
 PY
 
 broad_decomposition_state="$(mktemp -d)"
@@ -5134,6 +5262,7 @@ printf '%s\n' '{"ok":true}'
 SH
 chmod +x "$fake_brownie_broad_decomposition"
 
+broad_decomposition_exit=0
 PHASE_LOOP_STATE_DIR="$broad_decomposition_state" \
 PHASE_LOOP_PROMPT="$broad_decomposition_prompt" \
 PHASE_LOOP_TODO="$broad_decomposition_todo" \
@@ -5141,7 +5270,8 @@ PHASE_LOOP_TODO_BREAKDOWN="$broad_decomposition_breakdown" \
 PHASE_LOOP_WORKSPACE_ROOT="$broad_decomposition_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 BROWNIE_BIN="$fake_brownie_broad_decomposition" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null || true
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || broad_decomposition_exit="$?"
+test "$broad_decomposition_exit" = "76"
 
 python3 - "$broad_decomposition_state/status.json" "$broad_decomposition_todo" "$broad_decomposition_breakdown" "$broad_decomposition_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
@@ -5152,14 +5282,15 @@ status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 breakdown = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 ledger = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
-assert status["status"] == "last_run_succeeded", status
-assert "Applied deterministic TODO decomposition repair" in status["detail"], status
+assert status["status"] == "no_progress", status
+assert "replanned, not completed" in status["detail"], status
 assert "E-99-runtime-release-evidence-blocker" in todo, todo
 assert "E-99-runtime-release-evidence" in todo, todo
 assert "## TODO-decompose-broad-todo-" in breakdown, breakdown
 assert "E-99-runtime-release-evidence" in breakdown, breakdown
 assert "TODO-decompose-broad-todo-" in ledger, ledger
-assert '"to_state":"completed"' in ledger or '"to_state": "completed"' in ledger, ledger
+assert '"trajectory_type":"todo.completed"' not in ledger, ledger
+assert '"trajectory_type": "todo.completed"' not in ledger, ledger
 PY
 
 no_eligible_split_state="$(mktemp -d)"
@@ -5235,6 +5366,7 @@ cp -R "$no_eligible_split_workspace/." "$terminal_write_unrelated_workspace/"
 printf 'base prompt\n' > "$terminal_write_unrelated_prompt"
 
 set +e
+no_eligible_split_liveness_exit=0
 PHASE_LOOP_STATE_DIR="$no_eligible_split_state" \
 PHASE_LOOP_PROMPT="$no_eligible_split_prompt" \
 PHASE_LOOP_TODO="$no_eligible_split_workspace/.brownie/todo.md" \
@@ -5363,7 +5495,8 @@ PHASE_LOOP_WORKSPACE_ROOT="$no_eligible_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_MUTATE_TARGET=1 \
 BROWNIE_BIN="$fake_brownie_completed" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || no_eligible_split_liveness_exit="$?"
+test "$no_eligible_split_liveness_exit" = "76"
 
 python3 - "$no_eligible_split_state/status.json" "$no_eligible_split_workspace/.brownie/todo.md" "$no_eligible_split_workspace/docs/a.md" "$no_eligible_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
 import json
@@ -5375,10 +5508,12 @@ status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 target = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 ledger = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
-assert status["status"] in {"last_run_succeeded", "pr_created"}, status
+assert status["status"] == "integrity_blocked", status
+assert "semantic_evidence" in status["detail"], status
 assert "phaseLoopCompletionFixtureCompleted" in target, target
-assert not re.search(r"^- \[ \] E-20g-final-judgment-sync-target-01:", todo, re.M), todo
-assert '"to_state":"completed"' in ledger or '"to_state": "completed"' in ledger, ledger
+assert re.search(r"^- \[ \] E-20g-final-judgment-sync-target-01:", todo, re.M), todo
+assert '"trajectory_type":"todo.completed"' not in ledger, ledger
+assert '"trajectory_type": "todo.completed"' not in ledger, ledger
 PY
 else
 assert_terminal_failure_claim_archived \
@@ -5415,6 +5550,7 @@ fi
 # selected multi-target task ended without any valid workspace.write proposal.
 # The next controller run must perform exactly one audited replan, then the
 # first child must be capable of producing a real target diff.
+terminal_write_split_liveness_exit=0
 PHASE_LOOP_STATE_DIR="$terminal_write_split_state" \
 PHASE_LOOP_PROMPT="$terminal_write_split_prompt" \
 PHASE_LOOP_TODO="$terminal_write_split_workspace/.brownie/todo.md" \
@@ -5547,17 +5683,25 @@ PHASE_LOOP_WORKSPACE_ROOT="$terminal_write_split_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_MUTATE_TARGET=1 \
 BROWNIE_BIN="$fake_brownie_completed" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || terminal_write_split_liveness_exit="$?"
+test "$terminal_write_split_liveness_exit" = "76"
 
-python3 - "$terminal_write_split_workspace/.brownie/todo.md" "$terminal_write_split_workspace/docs/a.md" <<'PY'
+python3 - "$terminal_write_split_state/status.json" "$terminal_write_split_workspace/.brownie/todo.md" "$terminal_write_split_workspace/docs/a.md" "$terminal_write_split_workspace/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+import json
 import pathlib
 import re
 import sys
 
-todo = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-target = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+status = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+target = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+ledger = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
+assert status["status"] == "integrity_blocked", status
+assert "semantic_evidence" in status["detail"], status
 assert "phaseLoopCompletionFixtureCompleted" in target, target
-assert not re.search(r"^- \[ \] E-20g-final-judgment-sync-target-01:", todo, re.M), todo
+assert re.search(r"^- \[ \] E-20g-final-judgment-sync-target-01:", todo, re.M), todo
+assert '"trajectory_type":"todo.completed"' not in ledger, ledger
+assert '"trajectory_type": "todo.completed"' not in ledger, ledger
 PY
 
 # Negative regression: a differently worded terminal Runtime failure is not
@@ -6034,7 +6178,8 @@ PHASE_LOOP_WORKSPACE_ROOT="$repair_feedback_workspace" \
 PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
 PHASE_LOOP_TEST_ARGV_FILE="$contract_replan_feedback_argv" \
 BROWNIE_BIN="$fake_brownie_repair_feedback" \
-run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" --expected-exit 76 "$PHASE_LOOP" run-once >/dev/null || contract_replan_feedback_exit="$?"
+test "${contract_replan_feedback_exit:-0}" = "76"
 
 contract_replan_feedback_prompt_file="$(find "$contract_replan_feedback_state/runs" -name '*.prompt.md' -print | sort | tail -n 1)"
 # A workspace-side ledger must not be accepted as a completion receipt for an
