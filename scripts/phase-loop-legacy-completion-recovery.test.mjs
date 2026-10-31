@@ -286,6 +286,190 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
   assert.equal(repairAudit.reason, 'legacy_review_rework_claim_had_no_fresh_dispatch_marker');
 });
 
+test('idempotent recovery reclaims a terminal claim that displaced its review-rework root without duplicating the target', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  writeJson(currentPath, {
+    claim_id: 'later-terminal-claim',
+    root_claim_id: 'later-terminal-claim',
+    status: 'integrity_blocked',
+    selected_todo: target,
+    queue_generation: 2,
+    failure_evidence: { reason: 'terminal_completion_evidence_missing' },
+    status_history: [{
+      status: 'integrity_blocked',
+      updated_at: '2026-10-31T00:00:30.000Z'
+    }]
+  });
+
+  const restored = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:01:00.000Z'
+  });
+  assert.equal(restored.recovered, true, JSON.stringify(restored));
+  assert.equal(restored.idempotent_recovery, true);
+  assert.equal(restored.idempotent_displacement, true);
+  const archived = JSON.parse(fs.readFileSync(path.join(value.root, restored.displaced_claim_archive_path), 'utf8'));
+  assert.equal(archived.claim_id, 'later-terminal-claim');
+  assert.equal(archived.status, 'integrity_blocked');
+  const current = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  assert.equal(current.claim_id, 'legacy-claim');
+  assert.equal(current.root_claim_id, 'legacy-claim');
+  assert.equal(current.review_rework_fresh_dispatch_pending, true);
+  const todo = fs.readFileSync(path.join(value.root, '.brownie/todo.md'), 'utf8');
+  assert.equal((todo.match(/E-target:/gu) ?? []).length, 1);
+});
+
+test('idempotent recovery refuses to replace a running foreign claim', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  writeJson(currentPath, {
+    claim_id: 'active-foreign-claim',
+    root_claim_id: 'active-foreign-claim',
+    status: 'running',
+    selected_todo: target
+  });
+  assert.throws(() => recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
+  }), /active_claim_must_be_preserved_before_legacy_recovery/);
+  assert.equal(JSON.parse(fs.readFileSync(currentPath, 'utf8')).claim_id, 'active-foreign-claim');
+});
+
+test('idempotent recovery preserves claims awaiting review reconciliation', () => {
+  for (const status of ['pr_pending_review', 'changes_requested']) {
+    const value = fixture();
+    const first = recoverLegacyRejectedCompletion({
+      repoRoot: value.root,
+      statePath: value.state,
+      completionPath: value.completion,
+      snapshotPath: value.snapshot,
+      reviewReceiptPath: value.review,
+      actorDeployment: value.actorDeployment
+    });
+    const currentPath = path.join(value.root, first.current_claim_path);
+    const reviewClaim = {
+      claim_id: 'review-pending-claim',
+      root_claim_id: 'review-pending-claim',
+      status,
+      selected_todo: target,
+      delivery_review: {
+        pr_url: 'https://github.com/globalpocket/brownie/pull/999',
+        semantic_completion_evidence: { claim_id: 'review-pending-claim' }
+      }
+    };
+    writeJson(currentPath, reviewClaim);
+    assert.throws(() => recoverLegacyRejectedCompletion({
+      repoRoot: value.root,
+      statePath: value.state,
+      completionPath: value.completion,
+      snapshotPath: value.snapshot,
+      reviewReceiptPath: value.review,
+      actorDeployment: value.actorDeployment
+    }), /review_pending_claim_must_be_preserved_before_legacy_recovery/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, 'utf8')), reviewClaim, status);
+  }
+});
+
+test('idempotent recovery refuses an unproven terminal claim with merged delivery evidence', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const completedClaim = {
+    claim_id: 'completed-delivery-claim',
+    root_claim_id: 'completed-delivery-claim',
+    status: 'completed',
+    selected_todo: target,
+    delivery_review: {
+      pr_url: 'https://github.com/globalpocket/brownie/pull/1000',
+      approved: true,
+      ci_passed: true,
+      merged: true
+    },
+    status_history: [{
+      status: 'completed',
+      updated_at: '2026-10-31T00:01:00.000Z'
+    }]
+  };
+  writeJson(currentPath, completedClaim);
+  assert.throws(() => recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
+  }), /idempotent_recovery_requires_proven_terminal_displacement/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, 'utf8')), completedClaim);
+});
+
+test('idempotent recovery completes an audited initial recovery interrupted after invalidation', () => {
+  const value = fixture();
+  const todoPath = path.join(value.root, '.brownie/todo.md');
+  const currentPath = path.join(value.root, `${value.state}/todo-claims/current.json`);
+  const todoBefore = fs.readFileSync(todoPath, 'utf8');
+  const claimBefore = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  fs.rmSync(path.join(value.root, first.audit_path));
+  writeJson(currentPath, claimBefore);
+  fs.writeFileSync(todoPath, todoBefore);
+
+  const retry = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:01:00.000Z'
+  });
+  assert.equal(retry.recovered, true, JSON.stringify(retry));
+  assert.equal(retry.idempotent_recovery, true);
+  assert.equal(retry.idempotent_partial_initial_recovery, true);
+  assert.equal(JSON.parse(fs.readFileSync(currentPath, 'utf8')).claim_id, 'legacy-claim');
+});
+
 test('recovery fails closed when the review receipt is not a same-head changes-requested decision', () => {
   const value = fixture();
   const receipt = JSON.parse(fs.readFileSync(path.join(value.root, value.review), 'utf8'));
