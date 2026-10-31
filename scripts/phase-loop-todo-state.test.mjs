@@ -3,7 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { readTrackedBreakdownReplanRecords, resolveTodoState } from './phase-loop-todo-state.mjs';
+import {
+  durableCompletionRecordReceipt,
+  readTodoCompletionRecords,
+  readTrackedBreakdownReplanRecords,
+  resolveTodoState
+} from './phase-loop-todo-state.mjs';
 
 const parent = `- [x] E-parent: Parent split anchor:
   Route: implementation.
@@ -98,6 +103,65 @@ test('an invalidation retracts a false completion when it is the only receipt', 
 
   assert(!state.completedIds.has('E-child-1'));
   assert.equal(state.invalidatedCompletionRecords.length, 1);
+});
+
+test('an absent dependency backed only by a legacy completion record remains identifiable for recovery', () => {
+  const state = resolveTodoState({
+    todoText: `- [ ] E-dependent: blocked by historical prerequisite.
+  Depends on: E-erased.
+`,
+    completionRecords: [{
+      schema_version: 1,
+      claim_id: 'legacy-claim',
+      selected_todo_id: 'E-erased'
+    }]
+  });
+
+  assert(state.completedIds.has('E-erased'));
+  assert(state.unverifiedArchivedCompletionIds.has('E-erased'));
+  assert.equal(state.unverifiedCompletionRecords[0]?.reason, 'legacy_completion_record_without_delivery_receipt');
+});
+
+test('a schema-v2 completion requires an internally consistent durable review receipt', () => {
+  const record = {
+    schema_version: 2,
+    claim_id: 'claim-verified',
+    root_claim_id: 'claim-verified',
+    selected_todo_id: 'E-verified',
+    selected_todo_sha256: 'a'.repeat(64),
+    delivery_receipt: {
+      schema_version: 1,
+      claim_id: 'claim-verified',
+      root_claim_id: 'claim-verified',
+      selected_todo_sha256: 'a'.repeat(64),
+      author: 'brownie-agent',
+      reviewer: 'globalpocket',
+      merge_actor: 'globalpocket',
+      approved: true,
+      ci_passed: true,
+      merged: true,
+      semantic_completion_evidence: {
+        schema_version: 1,
+        root_claim_id: 'claim-verified',
+        selected_todo_sha256: 'a'.repeat(64),
+        completion_condition_sha256: 'b'.repeat(64),
+        verification_results: [{ command: 'node --test fixture.mjs', exit_code: 0 }],
+        observables: [{ kind: 'fixture', sha256: 'c'.repeat(64) }]
+      }
+    }
+  };
+  assert.equal(durableCompletionRecordReceipt(record).valid, true);
+  assert.equal(durableCompletionRecordReceipt({ ...record, delivery_receipt: { ...record.delivery_receipt, merged: false } }).valid, false);
+});
+
+test('claim-id and run-stamp aliases do not duplicate one logical completion receipt', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-todo-completion-alias-'));
+  const directory = path.join(repoRoot, '.brownie/private/phase-loop/todo-completions');
+  fs.mkdirSync(directory, { recursive: true });
+  const record = { schema_version: 1, claim_id: 'claim-alias', selected_todo_id: 'E-alias' };
+  fs.writeFileSync(path.join(directory, 'claim-alias.json'), JSON.stringify(record));
+  fs.writeFileSync(path.join(directory, 'run-stamp.json'), JSON.stringify(record));
+  assert.equal(readTodoCompletionRecords(repoRoot).length, 1);
 });
 
 test('a generated child cannot belong to multiple superseded parents', () => {

@@ -149,6 +149,36 @@ export function validateSemanticCompletionEvidence({ claim, evidence }) {
 }
 
 /**
+ * Completion is a durable delivery assertion, not a shorthand for a green
+ * process, a pushed patch, or a CI result.  Keep the review/merge receipt in
+ * one reusable validator so the current claim and the durable completion
+ * record cannot drift into different definitions of "done".
+ */
+export function validateTerminalDeliveryReceipt({ claim, review = undefined }) {
+  const deliveryClaim = asObject(claim);
+  const reviewState = asObject(review === undefined ? deliveryClaim.delivery_review : review);
+  const errors = [];
+  if (deliveryClaim.status !== 'completed') errors.push('completion_claim_not_completed');
+  if (reviewState.merged !== true) errors.push('completed_requires_merged_pr');
+  if (reviewState.approved !== true) errors.push('completed_requires_independent_approval');
+  if (reviewState.ci_passed !== true) errors.push('completed_requires_passing_ci');
+  if (typeof reviewState.author !== 'string' || !reviewState.author) errors.push('completed_requires_implementation_author');
+  if (typeof reviewState.reviewer !== 'string' || !reviewState.reviewer) errors.push('completed_requires_independent_reviewer');
+  if (reviewState.author === reviewState.reviewer) errors.push('completed_requires_distinct_reviewer');
+  if (typeof reviewState.merge_actor !== 'string' || reviewState.merge_actor !== reviewState.reviewer) {
+    errors.push('completed_requires_observed_reviewer_merge_actor');
+  }
+  const semanticEvidence = validateSemanticCompletionEvidence({
+    claim: deliveryClaim,
+    evidence: reviewState.semantic_completion_evidence
+  });
+  if (!semanticEvidence.valid) {
+    errors.push(...semanticEvidence.errors.map((error) => `completed_requires_${error}`));
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+/**
  * Evaluate only what can be safely inferred from a run.  "allowed" here
  * means an implementation can be handed to review, never that the TODO is
  * done.  Final completion needs a merged, independently approved PR.
@@ -216,16 +246,8 @@ export function validateClaimLifecycleTransition({ previous, next, review = {} }
   if (rootClaimId(before) && rootClaimId(after) && rootClaimId(before) !== rootClaimId(after)) errors.push('root_claim_id_changed');
   if (before.selected_todo && after.selected_todo && selectedTodoSha256(before) !== selectedTodoSha256(after)) errors.push('selected_todo_fingerprint_changed');
   if (after.status === 'completed') {
-    const reviewState = asObject(review);
-    if (reviewState.merged !== true) errors.push('completed_requires_merged_pr');
-    if (reviewState.approved !== true) errors.push('completed_requires_independent_approval');
-    if (reviewState.ci_passed !== true) errors.push('completed_requires_passing_ci');
-    if (typeof reviewState.author !== 'string' || !reviewState.author) errors.push('completed_requires_implementation_author');
-    if (typeof reviewState.reviewer !== 'string' || !reviewState.reviewer) errors.push('completed_requires_independent_reviewer');
-    if (reviewState.author === reviewState.reviewer) errors.push('completed_requires_distinct_reviewer');
-    if (typeof reviewState.merge_actor !== 'string' || reviewState.merge_actor !== reviewState.reviewer) errors.push('completed_requires_observed_reviewer_merge_actor');
-    const semanticEvidence = validateSemanticCompletionEvidence({ claim: after, evidence: reviewState.semantic_completion_evidence });
-    if (!semanticEvidence.valid) errors.push(...semanticEvidence.errors.map((error) => `completed_requires_${error}`));
+    const terminalReceipt = validateTerminalDeliveryReceipt({ claim: after, review });
+    errors.push(...terminalReceipt.errors.filter((error) => error !== 'completion_claim_not_completed'));
   }
   if (after.status === 'pr_pending_review' && asObject(review).handoff_allowed !== true) {
     errors.push('pr_pending_review_requires_delivery_handoff');

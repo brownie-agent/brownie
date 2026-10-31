@@ -3,8 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { validatePhaseLoopProgressIntegrity } from './phase-loop-progress-integrity.mjs';
+import {
+  durableDeliveryReceiptForClaim,
+  validatePhaseLoopProgressIntegrity
+} from './phase-loop-progress-integrity.mjs';
 
 const e20a = `- [ ] E-20a-golden-journey-workspace-mutation: Patch only \`scripts/release-runtime-operational-evidence.mjs\` and \`scripts/guard-runtime-operational-evidence.test.mjs\`: make Golden Journey require mutation.
   Route: implementation.
@@ -37,6 +41,35 @@ const e20gLeaf = `- [ ] E-20g-final-judgment-sync-target-01: Patch only \`docs/a
 
 function queue(...blocks) {
   return `# Brownie TODO Queue\n\n## Product Ready Blocking Queue\n\n${blocks.join('\n\n')}\n`;
+}
+
+function completedClaim(claimId, selectedTodo, extra = {}) {
+  const completionCondition = selectedTodo.match(/^\s*Completion condition:\s*(.+?)\s*$/mu)?.[1] ?? '';
+  const sha256 = (value) => createHash('sha256').update(value, 'utf8').digest('hex');
+  return {
+    schema_version: 1,
+    claim_id: claimId,
+    root_claim_id: claimId,
+    status: 'completed',
+    selected_todo: selectedTodo,
+    delivery_review: {
+      merged: true,
+      approved: true,
+      ci_passed: true,
+      author: 'brownie-agent',
+      reviewer: 'globalpocket',
+      merge_actor: 'globalpocket',
+      semantic_completion_evidence: {
+        schema_version: 1,
+        root_claim_id: claimId,
+        selected_todo_sha256: sha256(selectedTodo),
+        completion_condition_sha256: sha256(completionCondition),
+        verification_results: [{ command: 'node --test fixture.mjs', exit_code: 0 }],
+        observables: [{ kind: 'fixture', sha256: 'a'.repeat(64) }]
+      }
+    },
+    ...extra
+  };
 }
 
 test('rejects removing selected TODO without completion record', () => {
@@ -227,13 +260,10 @@ test('CLI write-record allows selected targets that were already dirty at claim 
   fs.writeFileSync(path.join(tmp, 'docs/architecture/final-product-ready-judgment.md'), 'blocker: E-20\n');
   fs.writeFileSync(
     path.join(tmp, '.brownie/private/phase-loop/todo-claims/current.json'),
-    `${JSON.stringify({
-      schema_version: 1,
-      claim_id: 'claim-baseline-dirty',
-      selected_todo: e20gLeaf,
+    `${JSON.stringify(completedClaim('claim-baseline-dirty', e20gLeaf, {
       baseline_diff_files: ['docs/architecture/final-product-ready-judgment.md'],
       baseline_todo_text: queue(e20gLeaf)
-    }, null, 2)}\n`
+    }), null, 2)}\n`
   );
 
   const output = execFileSync('node', [
@@ -254,6 +284,17 @@ test('CLI write-record allows selected targets that were already dirty at claim 
   assert.equal(result.selected_target_dirty_at_baseline, true);
   assert.deepEqual(result.selected_targets_dirty_at_baseline, ['docs/architecture/final-product-ready-judgment.md']);
   assert.equal(result.completion_record_present, true);
+  const record = JSON.parse(fs.readFileSync(path.join(tmp, '.brownie/private/phase-loop/todo-completions/claim-baseline-dirty.json'), 'utf8'));
+  assert.equal(record.schema_version, 2);
+  assert.equal(record.delivery_receipt.merged, true);
+  assert.equal(record.delivery_receipt.semantic_completion_evidence.root_claim_id, 'claim-baseline-dirty');
+});
+
+test('completion records refuse a claim without the independent delivery receipt', () => {
+  const receipt = durableDeliveryReceiptForClaim({ claim_id: 'claim-absent-receipt', selected_todo: e20gLeaf });
+  assert.equal(receipt.valid, false);
+  assert(receipt.errors.includes('completion_claim_not_completed'));
+  assert(receipt.errors.includes('completed_requires_merged_pr'));
 });
 
 test('CLI write-record counts untracked Create only target as selected progress', () => {
@@ -275,13 +316,10 @@ test('CLI write-record counts untracked Create only target as selected progress'
   fs.writeFileSync(path.join(tmp, '.github/workflows/release.yml'), 'name: Release\n');
   fs.writeFileSync(
     path.join(tmp, '.brownie/private/phase-loop/todo-claims/current.json'),
-    `${JSON.stringify({
-      schema_version: 1,
-      claim_id: 'claim-create-only',
-      selected_todo: createOnlyTodo,
+    `${JSON.stringify(completedClaim('claim-create-only', createOnlyTodo, {
       baseline_diff_files: [],
       baseline_todo_text: queue(createOnlyTodo)
-    }, null, 2)}\n`
+    }), null, 2)}\n`
   );
 
   const output = execFileSync('node', [
@@ -322,13 +360,10 @@ test('CLI write-record does not count pre-existing untracked Create only target 
   fs.writeFileSync(path.join(tmp, '.github/workflows/release.yml'), 'name: Release\n');
   fs.writeFileSync(
     path.join(tmp, '.brownie/private/phase-loop/todo-claims/current.json'),
-    `${JSON.stringify({
-      schema_version: 1,
-      claim_id: 'claim-create-only',
-      selected_todo: createOnlyTodo,
+    `${JSON.stringify(completedClaim('claim-create-only', createOnlyTodo, {
       baseline_diff_files: ['.github/workflows/release.yml'],
       baseline_todo_text: queue(createOnlyTodo)
-    }, null, 2)}\n`
+    }), null, 2)}\n`
   );
 
   const output = execFileSync('node', [

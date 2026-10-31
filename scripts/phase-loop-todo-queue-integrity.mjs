@@ -282,6 +282,7 @@ export function validateTodoQueueIntegrity({
   beforeBreakdownText = null,
   afterBreakdownText = null,
   completedTodoIds: completedIdsInput = [],
+  unverifiedArchivedCompletionRecords = [],
   todoReplanRecords: todoReplanRecordsInput = [],
   contractRebaselineRecords: contractRebaselineRecordsInput = []
 }) {
@@ -296,8 +297,29 @@ export function validateTodoQueueIntegrity({
   const addedTodoIds = [];
   const replannedTodoIds = [];
   const breakdownDependenciesByTodo = breakdownDependencies(afterBreakdownText);
+  const legacyCompletionByTodoId = new Map();
+  for (const record of unverifiedArchivedCompletionRecords) {
+    const id = typeof record?.selected_todo_id === 'string' ? record.selected_todo_id.trim() : '';
+    if (!id) continue;
+    if (!legacyCompletionByTodoId.has(id)) legacyCompletionByTodoId.set(id, []);
+    legacyCompletionByTodoId.get(id).push({
+      claim_id: typeof record.claim_id === 'string' ? record.claim_id : null,
+      reason: typeof record.reason === 'string' ? record.reason : 'legacy_completion_record_without_delivery_receipt'
+    });
+  }
 
   for (const [id, block] of after.entries()) {
+    const unsafeDependencies = normalizedDependencies(lineValue(block, 'Depends on'))
+      .filter((dependency) => legacyCompletionByTodoId.has(dependency));
+    if (unsafeDependencies.length > 0) {
+      errors.push({
+        code: 'legacy_completion_dependency_requires_recovery',
+        message: 'A pending TODO depends on an absent prerequisite backed only by an unverifiable legacy completion record; restore or invalidate the original claim before scheduling a descendant.',
+        todo_id: id,
+        dependency_todo_ids: unsafeDependencies,
+        completion_records: Object.fromEntries(unsafeDependencies.map((dependency) => [dependency, legacyCompletionByTodoId.get(dependency)]))
+      });
+    }
     if (!breakdownDependenciesByTodo.has(id)) continue;
     const todoDependencies = normalizedDependencies(lineValue(block, 'Depends on'));
     const ledgerDependencyEntries = breakdownDependenciesByTodo.get(id);
@@ -471,6 +493,8 @@ export function loadCliInput(args) {
     beforeBreakdownText: breakdownBefore,
     afterBreakdownText: breakdownAfter,
     completedTodoIds: [...todoState.completedIds],
+    unverifiedArchivedCompletionRecords: todoState.unverifiedCompletionRecords
+      .filter((record) => todoState.unverifiedArchivedCompletionIds.has(record.selected_todo_id)),
     todoReplanRecords: replanRecords,
     contractRebaselineRecords: readContractRebaselineRecords(repoRoot)
   };
