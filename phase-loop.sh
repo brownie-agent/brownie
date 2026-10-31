@@ -3599,9 +3599,8 @@ for line in selected.splitlines():
         selected_route = stripped.removeprefix("Route:").strip().rstrip(".").lower()
         break
 review_rework = claim.get("review_rework") if isinstance(claim.get("review_rework"), dict) else {}
-review_rework_fresh_dispatch_pending = (
-    claim.get("review_rework_fresh_dispatch_pending") is True
-    and review_rework.get("required") is True
+review_rework_completion_blocked = (
+    review_rework.get("required") is True
     and review_rework.get("state") == "CHANGES_REQUESTED"
 )
 if selected_route == "todo-decomposition":
@@ -3613,7 +3612,7 @@ if selected_scopes and len(selected_scopes_dirty_at_baseline) == len(selected_sc
     # diff cannot turn it into delivery: the reviewer has already rejected
     # its semantics.  Bypass every deterministic completion shortcut and
     # dispatch Brownie with the review feedback for a fresh implementation.
-    if review_rework_fresh_dispatch_pending:
+    if review_rework_completion_blocked:
         print(json.dumps({
             "completed": False,
             "operation": "selected_todo_review_rework_dirty_baseline_requires_reimplementation",
