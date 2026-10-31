@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   completionConditionSha256,
+  createCompletionCertificate,
   evaluateDeliveryHandoff,
   produceSemanticCompletionEvidence,
   selectedTodoSha256,
+  validateCompletionCertificate,
   validateTerminalDeliveryReceipt,
   validateClaimLifecycleTransition
 } from './phase-loop-delivery-integrity.mjs';
@@ -126,20 +128,86 @@ test('a completed claim requires approved CI-passing merged review', () => {
   assert.equal(pending.valid, false);
   assert(pending.errors.includes('completed_requires_merged_pr'));
 
+  const review = {
+    pr_url: 'https://github.com/globalpocket/brownie/pull/42',
+    pr_number: 42,
+    head_oid: 'a'.repeat(40),
+    merged_at: '2026-10-31T07:00:00Z',
+    observed_at: '2026-10-31T07:01:00Z',
+    merged: true,
+    approved: true,
+    ci_passed: true,
+    author: 'brownie-agent',
+    reviewer: 'globalpocket',
+    merge_actor: 'globalpocket',
+    semantic_completion_evidence: validEvidence()
+  };
+  const issuance = createCompletionCertificate({ claim, review, issuedAt: '2026-10-31T07:02:00Z' });
+  assert.equal(issuance.valid, true, JSON.stringify(issuance.errors));
   const merged = validateClaimLifecycleTransition({
     previous: claim,
-    next: { ...claim, status: 'completed' },
-    review: {
-      merged: true,
-      approved: true,
-      ci_passed: true,
-      author: 'brownie-agent',
-      reviewer: 'globalpocket',
-      merge_actor: 'globalpocket',
-      semantic_completion_evidence: validEvidence()
-    }
+    next: { ...claim, status: 'completed', delivery_review: review, completion_certificate: issuance.certificate },
+    review
   });
   assert.equal(merged.valid, true, JSON.stringify(merged.errors));
+});
+
+test('a merged review without a durable completion certificate cannot complete a claim', () => {
+  const review = {
+    pr_url: 'https://github.com/globalpocket/brownie/pull/42',
+    pr_number: 42,
+    head_oid: 'a'.repeat(40),
+    merged_at: '2026-10-31T07:00:00Z',
+    observed_at: '2026-10-31T07:01:00Z',
+    merged: true,
+    approved: true,
+    ci_passed: true,
+    author: 'brownie-agent',
+    reviewer: 'globalpocket',
+    merge_actor: 'globalpocket',
+    semantic_completion_evidence: validEvidence()
+  };
+  const result = validateClaimLifecycleTransition({
+    previous: claim,
+    next: { ...claim, status: 'completed', delivery_review: review },
+    review
+  });
+  assert.equal(result.valid, false);
+  assert(result.errors.includes('completion_certificate_schema_invalid'));
+});
+
+test('a completion certificate is invalidated by a changed PR head or review rework', () => {
+  const review = {
+    pr_url: 'https://github.com/globalpocket/brownie/pull/42',
+    pr_number: 42,
+    head_oid: 'a'.repeat(40),
+    merged_at: '2026-10-31T07:00:00Z',
+    observed_at: '2026-10-31T07:01:00Z',
+    merged: true,
+    approved: true,
+    ci_passed: true,
+    author: 'brownie-agent',
+    reviewer: 'globalpocket',
+    merge_actor: 'globalpocket',
+    semantic_completion_evidence: validEvidence()
+  };
+  const { certificate } = createCompletionCertificate({ claim, review, issuedAt: '2026-10-31T07:02:00Z' });
+  const changedHead = validateCompletionCertificate({
+    claim: { ...claim, delivery_review: { ...review, head_oid: 'b'.repeat(40) }, completion_certificate: certificate }
+  });
+  assert.equal(changedHead.valid, false);
+  assert(changedHead.errors.includes('completion_certificate_review_head_oid_mismatch'));
+
+  const rework = validateCompletionCertificate({
+    claim: {
+      ...claim,
+      delivery_review: review,
+      completion_certificate: certificate,
+      review_rework: { required: true, state: 'CHANGES_REQUESTED' }
+    }
+  });
+  assert.equal(rework.valid, false);
+  assert(rework.errors.includes('completion_certificate_invalidated_by_changes_requested'));
 });
 
 test('a merged review still cannot complete without an observed independent merge actor', () => {

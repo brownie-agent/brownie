@@ -6,7 +6,10 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { validateSemanticCompletionEvidence } from './phase-loop-delivery-integrity.mjs';
+import {
+  createCompletionCertificate,
+  validateSemanticCompletionEvidence
+} from './phase-loop-delivery-integrity.mjs';
 
 function object(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -87,6 +90,7 @@ export function reconcileReviewSnapshot({ claim, pullRequest, reviewer, implemen
       reviewer: reviewActor || null,
       merge_actor: mergeActor || null,
       head_oid: headOid || null,
+      merged_at: typeof pr.mergedAt === 'string' ? pr.mergedAt : null,
       merged,
       approved,
       ci_passed: ciPassed,
@@ -116,6 +120,10 @@ export function applyReviewReconciliation({ claim, reconciliation, at = new Date
     note: 'github_review_reconciled'
   });
   if (result.status === 'changes_requested') {
+    // A request for changes invalidates every prior terminal receipt for this
+    // claim.  Preserve the history, but never let a certificate from a
+    // rejected head survive into the rework cycle.
+    delete next.completion_certificate;
     next.failure_history = list(next.failure_history);
     next.failure_history.push({
       at,
@@ -127,13 +135,52 @@ export function applyReviewReconciliation({ claim, reconciliation, at = new Date
     });
     next.review_rework = {
       required: true,
+      state: 'CHANGES_REQUESTED',
       root_claim_id: next.root_claim_id,
       pr_url: result.delivery_review?.pr_url ?? null,
+      head_oid: result.delivery_review?.head_oid ?? null,
+      reviewer: result.delivery_review?.reviewer ?? null,
       feedback: result.feedback,
       observed_at: at
     };
   } else if (result.status === 'completed') {
-    next.review_rework = { required: false, resolved_at: at };
+    const issuance = createCompletionCertificate({
+      claim: next,
+      review: next.delivery_review,
+      issuedAt: at
+    });
+    if (!issuance.valid) {
+      next.status = 'integrity_blocked';
+      next.status_history.push({
+        status: 'integrity_blocked',
+        run_stamp: runStamp,
+        updated_at: at,
+        note: 'completion_certificate_issuance_refused',
+        errors: issuance.errors
+      });
+      next.failure_history = list(next.failure_history);
+      next.failure_history.push({
+        at,
+        run_stamp: runStamp,
+        status: 'integrity_blocked',
+        root_claim_id: next.root_claim_id,
+        reason: 'completion_certificate_issuance_refused',
+        errors: issuance.errors
+      });
+      delete next.completion_certificate;
+    } else {
+      next.completion_certificate = issuance.certificate;
+      next.review_rework = {
+        required: false,
+        state: 'RESOLVED',
+        root_claim_id: next.root_claim_id,
+        resolved_at: at
+      };
+    }
+  } else {
+    // A PR can receive a new head or lose approval after a prior observation.
+    // Do not retain a terminal receipt outside the exact completed state.
+    delete next.completion_certificate;
   }
   return next;
 }

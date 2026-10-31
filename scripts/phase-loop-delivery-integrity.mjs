@@ -82,6 +82,10 @@ function canonicalJson(value) {
   return JSON.stringify(canonicalize(value));
 }
 
+export function semanticCompletionEvidenceSha256(evidence) {
+  return sha256(canonicalJson(asObject(evidence)));
+}
+
 /**
  * The runtime deliberately does not know an owner's controller claim.  The
  * controller therefore binds the already-executed, selected-TODO verification
@@ -179,6 +183,91 @@ export function validateTerminalDeliveryReceipt({ claim, review = undefined }) {
 }
 
 /**
+ * A completion certificate is the controller's immutable, claim-bound record
+ * of a terminal delivery receipt.  It deliberately contains only observed
+ * facts: a process exit, patch, PR creation, or green CI cannot mint one.
+ *
+ * Keeping this separate from `delivery_review` lets a later PR head or a
+ * CHANGES_REQUESTED review invalidate an old receipt without erasing the
+ * causal history that explains why the claim returned to rework.
+ */
+export function createCompletionCertificate({ claim, review = undefined, issuedAt = new Date().toISOString() }) {
+  const deliveryClaim = asObject(claim);
+  const reviewState = asObject(review === undefined ? deliveryClaim.delivery_review : review);
+  const receipt = validateTerminalDeliveryReceipt({
+    claim: { ...deliveryClaim, status: 'completed', delivery_review: reviewState },
+    review: reviewState
+  });
+  if (!receipt.valid) return { valid: false, certificate: null, errors: receipt.errors };
+
+  return {
+    valid: true,
+    errors: [],
+    certificate: {
+      schema_version: 1,
+      root_claim_id: rootClaimId(deliveryClaim),
+      selected_todo_sha256: selectedTodoSha256(deliveryClaim),
+      completion_condition_sha256: completionConditionSha256(deliveryClaim),
+      semantic_completion_evidence_sha256: semanticCompletionEvidenceSha256(reviewState.semantic_completion_evidence),
+      review: {
+        pr_url: reviewState.pr_url ?? null,
+        pr_number: reviewState.pr_number ?? null,
+        head_oid: reviewState.head_oid ?? null,
+        author: reviewState.author ?? null,
+        reviewer: reviewState.reviewer ?? null,
+        merge_actor: reviewState.merge_actor ?? null,
+        merged_at: reviewState.merged_at ?? null,
+        observed_at: reviewState.observed_at ?? null
+      },
+      issued_at: issuedAt
+    }
+  };
+}
+
+/**
+ * Validate the immutable completion certificate against the live claim.  A
+ * certificate must bind exactly the same PR head, review actors, semantic
+ * proof, and claim identity.  This prevents a later patch/review cycle from
+ * inheriting a receipt that was valid only for an earlier head.
+ */
+export function validateCompletionCertificate({ claim, certificate = undefined, review = undefined }) {
+  const deliveryClaim = asObject(claim);
+  const proof = asObject(certificate === undefined ? deliveryClaim.completion_certificate : certificate);
+  const reviewState = asObject(review === undefined ? deliveryClaim.delivery_review : review);
+  const errors = [];
+  if (proof.schema_version !== 1) errors.push('completion_certificate_schema_invalid');
+  if (!rootClaimId(deliveryClaim) || proof.root_claim_id !== rootClaimId(deliveryClaim)) {
+    errors.push('completion_certificate_root_claim_mismatch');
+  }
+  if (proof.selected_todo_sha256 !== selectedTodoSha256(deliveryClaim)) {
+    errors.push('completion_certificate_todo_mismatch');
+  }
+  if (proof.completion_condition_sha256 !== completionConditionSha256(deliveryClaim)) {
+    errors.push('completion_certificate_completion_condition_mismatch');
+  }
+  if (proof.semantic_completion_evidence_sha256 !== semanticCompletionEvidenceSha256(reviewState.semantic_completion_evidence)) {
+    errors.push('completion_certificate_semantic_evidence_mismatch');
+  }
+  const certificateReview = asObject(proof.review);
+  for (const field of ['pr_url', 'pr_number', 'head_oid', 'author', 'reviewer', 'merge_actor', 'merged_at', 'observed_at']) {
+    if (certificateReview[field] !== (reviewState[field] ?? null)) {
+      errors.push(`completion_certificate_review_${field}_mismatch`);
+    }
+  }
+  if (typeof proof.issued_at !== 'string' || !proof.issued_at) errors.push('completion_certificate_issued_at_missing');
+  const reviewRework = asObject(deliveryClaim.review_rework);
+  if (reviewRework.required === true && reviewRework.state === 'CHANGES_REQUESTED') {
+    errors.push('completion_certificate_invalidated_by_changes_requested');
+  }
+  const receipt = validateTerminalDeliveryReceipt({
+    claim: { ...deliveryClaim, status: 'completed', delivery_review: reviewState },
+    review: reviewState
+  });
+  if (!receipt.valid) errors.push(...receipt.errors.map((error) => `completion_certificate_requires_${error}`));
+  return { valid: errors.length === 0, errors };
+}
+
+/**
  * Evaluate only what can be safely inferred from a run.  "allowed" here
  * means an implementation can be handed to review, never that the TODO is
  * done.  Final completion needs a merged, independently approved PR.
@@ -248,6 +337,8 @@ export function validateClaimLifecycleTransition({ previous, next, review = {} }
   if (after.status === 'completed') {
     const terminalReceipt = validateTerminalDeliveryReceipt({ claim: after, review });
     errors.push(...terminalReceipt.errors.filter((error) => error !== 'completion_claim_not_completed'));
+    const certificate = validateCompletionCertificate({ claim: after, review });
+    errors.push(...certificate.errors);
   }
   if (after.status === 'pr_pending_review' && asObject(review).handoff_allowed !== true) {
     errors.push('pr_pending_review_requires_delivery_handoff');
@@ -257,6 +348,7 @@ export function validateClaimLifecycleTransition({ previous, next, review = {} }
 
 function usage() {
   process.stderr.write('usage: phase-loop-delivery-integrity.mjs evaluate --claim <claim.json> --stdout <run.stdout.json> [--verification <verification.json>]\n');
+  process.stderr.write('   or: phase-loop-delivery-integrity.mjs validate-certificate --claim <claim.json> [--require-completed]\n');
 }
 
 function parseArgs(argv) {
@@ -270,12 +362,21 @@ function parseArgs(argv) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const [command] = process.argv.slice(2);
   const args = parseArgs(process.argv.slice(3));
-  if (command !== 'evaluate' || !args.get('--claim') || !args.get('--stdout')) {
+  if (!args.get('--claim') || (command !== 'evaluate' && command !== 'validate-certificate') || (command === 'evaluate' && !args.get('--stdout'))) {
     usage();
     process.exit(64);
   }
   try {
     const claim = readJson(args.get('--claim'));
+    if (command === 'validate-certificate') {
+      const result = validateCompletionCertificate({ claim });
+      if (args.has('--require-completed') && asObject(claim).status !== 'completed') {
+        result.valid = false;
+        result.errors.push('completion_certificate_claim_not_completed');
+      }
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+      process.exit(result.valid ? 0 : 76);
+    }
     const stdoutPayload = readJson(args.get('--stdout'));
     let verification = null;
     if (args.get('--verification')) verification = JSON.parse(args.get('--verification'));

@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { applyReviewReconciliation, reconcileReviewSnapshot } from './phase-loop-review-reconcile.mjs';
-import { completionConditionSha256, selectedTodoSha256 } from './phase-loop-delivery-integrity.mjs';
+import {
+  completionConditionSha256,
+  selectedTodoSha256,
+  validateCompletionCertificate
+} from './phase-loop-delivery-integrity.mjs';
 
 const selectedTodo = '- [ ] T-1: implementation\n  Completion condition: the bounded implementation is independently delivered.';
 const claim = {
@@ -48,6 +52,8 @@ test('changes requested returns the same immutable claim to rework', () => {
   assert.equal(next.claim_id, 'claim-1');
   assert.equal(next.root_claim_id, 'claim-1');
   assert.equal(next.review_rework.required, true);
+  assert.equal(next.review_rework.state, 'CHANGES_REQUESTED');
+  assert.equal(next.review_rework.head_oid, 'a'.repeat(40));
   assert.equal(next.failure_history.at(-1).reason, 'independent_review_requested_changes');
   assert.deepEqual(next.delivery_review.semantic_completion_evidence, claim.delivery_review.semantic_completion_evidence);
 });
@@ -75,6 +81,47 @@ test('only a merged approved CI-passing PR completes the claim', () => {
   assert.equal(reconciliation.delivery_review.merged, true);
   assert.equal(reconciliation.delivery_review.approved, true);
   assert.equal(reconciliation.delivery_review.merge_actor, 'globalpocket');
+  assert.equal(reconciliation.delivery_review.merged_at, '2026-10-30T12:00:00Z');
+  const next = applyReviewReconciliation({ claim, reconciliation, at: '2026-10-30T12:01:00Z', runStamp: 'run-merged' });
+  assert.equal(next.status, 'completed');
+  assert.ok(next.completion_certificate);
+  assert.equal(validateCompletionCertificate({ claim: next }).valid, true);
+});
+
+test('changes requested removes a stale certificate and records a durable rework boundary', () => {
+  const completed = applyReviewReconciliation({
+    claim,
+    reconciliation: reconcileReviewSnapshot({
+      claim,
+      pullRequest: pr({
+        state: 'MERGED',
+        mergedAt: '2026-10-30T12:00:00Z',
+        mergedBy: { login: 'globalpocket' },
+        reviewDecision: 'APPROVED',
+        reviews: [{ state: 'APPROVED', author: { login: 'globalpocket' }, commit: { oid: 'a'.repeat(40) }, submittedAt: '2026-10-30T11:59:00Z' }]
+      }),
+      reviewer: 'globalpocket',
+      implementation: 'brownie-agent'
+    }),
+    at: '2026-10-30T12:01:00Z',
+    runStamp: 'run-completed'
+  });
+  assert.ok(completed.completion_certificate);
+
+  const reconciliation = reconcileReviewSnapshot({
+    claim: completed,
+    pullRequest: pr({
+      headRefOid: 'b'.repeat(40),
+      reviews: [{ state: 'CHANGES_REQUESTED', author: { login: 'globalpocket' }, commit: { oid: 'b'.repeat(40) }, body: 'new work required', submittedAt: '2026-10-30T12:02:00Z' }]
+    }),
+    reviewer: 'globalpocket',
+    implementation: 'brownie-agent'
+  });
+  const next = applyReviewReconciliation({ claim: completed, reconciliation, at: '2026-10-30T12:03:00Z', runStamp: 'run-rework' });
+  assert.equal(next.status, 'changes_requested');
+  assert.equal(next.completion_certificate, undefined);
+  assert.equal(next.review_rework.state, 'CHANGES_REQUESTED');
+  assert.equal(next.review_rework.root_claim_id, 'claim-1');
 });
 
 test('the reviewer latest decision at the current head overrides historical requests', () => {

@@ -288,54 +288,12 @@ PY
 
 phase_loop_terminal_delivery_receipt_valid() {
   local claim_path="${1:-$TODO_CLAIM_FILE}"
-  python3 - "$claim_path" <<'PY'
-import hashlib
-import json
-import pathlib
-import re
-import sys
-
-try:
-    claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(1)
-if not isinstance(claim, dict) or claim.get("status") != "completed":
-    raise SystemExit(1)
-review = claim.get("delivery_review")
-if not isinstance(review, dict):
-    raise SystemExit(1)
-author = review.get("author")
-reviewer = review.get("reviewer")
-merge_actor = review.get("merge_actor")
-semantic = review.get("semantic_completion_evidence")
-selected = claim.get("selected_todo")
-root_claim_id = claim.get("root_claim_id") or claim.get("claim_id")
-condition_match = re.search(r"^\s*Completion condition:\s*(.+?)\s*$", selected or "", re.MULTILINE)
-completion_condition = condition_match.group(1).strip() if condition_match else ""
-evidence_valid = (
-    isinstance(semantic, dict)
-    and semantic.get("schema_version") == 1
-    and semantic.get("root_claim_id") == root_claim_id
-    and semantic.get("selected_todo_sha256") == hashlib.sha256(str(selected or "").encode("utf-8")).hexdigest()
-    and semantic.get("completion_condition_sha256") == hashlib.sha256(completion_condition.encode("utf-8")).hexdigest()
-    and isinstance(semantic.get("verification_results"), list)
-    and bool(semantic.get("verification_results"))
-    and all(isinstance(item, dict) and isinstance(item.get("command"), str) and item.get("command") and item.get("exit_code") == 0 for item in semantic["verification_results"])
-    and isinstance(semantic.get("observables"), list)
-    and bool(semantic.get("observables"))
-    and all(isinstance(item, dict) and item.get("kind") and item.get("sha256") for item in semantic["observables"])
-)
-raise SystemExit(0 if (
-    review.get("merged") is True
-    and review.get("approved") is True
-    and review.get("ci_passed") is True
-    and isinstance(author, str) and bool(author)
-    and isinstance(reviewer, str) and bool(reviewer)
-    and isinstance(merge_actor, str) and merge_actor == reviewer
-    and author != reviewer
-    and evidence_valid
-) else 1)
-PY
+  [ -f "$claim_path" ] || return 1
+  # The JavaScript validator is the single source of truth for the terminal
+  # receipt.  Do not duplicate a looser Python predicate here: drift between
+  # event publication and claim promotion was the original false-completion
+  # failure mode.
+  node "$ROOT_DIR/scripts/phase-loop-delivery-integrity.mjs" validate-certificate --claim "$claim_path" --require-completed >/dev/null 2>&1
 }
 
 write_bdk_trajectory_event() {
@@ -12128,41 +12086,23 @@ requested_status = status
 # this gate at the common writer prevents an overlooked caller from removing
 # a TODO before independent approval, CI, and merge are all recorded.
 if status == "completed":
-    review = claim.get("delivery_review") if isinstance(claim.get("delivery_review"), dict) else {}
-    semantic = review.get("semantic_completion_evidence")
-    selected = claim.get("selected_todo")
-    condition_match = re.search(r"^\s*Completion condition:\s*(.+?)\s*$", selected or "", re.MULTILINE)
-    completion_condition = condition_match.group(1).strip() if condition_match else ""
-    semantic_valid = (
-        isinstance(semantic, dict)
-        and semantic.get("schema_version") == 1
-        and semantic.get("root_claim_id") == (claim.get("root_claim_id") or claim.get("claim_id"))
-        and semantic.get("selected_todo_sha256") == hashlib.sha256(str(selected or "").encode("utf-8")).hexdigest()
-        and semantic.get("completion_condition_sha256") == hashlib.sha256(completion_condition.encode("utf-8")).hexdigest()
-        and isinstance(semantic.get("verification_results"), list)
-        and bool(semantic.get("verification_results"))
-        and all(isinstance(item, dict) and isinstance(item.get("command"), str) and item.get("command") and item.get("exit_code") == 0 for item in semantic["verification_results"])
-        and isinstance(semantic.get("observables"), list)
-        and bool(semantic.get("observables"))
-        and all(isinstance(item, dict) and item.get("kind") and item.get("sha256") for item in semantic["observables"])
-    )
-    receipt_valid = (
-        review.get("merged") is True
-        and review.get("approved") is True
-        and review.get("ci_passed") is True
-        and isinstance(review.get("author"), str) and bool(review.get("author"))
-        and isinstance(review.get("reviewer"), str) and bool(review.get("reviewer"))
-        and review.get("author") != review.get("reviewer")
-        and isinstance(review.get("merge_actor"), str) and review.get("merge_actor") == review.get("reviewer")
-        and semantic_valid
-    )
-    if not receipt_valid:
+    # Completion certificates are validated by the controller's JavaScript
+    # source of truth.  A local process success, patch, PR, or CI result must
+    # not be able to recreate a weaker acceptance predicate in this writer.
+    certificate_check = subprocess.run(
+        ["node", str(workspace / "scripts" / "phase-loop-delivery-integrity.mjs"), "validate-certificate", "--claim", str(current_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=workspace,
+        check=False,
+    ) if current_path.exists() else None
+    if certificate_check is None or certificate_check.returncode != 0:
         status = "integrity_blocked"
         claim.setdefault("completion_promotion_rejections", []).append({
             "at": timestamp,
             "run_stamp": sys.argv[8],
             "requested_status": requested_status,
-            "reason": "completed_requires_claim_bound_semantic_evidence_and_independent_review_ci_merge_receipt",
+            "reason": "completed_requires_claim_bound_completion_certificate_and_independent_review_ci_merge_receipt",
         })
 if status in {"integrity_blocked", "changes_requested", "failed", "blocked"}:
     claim.setdefault("failure_history", []).append({
@@ -12191,14 +12131,14 @@ PY
   if [ "$requested_status" = "completed" ] && [ "$(claim_field status 2>/dev/null || true)" != "completed" ]; then
     PHASE_LOOP_COMPLETION_PROMOTION_REFUSED=1
     PHASE_LOOP_COMPLETION_PROMOTION_REFUSED_DETAIL="claim=$claim_id requested_status=completed actual_status=$(claim_field status 2>/dev/null || true) run=$run_stamp"
-    printf '%s completion_promotion_refused=true claim=%s requested=completed actual=%s run=%s reason=independent_review_ci_merge_missing\n' \
+    printf '%s completion_promotion_refused=true claim=%s requested=completed actual=%s run=%s reason=completion_certificate_or_independent_review_ci_merge_missing\n' \
       "$(now_utc)" "$claim_id" "$(claim_field status 2>/dev/null || true)" "$run_stamp" >> "$SUPERVISOR_LOG"
     # This is the universal terminal gate for legacy/fallback callers.  Write
     # the observable failed outcome here, before any caller can archive a
     # claim, publish a PR, or replace the status with a success-shaped value.
     # write_status exits 76 when the promotion flag is set, so this function
     # cannot be accidentally ignored by a future caller.
-    write_status "integrity_blocked" "Refused TODO completion before independent review approval, required CI, and merge. ${PHASE_LOOP_COMPLETION_PROMOTION_REFUSED_DETAIL}" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
+    write_status "integrity_blocked" "Refused TODO completion before a valid claim-bound completion certificate, independent review approval, required CI, and merge. ${PHASE_LOOP_COMPLETION_PROMOTION_REFUSED_DETAIL}" "$run_stamp" "76" "${CONSECUTIVE_FAILURES:-0}"
     return 76
   fi
 }
@@ -20583,6 +20523,13 @@ supervise() {
     fi
 
     if run_brownie_once; then
+      # `set +e` is intentional for durable cleanup, so a legacy branch may
+      # ignore the common-writer return value.  Never let that turn a refused
+      # completion promotion into a successful supervisor iteration.
+      if [ "${PHASE_LOOP_COMPLETION_PROMOTION_REFUSED:-0}" = "1" ]; then
+        printf '%s completion_promotion_refused_supervisor_stop=true detail=%s\n' "$(now_utc)" "${PHASE_LOOP_COMPLETION_PROMOTION_REFUSED_DETAIL:-unknown}" >> "$SUPERVISOR_LOG"
+        exit 76
+      fi
       CONSECUTIVE_FAILURES=0
       if [ "${PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUESTED:-0}" -eq 1 ]; then
         printf '%s controller_shell_reload_requested=true\n' "$(now_utc)" >> "$SUPERVISOR_LOG"
@@ -20847,6 +20794,12 @@ case "${1:-status}" in
     trap 'phase_loop_handle_run_signal TERM' TERM
     run_brownie_once
     run_once_status=$?
+    # The controller deliberately runs without errexit.  Make the terminal
+    # exit contract explicit so an ignored legacy fallback call cannot report
+    # `exit_code:0` after its completion was rejected.
+    if [ "${PHASE_LOOP_COMPLETION_PROMOTION_REFUSED:-0}" = "1" ]; then
+      run_once_status=76
+    fi
     if [ "${PHASE_LOOP_CONTROLLER_SHELL_RELOAD_REQUESTED:-0}" -eq 1 ]; then
       if ! phase_loop_release_supervisor_lock || [ -d "$LOCK_DIR" ]; then
         write_status "blocked" "Controller shell reload refused because the run-once generation could not release its durable lock ownership." "" "78" "${CONSECUTIVE_FAILURES:-0}"

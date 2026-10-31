@@ -5000,6 +5000,8 @@ supervisor_log = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 target = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
 assert claim["status"] == "integrity_blocked", claim
 assert claim.get("completion_cleanup_pending") is not True, claim
+assert "completion_certificate" not in claim, claim
+assert claim["completion_promotion_rejections"][-1]["reason"] == "completed_requires_claim_bound_completion_certificate_and_independent_review_ci_merge_receipt", claim
 assert "E-empty-queue-exact" in todo, todo
 assert "completion_promotion_refused=true" in supervisor_log, supervisor_log
 assert "  fixture_path: fixtureRoot,\n  lifecycle_evidence: lifecycleEvidence,\n  commands," in target, target
@@ -6741,6 +6743,7 @@ assert claim["claim_id"] == "todo-g1-review-rework", claim
 assert claim["root_claim_id"] == "todo-g1-review-rework", claim
 assert claim["queue_generation"] == 2, claim
 assert claim["status"] != "completed", claim
+assert "completion_certificate" not in claim, claim
 assert claim["review_rework_fresh_dispatch_pending"] is False, claim
 assert claim["review_rework_fresh_dispatch_activated_run_stamp"], claim
 assert claim["review_rework_fresh_dispatch_activated_at"], claim
@@ -6789,6 +6792,7 @@ claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 assert claim["review_rework_fresh_dispatch_pending"] is False, claim
 assert claim["status"] != "completed", claim
+assert "completion_certificate" not in claim, claim
 assert "E-review-rework" in todo, todo
 PY
 fi
