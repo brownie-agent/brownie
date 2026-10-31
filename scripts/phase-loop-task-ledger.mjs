@@ -812,6 +812,21 @@ export function recordTrajectory(repoRoot, {
   } catch (error) {
     return { ok: false, code: 'ledger_append_failed', error: error.message };
   }
+  const attemptIdentity = reviewReworkLedgerAttemptIdentity(repoRoot, {
+    claim,
+    sourceTaskId,
+    spec,
+    events
+  });
+  if (!attemptIdentity.ok) {
+    return {
+      ok: false,
+      code: attemptIdentity.code,
+      reason: attemptIdentity.reason,
+      claim_id: claimId,
+      source_task_id: sourceTaskId
+    };
+  }
   const projectedSourceTask = taskProjection(events).get(sourceTaskId);
   // Replan creates the replacement child as the durable queued task itself.
   // Once that child is claimed, keep transitioning the raw child id so the
@@ -825,7 +840,7 @@ export function recordTrajectory(repoRoot, {
       || (projectedSourceTask.claim_id ?? null) === (claimId ?? null));
   const taskId = continuesSameReplacementClaim
     ? sourceTaskId
-    : taskAttemptId(sourceTaskId, claimId);
+    : attemptIdentity.task_id;
   if (replacementParentTaskId
     && !isTerminalTaskState(projectedSourceTask.to_state)
     && projectedSourceTask.claim_id
@@ -854,7 +869,7 @@ export function recordTrajectory(repoRoot, {
     const reason = String(payload.reason ?? '');
     const evidenceSource = payload.evidence_source ?? null;
     const replanTaskId = String(payload.terminal_replan_task_id ?? '');
-    const sourceAttemptId = taskAttemptId(sourceTaskId, claimId);
+    const sourceAttemptId = attemptIdentity.task_id;
     if (!reason || !replanTaskId) {
       return { ok: false, code: 'terminal_replan_payload_missing_binding' };
     }
@@ -954,6 +969,104 @@ export function recordTrajectory(repoRoot, {
 // identifies one execution attempt while sourceTaskId remains the TODO key.
 export function taskAttemptId(sourceTaskId, claimId) {
   return claimId ? `${sourceTaskId}@${claimId}` : sourceTaskId;
+}
+
+// A review-rework claim deliberately preserves its original claim id so the
+// rejected delivery remains causally visible.  Its earlier controller may,
+// however, have already (and incorrectly) terminalized that claim's ledger
+// attempt.  A fresh Runtime dispatch must never reopen that immutable record.
+// Bind the replacement ledger identity to the exact terminal event and the
+// immutable recovery id instead of treating a new run id as a new attempt.
+export function reviewReworkLedgerAttemptId({
+  sourceTaskId,
+  recoveryId,
+  sourceTerminalEventId,
+  selectedTodoSha256
+}) {
+  const binding = [sourceTaskId, recoveryId, sourceTerminalEventId, selectedTodoSha256].join('\n');
+  const suffix = crypto.createHash('sha256').update(binding).digest('hex').slice(0, 24);
+  return `${sourceTaskId}@review-rework-${suffix}`;
+}
+
+function repositoryRelativeExistingPath(repoRoot, candidate) {
+  if (typeof candidate !== 'string' || !candidate || path.isAbsolute(candidate)) return null;
+  const resolved = path.resolve(repoRoot, candidate);
+  const relative = path.relative(repoRoot, resolved);
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || !fs.existsSync(resolved)) return null;
+  return { resolved, relative };
+}
+
+function reviewReworkLedgerAttemptIdentity(repoRoot, { claim, sourceTaskId, spec, events }) {
+  const fallback = taskAttemptId(sourceTaskId, claim.claim_id);
+  const binding = claim?.review_rework_ledger_attempt;
+  if (binding == null) return { ok: true, task_id: fallback, isolated: false };
+
+  const selectedTodoSha256 = crypto.createHash('sha256').update(spec).digest('hex');
+  const recoveryId = claim?.legacy_completion_recovery?.recovery_id;
+  const required = [
+    binding?.schema_version === 1,
+    binding?.kind === 'review_rework_terminal_attempt_isolation',
+    binding?.root_claim_id === claim.claim_id,
+    typeof recoveryId === 'string' && recoveryId.length > 0 && binding?.recovery_id === recoveryId,
+    claim?.legacy_completion_recovery?.invalidated_completion_claim_id === claim.claim_id,
+    claim?.review_rework?.required === true && claim?.review_rework?.state === 'CHANGES_REQUESTED',
+    binding?.selected_todo_sha256 === selectedTodoSha256,
+    binding?.source_task_id === fallback,
+    typeof binding?.source_terminal_event_id === 'string' && binding.source_terminal_event_id.length > 0,
+    typeof binding?.source_terminal_event_sha256 === 'string' && /^[a-f0-9]{64}$/u.test(binding.source_terminal_event_sha256),
+    typeof binding?.source_task_spec_sha256 === 'string' && binding.source_task_spec_sha256 === selectedTodoSha256,
+    typeof binding?.ledger_attempt_id === 'string' && binding.ledger_attempt_id.length > fallback.length,
+    typeof binding?.audit_sha256 === 'string' && /^[a-f0-9]{64}$/u.test(binding.audit_sha256)
+  ];
+  if (required.some((valid) => !valid)) {
+    return { ok: false, code: 'review_rework_ledger_attempt_invalid', reason: 'binding_fields_invalid' };
+  }
+  const expectedAttemptId = reviewReworkLedgerAttemptId({
+    sourceTaskId: fallback,
+    recoveryId,
+    sourceTerminalEventId: binding.source_terminal_event_id,
+    selectedTodoSha256
+  });
+  if (binding.ledger_attempt_id !== expectedAttemptId) {
+    return { ok: false, code: 'review_rework_ledger_attempt_invalid', reason: 'binding_id_mismatch' };
+  }
+  const auditLocation = repositoryRelativeExistingPath(repoRoot, binding.audit_path);
+  if (!auditLocation || !auditLocation.relative.startsWith('.brownie/private/phase-loop/review-rework-ledger-attempts/')) {
+    return { ok: false, code: 'review_rework_ledger_attempt_invalid', reason: 'audit_path_invalid' };
+  }
+  let audit;
+  let auditText;
+  try {
+    auditText = fs.readFileSync(auditLocation.resolved, 'utf8');
+    audit = JSON.parse(auditText);
+  } catch {
+    return { ok: false, code: 'review_rework_ledger_attempt_invalid', reason: 'audit_unreadable' };
+  }
+  if (crypto.createHash('sha256').update(auditText).digest('hex') !== binding.audit_sha256) {
+    return { ok: false, code: 'review_rework_ledger_attempt_invalid', reason: 'audit_digest_mismatch' };
+  }
+  for (const field of [
+    'schema_version', 'record_type', 'recovery_id', 'root_claim_id', 'selected_todo_sha256',
+    'source_task_id', 'source_terminal_event_id', 'source_terminal_event_sha256',
+    'source_task_spec_sha256', 'ledger_attempt_id'
+  ]) {
+    const expected = field === 'record_type' ? 'review_rework_terminal_attempt_isolation' : binding[field];
+    if (audit?.[field] !== expected) {
+      return { ok: false, code: 'review_rework_ledger_attempt_invalid', reason: 'audit_binding_mismatch' };
+    }
+  }
+  const source = taskProjection(events).get(fallback);
+  const sourceEvent = events.find((event) => event?.task_id === fallback && event?.event_id === binding.source_terminal_event_id);
+  if (!sourceEvent
+    || source?.event_id !== binding.source_terminal_event_id
+    || !isTerminalTaskState(source.to_state)
+    || source?.claim_id !== claim.claim_id
+    || source?.task_spec_sha256 !== selectedTodoSha256
+    || audit?.source_terminal_state !== source.to_state
+    || crypto.createHash('sha256').update(JSON.stringify(sourceEvent)).digest('hex') !== binding.source_terminal_event_sha256) {
+    return { ok: false, code: 'review_rework_ledger_attempt_invalid', reason: 'source_terminal_provenance_mismatch' };
+  }
+  return { ok: true, task_id: binding.ledger_attempt_id, isolated: true, source_task_id: fallback };
 }
 
 function replacementChildren(todoPath, parentTaskId) {

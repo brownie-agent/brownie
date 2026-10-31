@@ -19,6 +19,13 @@ import {
 } from './phase-loop-todo-state.mjs';
 import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
 import { completionConditionSha256, validateTerminalDeliveryReceipt } from './phase-loop-delivery-integrity.mjs';
+import {
+  isTerminalTaskState,
+  readTaskLedger,
+  reviewReworkLedgerAttemptId,
+  taskAttemptId,
+  taskProjection
+} from './phase-loop-task-ledger.mjs';
 import { validateTodoQueueIntegrity } from './phase-loop-todo-queue-integrity.mjs';
 
 const defaultTodo = '.brownie/todo.md';
@@ -1186,6 +1193,103 @@ function isAuditedPartialInitialRecovery({ stateRoot, todoText, input, review, c
   );
 }
 
+// A rejected implementation retains its root claim id by design.  If an older
+// controller nevertheless terminalized that root's ledger attempt, the next
+// dispatch needs a distinct immutable task identity.  This creates it only
+// from the exact terminal event already in the append-only ledger and records
+// the relationship before publishing it in the claim.  It never rewrites the
+// historical attempt and it never mints an identity for a non-terminal or
+// mismatched source.
+function establishReviewReworkLedgerAttempt({ root, stateRoot, currentClaim, claimId, selected, recoveryId }) {
+  const sourceTodoId = todoId(selected);
+  const selectedTodoSha256 = sha256(selected);
+  if (!sourceTodoId || sha256(currentClaim?.selected_todo) !== selectedTodoSha256) {
+    throw new Error('review_rework_ledger_attempt_selected_todo_invalid');
+  }
+  const sourceTaskId = taskAttemptId(sourceTodoId, claimId);
+  const existing = currentClaim?.review_rework_ledger_attempt;
+  let events;
+  try {
+    events = readTaskLedger(root);
+  } catch (error) {
+    throw new Error(`review_rework_ledger_attempt_ledger_unreadable:${error.message}`);
+  }
+  const terminal = taskProjection(events).get(sourceTaskId);
+  if (!terminal) {
+    if (existing != null) throw new Error('review_rework_ledger_attempt_source_missing');
+    return { claim: currentClaim, required: false, established: false };
+  }
+  if (!isTerminalTaskState(terminal.to_state)) {
+    if (existing != null) throw new Error('review_rework_ledger_attempt_source_not_terminal');
+    return { claim: currentClaim, required: false, established: false };
+  }
+  const sourceEvent = events.find((event) => (
+    event?.task_id === sourceTaskId && event?.event_id === terminal.event_id
+  ));
+  if (!sourceEvent
+    || terminal.claim_id !== claimId
+    || terminal.task_spec_sha256 !== selectedTodoSha256
+    || !terminal.event_id) {
+    throw new Error('review_rework_ledger_attempt_source_provenance_invalid');
+  }
+  const sourceTerminalEventSha256 = sha256(JSON.stringify(sourceEvent));
+  const ledgerAttemptId = reviewReworkLedgerAttemptId({
+    sourceTaskId,
+    recoveryId,
+    sourceTerminalEventId: terminal.event_id,
+    selectedTodoSha256
+  });
+  const audit = {
+    schema_version: 1,
+    record_type: 'review_rework_terminal_attempt_isolation',
+    recovery_id: recoveryId,
+    root_claim_id: claimId,
+    selected_todo_sha256: selectedTodoSha256,
+    source_task_id: sourceTaskId,
+    source_terminal_event_id: terminal.event_id,
+    source_terminal_event_sha256: sourceTerminalEventSha256,
+    source_terminal_state: terminal.to_state,
+    source_task_spec_sha256: selectedTodoSha256,
+    ledger_attempt_id: ledgerAttemptId
+  };
+  const auditId = sha256(JSON.stringify(audit)).slice(0, 24);
+  const auditPath = path.join(stateRoot, 'review-rework-ledger-attempts', `${auditId}.json`);
+  if (fs.existsSync(auditPath)) {
+    const persisted = readJson(auditPath);
+    if (JSON.stringify(persisted) !== JSON.stringify(audit)) {
+      throw new Error('review_rework_ledger_attempt_audit_conflict');
+    }
+  } else {
+    atomicJson(auditPath, audit);
+  }
+  const auditRelativePath = path.relative(root, auditPath);
+  const binding = {
+    schema_version: 1,
+    kind: 'review_rework_terminal_attempt_isolation',
+    recovery_id: recoveryId,
+    root_claim_id: claimId,
+    selected_todo_sha256: selectedTodoSha256,
+    source_task_id: sourceTaskId,
+    source_terminal_event_id: terminal.event_id,
+    source_terminal_event_sha256: sourceTerminalEventSha256,
+    source_task_spec_sha256: selectedTodoSha256,
+    ledger_attempt_id: ledgerAttemptId,
+    audit_path: auditRelativePath,
+    audit_sha256: sha256(readText(auditPath))
+  };
+  if (existing != null && JSON.stringify(existing) !== JSON.stringify(binding)) {
+    throw new Error('review_rework_ledger_attempt_binding_conflict');
+  }
+  return {
+    claim: existing == null ? { ...currentClaim, review_rework_ledger_attempt: binding } : currentClaim,
+    required: true,
+    established: existing == null,
+    ledger_attempt_id: ledgerAttemptId,
+    source_task_id: sourceTaskId,
+    audit_path: auditRelativePath
+  };
+}
+
 function ensureReviewReworkFreshDispatch({
   root,
   stateRoot,
@@ -1202,6 +1306,21 @@ function ensureReviewReworkFreshDispatch({
   if (!sameRecoveredClaim) {
     throw new Error('idempotent_recovery_requires_live_matching_review_rework_claim');
   }
+  const ledgerAttempt = establishReviewReworkLedgerAttempt({
+    root,
+    stateRoot,
+    currentClaim,
+    claimId,
+    selected,
+    recoveryId
+  });
+  currentClaim = ledgerAttempt.claim;
+  if (ledgerAttempt.established) atomicJson(currentClaimPath, currentClaim);
+  const ledgerAttemptEvidence = ledgerAttempt.required ? {
+    review_rework_ledger_attempt_isolated: true,
+    review_rework_ledger_attempt_id: ledgerAttempt.ledger_attempt_id,
+    review_rework_ledger_attempt_audit_path: ledgerAttempt.audit_path
+  } : { review_rework_ledger_attempt_isolated: false };
   if (isRearmableReviewReworkCompletionRefusal(currentClaim)) {
     const rearmHistory = Array.isArray(currentClaim.review_rework_fresh_dispatch_rearm_history)
       ? currentClaim.review_rework_fresh_dispatch_rearm_history
@@ -1267,7 +1386,8 @@ function ensureReviewReworkFreshDispatch({
       fresh_runtime_dispatch_marker_restored: true,
       fresh_runtime_dispatch_rearmed: true,
       fresh_runtime_dispatch_attempt: dispatchAttempt,
-      fresh_runtime_dispatch_rearm_audit_path: path.relative(root, auditPath)
+      fresh_runtime_dispatch_rearm_audit_path: path.relative(root, auditPath),
+      ...ledgerAttemptEvidence
     };
   }
   if (typeof currentClaim.review_rework_fresh_dispatch_activated_run_stamp === 'string'
@@ -1275,7 +1395,8 @@ function ensureReviewReworkFreshDispatch({
     return {
       fresh_runtime_dispatch_required: false,
       fresh_runtime_dispatch_marker_restored: false,
-      fresh_runtime_dispatch_activated_run_stamp: currentClaim.review_rework_fresh_dispatch_activated_run_stamp
+      fresh_runtime_dispatch_activated_run_stamp: currentClaim.review_rework_fresh_dispatch_activated_run_stamp,
+      ...ledgerAttemptEvidence
     };
   }
   if (currentClaim.review_rework_fresh_dispatch_pending === true) {
@@ -1315,12 +1436,14 @@ function ensureReviewReworkFreshDispatch({
         fresh_runtime_dispatch_marker_restored: true,
         fresh_runtime_dispatch_attempt: dispatchAttempt,
         fresh_runtime_dispatch_attempt_repair_audit_path: path.relative(root, auditPath),
+        ...ledgerAttemptEvidence
       };
     }
     return {
       fresh_runtime_dispatch_required: true,
       fresh_runtime_dispatch_marker_restored: false,
       fresh_runtime_dispatch_attempt: dispatchAttempt,
+      ...ledgerAttemptEvidence
     };
   }
 
@@ -1360,7 +1483,8 @@ function ensureReviewReworkFreshDispatch({
   return {
     fresh_runtime_dispatch_required: true,
     fresh_runtime_dispatch_marker_restored: true,
-    fresh_runtime_dispatch_repair_audit_path: path.relative(root, auditPath)
+    fresh_runtime_dispatch_repair_audit_path: path.relative(root, auditPath),
+    ...ledgerAttemptEvidence
   };
 }
 
@@ -1616,7 +1740,7 @@ export function recoverLegacyRejectedCompletion({
       lineageSourceMigration = existingFeedback.lineage_source_migration ?? null;
     }
   }
-  const restoredClaim = {
+  let restoredClaim = {
     schema_version: 1,
     claim_id: input.claimId,
     root_claim_id: input.claimId,
@@ -1684,6 +1808,15 @@ export function recoverLegacyRejectedCompletion({
     ],
     updated_at: now
   };
+  const ledgerAttempt = establishReviewReworkLedgerAttempt({
+    root,
+    stateRoot,
+    currentClaim: restoredClaim,
+    claimId: input.claimId,
+    selected: input.selected,
+    recoveryId
+  });
+  restoredClaim = ledgerAttempt.claim;
   const feedback = {
     schema_version: 1,
     kind: 'phase_loop_review_rework_required',
@@ -1727,6 +1860,9 @@ export function recoverLegacyRejectedCompletion({
     archived_current_claim_path: currentClaim ? path.relative(root, currentArchivePath) : null,
     invalidation_path: path.relative(root, invalidationPath),
     fresh_runtime_dispatch_required: true,
+    review_rework_ledger_attempt_isolated: ledgerAttempt.required,
+    review_rework_ledger_attempt_id: ledgerAttempt.ledger_attempt_id ?? null,
+    review_rework_ledger_attempt_audit_path: ledgerAttempt.audit_path ?? null,
     idempotent_displacement: idempotentDisplacement,
     idempotent_partial_initial_recovery: partialInitialRecovery,
     audited_derivative_preemption: derivativePreemption ? {
@@ -1759,6 +1895,9 @@ export function recoverLegacyRejectedCompletion({
     selected_todo_id: input.targetId,
     pr_url: review.pr_url,
     fresh_runtime_dispatch_required: true,
+    review_rework_ledger_attempt_isolated: ledgerAttempt.required,
+    review_rework_ledger_attempt_id: ledgerAttempt.ledger_attempt_id ?? null,
+    review_rework_ledger_attempt_audit_path: ledgerAttempt.audit_path ?? null,
     actor_deployment_path: actors.deploymentPath ? path.relative(root, actors.deploymentPath) : null,
     audit_path: path.relative(root, auditPath),
     invalidation_path: path.relative(root, invalidationPath),

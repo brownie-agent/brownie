@@ -6575,6 +6575,7 @@ PY
   # root before it can choose a Runtime action.
   node --input-type=module - "$REPO_ROOT" "$review_rework_workspace" "$review_rework_todo" "$PHASE_LOOP_ACTOR_DEPLOYMENT" <<'NODE'
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -6582,6 +6583,10 @@ const [controllerRoot, workspaceRoot, todoPath, actorDeploymentPath] = process.a
 const { recoverLegacyRejectedCompletion } = await import(pathToFileURL(path.join(
   controllerRoot,
   'scripts/phase-loop-legacy-completion-recovery.mjs'
+)).href);
+const { appendTaskTransition, taskAttemptId } = await import(pathToFileURL(path.join(
+  controllerRoot,
+  'scripts/phase-loop-task-ledger.mjs'
 )).href);
 const statePath = '.brownie/private/phase-loop';
 const stateRoot = path.join(workspaceRoot, statePath);
@@ -6631,6 +6636,22 @@ writeJson(reviewPath, {
     body: 'Implement a fresh bounded journey; the retained baseline is rejected.'
   }
 });
+// Reproduce the second historical defect: the old controller terminalized the
+// same claim in its append-only task ledger before independent review rejected
+// it. Recovery must retain that source event and bind the fresh Runtime
+// dispatch to a distinct ledger attempt instead of reopening the old one.
+const sourceTaskId = taskAttemptId('E-review-rework', current.claim_id);
+const selectedHash = crypto.createHash('sha256').update(selected).digest('hex');
+for (const to_state of ['queued', 'claimed', 'running', 'completed']) {
+  const transition = appendTaskTransition(workspaceRoot, {
+    task_id: sourceTaskId,
+    to_state,
+    claim_id: current.claim_id,
+    run_id: 'historical-false-completion',
+    task_spec_sha256: selectedHash,
+  });
+  if (!transition.ok) throw new Error(`review_rework_fixture_historical_ledger_${transition.code}`);
+}
 const first = recoverLegacyRejectedCompletion({
   repoRoot: workspaceRoot,
   todoPath,
@@ -6750,7 +6771,7 @@ SH
     pnpm --workspace-root guard:runtime-operational-evidence:test
   ) >/dev/null
 
-  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_state/todo-claims/repair-feedback.json" "$review_rework_effective_prompt" "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs" "$review_rework_runtime_store" <<'PY'
+  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_state/todo-claims/repair-feedback.json" "$review_rework_effective_prompt" "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs" "$review_rework_runtime_store" "$review_rework_state/task-ledger.jsonl" <<'PY'
 import json
 import pathlib
 import sys
@@ -6762,6 +6783,7 @@ feedback = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding="utf-8"))
 effective_prompt = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
 runtime_target = pathlib.Path(sys.argv[6]).read_text(encoding="utf-8")
 runtime_store = pathlib.Path(sys.argv[7]).read_text(encoding="utf-8").strip()
+ledger = [json.loads(line) for line in pathlib.Path(sys.argv[8]).read_text(encoding="utf-8").splitlines() if line]
 assert "--json run --file" in argv, argv
 assert "--json resume" not in argv, argv
 assert claim["claim_id"] == "todo-g1-review-rework", claim
@@ -6783,6 +6805,14 @@ assert "review_rework_feedback" in effective_prompt, effective_prompt
 assert "Implement a fresh bounded journey; the retained baseline is rejected." in effective_prompt, effective_prompt
 assert "review_rework_completion_policy" in effective_prompt, effective_prompt
 assert "fresh_reimplementation" in runtime_target, runtime_target
+isolation = claim["review_rework_ledger_attempt"]
+assert isolation["source_task_id"] == "E-review-rework@todo-g1-review-rework", isolation
+assert isolation["ledger_attempt_id"] != isolation["source_task_id"], isolation
+events = [event for record in ledger for event in record.get("events", [record])]
+source = [event for event in events if event.get("task_id") == isolation["source_task_id"]]
+fresh = [event for event in events if event.get("task_id") == isolation["ledger_attempt_id"]]
+assert source[-1]["to_state"] == "completed", source
+assert [event["to_state"] for event in fresh[:3]] == ["queued", "claimed", "running"], fresh
 PY
 
   # The fresh-dispatch marker is intentionally consumed after the first

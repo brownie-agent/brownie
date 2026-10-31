@@ -11,6 +11,7 @@ import {
   reconcilePersistedReviewRework
 } from './phase-loop-legacy-completion-recovery.mjs';
 import { produceSemanticCompletionEvidence } from './phase-loop-delivery-integrity.mjs';
+import { appendTaskTransition, taskAttemptId } from './phase-loop-task-ledger.mjs';
 
 const target = `- [ ] E-target: Patch only \`scripts/target.mjs\`.
   Route: implementation.
@@ -309,6 +310,52 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
   const repairAudit = JSON.parse(fs.readFileSync(path.join(value.root, repaired.fresh_runtime_dispatch_repair_audit_path), 'utf8'));
   assert.equal(repairAudit.recovery_id, result.recovery_id);
   assert.equal(repairAudit.reason, 'legacy_review_rework_claim_had_no_fresh_dispatch_marker');
+});
+
+test('recovery isolates an already-terminal same-root task attempt without reopening its history', () => {
+  const value = fixture();
+  const sourceTaskId = taskAttemptId('E-target', 'legacy-claim');
+  const specHash = crypto.createHash('sha256').update(target).digest('hex');
+  let terminalEvent;
+  for (const to_state of ['queued', 'claimed', 'running', 'completed']) {
+    const transition = appendTaskTransition(value.root, {
+      task_id: sourceTaskId,
+      to_state,
+      claim_id: 'legacy-claim',
+      task_spec_sha256: specHash,
+      run_id: 'historical-run'
+    });
+    assert.equal(transition.ok, true);
+    if (to_state === 'completed') terminalEvent = transition.event;
+  }
+  const recovered = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  assert.equal(recovered.recovered, true, JSON.stringify(recovered));
+  assert.equal(recovered.review_rework_ledger_attempt_isolated, true);
+  const current = JSON.parse(fs.readFileSync(path.join(value.root, recovered.current_claim_path), 'utf8'));
+  const binding = current.review_rework_ledger_attempt;
+  assert.equal(binding.source_task_id, sourceTaskId);
+  assert.equal(binding.source_terminal_event_id, terminalEvent.event_id);
+  assert.notEqual(binding.ledger_attempt_id, sourceTaskId);
+  assert.ok(fs.existsSync(path.join(value.root, binding.audit_path)));
+
+  const reconciled = reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:01:00.000Z'
+  });
+  assert.equal(reconciled.reason, 'review_rework_live_root_preserved');
+  assert.equal(reconciled.review_rework_ledger_attempt_id, binding.ledger_attempt_id);
+  const unchanged = JSON.parse(fs.readFileSync(path.join(value.root, recovered.current_claim_path), 'utf8'));
+  assert.deepEqual(unchanged.review_rework_ledger_attempt, binding);
 });
 
 test('idempotent recovery reclaims a terminal claim that displaced its review-rework root without duplicating the target', () => {

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { appendTaskTransition, readTaskLedger, recordTerminalFailureRecovery, recordTerminalReplanWithChildren, recordTrajectory, replanTaskWithChildren, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
+import { appendTaskTransition, readTaskLedger, recordTerminalFailureRecovery, recordTerminalReplanWithChildren, recordTrajectory, replanTaskWithChildren, reviewReworkLedgerAttemptId, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
 
 function terminalEvidence(selectedTodo, claimId) {
   return {
@@ -13,6 +13,60 @@ function terminalEvidence(selectedTodo, claimId) {
     task_execution_confirmed: true,
     claim_id: claimId,
     selected_todo_sha256: crypto.createHash('sha256').update(selectedTodo).digest('hex')
+  };
+}
+
+function reviewReworkClaimForTerminalAttempt({ repo, claimId, selectedTodo, terminalEvent }) {
+  const sourceTaskId = taskAttemptId('T-review-rework', claimId);
+  const selectedTodoSha256 = crypto.createHash('sha256').update(selectedTodo).digest('hex');
+  const recoveryId = 'review-rework-recovery';
+  const sourceTerminalEventSha256 = crypto.createHash('sha256').update(JSON.stringify(terminalEvent)).digest('hex');
+  const ledgerAttemptId = reviewReworkLedgerAttemptId({
+    sourceTaskId,
+    recoveryId,
+    sourceTerminalEventId: terminalEvent.event_id,
+    selectedTodoSha256
+  });
+  const audit = {
+    schema_version: 1,
+    record_type: 'review_rework_terminal_attempt_isolation',
+    recovery_id: recoveryId,
+    root_claim_id: claimId,
+    selected_todo_sha256: selectedTodoSha256,
+    source_task_id: sourceTaskId,
+    source_terminal_event_id: terminalEvent.event_id,
+    source_terminal_event_sha256: sourceTerminalEventSha256,
+    source_terminal_state: 'completed',
+    source_task_spec_sha256: selectedTodoSha256,
+    ledger_attempt_id: ledgerAttemptId
+  };
+  const auditPath = path.join(repo, '.brownie/private/phase-loop/review-rework-ledger-attempts/recovery.json');
+  fs.mkdirSync(path.dirname(auditPath), { recursive: true });
+  fs.writeFileSync(auditPath, `${JSON.stringify(audit, null, 2)}\n`);
+  return {
+    claim_id: claimId,
+    root_claim_id: claimId,
+    status: 'in_progress',
+    selected_todo: selectedTodo,
+    legacy_completion_recovery: {
+      recovery_id: recoveryId,
+      invalidated_completion_claim_id: claimId
+    },
+    review_rework: { required: true, state: 'CHANGES_REQUESTED' },
+    review_rework_ledger_attempt: {
+      schema_version: 1,
+      kind: 'review_rework_terminal_attempt_isolation',
+      recovery_id: recoveryId,
+      root_claim_id: claimId,
+      selected_todo_sha256: selectedTodoSha256,
+      source_task_id: sourceTaskId,
+      source_terminal_event_id: terminalEvent.event_id,
+      source_terminal_event_sha256: sourceTerminalEventSha256,
+      source_task_spec_sha256: selectedTodoSha256,
+      ledger_attempt_id: ledgerAttemptId,
+      audit_path: path.relative(repo, auditPath),
+      audit_sha256: crypto.createHash('sha256').update(fs.readFileSync(auditPath, 'utf8')).digest('hex')
+    }
   };
 }
 
@@ -515,6 +569,88 @@ test('records repeated claims as separate immutable task attempts', () => {
   const projection = taskProjection(readTaskLedger(repo));
   assert.equal(projection.get(taskAttemptId('T-8', 'claim-one')).to_state, 'claimed');
   assert.equal(projection.get(taskAttemptId('T-8', 'claim-two')).to_state, 'claimed');
+});
+
+test('isolates a review-rework execution from an erroneous terminal attempt of the same claim', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  const selectedTodo = [
+    '- [ ] T-review-rework: rejected implementation root',
+    '  Route: implementation.',
+    '  Patch only `scripts/root.mjs`.',
+    '  Verification: run `node --test scripts/root.test.mjs`.'
+  ].join('\n');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, [
+    '- [ ] T-review-rework-followup: review-directed replacement',
+    '  Route: implementation.',
+    '  Source TODO: T-review-rework.',
+    '  Patch only `scripts/followup.mjs`.',
+    '  Verification: run `node --test scripts/followup.test.mjs`.',
+    ''
+  ].join('\n'));
+  const claimId = 'claim-review-rework';
+  const sourceTaskId = taskAttemptId('T-review-rework', claimId);
+  const specHash = crypto.createHash('sha256').update(selectedTodo).digest('hex');
+  let terminalEvent;
+  for (const to_state of ['queued', 'claimed', 'running', 'completed']) {
+    const result = appendTaskTransition(repo, {
+      task_id: sourceTaskId,
+      to_state,
+      claim_id: claimId,
+      run_id: 'historical-run',
+      task_spec_sha256: specHash
+    });
+    assert.equal(result.ok, true);
+    if (to_state === 'completed') terminalEvent = result.event;
+  }
+  const claim = path.join(repo, 'claim.json');
+  const reviewReworkClaim = reviewReworkClaimForTerminalAttempt({ repo, claimId, selectedTodo, terminalEvent });
+  fs.writeFileSync(claim, JSON.stringify(reviewReworkClaim));
+
+  assert.equal(recordTrajectory(repo, { claimPath: claim, todoPath: todo, type: 'todo.claimed', runId: 'fresh-run' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath: claim, todoPath: todo, type: 'workflow.routed', runId: 'fresh-run' }).ok, true);
+  const replanned = recordTrajectory(repo, {
+    claimPath: claim,
+    todoPath: todo,
+    type: 'todo.replanned',
+    payloadRaw: JSON.stringify({ reason: 'review_directed_reimplementation' }),
+    runId: 'fresh-run'
+  });
+  assert.equal(replanned.ok, true, JSON.stringify(replanned));
+  const isolatedTaskId = reviewReworkClaim.review_rework_ledger_attempt.ledger_attempt_id;
+  const projection = taskProjection(readTaskLedger(repo));
+  assert.equal(projection.get(sourceTaskId).to_state, 'completed');
+  assert.equal(projection.get(isolatedTaskId).to_state, 'replanned');
+  assert.equal(projection.get('T-review-rework-followup').parent_task_id, isolatedTaskId);
+
+  const continued = recordTrajectory(repo, { claimPath: claim, todoPath: todo, type: 'workflow.routed', runId: 'continuation-run' });
+  assert.equal(continued.ok, true);
+  assert.equal(continued.code, 'duplicate_trajectory');
+  assert.equal(taskProjection(readTaskLedger(repo)).get(isolatedTaskId).to_state, 'replanned');
+  assert.equal(taskProjection(readTaskLedger(repo)).get(sourceTaskId).to_state, 'completed');
+});
+
+test('fails closed when a review-rework isolation binding no longer matches its terminal source', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const selectedTodo = '- [ ] T-review-rework: rejected implementation root';
+  const claimId = 'claim-review-rework-invalid';
+  const sourceTaskId = taskAttemptId('T-review-rework', claimId);
+  const specHash = crypto.createHash('sha256').update(selectedTodo).digest('hex');
+  let terminalEvent;
+  for (const to_state of ['queued', 'claimed', 'running', 'completed']) {
+    const result = appendTaskTransition(repo, { task_id: sourceTaskId, to_state, claim_id: claimId, task_spec_sha256: specHash });
+    if (to_state === 'completed') terminalEvent = result.event;
+  }
+  const claim = path.join(repo, 'claim.json');
+  const value = reviewReworkClaimForTerminalAttempt({ repo, claimId, selectedTodo, terminalEvent });
+  value.review_rework_ledger_attempt.source_terminal_event_id = 'not-the-terminal-event';
+  fs.writeFileSync(claim, JSON.stringify(value));
+  const before = fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl'), 'utf8');
+  const result = recordTrajectory(repo, { claimPath: claim, type: 'todo.claimed', runId: 'fresh-run' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'review_rework_ledger_attempt_invalid');
+  assert.equal(fs.readFileSync(path.join(repo, '.brownie/private/phase-loop/task-ledger.jsonl'), 'utf8'), before);
 });
 
 test('records a failed retry and its later completion as unique task attempts', () => {
