@@ -271,6 +271,46 @@ test('preserves the same rejected-review root for a fresh admission despite queu
   assert.equal(preserved.review_rework_fresh_dispatch_pending, true);
 });
 
+test('preserves an exact persisted changes-requested root before generic stale rebaseline can create another lineage archive', () => {
+  const f = fixture();
+  const claim = JSON.parse(fs.readFileSync(f.claimPath, 'utf8'));
+  Object.assign(claim, {
+    root_claim_id: claim.claim_id,
+    review_rework: { required: true, state: 'CHANGES_REQUESTED' },
+    legacy_completion_recovery: { recovery_id: 'review-rework-recovery' },
+  });
+  writeJson(f.claimPath, claim);
+  writeJson(path.join(f.stateDir, 'todo-repair-feedback.json'), {
+    schema_version: 1,
+    kind: 'phase_loop_review_rework_required',
+    completed: false,
+    claim_id: claim.claim_id,
+    root_claim_id: claim.claim_id,
+    recovery_id: 'review-rework-recovery',
+    selected_todo_first_line: f.selected.split('\n')[0],
+    recovery_inputs: {
+      selected_todo_sha256: crypto.createHash('sha256').update(f.selected).digest('hex'),
+    },
+  });
+
+  const result = rebaselineStaleClaim({
+    repo: repositoryRoot,
+    stateDir: f.stateDir,
+    claimPath: f.claimPath,
+    statusPath: path.join(f.stateDir, 'status.json'),
+    progressPath: path.join(f.stateDir, 'progress-state.json'),
+    queuePath: path.join(f.claims, 'todo-queue-state.json'),
+    ledgerPath: path.join(f.stateDir, 'task-ledger.jsonl'),
+    runsDir: f.runs,
+    todoPath: path.join(f.root, 'todo.md'),
+    runStamp: '20261020T090000Z',
+    baselineRef: 'origin/main',
+  });
+  assert.equal(result.rebaselined, false, JSON.stringify(result));
+  assert.equal(result.reason, 'review_rework_root_preserved_for_persisted_feedback_reconciliation');
+  assert.equal(fs.existsSync(f.claimPath), true);
+});
+
 test('does not exempt a non-changes-requested review claim from stale rebaseline', () => {
   const f = fixture();
   const claim = JSON.parse(fs.readFileSync(f.claimPath, 'utf8'));

@@ -81,6 +81,31 @@ function hasExactPendingTodo(todoText, selectedTodo) {
   return Boolean(selected) && claimSelectorTodoBlocks(todoText).includes(selected);
 }
 
+function persistedChangesRequestedRoot(stateDir, claim) {
+  const feedback = readJson(path.join(stateDir, 'todo-repair-feedback.json'));
+  const selected = String(claim?.selected_todo ?? '').trimEnd();
+  const firstLine = selected.split('\n')[0] ?? '';
+  const expectedHash = sha256(selected);
+  if (
+    feedback?.schema_version !== 1
+    || feedback?.kind !== 'phase_loop_review_rework_required'
+    || feedback?.completed !== false
+    || typeof feedback?.claim_id !== 'string'
+    || feedback.root_claim_id !== feedback.claim_id
+    || claim?.claim_id !== feedback.claim_id
+    || claim?.root_claim_id !== feedback.claim_id
+    || claim?.review_rework?.required !== true
+    || claim?.review_rework?.state !== 'CHANGES_REQUESTED'
+    || claim?.legacy_completion_recovery?.recovery_id !== feedback.recovery_id
+    || feedback.selected_todo_first_line !== firstLine
+    || feedback.recovery_inputs?.selected_todo_sha256 !== expectedHash
+  ) return null;
+  return {
+    recovery_id: feedback.recovery_id,
+    selected_todo_sha256: expectedHash,
+  };
+}
+
 function selectedContract(selectedTodo) {
   const text = String(selectedTodo ?? '');
   const targetText = text.match(/\b(?:Patch|Create) only\s+([^\n]*)/u)?.[1] ?? '';
@@ -300,6 +325,24 @@ export function rebaselineStaleClaim({
   }
   if (claim.terminal_failure_recovery_pending === true || claim.terminal_failure_source_transition_pending === true) {
     return { ok: true, rebaselined: false, reason: 'durable_recovery_pending', claim_id: claim.claim_id };
+  }
+  // A persisted CHANGES_REQUESTED receipt is a stronger causal obligation
+  // than generic stale-claim routing.  The reconciliation gate restores or
+  // re-arms this exact root; archiving it again here merely manufactures more
+  // lineage candidates and can make a rejected delivery look fresh.  Preserve
+  // only the exact same-root, immutable-feedback shape.  Any malformed or
+  // mismatched feedback continues through the ordinary fail-closed path.
+  const persistedReviewRework = persistedChangesRequestedRoot(stateDir, claim);
+  if (persistedReviewRework) {
+    return {
+      ok: true,
+      rebaselined: false,
+      reason: 'review_rework_root_preserved_for_persisted_feedback_reconciliation',
+      claim_id: claim.claim_id,
+      root_claim_id: claim.root_claim_id,
+      recovery_id: persistedReviewRework.recovery_id,
+      selected_todo_sha256: persistedReviewRework.selected_todo_sha256,
+    };
   }
   const projection = progressProjection(progress);
   const claimMatchesProjection = projection.claim_id === claim.claim_id;
