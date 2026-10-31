@@ -18,6 +18,7 @@ import {
   resolveTodoState
 } from './phase-loop-todo-state.mjs';
 import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
+import { completionConditionSha256 } from './phase-loop-delivery-integrity.mjs';
 import { validateTodoQueueIntegrity } from './phase-loop-todo-queue-integrity.mjs';
 
 const defaultTodo = '.brownie/todo.md';
@@ -107,6 +108,59 @@ function reviewRejectionValid(review, expectedAuthor, expectedReviewer) {
   return { valid, reason: valid ? null : 'review_rejection_receipt_invalid' };
 }
 
+function verificationCommands(block) {
+  return [...lineValue(block, 'Verification').matchAll(/`([^`]+)`/gu)]
+    .map((match) => match[1].trim())
+    .filter(Boolean);
+}
+
+// A v1 completion may be retained as historical evidence only.  This is the
+// deliberately narrow upgrade path for a separate, independently reviewed
+// and merged delivery: it requires the immutable claim snapshot, the active
+// deployment roles, same-head approval, a reviewer merge, complete CI, and
+// evidence for every concrete command in the original TODO verification line.
+// It appends a v2 record instead of rewriting history.
+function mergedDeliveryReceiptValid(receipt, { claimId, selected, expectedAuthor, expectedReviewer }) {
+  const approval = receipt?.latest_approval;
+  const semantic = receipt?.semantic_completion_evidence;
+  const selectedHash = sha256(selected);
+  const completionConditionHash = completionConditionSha256({ selected_todo: selected });
+  const verification = Array.isArray(semantic?.verification_results)
+    ? semantic.verification_results
+    : [];
+  const observables = Array.isArray(semantic?.observables) ? semantic.observables : [];
+  const requiredCommands = verificationCommands(selected);
+  const commandsCovered = requiredCommands.every((command) => verification.some((result) => (
+    result?.command === command && result?.exit_code === 0
+  )));
+  const valid = (
+    receipt?.schema_version === 1
+    && typeof receipt?.pr_url === 'string' && receipt.pr_url
+    && receipt?.state === 'MERGED'
+    && receipt?.author === expectedAuthor
+    && typeof receipt?.head_sha === 'string' && /^[a-f0-9]{40}$/u.test(receipt.head_sha)
+    && typeof receipt?.merge_commit === 'string' && /^[a-f0-9]{40}$/u.test(receipt.merge_commit)
+    && typeof receipt?.merged_at === 'string' && receipt.merged_at
+    && receipt?.merged_by === expectedReviewer
+    && approval?.author === expectedReviewer
+    && approval?.state === 'APPROVED'
+    && approval?.commit_id === receipt.head_sha
+    && receipt?.ci?.passed === true
+    && Array.isArray(receipt.ci.checks) && receipt.ci.checks.length > 0
+    && receipt.ci.checks.every((check) => check?.status === 'COMPLETED' && check?.conclusion === 'SUCCESS')
+    && semantic?.schema_version === 1
+    && semantic.root_claim_id === claimId
+    && semantic.selected_todo_sha256 === selectedHash
+    && semantic.completion_condition_sha256 === completionConditionHash
+    && verification.length > 0
+    && verification.every((result) => result && typeof result.command === 'string' && result.command && result.exit_code === 0)
+    && commandsCovered
+    && observables.length > 0
+    && observables.every((observable) => observable && observable.kind && typeof observable.sha256 === 'string' && /^[a-f0-9]{64}$/u.test(observable.sha256))
+  );
+  return { valid, reason: valid ? null : 'merged_delivery_receipt_invalid' };
+}
+
 function legacyDependencyBlocks(repoRoot, todoText, breakdownPath) {
   const state = resolveTodoState({
     todoText,
@@ -161,6 +215,7 @@ function parseArgs(argv) {
     else if (key === '--completion') { args.completion = value; index += 1; }
     else if (key === '--snapshot') { args.snapshot = value; index += 1; }
     else if (key === '--review-receipt') { args.reviewReceipt = value; index += 1; }
+    else if (key === '--merge-receipt') { args.mergeReceipt = value; index += 1; }
     else if (key === '--actor-deployment') { args.actorDeployment = value; index += 1; }
     else throw new Error(`unknown_argument:${key}`);
   }
@@ -217,6 +272,149 @@ function assertRecoveryInputs({ completion, snapshot, review, todoText, expected
   const reviewValidation = reviewRejectionValid(review, expectedAuthor, expectedReviewer);
   if (!reviewValidation.valid) throw new Error(reviewValidation.reason);
   return { claimId, targetId, selected, parentId, parent };
+}
+
+function assertLegacyAttestationInputs({ completion, snapshot, mergeReceipt, todoText, expectedAuthor, expectedReviewer }) {
+  const claimId = typeof completion?.claim_id === 'string' ? completion.claim_id : '';
+  const targetId = typeof completion?.selected_todo_id === 'string' ? completion.selected_todo_id : '';
+  if (!claimId || !targetId || completion?.schema_version >= 2) {
+    throw new Error('legacy_completion_record_required');
+  }
+  const selected = typeof snapshot?.selected_todo === 'string' ? snapshot.selected_todo.trimEnd() : '';
+  const baseline = typeof snapshot?.baseline_todo_text === 'string' ? snapshot.baseline_todo_text : '';
+  if (!selected || todoId(selected) !== targetId || !baseline.includes(selected)) {
+    throw new Error('immutable_snapshot_does_not_match_legacy_completion');
+  }
+  if (snapshot?.claim_id !== claimId) {
+    throw new Error('immutable_snapshot_claim_does_not_match_legacy_completion');
+  }
+  const selectedFirstLine = selected.split('\n')[0] ?? '';
+  if (
+    (snapshot?.selected_todo_id && snapshot.selected_todo_id !== targetId)
+    || (snapshot?.selected_todo_first_line && snapshot.selected_todo_first_line !== selectedFirstLine)
+    || (snapshot?.selected_todo_sha256 && snapshot.selected_todo_sha256 !== sha256(selected))
+    || (completion?.selected_todo_first_line && completion.selected_todo_first_line !== selectedFirstLine)
+  ) {
+    throw new Error('immutable_snapshot_selected_todo_does_not_match_legacy_completion');
+  }
+  if (findBlock(todoText, targetId)) {
+    throw new Error('legacy_target_is_already_live');
+  }
+  const receiptValidation = mergedDeliveryReceiptValid(mergeReceipt, {
+    claimId,
+    selected,
+    expectedAuthor,
+    expectedReviewer
+  });
+  if (!receiptValidation.valid) throw new Error(receiptValidation.reason);
+  return { claimId, targetId, selected };
+}
+
+export function attestLegacyMergedCompletion({
+  repoRoot,
+  todoPath = defaultTodo,
+  statePath = defaultState,
+  completionPath,
+  snapshotPath,
+  mergeReceiptPath,
+  actorDeploymentPath,
+  actorDeployment,
+  now = new Date().toISOString()
+}) {
+  const root = path.resolve(repoRoot);
+  const actors = recoveryActors({ repoRoot: root, actorDeploymentPath, actorDeployment });
+  const todoFile = path.resolve(root, todoPath);
+  const stateRoot = path.resolve(root, statePath);
+  const completionFile = path.resolve(root, completionPath);
+  const snapshotFile = path.resolve(root, snapshotPath);
+  const receiptFile = path.resolve(root, mergeReceiptPath);
+  const completion = readJson(completionFile);
+  const snapshot = readJson(snapshotFile);
+  const mergeReceipt = readJson(receiptFile);
+  const todoText = readText(todoFile);
+  const input = assertLegacyAttestationInputs({
+    completion,
+    snapshot,
+    mergeReceipt,
+    todoText,
+    expectedAuthor: actors.implementation,
+    expectedReviewer: actors.review
+  });
+  const receiptId = sha256(`${input.claimId}\n${sha256(input.selected)}\n${mergeReceipt.pr_url}\n${mergeReceipt.merge_commit}`).slice(0, 24);
+  const completionDir = path.join(stateRoot, 'todo-completions');
+  const recordPath = path.join(completionDir, `durable-legacy-${input.claimId}-${receiptId}.json`);
+  if (fs.existsSync(recordPath)) {
+    return {
+      schema_version: 1,
+      attested: false,
+      idempotent_attestation: true,
+      claim_id: input.claimId,
+      selected_todo_id: input.targetId,
+      durable_record_path: path.relative(root, recordPath)
+    };
+  }
+  const deliveryReceipt = {
+    schema_version: 1,
+    claim_id: input.claimId,
+    root_claim_id: input.claimId,
+    selected_todo_sha256: sha256(input.selected),
+    approved: true,
+    ci_passed: true,
+    merged: true,
+    author: actors.implementation,
+    reviewer: actors.review,
+    merge_actor: actors.review,
+    pr_url: mergeReceipt.pr_url,
+    pr_head_sha: mergeReceipt.head_sha,
+    merge_commit: mergeReceipt.merge_commit,
+    merged_at: mergeReceipt.merged_at,
+    semantic_completion_evidence: mergeReceipt.semantic_completion_evidence
+  };
+  const record = {
+    schema_version: 2,
+    record_type: 'legacy_completion_delivery_attestation',
+    claim_id: input.claimId,
+    root_claim_id: input.claimId,
+    selected_todo_id: input.targetId,
+    selected_todo_first_line: input.selected.split('\n')[0],
+    selected_todo_sha256: sha256(input.selected),
+    reason: 'historical_completion_attested_by_independent_merged_delivery',
+    delivery_receipt: deliveryReceipt,
+    attestation: {
+      receipt_id: receiptId,
+      legacy_completion_path: path.relative(root, completionFile),
+      immutable_snapshot_path: path.relative(root, snapshotFile),
+      merge_receipt_path: path.relative(root, receiptFile),
+      completion_record_sha256: sha256(readText(completionFile)),
+      snapshot_sha256: sha256(readText(snapshotFile)),
+      merge_receipt_sha256: sha256(readText(receiptFile)),
+      attested_at: now
+    }
+  };
+  const auditPath = path.join(stateRoot, 'legacy-completion-attestations', `${receiptId}.json`);
+  const audit = {
+    schema_version: 1,
+    record_type: 'legacy_completion_delivery_attestation',
+    receipt_id: receiptId,
+    claim_id: input.claimId,
+    selected_todo_id: input.targetId,
+    durable_record_path: path.relative(root, recordPath),
+    pr_url: mergeReceipt.pr_url,
+    merge_commit: mergeReceipt.merge_commit,
+    reviewer: actors.review,
+    attested_at: now
+  };
+  atomicJson(recordPath, record);
+  atomicJson(auditPath, audit);
+  return {
+    schema_version: 1,
+    attested: true,
+    claim_id: input.claimId,
+    selected_todo_id: input.targetId,
+    durable_record_path: path.relative(root, recordPath),
+    audit_path: path.relative(root, auditPath),
+    actor_deployment_path: actors.deploymentPath ? path.relative(root, actors.deploymentPath) : null
+  };
 }
 
 export function recoverLegacyRejectedCompletion({
@@ -459,6 +657,16 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
             reviewReceiptPath: args.reviewReceipt,
             actorDeploymentPath: args.actorDeployment
           })
+        : args.mode === 'attest'
+          ? attestLegacyMergedCompletion({
+              repoRoot: root,
+              todoPath: args.todo,
+              statePath: args.state,
+              completionPath: args.completion,
+              snapshotPath: args.snapshot,
+              mergeReceiptPath: args.mergeReceipt,
+              actorDeploymentPath: args.actorDeployment
+            })
         : (() => { throw new Error(`unknown_mode:${args.mode}`); })();
     console.log(JSON.stringify(result, null, 2));
   } catch (error) {
