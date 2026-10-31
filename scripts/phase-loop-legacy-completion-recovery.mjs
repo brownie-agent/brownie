@@ -451,6 +451,132 @@ function isProvenTerminalDisplacement({ currentClaim, claimId, selected, invalid
   );
 }
 
+function exactSelectedTodoFirstLine(selected) {
+  return typeof selected === 'string' && selected.trim()
+    ? selected.trim().split('\n')[0]
+    : '';
+}
+
+function existingRepositoryRelativePath(root, value, label) {
+  if (typeof value !== 'string' || !value.trim() || path.isAbsolute(value)) {
+    throw new Error(`review_rework_lineage_${label}_path_invalid`);
+  }
+  const resolved = path.resolve(root, value);
+  const relative = path.relative(root, resolved);
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || !fs.existsSync(resolved)) {
+    throw new Error(`review_rework_lineage_${label}_path_invalid`);
+  }
+  return relative;
+}
+
+function persistedReviewReworkSource({ root, stateRoot, feedback }) {
+  const claimId = typeof feedback?.claim_id === 'string' ? feedback.claim_id : '';
+  const recoveryId = typeof feedback?.recovery_id === 'string' ? feedback.recovery_id : '';
+  const selectedFirstLine = typeof feedback?.selected_todo_first_line === 'string'
+    ? feedback.selected_todo_first_line
+    : '';
+  if (
+    feedback?.kind !== 'phase_loop_review_rework_required'
+    || feedback?.completed !== false
+    || !claimId
+    || feedback?.root_claim_id !== claimId
+    || !recoveryId
+    || !selectedFirstLine
+    || feedback?.review_state !== 'CHANGES_REQUESTED'
+  ) {
+    throw new Error('review_rework_lineage_feedback_invalid');
+  }
+
+  // A stale rebaseline is the only normal path that may displace a live
+  // review-rework root. Search that bounded, audit-only namespace rather
+  // than guessing from a PR, a current TODO, or an arbitrary old claim.
+  const claimsDir = path.join(stateRoot, 'todo-claims');
+  if (!fs.existsSync(claimsDir)) {
+    throw new Error('review_rework_lineage_source_missing');
+  }
+  const candidates = fs.readdirSync(claimsDir)
+    .filter((entry) => /^stale-rebaseline-[A-Za-z0-9TZ_-]+\.json$/u.test(entry))
+    .sort()
+    .map((entry) => ({
+      path: path.join(claimsDir, entry),
+      value: readJson(path.join(claimsDir, entry))
+    }))
+    .filter(({ value }) => (
+      value?.claim_id === claimId
+      && value?.root_claim_id === claimId
+      && value?.legacy_completion_recovery?.recovery_id === recoveryId
+      && value?.review_rework?.required === true
+      && value?.review_rework?.state === 'CHANGES_REQUESTED'
+      && exactSelectedTodoFirstLine(value?.selected_todo) === selectedFirstLine
+    ));
+  if (candidates.length !== 1) {
+    throw new Error(candidates.length === 0
+      ? 'review_rework_lineage_source_missing'
+      : 'review_rework_lineage_source_ambiguous');
+  }
+
+  const candidate = candidates[0];
+  const recovery = candidate.value.legacy_completion_recovery;
+  return {
+    source_claim_path: path.relative(root, candidate.path),
+    selected_todo: candidate.value.selected_todo.trimEnd(),
+    completion_path: existingRepositoryRelativePath(root, recovery.completion_record_path, 'completion'),
+    snapshot_path: existingRepositoryRelativePath(root, recovery.immutable_snapshot_path, 'snapshot'),
+    review_receipt_path: existingRepositoryRelativePath(root, recovery.review_receipt_path, 'review_receipt')
+  };
+}
+
+// A CHANGES_REQUESTED receipt is a durable causal obligation. If a later
+// terminal claim has replaced its root, reattach the exact audited root before
+// any normal claim selection or no-op completion fallback can run. Missing or
+// ambiguous lineage is intentionally an executable error: continuing would
+// turn a rejected implementation into a fresh-looking claim.
+export function reconcilePersistedReviewRework({
+  repoRoot,
+  todoPath = defaultTodo,
+  breakdownPath = defaultBreakdown,
+  statePath = defaultState,
+  actorDeploymentPath,
+  actorDeployment,
+  now = new Date().toISOString()
+}) {
+  const root = path.resolve(repoRoot);
+  const stateRoot = path.resolve(root, statePath);
+  const feedbackPath = path.join(stateRoot, 'todo-repair-feedback.json');
+  if (!fs.existsSync(feedbackPath)) {
+    return { schema_version: 1, applicable: false, reason: 'review_rework_feedback_absent' };
+  }
+  const feedback = readJson(feedbackPath);
+  const source = persistedReviewReworkSource({ root, stateRoot, feedback });
+  const currentClaimPath = path.join(stateRoot, 'todo-claims', 'current.json');
+  if (!fs.existsSync(currentClaimPath)) {
+    throw new Error('review_rework_lineage_current_claim_missing');
+  }
+  const currentClaim = readJson(currentClaimPath);
+  if (sha256(currentClaim?.selected_todo) !== sha256(source.selected_todo)) {
+    throw new Error('review_rework_lineage_selected_todo_mismatch');
+  }
+  const recovered = recoverLegacyRejectedCompletion({
+    repoRoot: root,
+    todoPath,
+    breakdownPath,
+    statePath,
+    completionPath: source.completion_path,
+    snapshotPath: source.snapshot_path,
+    reviewReceiptPath: source.review_receipt_path,
+    actorDeploymentPath,
+    actorDeployment,
+    now
+  });
+  return {
+    schema_version: 1,
+    applicable: true,
+    lineage_source_claim_path: source.source_claim_path,
+    feedback_path: path.relative(root, feedbackPath),
+    ...recovered
+  };
+}
+
 function isAuditedPartialInitialRecovery({ stateRoot, todoText, input, review, currentClaim, invalidation, recoveryId }) {
   if (findBlock(todoText, input.targetId)) return false;
   const recoverableCurrentStatus = currentClaim == null
@@ -827,6 +953,12 @@ export function recoverLegacyRejectedCompletion({
     review_head_sha: review.head_sha,
     feedback: review.latest_review.body,
     recovery_id: recoveryId,
+    recovery_inputs: {
+      completion_record_path: path.relative(root, completionFile),
+      immutable_snapshot_path: path.relative(root, snapshotFile),
+      review_receipt_path: path.relative(root, reviewFile),
+      selected_todo_sha256: sha256(input.selected)
+    },
     fresh_runtime_dispatch_required: true,
     updated_at: now
   };
@@ -901,6 +1033,14 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
             reviewReceiptPath: args.reviewReceipt,
             actorDeploymentPath: args.actorDeployment
           })
+        : args.mode === 'reconcile-review-rework'
+          ? reconcilePersistedReviewRework({
+              repoRoot: root,
+              todoPath: args.todo,
+              breakdownPath: args.breakdown,
+              statePath: args.state,
+              actorDeploymentPath: args.actorDeployment
+            })
         : args.mode === 'attest'
           ? attestLegacyMergedCompletion({
               repoRoot: root,

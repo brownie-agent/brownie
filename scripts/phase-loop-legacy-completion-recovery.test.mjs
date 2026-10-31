@@ -6,7 +6,8 @@ import test from 'node:test';
 import {
   detectLegacyCompletionRecovery,
   attestLegacyMergedCompletion,
-  recoverLegacyRejectedCompletion
+  recoverLegacyRejectedCompletion,
+  reconcilePersistedReviewRework
 } from './phase-loop-legacy-completion-recovery.mjs';
 import { produceSemanticCompletionEvidence } from './phase-loop-delivery-integrity.mjs';
 
@@ -332,6 +333,57 @@ test('idempotent recovery reclaims a terminal claim that displaced its review-re
   assert.equal(current.review_rework_fresh_dispatch_pending, true);
   const todo = fs.readFileSync(path.join(value.root, '.brownie/todo.md'), 'utf8');
   assert.equal((todo.match(/E-target:/gu) ?? []).length, 1);
+});
+
+test('reconciles persisted review feedback before a displaced terminal claim can become a fresh-looking TODO', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const reviewedRoot = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  assert.equal(reviewedRoot.review_rework_fresh_dispatch_pending, true);
+  const feedback = JSON.parse(fs.readFileSync(path.join(value.root, value.state, 'todo-repair-feedback.json'), 'utf8'));
+  assert.equal(feedback.recovery_inputs.completion_record_path, value.completion);
+  assert.equal(feedback.recovery_inputs.immutable_snapshot_path, value.snapshot);
+  assert.equal(feedback.recovery_inputs.review_receipt_path, value.review);
+
+  writeJson(path.join(value.root, value.state, 'todo-claims', 'stale-rebaseline-20261031T000010Z.json'), reviewedRoot);
+  writeJson(currentPath, {
+    claim_id: 'fresh-looking-terminal-claim',
+    root_claim_id: 'fresh-looking-terminal-claim',
+    status: 'integrity_blocked',
+    selected_todo: target,
+    status_history: [{
+      requested_status: 'completed',
+      status: 'integrity_blocked',
+      updated_at: '2026-10-31T00:00:30.000Z'
+    }]
+  });
+
+  const reconciled = reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:01:00.000Z'
+  });
+  assert.equal(reconciled.applicable, true, JSON.stringify(reconciled));
+  assert.equal(reconciled.recovered, true, JSON.stringify(reconciled));
+  assert.equal(reconciled.idempotent_displacement, true, JSON.stringify(reconciled));
+  const restored = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  assert.equal(restored.claim_id, 'legacy-claim');
+  assert.equal(restored.root_claim_id, 'legacy-claim');
+  assert.equal(restored.review_rework.state, 'CHANGES_REQUESTED');
+  assert.equal(restored.review_rework_fresh_dispatch_pending, true);
+  const displaced = JSON.parse(fs.readFileSync(path.join(value.root, reconciled.displaced_claim_archive_path), 'utf8'));
+  assert.equal(displaced.claim_id, 'fresh-looking-terminal-claim');
+  assert.equal(displaced.status, 'integrity_blocked');
 });
 
 test('idempotent recovery refuses to replace a running foreign claim', () => {

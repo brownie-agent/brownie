@@ -162,6 +162,18 @@ test('controller validates queue integrity before resuming an active claim', () 
 });
 
 test('review-rework recovery invalidates a stale Runtime continuation until an admitted fresh run clears its marker', () => {
+  const lineageReconciliationStart = controller.indexOf('phase_loop_reconcile_persisted_review_rework()');
+  const lineageReconciliationCall = controller.indexOf('phase_loop_reconcile_persisted_review_rework "$run_stamp"');
+  const staleClaimRestoreCall = controller.indexOf('phase_loop_restore_admission_backed_stale_claim "$run_stamp"');
+  const staleClaimRebaselineCall = controller.indexOf('phase_loop_rebaseline_stale_claim "$run_stamp"');
+  assert(lineageReconciliationStart >= 0, 'review-rework lineage reconciliation helper must exist');
+  assert(lineageReconciliationCall >= 0 && lineageReconciliationCall < staleClaimRestoreCall);
+  assert(staleClaimRestoreCall >= 0 && staleClaimRestoreCall < staleClaimRebaselineCall);
+  const lineageReconciliation = controller.slice(lineageReconciliationStart, controller.indexOf('\nphase_loop_restore_admission_backed_stale_claim()', lineageReconciliationStart));
+  assert.match(lineageReconciliation, /reconcile-review-rework/);
+  assert.match(lineageReconciliation, /--actor-deployment "\$PHASE_LOOP_ACTOR_DEPLOYMENT"/);
+  assert.match(lineageReconciliation, /review_rework_lineage_reconciliation_exit/);
+
   const resumeStart = controller.indexOf('phase_loop_should_resume_active_claim()');
   const resumeEnd = controller.indexOf('\nwrite_progress_state()', resumeStart);
   assert(resumeStart >= 0 && resumeEnd > resumeStart, 'resume selection helper must exist');
