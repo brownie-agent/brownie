@@ -11071,6 +11071,18 @@ same_objective_apply_scope = (
 # new three-replay budget even though Runtime is replaying the same proposal.
 objective_apply_target_scope = json.dumps({
     "selected_todo": progress_projection["selected_todo"],
+    # This value is empty for ordinary claim continuity. It changes only when
+    # the controller has durably archived an unsafe same-claim Runtime store
+    # for a review-rework fresh dispatch. That bounded generation is a new
+    # authorization lineage, not delivery progress.
+    "runtime_store_generation": (
+        "review-rework:"
+        + text(claim.get("review_rework_fresh_dispatch_store_isolation", {}).get("recovery_id"))
+        + ":"
+        + text(claim.get("review_rework_fresh_dispatch_store_isolation", {}).get("dispatch_attempt"))
+        if isinstance(claim.get("review_rework_fresh_dispatch_store_isolation"), dict)
+        else ""
+    ),
 }, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 previous_objective_apply_target_scope = text(previous_projection.get("objective_apply_target_scope"))
 same_objective_apply_target_scope = (
@@ -16831,6 +16843,55 @@ phase_loop_rebaseline_expired_runtime_authorization() {
   return 0
 }
 
+# A CHANGES_REQUESTED review-rework keeps its immutable claim so feedback and
+# future PR updates bind to the original TODO.  That stable claim must not
+# reuse the old Runtime store: it may contain the rejected objective proposal
+# and make a later `run` look fresh while only replaying the stale candidate.
+# Archive the prior store once for the audited fresh-dispatch generation.  The
+# helper is idempotent and never deletes a store; it fails closed on ambiguity.
+phase_loop_isolate_review_rework_fresh_runtime_dispatch() {
+  local output status
+  set +e
+  output="$(node "$ROOT_DIR/scripts/phase-loop-review-rework-dispatch-isolation.mjs" isolate \
+    --store-root "$PHASE_LOOP_BROWNIE_STORE_ROOT" \
+    --state-dir "$STATE_DIR" \
+    --claim "$TODO_CLAIM_FILE" 2>&1)"
+  status=$?
+  set -e
+  PHASE_LOOP_REVIEW_REWORK_STORE_ISOLATION_OUTPUT="$output"
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+  if ! printf '%s' "$output" | python3 -c 'import json,sys; value=json.load(sys.stdin); sys.exit(0 if value.get("ok") is True else 1)'; then
+    return 78
+  fi
+  return 0
+}
+
+# The first implementation of the review-rework re-arm invalidated `resume`
+# but left the claim-id-derived Runtime store in place. Repair only the
+# precisely evidenced historical shape (terminal replay-only resumes with no
+# task/run execution) once, then feed it through the normal audited store
+# isolation path. Any broader failure is deliberately not retried here.
+phase_loop_prepare_review_rework_stale_replay_store_isolation_repair() {
+  local output status
+  set +e
+  output="$(node "$ROOT_DIR/scripts/phase-loop-review-rework-dispatch-isolation.mjs" repair-stale-replay \
+    --state-dir "$STATE_DIR" \
+    --claim "$TODO_CLAIM_FILE" \
+    --progress "$PROGRESS_STATE_FILE" 2>&1)"
+  status=$?
+  set -e
+  PHASE_LOOP_REVIEW_REWORK_STALE_REPLAY_REPAIR_OUTPUT="$output"
+  if [ "$status" -ne 0 ]; then
+    return "$status"
+  fi
+  if ! printf '%s' "$output" | python3 -c 'import json,sys; value=json.load(sys.stdin); sys.exit(0 if value.get("ok") is True else 1)'; then
+    return 78
+  fi
+  return 0
+}
+
 runtime_stdout_has_expired_authorization() {
   local stdout_log="$1"
   python3 - "$stdout_log" <<'PY'
@@ -17587,6 +17648,19 @@ PY
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"terminal_multitarget_leaf_split_failed"}'
     return 74
   fi
+  if active_todo_claim_exists; then
+    if ! phase_loop_prepare_review_rework_stale_replay_store_isolation_repair; then
+      detail="A review-rework claim has a stale-replay store-isolation repair failure; refusing a resume or replacement claim. repair=${PHASE_LOOP_REVIEW_REWORK_STALE_REPLAY_REPAIR_OUTPUT:-<no output>}"
+      printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+      write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+      write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"review_rework_stale_replay_store_isolation_repair_failed","owner_blocked":true}'
+      return 78
+    fi
+    if printf '%s' "${PHASE_LOOP_REVIEW_REWORK_STALE_REPLAY_REPAIR_OUTPUT:-}" | python3 -c 'import json,sys; value=json.load(sys.stdin); sys.exit(0 if value.get("prepared") is True else 1)'; then
+      printf '%s run=%s review_rework_stale_replay_store_isolation_repair_prepared=true result=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_REVIEW_REWORK_STALE_REPLAY_REPAIR_OUTPUT" >> "$SUPERVISOR_LOG"
+      write_bdk_trajectory_event "$run_stamp" "todo.repair_feedback" '{"reason":"review_rework_stale_replay_store_isolation_repair_prepared","delivery_progress":false}'
+    fi
+  fi
   if phase_loop_should_resume_active_claim; then
     # Resume is execution, not a read-only status refresh.  Validate the
     # current queue projection before reusing a claim so a completed leaf or
@@ -17704,6 +17778,17 @@ PY
     record_stably_blocked_todo_claim "$run_stamp"
     write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"stably_blocked"}'
     return 0
+  fi
+  if ! phase_loop_isolate_review_rework_fresh_runtime_dispatch; then
+    detail="Review-rework fresh dispatch could not isolate the prior claim-local Runtime store; refusing an ambiguous resume. isolation=${PHASE_LOOP_REVIEW_REWORK_STORE_ISOLATION_OUTPUT:-<no output>}"
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"review_rework_runtime_store_isolation_failed","owner_blocked":true}'
+    return 78
+  fi
+  if printf '%s' "${PHASE_LOOP_REVIEW_REWORK_STORE_ISOLATION_OUTPUT:-}" | python3 -c 'import json,sys; value=json.load(sys.stdin); sys.exit(0 if value.get("isolated") is True else 1)'; then
+    printf '%s run=%s review_rework_runtime_store_isolated=true result=%s\n' "$(now_utc)" "$run_stamp" "$PHASE_LOOP_REVIEW_REWORK_STORE_ISOLATION_OUTPUT" >> "$SUPERVISOR_LOG"
+    write_bdk_trajectory_event "$run_stamp" "todo.repair_feedback" '{"reason":"review_rework_runtime_store_isolated_for_fresh_dispatch","delivery_progress":false}'
   fi
   # Capture the claim only after every stale-queue check and replacement has
   # settled. If the runtime removes current.json, terminal recovery must use

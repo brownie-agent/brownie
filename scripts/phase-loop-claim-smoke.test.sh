@@ -6543,6 +6543,7 @@ cat > "$review_rework_state/todo-claims/current.json" <<'EOF'
   "legacy_completion_recovery": {"recovery_id": "review-rework-recovery"},
   "review_rework": {"required": true, "state": "CHANGES_REQUESTED", "pr_url": "https://example.invalid/pull/793", "reviewer": "fixture-review", "feedback": "Implement artifact journey evidence; the retained baseline is not accepted."},
   "review_rework_fresh_dispatch_pending": true,
+  "review_rework_fresh_dispatch_attempt": 1,
   "review_rework_fresh_dispatch_recovery_id": "review-rework-recovery"
 }
 EOF
@@ -6654,11 +6655,33 @@ writeJson(`${statePath}/todo-claims/current.json`, {
   }]
 });
 NODE
+  # Seed the same-claim Runtime store with a rejected continuation. The
+  # review-rework rearm must archive this store before the fake Runtime is
+  # invoked, even though it deliberately preserves the claim id.
+  review_rework_runtime_store="$(mktemp)"
+  # The active file is deliberately a displaced terminal claim at this point.
+  # Seed the durable review root's store, which reconciliation restores before
+  # Runtime admission, rather than deriving a store from the disposable
+  # replacement claim.
+  python3 - "$review_rework_state/todo-claims/stale-rebaseline-20261031T000010Z.json" "$PHASE_LOOP_BROWNIE_STORE_ROOT" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+digest = hashlib.sha256(claim["claim_id"].encode("utf-8")).hexdigest()
+store = pathlib.Path(sys.argv[2]) / "phase-loop-claims" / digest
+store.mkdir(parents=True, exist_ok=True)
+(store / "stale-rejected-continuation.json").write_text('{"objective":"rejected"}\n', encoding="utf-8")
+PY
   fake_brownie_review_rework="$(mktemp)"
   cat > "$fake_brownie_review_rework" <<'SH'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" > "$PHASE_LOOP_TEST_ARGV_FILE"
+printf '%s\n' "$BROWNIE_STORE_ROOT" > "$PHASE_LOOP_TEST_RUNTIME_STORE_FILE"
+test ! -e "$BROWNIE_STORE_ROOT/stale-rejected-continuation.json"
 previous=""
 for argument in "$@"; do
   if [ "$previous" = "--file" ]; then
@@ -6718,6 +6741,7 @@ SH
   PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
   PHASE_LOOP_TEST_ARGV_FILE="$review_rework_argv" \
   PHASE_LOOP_TEST_PROMPT_FILE="$review_rework_effective_prompt" \
+  PHASE_LOOP_TEST_RUNTIME_STORE_FILE="$review_rework_runtime_store" \
   BROWNIE_BIN="$fake_brownie_review_rework" \
   run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
@@ -6726,7 +6750,7 @@ SH
     pnpm --workspace-root guard:runtime-operational-evidence:test
   ) >/dev/null
 
-  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_state/todo-claims/repair-feedback.json" "$review_rework_effective_prompt" "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs" <<'PY'
+  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_state/todo-claims/repair-feedback.json" "$review_rework_effective_prompt" "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs" "$review_rework_runtime_store" <<'PY'
 import json
 import pathlib
 import sys
@@ -6737,6 +6761,7 @@ todo = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 feedback = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding="utf-8"))
 effective_prompt = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
 runtime_target = pathlib.Path(sys.argv[6]).read_text(encoding="utf-8")
+runtime_store = pathlib.Path(sys.argv[7]).read_text(encoding="utf-8").strip()
 assert "--json run --file" in argv, argv
 assert "--json resume" not in argv, argv
 assert claim["claim_id"] == "todo-g1-review-rework", claim
@@ -6747,6 +6772,10 @@ assert "completion_certificate" not in claim, claim
 assert claim["review_rework_fresh_dispatch_pending"] is False, claim
 assert claim["review_rework_fresh_dispatch_activated_run_stamp"], claim
 assert claim["review_rework_fresh_dispatch_activated_at"], claim
+isolation = claim["review_rework_fresh_dispatch_store_isolation"]
+assert isolation["dispatch_attempt"] == 1, isolation
+assert pathlib.Path(isolation["archived_store"]).joinpath("stale-rejected-continuation.json").read_text(encoding="utf-8") == '{"objective":"rejected"}\n'
+assert not pathlib.Path(runtime_store).joinpath("stale-rejected-continuation.json").exists(), runtime_store
 assert "E-review-rework" in todo, todo
 assert feedback["reason"] == "review_rework_dirty_baseline_requires_reimplementation", feedback
 assert feedback["review_rework"]["state"] == "CHANGES_REQUESTED", feedback

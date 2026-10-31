@@ -243,6 +243,7 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
   assert.equal(current.review_rework.state, 'CHANGES_REQUESTED');
   assert.equal(current.review_rework_fresh_dispatch_pending, true);
   assert.equal(current.review_rework_fresh_dispatch_recovery_id, result.recovery_id);
+  assert.equal(current.review_rework_fresh_dispatch_attempt, 1);
   const archive = JSON.parse(fs.readFileSync(path.join(value.root, current.legacy_completion_recovery.archived_current_claim_path), 'utf8'));
   assert.equal(archive.claim_id, 'unrelated-e23d');
   assert.equal(archive.failure_evidence.reason, 'terminal_completion_evidence_missing');
@@ -260,13 +261,34 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
   assert.equal(retry.fresh_runtime_dispatch_required, true);
   assert.equal(retry.fresh_runtime_dispatch_marker_restored, false);
 
+  // A v1 marker without a generation identity is not safe for a claim-local
+  // Runtime-store archive. Repair its identity before any fresh dispatch.
+  const missingAttempt = { ...current };
+  delete missingAttempt.review_rework_fresh_dispatch_attempt;
+  writeJson(path.join(value.root, result.current_claim_path), missingAttempt);
+  const generationRepaired = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:30.000Z'
+  });
+  assert.equal(generationRepaired.fresh_runtime_dispatch_required, true);
+  assert.equal(generationRepaired.fresh_runtime_dispatch_attempt, 1);
+  assert.ok(generationRepaired.fresh_runtime_dispatch_attempt_repair_audit_path);
+  const generationRepairedClaim = JSON.parse(fs.readFileSync(path.join(value.root, result.current_claim_path), 'utf8'));
+  assert.equal(generationRepairedClaim.review_rework_fresh_dispatch_attempt, 1);
+
   // Older recovery records may predate the marker.  The idempotent path may
   // repair only the same live root claim and records that repair separately.
-  delete current.review_rework_fresh_dispatch_pending;
-  delete current.review_rework_fresh_dispatch_recovery_id;
-  delete current.review_rework_fresh_dispatch_reason;
-  delete current.review_rework_fresh_dispatch_requested_at;
-  writeJson(path.join(value.root, result.current_claim_path), current);
+  delete generationRepairedClaim.review_rework_fresh_dispatch_pending;
+  delete generationRepairedClaim.review_rework_fresh_dispatch_recovery_id;
+  delete generationRepairedClaim.review_rework_fresh_dispatch_reason;
+  delete generationRepairedClaim.review_rework_fresh_dispatch_requested_at;
+  delete generationRepairedClaim.review_rework_fresh_dispatch_attempt;
+  writeJson(path.join(value.root, result.current_claim_path), generationRepairedClaim);
   const repaired = recoverLegacyRejectedCompletion({
     repoRoot: value.root,
     statePath: value.state,
@@ -282,6 +304,7 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
   const repairedClaim = JSON.parse(fs.readFileSync(path.join(value.root, result.current_claim_path), 'utf8'));
   assert.equal(repairedClaim.review_rework_fresh_dispatch_pending, true);
   assert.equal(repairedClaim.review_rework_fresh_dispatch_recovery_id, result.recovery_id);
+  assert.equal(repairedClaim.review_rework_fresh_dispatch_attempt, 1);
   const repairAudit = JSON.parse(fs.readFileSync(path.join(value.root, repaired.fresh_runtime_dispatch_repair_audit_path), 'utf8'));
   assert.equal(repairAudit.recovery_id, result.recovery_id);
   assert.equal(repairAudit.reason, 'legacy_review_rework_claim_had_no_fresh_dispatch_marker');
