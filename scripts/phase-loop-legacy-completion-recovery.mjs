@@ -451,6 +451,33 @@ function isProvenTerminalDisplacement({ currentClaim, claimId, selected, invalid
   );
 }
 
+function isAuditedPartialInitialRecovery({ stateRoot, todoText, input, review, currentClaim, invalidation, recoveryId }) {
+  if (findBlock(todoText, input.targetId)) return false;
+  const recoverableCurrentStatus = currentClaim == null
+    || ['failed', 'integrity_blocked', 'stale_snapshot_rejected'].includes(currentClaim.status);
+  if (!recoverableCurrentStatus || currentClaim?.delivery_review != null) return false;
+  const todoSnapshotPath = path.join(stateRoot, 'legacy-completion-recoveries', `${recoveryId}.todo-before.md`);
+  if (!fs.existsSync(todoSnapshotPath)) return false;
+  let snapshotMatches;
+  try {
+    snapshotMatches = sha256(readText(todoSnapshotPath)) === sha256(todoText);
+  } catch {
+    return false;
+  }
+  return Boolean(
+    snapshotMatches
+    && invalidation?.schema_version === 1
+    && invalidation.record_type === 'todo_completion_invalidation'
+    && invalidation.selected_todo_id === input.targetId
+    && invalidation.invalidated_completion_claim_id === input.claimId
+    && invalidation.reason === 'legacy_completion_rejected_by_independent_review'
+    && invalidation.recovery_id === recoveryId
+    && invalidation.pr_url === review.pr_url
+    && invalidation.review_state === review.latest_review.state
+    && invalidation.review_head_sha === review.head_sha
+  );
+}
+
 function ensureReviewReworkFreshDispatch({
   root,
   stateRoot,
@@ -634,6 +661,15 @@ export function recoverLegacyRejectedCompletion({
       throw new Error('active_claim_must_be_preserved_before_legacy_recovery');
     }
   }
+  const partialInitialRecovery = alreadyInvalidated && isAuditedPartialInitialRecovery({
+    stateRoot,
+    todoText,
+    input,
+    review,
+    currentClaim,
+    invalidation,
+    recoveryId
+  });
   if (alreadyInvalidated && !isLiveMatchingReviewReworkClaim({
     currentClaim,
     claimId: input.claimId,
@@ -644,7 +680,7 @@ export function recoverLegacyRejectedCompletion({
     claimId: input.claimId,
     selected: input.selected,
     invalidation
-  })) {
+  }) && !partialInitialRecovery) {
     throw new Error('idempotent_recovery_requires_proven_terminal_displacement');
   }
 
@@ -704,7 +740,7 @@ export function recoverLegacyRejectedCompletion({
   const recoveryDir = path.join(stateRoot, 'legacy-completion-recoveries');
   const invalidationPath = path.join(stateRoot, 'todo-completion-invalidations', `${input.claimId}-${recoveryId}.json`);
   const displacedClaimDigest = currentClaim ? sha256(JSON.stringify(currentClaim)).slice(0, 16) : null;
-  const idempotentDisplacement = alreadyInvalidated && !isLiveMatchingReviewReworkClaim({
+  const idempotentDisplacement = alreadyInvalidated && !partialInitialRecovery && !isLiveMatchingReviewReworkClaim({
     currentClaim,
     claimId: input.claimId,
     selected: input.selected,
@@ -813,6 +849,7 @@ export function recoverLegacyRejectedCompletion({
     invalidation_path: path.relative(root, invalidationPath),
     fresh_runtime_dispatch_required: true,
     idempotent_displacement: idempotentDisplacement,
+    idempotent_partial_initial_recovery: partialInitialRecovery,
     recovered_at: now
   };
 
@@ -831,6 +868,7 @@ export function recoverLegacyRejectedCompletion({
     schema_version: 1,
     recovered: true,
     idempotent_recovery: alreadyInvalidated,
+    idempotent_partial_initial_recovery: partialInitialRecovery,
     recovery_id: recoveryId,
     claim_id: input.claimId,
     selected_todo_id: input.targetId,

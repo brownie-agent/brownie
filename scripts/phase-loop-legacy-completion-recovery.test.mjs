@@ -436,6 +436,40 @@ test('idempotent recovery refuses an unproven terminal claim with merged deliver
   assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, 'utf8')), completedClaim);
 });
 
+test('idempotent recovery completes an audited initial recovery interrupted after invalidation', () => {
+  const value = fixture();
+  const todoPath = path.join(value.root, '.brownie/todo.md');
+  const currentPath = path.join(value.root, `${value.state}/todo-claims/current.json`);
+  const todoBefore = fs.readFileSync(todoPath, 'utf8');
+  const claimBefore = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  fs.rmSync(path.join(value.root, first.audit_path));
+  writeJson(currentPath, claimBefore);
+  fs.writeFileSync(todoPath, todoBefore);
+
+  const retry = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:01:00.000Z'
+  });
+  assert.equal(retry.recovered, true, JSON.stringify(retry));
+  assert.equal(retry.idempotent_recovery, true);
+  assert.equal(retry.idempotent_partial_initial_recovery, true);
+  assert.equal(JSON.parse(fs.readFileSync(currentPath, 'utf8')).claim_id, 'legacy-claim');
+});
+
 test('recovery fails closed when the review receipt is not a same-head changes-requested decision', () => {
   const value = fixture();
   const receipt = JSON.parse(fs.readFileSync(path.join(value.root, value.review), 'utf8'));
