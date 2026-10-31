@@ -877,9 +877,48 @@ function ensureReviewReworkFreshDispatch({
     };
   }
   if (currentClaim.review_rework_fresh_dispatch_pending === true) {
+    const dispatchAttempt = Number.isSafeInteger(currentClaim.review_rework_fresh_dispatch_attempt)
+      && currentClaim.review_rework_fresh_dispatch_attempt >= 1
+      ? currentClaim.review_rework_fresh_dispatch_attempt
+      : 1;
+    if (currentClaim.review_rework_fresh_dispatch_attempt !== dispatchAttempt) {
+      const auditPath = path.join(
+        stateRoot,
+        'legacy-completion-fresh-dispatch-repairs',
+        `${recoveryId}-dispatch-attempt-${dispatchAttempt}.json`
+      );
+      const audit = {
+        schema_version: 1,
+        record_type: 'legacy_completion_review_rework_fresh_dispatch_attempt_repair',
+        recovery_id: recoveryId,
+        claim_id: claimId,
+        dispatch_attempt: dispatchAttempt,
+        reason: 'legacy_fresh_dispatch_marker_missing_generation_identity',
+        repaired_at: now,
+      };
+      if (!fs.existsSync(auditPath)) atomicJson(auditPath, audit);
+      atomicJson(currentClaimPath, {
+        ...currentClaim,
+        review_rework_fresh_dispatch_attempt: dispatchAttempt,
+        review_rework_fresh_dispatch_attempt_repair: {
+          schema_version: 1,
+          dispatch_attempt: dispatchAttempt,
+          audit_path: path.relative(root, auditPath),
+          repaired_at: now,
+        },
+        updated_at: now,
+      });
+      return {
+        fresh_runtime_dispatch_required: true,
+        fresh_runtime_dispatch_marker_restored: true,
+        fresh_runtime_dispatch_attempt: dispatchAttempt,
+        fresh_runtime_dispatch_attempt_repair_audit_path: path.relative(root, auditPath),
+      };
+    }
     return {
       fresh_runtime_dispatch_required: true,
-      fresh_runtime_dispatch_marker_restored: false
+      fresh_runtime_dispatch_marker_restored: false,
+      fresh_runtime_dispatch_attempt: dispatchAttempt,
     };
   }
 
@@ -904,6 +943,7 @@ function ensureReviewReworkFreshDispatch({
     review_rework_fresh_dispatch_recovery_id: recoveryId,
     review_rework_fresh_dispatch_reason: 'legacy_completion_rejected_by_independent_review',
     review_rework_fresh_dispatch_requested_at: now,
+    review_rework_fresh_dispatch_attempt: 1,
     status_history: [
       ...(Array.isArray(currentClaim.status_history) ? currentClaim.status_history : []),
       {
@@ -1147,6 +1187,7 @@ export function recoverLegacyRejectedCompletion({
     review_rework_fresh_dispatch_recovery_id: recoveryId,
     review_rework_fresh_dispatch_reason: 'legacy_completion_rejected_by_independent_review',
     review_rework_fresh_dispatch_requested_at: now,
+    review_rework_fresh_dispatch_attempt: 1,
     legacy_completion_recovery: {
       recovery_id: recoveryId,
       invalidated_completion_claim_id: input.claimId,
