@@ -20730,6 +20730,7 @@ case "${1:-status}" in
     supervise
     ;;
   stop)
+    load_env || exit $?
     stop_loop
     ;;
   watchdog)
@@ -20746,6 +20747,7 @@ case "${1:-status}" in
     restart
     ;;
   status)
+    load_env || exit $?
     status
     ;;
   check-binary-freshness)
