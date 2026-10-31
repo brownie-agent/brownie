@@ -6487,14 +6487,19 @@ if claim_smoke_section_enabled review-rework; then
   review_rework_todo="$(mktemp)"
   review_rework_workspace="$(mktemp -d)"
   review_rework_argv="$review_rework_state/fake-brownie.argv"
+  review_rework_effective_prompt="$review_rework_state/fake-brownie.prompt.md"
   git -C "$review_rework_workspace" init -b main >/dev/null
   git -C "$review_rework_workspace" config user.name Brownie
   git -C "$review_rework_workspace" config user.email brownie@example.invalid
   mkdir -p "$review_rework_workspace/scripts"
-  printf '{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs"}}\n' > "$review_rework_workspace/package.json"
+  printf '{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","guard:runtime-operational-evidence:test":"true"}}\n' > "$review_rework_workspace/package.json"
   printf 'export const operationalEvidence = {};\n' > "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs"
   git -C "$review_rework_workspace" add package.json scripts/release-runtime-operational-evidence.mjs
   git -C "$review_rework_workspace" commit -m init >/dev/null
+  # Simulate the rejected implementation that recovery preserved as the
+  # workspace baseline. Its own verification command is green, so the test
+  # proves the controller cannot misclassify preexisting diff as completion.
+  printf '// rejected baseline retained for review-directed rework\n' >> "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs"
   printf 'base prompt\n' > "$review_rework_prompt"
   cat > "$review_rework_todo" <<'EOF'
 - [ ] E-review-rework: Patch only `scripts/release-runtime-operational-evidence.mjs` to generate satisfied soak evidence.
@@ -6525,7 +6530,7 @@ cat > "$review_rework_state/todo-claims/current.json" <<'EOF'
   "selected_todo": "- [ ] E-review-rework: Patch only `scripts/release-runtime-operational-evidence.mjs` to generate satisfied soak evidence.\n  Route: implementation.\n  Source TODO: E-review-rework-parent.\n  Completion condition: generated satisfied soak evidence has all required stateful steps from a bounded Runtime fixture, not version-only repetition.\n  Verification: run `pnpm --workspace-root guard:runtime-operational-evidence:test`.",
   "status": "in_progress",
   "legacy_completion_recovery": {"recovery_id": "review-rework-recovery"},
-  "review_rework": {"required": true, "state": "CHANGES_REQUESTED"},
+  "review_rework": {"required": true, "state": "CHANGES_REQUESTED", "pr_url": "https://example.invalid/pull/793", "reviewer": "fixture-review", "feedback": "Implement artifact journey evidence; the retained baseline is not accepted."},
   "review_rework_fresh_dispatch_pending": true,
   "review_rework_fresh_dispatch_recovery_id": "review-rework-recovery"
 }
@@ -6548,7 +6553,7 @@ todo = todo_path.read_text(encoding="utf-8")
 fingerprint = hashlib.sha256(todo.encode("utf-8")).hexdigest()
 claim["queue_fingerprint"] = fingerprint
 claim["baseline_todo_text"] = todo
-claim["baseline_diff_files"] = []
+claim["baseline_diff_files"] = ["scripts/release-runtime-operational-evidence.mjs"]
 claim_path.write_text(json.dumps(claim, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 queue_path.write_text(json.dumps({"schema_version": 1, "generation": 2, "fingerprint": fingerprint}, sort_keys=True) + "\n", encoding="utf-8")
 PY
@@ -6557,6 +6562,14 @@ PY
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" > "$PHASE_LOOP_TEST_ARGV_FILE"
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--file" ]; then
+    cp "$argument" "$PHASE_LOOP_TEST_PROMPT_FILE"
+    break
+  fi
+  previous="$argument"
+done
 cat <<'JSON'
 {
   "command": "run",
@@ -6606,24 +6619,35 @@ SH
   PHASE_LOOP_WORKSPACE_ROOT="$review_rework_workspace" \
   PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
   PHASE_LOOP_TEST_ARGV_FILE="$review_rework_argv" \
+  PHASE_LOOP_TEST_PROMPT_FILE="$review_rework_effective_prompt" \
   BROWNIE_BIN="$fake_brownie_review_rework" \
   run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" <<'PY'
+  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_state/todo-claims/repair-feedback.json" "$review_rework_effective_prompt" <<'PY'
 import json
 import pathlib
 import sys
 
 argv = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+feedback = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding="utf-8"))
+effective_prompt = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
 assert "--json run --file" in argv, argv
 assert "--json resume" not in argv, argv
 assert claim["claim_id"] == "todo-g1-review-rework", claim
 assert claim["root_claim_id"] == "todo-g1-review-rework", claim
 assert claim["queue_generation"] == 2, claim
+assert claim["status"] != "completed", claim
 assert claim["review_rework_fresh_dispatch_pending"] is False, claim
 assert claim["review_rework_fresh_dispatch_activated_run_stamp"], claim
 assert claim["review_rework_fresh_dispatch_activated_at"], claim
+assert "E-review-rework" in todo, todo
+assert feedback["reason"] == "review_rework_dirty_baseline_requires_reimplementation", feedback
+assert feedback["review_rework"]["state"] == "CHANGES_REQUESTED", feedback
+assert "review_rework_feedback" in effective_prompt, effective_prompt
+assert "Implement artifact journey evidence; the retained baseline is not accepted." in effective_prompt, effective_prompt
+assert "review_rework_completion_policy" in effective_prompt, effective_prompt
 PY
 fi
 
