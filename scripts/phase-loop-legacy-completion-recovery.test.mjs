@@ -240,6 +240,8 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
   assert.equal(current.root_claim_id, 'legacy-claim');
   assert.equal(current.status, 'in_progress');
   assert.equal(current.review_rework.state, 'CHANGES_REQUESTED');
+  assert.equal(current.review_rework_fresh_dispatch_pending, true);
+  assert.equal(current.review_rework_fresh_dispatch_recovery_id, result.recovery_id);
   const archive = JSON.parse(fs.readFileSync(path.join(value.root, current.legacy_completion_recovery.archived_current_claim_path), 'utf8'));
   assert.equal(archive.claim_id, 'unrelated-e23d');
   assert.equal(archive.failure_evidence.reason, 'terminal_completion_evidence_missing');
@@ -254,6 +256,34 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
     actorDeployment: value.actorDeployment
   });
   assert.equal(retry.idempotent_recovery, true);
+  assert.equal(retry.fresh_runtime_dispatch_required, true);
+  assert.equal(retry.fresh_runtime_dispatch_marker_restored, false);
+
+  // Older recovery records may predate the marker.  The idempotent path may
+  // repair only the same live root claim and records that repair separately.
+  delete current.review_rework_fresh_dispatch_pending;
+  delete current.review_rework_fresh_dispatch_recovery_id;
+  delete current.review_rework_fresh_dispatch_reason;
+  delete current.review_rework_fresh_dispatch_requested_at;
+  writeJson(path.join(value.root, result.current_claim_path), current);
+  const repaired = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:01:00.000Z'
+  });
+  assert.equal(repaired.fresh_runtime_dispatch_required, true);
+  assert.equal(repaired.fresh_runtime_dispatch_marker_restored, true);
+  assert.ok(repaired.fresh_runtime_dispatch_repair_audit_path);
+  const repairedClaim = JSON.parse(fs.readFileSync(path.join(value.root, result.current_claim_path), 'utf8'));
+  assert.equal(repairedClaim.review_rework_fresh_dispatch_pending, true);
+  assert.equal(repairedClaim.review_rework_fresh_dispatch_recovery_id, result.recovery_id);
+  const repairAudit = JSON.parse(fs.readFileSync(path.join(value.root, repaired.fresh_runtime_dispatch_repair_audit_path), 'utf8'));
+  assert.equal(repairAudit.recovery_id, result.recovery_id);
+  assert.equal(repairAudit.reason, 'legacy_review_rework_claim_had_no_fresh_dispatch_marker');
 });
 
 test('recovery fails closed when the review receipt is not a same-head changes-requested decision', () => {

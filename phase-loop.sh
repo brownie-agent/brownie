@@ -10775,9 +10775,11 @@ phase_loop_should_resume_active_claim() {
   if ! active_todo_claim_exists; then
     return 1
   fi
-  # A previous Runtime session can contain an explicit proposal approval that
-  # is no longer current.  Its store is archived by the bounded recovery
-  # below; never issue `resume` against that archived authorization.
+  # A previous Runtime session can contain either an explicit proposal
+  # approval that is no longer current or a continuation from a completion
+  # later rejected in independent review.  Both recovery paths retain the
+  # claim but invalidate that session; never issue `resume` until an admitted
+  # fresh `run` has atomically cleared the claim-local marker.
   if python3 - "$TODO_CLAIM_FILE" <<'PY'
 import json
 import sys
@@ -10787,7 +10789,10 @@ try:
         claim = json.load(handle)
 except Exception:
     sys.exit(1)
-sys.exit(0 if claim.get("runtime_authorization_rebaseline_pending") is True else 1)
+sys.exit(0 if (
+    claim.get("runtime_authorization_rebaseline_pending") is True
+    or claim.get("review_rework_fresh_dispatch_pending") is True
+) else 1)
 PY
   then
     return 1
@@ -17005,7 +17010,7 @@ phase_loop_recover_expired_runtime_authorization() {
   return 76
 }
 
-clear_runtime_authorization_rebaseline_pending() {
+clear_fresh_runtime_dispatch_pending() {
   local run_stamp="$1"
   local temporary pending_status
   set +e
@@ -17018,7 +17023,10 @@ try:
         claim = json.load(handle)
 except Exception:
     sys.exit(2)
-sys.exit(0 if claim.get("runtime_authorization_rebaseline_pending") is True else 1)
+sys.exit(0 if (
+    claim.get("runtime_authorization_rebaseline_pending") is True
+    or claim.get("review_rework_fresh_dispatch_pending") is True
+) else 1)
 PY
   pending_status=$?
   set -e
@@ -17028,7 +17036,7 @@ PY
   if [ "$pending_status" -ne 0 ]; then
     return 1
   fi
-  temporary="$TODO_CLAIM_FILE.$$.$RANDOM.authorization-rebaseline.tmp"
+  temporary="$TODO_CLAIM_FILE.$$.$RANDOM.fresh-dispatch.tmp"
   if ! python3 - "$TODO_CLAIM_FILE" "$temporary" "$run_stamp" "$(now_utc)" <<'PY'
 import json
 import os
@@ -17049,6 +17057,10 @@ if claim.get("runtime_authorization_rebaseline_pending") is True:
     claim["runtime_authorization_rebaseline_pending"] = False
     claim["runtime_authorization_rebaseline_activated_run_stamp"] = run_stamp
     claim["runtime_authorization_rebaseline_activated_at"] = timestamp
+if claim.get("review_rework_fresh_dispatch_pending") is True:
+    claim["review_rework_fresh_dispatch_pending"] = False
+    claim["review_rework_fresh_dispatch_activated_run_stamp"] = run_stamp
+    claim["review_rework_fresh_dispatch_activated_at"] = timestamp
 destination.write_text(json.dumps(claim, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 os.chmod(destination, 0o600)
 PY
@@ -18419,16 +18431,16 @@ NODE
   fi
   # A fresh Runtime admission can legitimately retire the current claim before
   # its terminal result is projected (for example, during deterministic
-  # terminal-failure recovery).  In that case no durable rebaseline marker can
-  # exist: the marker lives on the claim itself.  Do not reinterpret an absent
-  # claim as a failed marker clear; there is no session that a later resume can
-  # accidentally reuse.  A present claim still has to clear its marker
-  # atomically before continuing.
-  if [ "$use_resume" -ne 1 ] && [ -f "$TODO_CLAIM_FILE" ] && ! clear_runtime_authorization_rebaseline_pending "$run_stamp"; then
-    detail="Runtime returned an admitted fresh session, but the expired-authorization rebaseline marker could not be cleared atomically; refusing to continue with ambiguous resume state. stdout=$stdout_log stderr=$stderr_log"
+  # terminal-failure recovery).  In that case no durable fresh-dispatch marker
+  # can exist: the marker lives on the claim itself.  Do not reinterpret an
+  # absent claim as a failed marker clear; there is no session that a later
+  # resume can accidentally reuse.  A present claim still has to clear every
+  # fresh-dispatch marker atomically before continuing.
+  if [ "$use_resume" -ne 1 ] && [ -f "$TODO_CLAIM_FILE" ] && ! clear_fresh_runtime_dispatch_pending "$run_stamp"; then
+    detail="Runtime returned an admitted fresh session, but a claim-local fresh-dispatch marker could not be cleared atomically; refusing to continue with ambiguous resume state. stdout=$stdout_log stderr=$stderr_log"
     printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
     write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-1}"
-    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"runtime_authorization_rebaseline_marker_clear_failed","owner_blocked":true}'
+    write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"fresh_runtime_dispatch_marker_clear_failed","owner_blocked":true}'
     return 78
   fi
   bind_runtime_stdout_to_active_claim "$stdout_log"

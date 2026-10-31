@@ -160,6 +160,30 @@ test('controller validates queue integrity before resuming an active claim', () 
   assert.match(controller, /todo-queue-integrity-resume-\$run_stamp/);
 });
 
+test('review-rework recovery invalidates a stale Runtime continuation until an admitted fresh run clears its marker', () => {
+  const resumeStart = controller.indexOf('phase_loop_should_resume_active_claim()');
+  const resumeEnd = controller.indexOf('\nwrite_progress_state()', resumeStart);
+  assert(resumeStart >= 0 && resumeEnd > resumeStart, 'resume selection helper must exist');
+  const resume = controller.slice(resumeStart, resumeEnd);
+  assert.match(resume, /claim\.get\("review_rework_fresh_dispatch_pending"\) is True/);
+  assert.match(resume, /return 1/);
+
+  const clearStart = controller.indexOf('clear_fresh_runtime_dispatch_pending()');
+  const clearEnd = controller.indexOf('\nbind_runtime_stdout_to_active_claim()', clearStart);
+  assert(clearStart >= 0 && clearEnd > clearStart, 'fresh-dispatch clear helper must exist');
+  const clear = controller.slice(clearStart, clearEnd);
+  assert.match(clear, /claim\["review_rework_fresh_dispatch_pending"\] = False/);
+  assert.match(clear, /claim\["review_rework_fresh_dispatch_activated_run_stamp"\] = run_stamp/);
+  assert.match(clear, /claim\["review_rework_fresh_dispatch_activated_at"\] = timestamp/);
+
+  const admissionStart = controller.indexOf('  # A fresh Runtime admission can legitimately retire');
+  const admissionEnd = controller.indexOf('\n  bind_runtime_stdout_to_active_claim', admissionStart);
+  assert(admissionStart >= 0 && admissionEnd > admissionStart, 'fresh admission marker boundary must exist');
+  const admission = controller.slice(admissionStart, admissionEnd);
+  assert.match(admission, /if \[ "\$use_resume" -ne 1 \].*clear_fresh_runtime_dispatch_pending "\$run_stamp"/s);
+  assert.match(admission, /fresh_runtime_dispatch_marker_clear_failed/);
+});
+
 test('controller defers only the selected-target integrity finding for a verified Runtime resume continuation', () => {
   const helperStart = controller.indexOf('phase_loop_can_defer_selected_target_change_for_continuation()');
   const helperEnd = controller.indexOf('\ntry_reconstruct_missing_todo_replan_records()', helperStart);

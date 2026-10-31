@@ -351,7 +351,7 @@ phase_loop_prepare_pr_fixture_workspace() {
 }
 
 case "$PHASE_LOOP_CLAIM_SMOKE_SECTION" in
-  all|core|terminal|completion|terminal-absent|queue-claim|queue-recovery|queue-integrity|pr|lifecycle|guards|feedback) ;;
+  all|core|terminal|completion|terminal-absent|queue-claim|queue-recovery|queue-integrity|pr|lifecycle|guards|feedback|review-rework) ;;
   *)
     echo "unknown phase-loop claim smoke section: $PHASE_LOOP_CLAIM_SMOKE_SECTION" >&2
     exit 2
@@ -365,7 +365,7 @@ esac
 # aggregate command with its diagnostics.
 if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "all" ]; then
   claim_smoke_shard_dir="$(mktemp -d)"
-  claim_smoke_shards=(core terminal completion terminal-absent queue-claim queue-recovery queue-integrity pr guards feedback lifecycle)
+  claim_smoke_shards=(core terminal completion terminal-absent queue-claim queue-recovery queue-integrity pr guards feedback review-rework lifecycle)
   # A guards shard must pass end-to-end. Treating its historical static-check
   # failure as success would mask the very controller regressions this suite
   # exists to catch.
@@ -6474,6 +6474,138 @@ PY
 # leaving status.json at `running`.
 run_status_write_signal_regression TERM 143
 run_status_write_signal_regression INT 130
+fi
+
+if claim_smoke_section_enabled review-rework; then
+  # A review-rework recovery retains the root claim but must never replay the
+  # rejected Runtime continuation. This clean fixture deliberately leaves a
+  # prior projection asking for resume and supplies no repair-feedback file.
+  # The only valid path is an admitted fresh run, which atomically clears the
+  # claim-local marker for later legitimate continuation.
+  review_rework_state="$(mktemp -d)"
+  review_rework_prompt="$(mktemp)"
+  review_rework_todo="$(mktemp)"
+  review_rework_workspace="$(mktemp -d)"
+  review_rework_argv="$review_rework_state/fake-brownie.argv"
+  git -C "$review_rework_workspace" init -b main >/dev/null
+  git -C "$review_rework_workspace" config user.name Brownie
+  git -C "$review_rework_workspace" config user.email brownie@example.invalid
+  mkdir -p "$review_rework_workspace/scripts"
+  printf '{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs"}}\n' > "$review_rework_workspace/package.json"
+  printf 'export const operationalEvidence = {};\n' > "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs"
+  git -C "$review_rework_workspace" add package.json scripts/release-runtime-operational-evidence.mjs
+  git -C "$review_rework_workspace" commit -m init >/dev/null
+  printf 'base prompt\n' > "$review_rework_prompt"
+  cat > "$review_rework_todo" <<'EOF'
+- [ ] E-review-rework: Patch only `scripts/release-runtime-operational-evidence.mjs` to generate satisfied soak evidence.
+  Route: implementation.
+  Source TODO: E-review-rework-parent.
+  Completion condition: generated satisfied soak evidence has all required stateful steps from a bounded Runtime fixture, not version-only repetition.
+  Verification: run `pnpm --workspace-root guard:runtime-operational-evidence:test`.
+EOF
+  mkdir -p "$review_rework_state/todo-claims"
+  cat > "$review_rework_state/progress-state.json" <<'EOF'
+{
+  "schema_version": 1,
+  "progress_projection": {
+    "route": "{\"command\":\"resume\",\"arguments\":[]}",
+    "controller_action": "resume",
+    "next_action": "continue_existing_task"
+  }
+}
+EOF
+  cat > "$review_rework_state/todo-claims/current.json" <<'EOF'
+{
+  "claim_id": "todo-g1-review-rework",
+  "root_claim_id": "todo-g1-review-rework",
+  "queue_fingerprint": "abc",
+  "queue_generation": 1,
+  "run_stamp": "20260913T000000Z",
+  "schema_version": 1,
+  "selected_todo": "- [ ] E-review-rework: Patch only `scripts/release-runtime-operational-evidence.mjs` to generate satisfied soak evidence.\n  Route: implementation.\n  Source TODO: E-review-rework-parent.\n  Completion condition: generated satisfied soak evidence has all required stateful steps from a bounded Runtime fixture, not version-only repetition.\n  Verification: run `pnpm --workspace-root guard:runtime-operational-evidence:test`.",
+  "status": "in_progress",
+  "legacy_completion_recovery": {"recovery_id": "review-rework-recovery"},
+  "review_rework": {"required": true, "state": "CHANGES_REQUESTED"},
+  "review_rework_fresh_dispatch_pending": true,
+  "review_rework_fresh_dispatch_recovery_id": "review-rework-recovery"
+}
+EOF
+  fake_brownie_review_rework="$(mktemp)"
+  cat > "$fake_brownie_review_rework" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" > "$PHASE_LOOP_TEST_ARGV_FILE"
+cat <<'JSON'
+{
+  "command": "run",
+  "ok": true,
+  "run": {
+    "automation": {
+      "schema_version": 1,
+      "status": "continuation_required",
+      "controller_action": "resume",
+      "stop_class": "continuation_required",
+      "stop_reason": "bounded_progress",
+      "completed": false,
+      "blocked": false,
+      "retryable": true,
+      "terminal_failure": false,
+      "task_id": "task-review-rework",
+      "run_id": "run-review-rework",
+      "journey_id": "journey-review-rework",
+      "next_action": "inspect_progress_overview",
+      "next_invocation": {"command": "resume", "arguments": []}
+    },
+    "status": "task_executed",
+    "session_id": "session-review-rework",
+    "drive_id": "drive-review-rework",
+    "task_id": "task-review-rework",
+    "run_id": "run-review-rework",
+    "journey_id": "journey-review-rework",
+    "completion_closure_status": "budget_exhausted",
+    "next_action": "inspect_progress_overview",
+    "completed": false,
+    "blocked": false,
+    "retryable": true,
+    "terminal_failure": false,
+    "controller_action": "resume",
+    "stop_class": "continuation_required",
+    "stop_reason": "bounded_progress",
+    "next_invocation": {"command": "resume", "arguments": []}
+  }
+}
+JSON
+SH
+  chmod +x "$fake_brownie_review_rework"
+
+  PHASE_LOOP_STATE_DIR="$review_rework_state" \
+  PHASE_LOOP_PROMPT="$review_rework_prompt" \
+  PHASE_LOOP_TODO="$review_rework_todo" \
+  PHASE_LOOP_WORKSPACE_ROOT="$review_rework_workspace" \
+  PHASE_LOOP_SKIP_BINARY_FRESHNESS_CHECK=1 \
+  PHASE_LOOP_TEST_ARGV_FILE="$review_rework_argv" \
+  BROWNIE_BIN="$fake_brownie_review_rework" \
+  run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
+
+  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" <<'PY'
+import json
+import pathlib
+import sys
+
+argv = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+assert "--json run --file" in argv, argv
+assert "--json resume" not in argv, argv
+assert claim["review_rework_fresh_dispatch_pending"] is False, claim
+assert claim["review_rework_fresh_dispatch_activated_run_stamp"], claim
+assert claim["review_rework_fresh_dispatch_activated_at"], claim
+PY
+fi
+
+if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "review-rework" ]; then
+  assert_repository_state_unchanged
+  echo "phase-loop claim smoke passed"
+  exit 0
 fi
 
 assert_repository_state_unchanged
