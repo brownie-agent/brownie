@@ -418,6 +418,27 @@ export function attestLegacyMergedCompletion({
   };
 }
 
+function isRearmableReviewReworkCompletionRefusal(currentClaim) {
+  if (currentClaim?.status !== 'integrity_blocked') return false;
+  if (currentClaim?.delivery_review?.merged === true) return false;
+  if (currentClaim?.completion_certificate != null) return false;
+  const terminalTransition = Array.isArray(currentClaim?.status_history)
+    ? currentClaim.status_history.at(-1)
+    : null;
+  if (
+    terminalTransition?.status !== 'integrity_blocked'
+    || terminalTransition?.requested_status !== 'completed'
+  ) return false;
+  const refusals = Array.isArray(currentClaim?.completion_promotion_rejections)
+    ? currentClaim.completion_promotion_rejections
+    : [];
+  return refusals.some((refusal) => (
+    refusal?.requested_status === 'completed'
+    && typeof refusal?.reason === 'string'
+    && refusal.reason.startsWith('completed_requires_claim_bound_')
+  ));
+}
+
 function isLiveMatchingReviewReworkClaim({ currentClaim, claimId, selected, recoveryId }) {
   return Boolean(
     currentClaim
@@ -427,7 +448,10 @@ function isLiveMatchingReviewReworkClaim({ currentClaim, claimId, selected, reco
     && currentClaim.review_rework?.required === true
     && currentClaim.review_rework?.state === 'CHANGES_REQUESTED'
     && sha256(currentClaim.selected_todo) === sha256(selected)
-    && ['claimed', 'in_progress'].includes(currentClaim.status)
+    && (
+      ['claimed', 'in_progress'].includes(currentClaim.status)
+      || isRearmableReviewReworkCompletionRefusal(currentClaim)
+    )
   );
 }
 
@@ -775,6 +799,74 @@ function ensureReviewReworkFreshDispatch({
   const sameRecoveredClaim = isLiveMatchingReviewReworkClaim({ currentClaim, claimId, selected, recoveryId });
   if (!sameRecoveredClaim) {
     throw new Error('idempotent_recovery_requires_live_matching_review_rework_claim');
+  }
+  if (isRearmableReviewReworkCompletionRefusal(currentClaim)) {
+    const rearmHistory = Array.isArray(currentClaim.review_rework_fresh_dispatch_rearm_history)
+      ? currentClaim.review_rework_fresh_dispatch_rearm_history
+      : [];
+    // One re-arm repairs the controller's own premature completion attempt.
+    // A second rejection of the replacement run is no longer safe to replay:
+    // preserve the claim and make the failure executable instead of creating an
+    // unbounded recovery loop.
+    if (rearmHistory.length >= 1) {
+      throw new Error('review_rework_fresh_dispatch_rearm_limit_exceeded');
+    }
+    const priorAttempt = Number.isInteger(currentClaim.review_rework_fresh_dispatch_attempt)
+      ? currentClaim.review_rework_fresh_dispatch_attempt
+      : 1;
+    const dispatchAttempt = priorAttempt + 1;
+    const auditPath = path.join(
+      stateRoot,
+      'legacy-completion-fresh-dispatch-repairs',
+      `${recoveryId}-rearm-${dispatchAttempt}.json`
+    );
+    const audit = {
+      schema_version: 1,
+      record_type: 'legacy_completion_review_rework_completion_refusal_rearm',
+      recovery_id: recoveryId,
+      claim_id: claimId,
+      pr_url: prUrl,
+      reviewer,
+      dispatch_attempt: dispatchAttempt,
+      prior_activated_run_stamp: currentClaim.review_rework_fresh_dispatch_activated_run_stamp ?? null,
+      reason: 'completion_promotion_refused_for_changes_requested_root_claim',
+      rearmed_at: now
+    };
+    if (!fs.existsSync(auditPath)) atomicJson(auditPath, audit);
+    const { completion_certificate: _discardedCertificate, ...withoutCertificate } = currentClaim;
+    const rearmedClaim = {
+      ...withoutCertificate,
+      status: 'in_progress',
+      review_rework_fresh_dispatch_pending: true,
+      review_rework_fresh_dispatch_recovery_id: recoveryId,
+      review_rework_fresh_dispatch_reason: 'completion_promotion_refused_for_changes_requested_root_claim',
+      review_rework_fresh_dispatch_requested_at: now,
+      review_rework_fresh_dispatch_attempt: dispatchAttempt,
+      review_rework_fresh_dispatch_rearm_history: [...rearmHistory, {
+        rearmed_at: now,
+        dispatch_attempt: dispatchAttempt,
+        prior_activated_run_stamp: currentClaim.review_rework_fresh_dispatch_activated_run_stamp ?? null,
+        audit_path: path.relative(root, auditPath),
+        reason: 'completion_promotion_refused_for_changes_requested_root_claim'
+      }],
+      status_history: [
+        ...(Array.isArray(currentClaim.status_history) ? currentClaim.status_history : []),
+        {
+          status: 'in_progress',
+          updated_at: now,
+          note: 'review-rework completion promotion refusal rearmed one fresh Runtime dispatch'
+        }
+      ],
+      updated_at: now
+    };
+    atomicJson(currentClaimPath, rearmedClaim);
+    return {
+      fresh_runtime_dispatch_required: true,
+      fresh_runtime_dispatch_marker_restored: true,
+      fresh_runtime_dispatch_rearmed: true,
+      fresh_runtime_dispatch_attempt: dispatchAttempt,
+      fresh_runtime_dispatch_rearm_audit_path: path.relative(root, auditPath)
+    };
   }
   if (typeof currentClaim.review_rework_fresh_dispatch_activated_run_stamp === 'string'
     && currentClaim.review_rework_fresh_dispatch_activated_run_stamp) {

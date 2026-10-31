@@ -84,7 +84,11 @@ function baseEnvironment() {
 }
 
 function runBootstrapCheck(environment) {
-  return spawnSync('bash', [controllerPath, 'check-runtime-bootstrap'], {
+  return runController('check-runtime-bootstrap', environment);
+}
+
+function runController(command, environment) {
+  return spawnSync('bash', [controllerPath, command], {
     cwd: repoRoot,
     env: { ...baseEnvironment(), ...environment },
     encoding: 'utf8'
@@ -167,6 +171,25 @@ test('loads only an explicitly selected environment file', () => {
     const result = runBootstrapCheck({ PHASE_LOOP_ENV_FILE: environmentFile });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), { ok: true, code: 'phase_loop_bootstrap_ready' });
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('status reads the explicitly selected environment-file state root', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-status-env-file-'));
+  try {
+    const state = path.join(fixture, 'state');
+    fs.mkdirSync(state, { recursive: true });
+    const status = { status: 'integrity_blocked', detail: 'fixture status' };
+    fs.writeFileSync(path.join(state, 'status.json'), `${JSON.stringify(status)}\n`);
+    const environmentFile = path.join(fixture, 'deployment.env');
+    fs.writeFileSync(environmentFile, `PHASE_LOOP_STATE_DIR=${JSON.stringify(state)}\n`);
+    const result = runController('status', { PHASE_LOOP_ENV_FILE: environmentFile });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /phase-loop not running/u);
+    assert.match(result.stdout, /fixture status/u);
+    assert.doesNotMatch(result.stdout, /no status file:/u);
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });
   }

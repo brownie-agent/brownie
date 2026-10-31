@@ -413,6 +413,69 @@ test('reconciliation preserves a live review-rework root without requiring a sta
   assert.equal(current.review_rework_fresh_dispatch_pending, true);
 });
 
+test('reconciliation rearms exactly one fresh dispatch when a changes-requested root is blocked by its own completion gate', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const blockedClaim = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  blockedClaim.status = 'integrity_blocked';
+  blockedClaim.review_rework_fresh_dispatch_pending = false;
+  blockedClaim.review_rework_fresh_dispatch_activated_run_stamp = '20261031T000010Z';
+  blockedClaim.status_history.push({
+    requested_status: 'completed',
+    status: 'integrity_blocked',
+    updated_at: '2026-10-31T00:00:10.000Z'
+  });
+  blockedClaim.completion_promotion_rejections = [{
+    requested_status: 'completed',
+    reason: 'completed_requires_claim_bound_completion_certificate_and_independent_review_ci_merge_receipt'
+  }];
+  writeJson(currentPath, blockedClaim);
+
+  const rearmed = reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:01:00.000Z'
+  });
+  assert.equal(rearmed.applicable, false, JSON.stringify(rearmed));
+  assert.equal(rearmed.reason, 'review_rework_live_root_preserved');
+  assert.equal(rearmed.fresh_runtime_dispatch_rearmed, true);
+  assert.equal(rearmed.fresh_runtime_dispatch_attempt, 2);
+  const current = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  assert.equal(current.claim_id, 'legacy-claim');
+  assert.equal(current.root_claim_id, 'legacy-claim');
+  assert.equal(current.status, 'in_progress');
+  assert.equal(current.review_rework_fresh_dispatch_pending, true);
+  assert.equal(current.review_rework_fresh_dispatch_attempt, 2);
+  assert.equal(current.review_rework_fresh_dispatch_rearm_history.length, 1);
+  assert.ok(fs.existsSync(path.join(value.root, rearmed.fresh_runtime_dispatch_rearm_audit_path)));
+
+  current.status = 'integrity_blocked';
+  current.review_rework_fresh_dispatch_pending = false;
+  current.review_rework_fresh_dispatch_activated_run_stamp = '20261031T000110Z';
+  current.status_history.push({
+    requested_status: 'completed',
+    status: 'integrity_blocked',
+    updated_at: '2026-10-31T00:01:10.000Z'
+  });
+  writeJson(currentPath, current);
+  assert.throws(() => reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:02:00.000Z'
+  }), /review_rework_fresh_dispatch_rearm_limit_exceeded/);
+});
+
 test('reconciliation resolves review feedback only after same-root merged semantic delivery and durable TODO removal', () => {
   const value = fixture();
   const first = recoverLegacyRejectedCompletion({
