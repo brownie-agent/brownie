@@ -304,7 +304,11 @@ test('idempotent recovery reclaims a terminal claim that displaced its review-re
     status: 'integrity_blocked',
     selected_todo: target,
     queue_generation: 2,
-    failure_evidence: { reason: 'terminal_completion_evidence_missing' }
+    failure_evidence: { reason: 'terminal_completion_evidence_missing' },
+    status_history: [{
+      status: 'integrity_blocked',
+      updated_at: '2026-10-31T00:00:30.000Z'
+    }]
   });
 
   const restored = recoverLegacyRejectedCompletion({
@@ -391,6 +395,45 @@ test('idempotent recovery preserves claims awaiting review reconciliation', () =
     }), /review_pending_claim_must_be_preserved_before_legacy_recovery/);
     assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, 'utf8')), reviewClaim, status);
   }
+});
+
+test('idempotent recovery refuses an unproven terminal claim with merged delivery evidence', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const completedClaim = {
+    claim_id: 'completed-delivery-claim',
+    root_claim_id: 'completed-delivery-claim',
+    status: 'completed',
+    selected_todo: target,
+    delivery_review: {
+      pr_url: 'https://github.com/globalpocket/brownie/pull/1000',
+      approved: true,
+      ci_passed: true,
+      merged: true
+    },
+    status_history: [{
+      status: 'completed',
+      updated_at: '2026-10-31T00:01:00.000Z'
+    }]
+  };
+  writeJson(currentPath, completedClaim);
+  assert.throws(() => recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
+  }), /idempotent_recovery_requires_proven_terminal_displacement/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, 'utf8')), completedClaim);
 });
 
 test('recovery fails closed when the review receipt is not a same-head changes-requested decision', () => {

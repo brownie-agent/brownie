@@ -431,6 +431,26 @@ function isLiveMatchingReviewReworkClaim({ currentClaim, claimId, selected, reco
   );
 }
 
+function isProvenTerminalDisplacement({ currentClaim, claimId, selected, invalidation }) {
+  const terminalTransition = Array.isArray(currentClaim?.status_history)
+    ? currentClaim.status_history.at(-1)
+    : null;
+  const invalidatedAt = Date.parse(invalidation?.invalidated_at ?? '');
+  const terminalAt = Date.parse(terminalTransition?.updated_at ?? '');
+  return Boolean(
+    currentClaim
+    && currentClaim.claim_id !== claimId
+    && currentClaim.root_claim_id !== claimId
+    && currentClaim.status === 'integrity_blocked'
+    && currentClaim.delivery_review == null
+    && sha256(currentClaim.selected_todo) === sha256(selected)
+    && terminalTransition?.status === 'integrity_blocked'
+    && Number.isFinite(invalidatedAt)
+    && Number.isFinite(terminalAt)
+    && terminalAt >= invalidatedAt
+  );
+}
+
 function ensureReviewReworkFreshDispatch({
   root,
   stateRoot,
@@ -595,6 +615,9 @@ export function recoverLegacyRejectedCompletion({
   const alreadyInvalidated = invalidations.some((record) => (
     record.selected_todo_id === input.targetId && record.invalidated_completion_claim_id === input.claimId
   ));
+  const invalidation = invalidations.find((record) => (
+    record.selected_todo_id === input.targetId && record.invalidated_completion_claim_id === input.claimId
+  ));
   const recoveryId = sha256(`${input.claimId}\n${sha256(input.selected)}\n${review.pr_url}\n${review.head_sha}`).slice(0, 24);
   const currentClaim = fs.existsSync(currentClaimPath) ? readJson(currentClaimPath) : null;
   const currentStatus = currentClaim?.status;
@@ -610,6 +633,19 @@ export function recoverLegacyRejectedCompletion({
     if (!(currentClaim?.claim_id === input.claimId && currentClaim?.legacy_completion_recovery?.recovery_id === recoveryId)) {
       throw new Error('active_claim_must_be_preserved_before_legacy_recovery');
     }
+  }
+  if (alreadyInvalidated && !isLiveMatchingReviewReworkClaim({
+    currentClaim,
+    claimId: input.claimId,
+    selected: input.selected,
+    recoveryId
+  }) && !isProvenTerminalDisplacement({
+    currentClaim,
+    claimId: input.claimId,
+    selected: input.selected,
+    invalidation
+  })) {
+    throw new Error('idempotent_recovery_requires_proven_terminal_displacement');
   }
 
   const restoredParent = replaceCheckbox(input.parent, false);
