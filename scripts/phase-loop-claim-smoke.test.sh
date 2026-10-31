@@ -6514,7 +6514,7 @@ EOF
   }
 }
 EOF
-  cat > "$review_rework_state/todo-claims/current.json" <<'EOF'
+cat > "$review_rework_state/todo-claims/current.json" <<'EOF'
 {
   "claim_id": "todo-g1-review-rework",
   "root_claim_id": "todo-g1-review-rework",
@@ -6530,6 +6530,28 @@ EOF
   "review_rework_fresh_dispatch_recovery_id": "review-rework-recovery"
 }
 EOF
+  # Model the production failure: the queue contents are unchanged, but a
+  # controller-only generation advance predates the required fresh dispatch.
+  # The claim must retain its original root and synchronize the generation,
+  # rather than being replaced before Runtime admission.
+  python3 - "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_state/todo-claims/todo-queue-state.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+claim_path = pathlib.Path(sys.argv[1])
+todo_path = pathlib.Path(sys.argv[2])
+queue_path = pathlib.Path(sys.argv[3])
+claim = json.loads(claim_path.read_text(encoding="utf-8"))
+todo = todo_path.read_text(encoding="utf-8")
+fingerprint = hashlib.sha256(todo.encode("utf-8")).hexdigest()
+claim["queue_fingerprint"] = fingerprint
+claim["baseline_todo_text"] = todo
+claim["baseline_diff_files"] = []
+claim_path.write_text(json.dumps(claim, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+queue_path.write_text(json.dumps({"schema_version": 1, "generation": 2, "fingerprint": fingerprint}, sort_keys=True) + "\n", encoding="utf-8")
+PY
   fake_brownie_review_rework="$(mktemp)"
   cat > "$fake_brownie_review_rework" <<'SH'
 #!/usr/bin/env bash
@@ -6596,6 +6618,9 @@ argv = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 assert "--json run --file" in argv, argv
 assert "--json resume" not in argv, argv
+assert claim["claim_id"] == "todo-g1-review-rework", claim
+assert claim["root_claim_id"] == "todo-g1-review-rework", claim
+assert claim["queue_generation"] == 2, claim
 assert claim["review_rework_fresh_dispatch_pending"] is False, claim
 assert claim["review_rework_fresh_dispatch_activated_run_stamp"], claim
 assert claim["review_rework_fresh_dispatch_activated_at"], claim

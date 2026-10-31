@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const controller = fs.readFileSync(path.join(repoRoot, 'phase-loop.sh'), 'utf8');
+const claimRebaseline = fs.readFileSync(path.join(repoRoot, 'scripts/phase-loop-claim-rebaseline.mjs'), 'utf8');
 
 function mismatchRecoveryBlock() {
   const start = controller.indexOf('if [ "$runtime_admission_status" -ne 0 ]; then');
@@ -182,6 +183,18 @@ test('review-rework recovery invalidates a stale Runtime continuation until an a
   const admission = controller.slice(admissionStart, admissionEnd);
   assert.match(admission, /if \[ "\$use_resume" -ne 1 \].*clear_fresh_runtime_dispatch_pending "\$run_stamp"/s);
   assert.match(admission, /fresh_runtime_dispatch_marker_clear_failed/);
+
+  assert.match(controller, /phase_loop_rebaseline_stale_claim "\$run_stamp"/);
+  assert.match(
+    claimRebaseline,
+    /review_rework_fresh_dispatch_claim_preserved_for_same_root_admission/,
+    'the review-rework root must survive the stale-claim boundary before fresh Runtime admission',
+  );
+  assert.match(
+    controller,
+    /queue_state_generation == int\(claim\.get\("queue_generation"\) or 1\)/,
+    'a preserved review-rework claim must synchronize generation-only queue drift before later resume',
+  );
 });
 
 test('controller defers only the selected-target integrity finding for a verified Runtime resume continuation', () => {

@@ -2152,6 +2152,16 @@ if live != selected:
     os.replace(tmp, claim_path)
     raise SystemExit(0)
 fingerprint = hashlib.sha256(todo_text.encode("utf-8")).hexdigest()
+queue_state = {}
+queue_state_generation = None
+try:
+    queue_state = json.loads(queue_state_path.read_text(encoding="utf-8"))
+    queue_state_generation = int(queue_state.get("generation"))
+except Exception:
+    # A missing or malformed queue-state file cannot establish that an active
+    # claim is current. Fall through to the existing durable refresh path.
+    queue_state = {}
+    queue_state_generation = None
 baseline_todo_text = claim.get("baseline_todo_text")
 baseline_matches_live_todo = isinstance(baseline_todo_text, str) and baseline_todo_text == todo_text
 try:
@@ -2176,16 +2186,24 @@ baseline_diff_matches_live_workspace = sorted(str(item) for item in claim_baseli
 if (
     live == selected
     and claim.get("queue_fingerprint") == fingerprint
+    and queue_state.get("fingerprint") == fingerprint
+    and queue_state_generation == int(claim.get("queue_generation") or 1)
     and baseline_matches_live_todo
     and baseline_diff_matches_live_workspace
 ):
     raise SystemExit(0)
 generation = int(claim.get("queue_generation") or 1)
-try:
-    state = json.loads(queue_state_path.read_text(encoding="utf-8"))
-    if state.get("fingerprint") != fingerprint:
-        generation = int(state.get("generation") or generation) + 1
-except Exception:
+if queue_state_generation is not None:
+    if queue_state.get("fingerprint") == fingerprint:
+        # The immutable selected TODO and full queue fingerprint still match,
+        # so a generation-only drift is controller bookkeeping rather than a
+        # new contract. Adopt the durable queue generation before Runtime
+        # admission; otherwise the following resume would falsely rebaseline
+        # this exact claim again.
+        generation = queue_state_generation
+    else:
+        generation = queue_state_generation + 1
+else:
     generation = generation + 1
 try:
     baseline_commit = subprocess.check_output(
