@@ -15708,6 +15708,45 @@ phase_loop_rebaseline_workspace_to_approved_baseline() {
   return 0
 }
 
+phase_loop_reconcile_persisted_review_rework() {
+  local run_stamp="$1"
+  local recovery_script="$ROOT_DIR/scripts/phase-loop-legacy-completion-recovery.mjs"
+  local output status applicable
+  if [ ! -f "$recovery_script" ]; then
+    printf '%s run=%s review_rework_lineage_reconciliation_missing=true path=%s\n' "$(now_utc)" "$run_stamp" "$recovery_script" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  if [ -z "${PHASE_LOOP_ACTOR_DEPLOYMENT:-}" ]; then
+    printf '%s run=%s review_rework_lineage_reconciliation_missing_actor_deployment=true\n' "$(now_utc)" "$run_stamp" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  set +e
+  output="$(
+    cd "$ROOT_DIR" || exit 70
+    node "$recovery_script" reconcile-review-rework \
+      --repo "$PHASE_LOOP_WORKSPACE_ROOT" \
+      --state "$STATE_DIR" \
+      --todo "$PHASE_LOOP_TODO" \
+      --breakdown "$PHASE_LOOP_TODO_BREAKDOWN" \
+      --actor-deployment "$PHASE_LOOP_ACTOR_DEPLOYMENT" 2>&1
+  )"
+  status=$?
+  set -e
+  printf '%s run=%s review_rework_lineage_reconciliation_exit=%s result=%s\n' "$(now_utc)" "$run_stamp" "$status" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+  if [ "$status" -ne 0 ]; then
+    return 78
+  fi
+  applicable="$(printf '%s' "$output" | python3 -c 'import json,sys; value=json.load(sys.stdin).get("applicable"); print("1" if value is True else "0" if value is False else "")' 2>/dev/null || true)"
+  if [ "$applicable" != "0" ] && [ "$applicable" != "1" ]; then
+    printf '%s run=%s review_rework_lineage_reconciliation_result_invalid=true result=%s\n' "$(now_utc)" "$run_stamp" "${output:-<no output>}" >> "$SUPERVISOR_LOG"
+    return 78
+  fi
+  if [ "$applicable" = "1" ]; then
+    PHASE_LOOP_REVIEW_REWORK_LINEAGE_RECONCILED=1
+  fi
+  return 0
+}
+
 phase_loop_restore_admission_backed_stale_claim() {
   local run_stamp="$1"
   local output status restored
@@ -17275,6 +17314,16 @@ _run_brownie_once() {
     if [ -n "${PHASE_LOOP_ACTIVE_STDOUT_LOG:-}" ]; then
       printf '%s\n' "$PHASE_LOOP_BOOTSTRAP_DIAGNOSTIC" >> "$PHASE_LOOP_ACTIVE_STDOUT_LOG"
     fi
+    write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
+    return 78
+  fi
+
+  # A rejected review is durable work, not an advisory note. Reattach its
+  # audited root before any stale-claim handling, claim selection, or
+  # deterministic no-op fallback can see a later terminal replacement claim.
+  if ! phase_loop_reconcile_persisted_review_rework "$run_stamp"; then
+    detail="A persisted CHANGES_REQUESTED review-rework lineage could not be reconciled before claim selection; refusing claim rebaseline, claim selection, task-ledger transition, and Runtime start."
+    printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
     write_status "blocked" "$detail" "$run_stamp" "78" "${CONSECUTIVE_FAILURES:-0}"
     return 78
   fi

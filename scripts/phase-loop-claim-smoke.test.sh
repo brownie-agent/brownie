@@ -6482,26 +6482,35 @@ if claim_smoke_section_enabled review-rework; then
   # prior projection asking for resume and supplies no repair-feedback file.
   # The only valid path is an admitted fresh run, which atomically clears the
   # claim-local marker for later legitimate continuation.
-  review_rework_state="$(mktemp -d)"
   review_rework_prompt="$(mktemp)"
   review_rework_todo="$(mktemp)"
   review_rework_workspace="$(mktemp -d)"
+  review_rework_state="$review_rework_workspace/.brownie/private/phase-loop"
+  mkdir -p "$review_rework_state"
   review_rework_argv="$review_rework_state/fake-brownie.argv"
   review_rework_effective_prompt="$review_rework_state/fake-brownie.prompt.md"
   git -C "$review_rework_workspace" init -b main >/dev/null
   git -C "$review_rework_workspace" config user.name Brownie
   git -C "$review_rework_workspace" config user.email brownie@example.invalid
   mkdir -p "$review_rework_workspace/scripts"
-  printf '{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","guard:runtime-operational-evidence:test":"true"}}\n' > "$review_rework_workspace/package.json"
+  # The selected TODO's real verification is invoked through pnpm's workspace
+  # root. Keep the fixture on that same path instead of silently accepting a
+  # non-workspace package script.
+  printf 'packages: []\n' > "$review_rework_workspace/pnpm-workspace.yaml"
+  printf '{"scripts":{"guard:todo-decomposition":"node scripts/guard-todo-decomposition.mjs","guard:runtime-operational-evidence:test":"node --check scripts/release-runtime-operational-evidence.mjs && grep -q fresh_reimplementation scripts/release-runtime-operational-evidence.mjs"}}\n' > "$review_rework_workspace/package.json"
   printf 'export const operationalEvidence = {};\n' > "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs"
   git -C "$review_rework_workspace" add package.json scripts/release-runtime-operational-evidence.mjs
   git -C "$review_rework_workspace" commit -m init >/dev/null
-  # Simulate the rejected implementation that recovery preserved as the
-  # workspace baseline. Its own verification command is green, so the test
-  # proves the controller cannot misclassify preexisting diff as completion.
+  # Simulate the rejected implementation retained as the workspace baseline.
+  # The fake Runtime below applies a distinct, verified reimplementation; the
+  # controller must not treat this retained diff as completed beforehand.
   printf '// rejected baseline retained for review-directed rework\n' >> "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs"
   printf 'base prompt\n' > "$review_rework_prompt"
   cat > "$review_rework_todo" <<'EOF'
+- [ ] E-review-rework-parent: keep the review-rework source live.
+  Route: implementation.
+  Depends on: <none>.
+
 - [ ] E-review-rework: Patch only `scripts/release-runtime-operational-evidence.mjs` to generate satisfied soak evidence.
   Route: implementation.
   Source TODO: E-review-rework-parent.
@@ -6557,6 +6566,92 @@ claim["baseline_diff_files"] = ["scripts/release-runtime-operational-evidence.mj
 claim_path.write_text(json.dumps(claim, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 queue_path.write_text(json.dumps({"schema_version": 1, "generation": 2, "fingerprint": fingerprint}, sort_keys=True) + "\n", encoding="utf-8")
 PY
+  # Reproduce the production failure shape: a CHANGES_REQUESTED root was
+  # archived by a stale rebaseline, then a same-TODO terminal replacement
+  # appeared without review metadata. The controller must restore the audited
+  # root before it can choose a Runtime action.
+  node --input-type=module - "$REPO_ROOT" "$review_rework_workspace" "$review_rework_todo" "$PHASE_LOOP_ACTOR_DEPLOYMENT" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const [controllerRoot, workspaceRoot, todoPath, actorDeploymentPath] = process.argv.slice(2);
+const { recoverLegacyRejectedCompletion } = await import(pathToFileURL(path.join(
+  controllerRoot,
+  'scripts/phase-loop-legacy-completion-recovery.mjs'
+)).href);
+const statePath = '.brownie/private/phase-loop';
+const stateRoot = path.join(workspaceRoot, statePath);
+const currentPath = path.join(stateRoot, 'todo-claims/current.json');
+const current = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+const selected = current.selected_todo;
+const baselineTodo = fs.readFileSync(todoPath, 'utf8');
+const selectedOffset = baselineTodo.indexOf(selected);
+if (selectedOffset < 0) throw new Error('review_rework_fixture_selected_todo_missing');
+// A legacy false completion had removed this leaf. The recovery restores it
+// before the later stale-rebaseline displacement is exercised.
+fs.writeFileSync(todoPath, `${baselineTodo.slice(0, selectedOffset).trimEnd()}\n`);
+fs.writeFileSync(currentPath, `${JSON.stringify({
+  ...current,
+  status: 'failed',
+  failure_evidence: { reason: 'legacy_completion_requires_review_recovery' }
+}, null, 2)}\n`);
+const writeJson = (relativePath, value) => {
+  const filePath = path.join(workspaceRoot, relativePath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+};
+const completionPath = `${statePath}/todo-completions/${current.claim_id}.json`;
+const snapshotPath = `${statePath}/runs/review-rework.claim.before-runtime.json`;
+const reviewPath = `${statePath}/review-rework-review-receipt.json`;
+writeJson(completionPath, {
+  schema_version: 1,
+  claim_id: current.claim_id,
+  selected_todo_id: 'E-review-rework',
+  selected_todo_first_line: selected.split('\n')[0]
+});
+writeJson(snapshotPath, {
+  claim_id: current.claim_id,
+  selected_todo: selected,
+  baseline_todo_text: baselineTodo
+});
+writeJson(reviewPath, {
+  schema_version: 1,
+  pr_url: 'https://example.invalid/pull/793',
+  state: 'OPEN',
+  author: 'fixture-implementation',
+  head_sha: 'a'.repeat(40),
+  latest_review: {
+    author: 'fixture-review',
+    state: 'CHANGES_REQUESTED',
+    commit_id: 'a'.repeat(40),
+    body: 'Implement a fresh bounded journey; the retained baseline is rejected.'
+  }
+});
+const first = recoverLegacyRejectedCompletion({
+  repoRoot: workspaceRoot,
+  todoPath,
+  statePath,
+  completionPath,
+  snapshotPath,
+  reviewReceiptPath: reviewPath,
+  actorDeploymentPath,
+  now: '2026-10-31T00:00:00.000Z'
+});
+const reviewedRoot = JSON.parse(fs.readFileSync(path.join(workspaceRoot, first.current_claim_path), 'utf8'));
+writeJson(`${statePath}/todo-claims/stale-rebaseline-20261031T000010Z.json`, reviewedRoot);
+writeJson(`${statePath}/todo-claims/current.json`, {
+  claim_id: 'fresh-looking-terminal-review-rework',
+  root_claim_id: 'fresh-looking-terminal-review-rework',
+  status: 'integrity_blocked',
+  selected_todo: selected,
+  status_history: [{
+    requested_status: 'completed',
+    status: 'integrity_blocked',
+    updated_at: '2026-10-31T00:00:30.000Z'
+  }]
+});
+NODE
   fake_brownie_review_rework="$(mktemp)"
   cat > "$fake_brownie_review_rework" <<'SH'
 #!/usr/bin/env bash
@@ -6570,6 +6665,7 @@ for argument in "$@"; do
   fi
   previous="$argument"
 done
+printf 'export const fresh_reimplementation = true;\n' >> "$PHASE_LOOP_WORKSPACE_ROOT/scripts/release-runtime-operational-evidence.mjs"
 cat <<'JSON'
 {
   "command": "run",
@@ -6623,7 +6719,12 @@ SH
   BROWNIE_BIN="$fake_brownie_review_rework" \
   run_with_timeout "$PHASE_LOOP_COMMAND_TIMEOUT_SECONDS" "$PHASE_LOOP" run-once >/dev/null
 
-  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_state/todo-claims/repair-feedback.json" "$review_rework_effective_prompt" <<'PY'
+  (
+    cd "$review_rework_workspace"
+    pnpm --workspace-root guard:runtime-operational-evidence:test
+  ) >/dev/null
+
+  python3 - "$review_rework_argv" "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_state/todo-claims/repair-feedback.json" "$review_rework_effective_prompt" "$review_rework_workspace/scripts/release-runtime-operational-evidence.mjs" <<'PY'
 import json
 import pathlib
 import sys
@@ -6633,6 +6734,7 @@ claim = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 todo = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 feedback = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding="utf-8"))
 effective_prompt = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
+runtime_target = pathlib.Path(sys.argv[6]).read_text(encoding="utf-8")
 assert "--json run --file" in argv, argv
 assert "--json resume" not in argv, argv
 assert claim["claim_id"] == "todo-g1-review-rework", claim
@@ -6646,8 +6748,9 @@ assert "E-review-rework" in todo, todo
 assert feedback["reason"] == "review_rework_dirty_baseline_requires_reimplementation", feedback
 assert feedback["review_rework"]["state"] == "CHANGES_REQUESTED", feedback
 assert "review_rework_feedback" in effective_prompt, effective_prompt
-assert "Implement artifact journey evidence; the retained baseline is not accepted." in effective_prompt, effective_prompt
+assert "Implement a fresh bounded journey; the retained baseline is rejected." in effective_prompt, effective_prompt
 assert "review_rework_completion_policy" in effective_prompt, effective_prompt
+assert "fresh_reimplementation" in runtime_target, runtime_target
 PY
 fi
 
