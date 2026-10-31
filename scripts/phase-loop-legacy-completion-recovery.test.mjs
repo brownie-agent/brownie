@@ -358,6 +358,41 @@ test('idempotent recovery refuses to replace a running foreign claim', () => {
   assert.equal(JSON.parse(fs.readFileSync(currentPath, 'utf8')).claim_id, 'active-foreign-claim');
 });
 
+test('idempotent recovery preserves claims awaiting review reconciliation', () => {
+  for (const status of ['pr_pending_review', 'changes_requested']) {
+    const value = fixture();
+    const first = recoverLegacyRejectedCompletion({
+      repoRoot: value.root,
+      statePath: value.state,
+      completionPath: value.completion,
+      snapshotPath: value.snapshot,
+      reviewReceiptPath: value.review,
+      actorDeployment: value.actorDeployment
+    });
+    const currentPath = path.join(value.root, first.current_claim_path);
+    const reviewClaim = {
+      claim_id: 'review-pending-claim',
+      root_claim_id: 'review-pending-claim',
+      status,
+      selected_todo: target,
+      delivery_review: {
+        pr_url: 'https://github.com/globalpocket/brownie/pull/999',
+        semantic_completion_evidence: { claim_id: 'review-pending-claim' }
+      }
+    };
+    writeJson(currentPath, reviewClaim);
+    assert.throws(() => recoverLegacyRejectedCompletion({
+      repoRoot: value.root,
+      statePath: value.state,
+      completionPath: value.completion,
+      snapshotPath: value.snapshot,
+      reviewReceiptPath: value.review,
+      actorDeployment: value.actorDeployment
+    }), /review_pending_claim_must_be_preserved_before_legacy_recovery/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, 'utf8')), reviewClaim, status);
+  }
+});
+
 test('recovery fails closed when the review receipt is not a same-head changes-requested decision', () => {
   const value = fixture();
   const receipt = JSON.parse(fs.readFileSync(path.join(value.root, value.review), 'utf8'));

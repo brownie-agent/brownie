@@ -598,6 +598,14 @@ export function recoverLegacyRejectedCompletion({
   const recoveryId = sha256(`${input.claimId}\n${sha256(input.selected)}\n${review.pr_url}\n${review.head_sha}`).slice(0, 24);
   const currentClaim = fs.existsSync(currentClaimPath) ? readJson(currentClaimPath) : null;
   const currentStatus = currentClaim?.status;
+  // A claim awaiting review, or carrying newly requested changes, has a
+  // durable PR handoff that phase-loop.sh must reconcile.  It is neither a
+  // terminal displacement nor a recoverable copy of an earlier rejection;
+  // replacing it would discard the current delivery evidence and restart
+  // implementation before that review is resolved.
+  if (['pr_pending_review', 'changes_requested'].includes(currentStatus)) {
+    throw new Error('review_pending_claim_must_be_preserved_before_legacy_recovery');
+  }
   if (['claimed', 'in_progress', 'running'].includes(currentStatus)) {
     if (!(currentClaim?.claim_id === input.claimId && currentClaim?.legacy_completion_recovery?.recovery_id === recoveryId)) {
       throw new Error('active_claim_must_be_preserved_before_legacy_recovery');
