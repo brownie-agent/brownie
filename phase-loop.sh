@@ -3598,10 +3598,35 @@ for line in selected.splitlines():
     if stripped.startswith("Route:"):
         selected_route = stripped.removeprefix("Route:").strip().rstrip(".").lower()
         break
+review_rework = claim.get("review_rework") if isinstance(claim.get("review_rework"), dict) else {}
+review_rework_fresh_dispatch_pending = (
+    claim.get("review_rework_fresh_dispatch_pending") is True
+    and review_rework.get("required") is True
+    and review_rework.get("state") == "CHANGES_REQUESTED"
+)
 if selected_route == "todo-decomposition":
     print(json.dumps({"completed": False, "reason": "todo_decomposition_requires_brownie_split_not_dirty_baseline_noop"}, sort_keys=True))
     raise SystemExit(2)
 if selected_scopes and len(selected_scopes_dirty_at_baseline) == len(selected_scopes):
+    # A CHANGES_REQUESTED recovery deliberately preserves the rejected diff as
+    # the baseline for the same claim.  Even a green syntax/test pass on that
+    # diff cannot turn it into delivery: the reviewer has already rejected
+    # its semantics.  Bypass every deterministic completion shortcut and
+    # dispatch Brownie with the review feedback for a fresh implementation.
+    if review_rework_fresh_dispatch_pending:
+        print(json.dumps({
+            "completed": False,
+            "operation": "selected_todo_review_rework_dirty_baseline_requires_reimplementation",
+            "reason": "review_rework_dirty_baseline_requires_reimplementation",
+            "selected_scopes_dirty_at_baseline": selected_scopes_dirty_at_baseline,
+            "review_rework": {
+                "state": review_rework.get("state"),
+                "pr_url": review_rework.get("pr_url"),
+                "reviewer": review_rework.get("reviewer"),
+                "feedback": review_rework.get("feedback"),
+            },
+        }, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
     verification_text = ""
     for line in selected.splitlines():
         if line.strip().startswith("Verification:"):
@@ -9452,7 +9477,14 @@ verification_error_codes = {
     for error in verification_errors
     if isinstance(error, dict) and error.get("code")
 }
-if "selected_target_not_changed" in verification_error_codes:
+review_rework = verification.get("review_rework") if isinstance(verification.get("review_rework"), dict) else {}
+if verification.get("reason") == "review_rework_dirty_baseline_requires_reimplementation":
+    semantic_repair_policy["failure_class"] = "independent_review_rework_required"
+    semantic_repair_policy["repair_objective"] = (
+        "Address the independent CHANGES_REQUESTED feedback with a new semantic implementation for the same claim. "
+        "The retained baseline diff is rejected and cannot be used as completion evidence."
+    )
+elif "selected_target_not_changed" in verification_error_codes:
     semantic_repair_policy["failure_class"] = "selected_todo_target_not_changed"
     semantic_repair_policy["repair_objective"] = (
         "Repair only the currently selected TODO by editing at least one of its Patch only/Create only target files. "
@@ -9494,6 +9526,7 @@ feedback = {
     "updated_at": timestamp,
     "reason": verification.get("reason"),
     "verification": verification,
+    "review_rework": review_rework,
     "stdout_log": stdout_log,
     "stderr_log": stderr_log,
 }
@@ -13826,6 +13859,17 @@ if repair_feedback:
         f"- repair_reason: `{repair_feedback.get('reason', '')}`",
         f"- repair_run_stamp: `{repair_feedback.get('run_stamp', '')}`",
     ]
+    review_rework_feedback = repair_feedback.get("review_rework") if isinstance(repair_feedback.get("review_rework"), dict) else {}
+    if repair_feedback.get("reason") == "review_rework_dirty_baseline_requires_reimplementation":
+        repair_feedback_lines.append("- review_rework_required: an independent reviewer issued CHANGES_REQUESTED for this same claim. The retained workspace baseline is rejected implementation, not delivery progress.")
+        if review_rework_feedback.get("pr_url"):
+            repair_feedback_lines.append(f"- review_rework_pr_url: `{review_rework_feedback.get('pr_url')}`")
+        if review_rework_feedback.get("reviewer"):
+            repair_feedback_lines.append(f"- review_rework_reviewer: `{review_rework_feedback.get('reviewer')}`")
+        if review_rework_feedback.get("feedback"):
+            repair_feedback_lines.append(f"- review_rework_feedback: {json.dumps(str(review_rework_feedback.get('feedback'))[-1600:], ensure_ascii=False)}")
+        repair_feedback_lines.append("- review_rework_dispatch_policy: make a new semantic implementation for the selected TODO and preserve unrelated dirty files. Do not reuse the rejected diff as a no-op completion, and do not mark the TODO complete from local tests or CI alone.")
+        repair_feedback_lines.append("- review_rework_completion_policy: completion remains prohibited until the replacement PR has independent approval, required CI, and merge evidence for this same claim.")
     if reported_repair_target_path:
         if selected_repair_target_path:
             repair_feedback_lines.append(f"- repair_selected_target_path: `{selected_repair_target_path}`")
@@ -18095,22 +18139,44 @@ failed = [entry for entry in results if isinstance(entry, dict) and entry.get("e
 failed_commands = [entry.get("command") for entry in failed if entry.get("command")]
 stdout_tail = "\n".join(str(entry.get("stdout_tail", "")) for entry in failed)[-4000:]
 stderr_tail = "\n".join(str(entry.get("stderr_tail", "")) for entry in failed)[-4000:]
+review_rework = parsed.get("review_rework", {}) if isinstance(parsed, dict) else {}
+if reason == "review_rework_dirty_baseline_requires_reimplementation":
+    diagnosis = "An independently reviewed CHANGES_REQUESTED claim retained its rejected diff at the workspace baseline. Passing local verification is not delivery evidence and must not complete the TODO."
+    repair_hint = "Re-read the selected TODO and independent review feedback. Reimplement only the selected TODO target files, preserving unrelated dirty state. Produce new semantic evidence; do not reuse the rejected diff or declare completion from existing tests."
+    next_required_behavior = "Run Brownie as a fresh implementation session for this same claim with the review feedback embedded. Do not use a deterministic completion shortcut."
+else:
+    diagnosis = "The selected TODO looked eligible for deterministic verified-noop completion, but its own verification command failed. Treat this as repairable implementation/test-fixture drift, not as a terminal blocker."
+    repair_hint = "Re-read the selected TODO and the failed command output. Repair only the selected TODO target files so the verification command passes semantically. If implementation and tests/fixtures drifted, align the tests/fixtures with the repository's actual public contract; do not merely weaken the guard and do not edit unrelated TODO files unless the TODO route is todo-decomposition."
+    next_required_behavior = "Retry the same selected TODO with the repair feedback embedded. Do not stop solely because verified-noop fallback failed."
 
 print(json.dumps({
     "schema_version": 1,
     "completed": False,
     "reason": reason,
-    "diagnosis": "The selected TODO looked eligible for deterministic verified-noop completion, but its own verification command failed. Treat this as repairable implementation/test-fixture drift, not as a terminal blocker.",
+    "diagnosis": diagnosis,
     "failed_commands": failed_commands,
     "stdout_tail": stdout_tail,
     "stderr_tail": stderr_tail,
-    "repair_hint": "Re-read the selected TODO and the failed command output. Repair only the selected TODO target files so the verification command passes semantically. If implementation and tests/fixtures drifted, align the tests/fixtures with the repository's actual public contract; do not merely weaken the guard and do not edit unrelated TODO files unless the TODO route is todo-decomposition.",
-    "next_required_behavior": "Retry the same selected TODO with the repair feedback embedded. Do not stop solely because verified-noop fallback failed.",
+    "review_rework": review_rework,
+    "repair_hint": repair_hint,
+    "next_required_behavior": next_required_behavior,
 }, ensure_ascii=False, sort_keys=True))
 PY
 )"
     write_repair_feedback "$run_stamp" "$verified_noop_feedback" "$stdout_log" "$stderr_log" || true
-    if printf '%s' "$pre_guard_verified_noop_output" | grep -Eq 'dirty_baseline_(syntax_check|verification)_failed'; then
+    if printf '%s' "$pre_guard_verified_noop_output" | grep -Eq 'dirty_baseline_(syntax_check|verification)_failed|review_rework_dirty_baseline_requires_reimplementation'; then
+      # The first effective prompt was built before the deterministic fallback
+      # ran. Rebuild it after persisting repair feedback so the delegated
+      # Brownie session receives the exact failure/review context rather than
+      # treating a rejected baseline as an unexplained fresh task.
+      if ! build_effective_prompt "$effective_prompt"; then
+        detail="Failed to rebuild the effective prompt after selected TODO repair feedback: $effective_prompt"
+        printf '%s %s\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
+        write_status "blocked" "$detail" "$run_stamp" "74" "${CONSECUTIVE_FAILURES:-0}"
+        write_bdk_trajectory_event "$run_stamp" "todo.blocked" '{"reason":"repair_feedback_prompt_rebuild_failed"}'
+        return 74
+      fi
+      write_bdk_trajectory_prompt_routing_event "$run_stamp" "$effective_prompt"
       printf '%s %s; continuing into Brownie repair with embedded feedback instead of repeating pre-guard verified-noop.\n' "$(now_utc)" "$detail" >> "$SUPERVISOR_LOG"
       write_bdk_trajectory_event "$run_stamp" "todo.repair_feedback" '{"reason":"verified_noop_dirty_baseline_repair_feedback_recorded"}' "todo.replanned"
     else
