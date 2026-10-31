@@ -17,6 +17,7 @@ import {
   readTodoCompletionRecords,
   resolveTodoState
 } from './phase-loop-todo-state.mjs';
+import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
 import { validateTodoQueueIntegrity } from './phase-loop-todo-queue-integrity.mjs';
 
 const defaultTodo = '.brownie/todo.md';
@@ -148,8 +149,7 @@ function parseArgs(argv) {
     todo: defaultTodo,
     breakdown: defaultBreakdown,
     state: defaultState,
-    expectedAuthor: 'brownie-agent',
-    expectedReviewer: 'globalpocket'
+    actorDeployment: null
   };
   for (let index = 3; index < argv.length; index += 1) {
     const key = argv[index];
@@ -161,11 +161,27 @@ function parseArgs(argv) {
     else if (key === '--completion') { args.completion = value; index += 1; }
     else if (key === '--snapshot') { args.snapshot = value; index += 1; }
     else if (key === '--review-receipt') { args.reviewReceipt = value; index += 1; }
-    else if (key === '--expected-author') { args.expectedAuthor = value; index += 1; }
-    else if (key === '--expected-reviewer') { args.expectedReviewer = value; index += 1; }
+    else if (key === '--actor-deployment') { args.actorDeployment = value; index += 1; }
     else throw new Error(`unknown_argument:${key}`);
   }
   return args;
+}
+
+function recoveryActors({ repoRoot, actorDeploymentPath, actorDeployment }) {
+  const loaded = loadPhaseLoopActorDeployment({
+    repoRoot,
+    deploymentPath: actorDeploymentPath,
+    deployment: actorDeployment
+  });
+  if (!loaded.ok) {
+    throw new Error(`actor_deployment_invalid:${loaded.errors.join(';')}`);
+  }
+  const implementation = roleActor(loaded.deployment, 'implementation');
+  const review = roleActor(loaded.deployment, 'review');
+  if (!implementation || !review) {
+    throw new Error('actor_deployment_missing_recovery_roles');
+  }
+  return { implementation, review, deploymentPath: loaded.deploymentPath };
 }
 
 function assertRecoveryInputs({ completion, snapshot, review, todoText, expectedAuthor, expectedReviewer }) {
@@ -178,6 +194,18 @@ function assertRecoveryInputs({ completion, snapshot, review, todoText, expected
   const baseline = typeof snapshot?.baseline_todo_text === 'string' ? snapshot.baseline_todo_text : '';
   if (!selected || todoId(selected) !== targetId || !baseline.includes(selected)) {
     throw new Error('immutable_snapshot_does_not_match_legacy_completion');
+  }
+  if (snapshot?.claim_id !== claimId) {
+    throw new Error('immutable_snapshot_claim_does_not_match_legacy_completion');
+  }
+  const selectedFirstLine = selected.split('\n')[0] ?? '';
+  if (
+    (snapshot?.selected_todo_id && snapshot.selected_todo_id !== targetId)
+    || (snapshot?.selected_todo_first_line && snapshot.selected_todo_first_line !== selectedFirstLine)
+    || (snapshot?.selected_todo_sha256 && snapshot.selected_todo_sha256 !== sha256(selected))
+    || (completion?.selected_todo_first_line && completion.selected_todo_first_line !== selectedFirstLine)
+  ) {
+    throw new Error('immutable_snapshot_selected_todo_does_not_match_legacy_completion');
   }
   if (findBlock(todoText, targetId)) {
     throw new Error('legacy_target_is_already_live');
@@ -199,11 +227,14 @@ export function recoverLegacyRejectedCompletion({
   completionPath,
   snapshotPath,
   reviewReceiptPath,
-  expectedAuthor = 'brownie-agent',
-  expectedReviewer = 'globalpocket',
+  actorDeploymentPath,
+  actorDeployment,
   now = new Date().toISOString()
 }) {
   const root = path.resolve(repoRoot);
+  const actors = recoveryActors({ repoRoot: root, actorDeploymentPath, actorDeployment });
+  const expectedAuthor = actors.implementation;
+  const expectedReviewer = actors.review;
   const todoFile = path.resolve(root, todoPath);
   const breakdownFile = path.resolve(root, breakdownPath);
   const stateRoot = path.resolve(root, statePath);
@@ -403,6 +434,7 @@ export function recoverLegacyRejectedCompletion({
     claim_id: input.claimId,
     selected_todo_id: input.targetId,
     pr_url: review.pr_url,
+    actor_deployment_path: actors.deploymentPath ? path.relative(root, actors.deploymentPath) : null,
     audit_path: path.relative(root, auditPath),
     invalidation_path: path.relative(root, invalidationPath),
     current_claim_path: path.relative(root, currentClaimPath),
@@ -425,8 +457,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
             completionPath: args.completion,
             snapshotPath: args.snapshot,
             reviewReceiptPath: args.reviewReceipt,
-            expectedAuthor: args.expectedAuthor,
-            expectedReviewer: args.expectedReviewer
+            actorDeploymentPath: args.actorDeployment
           })
         : (() => { throw new Error(`unknown_mode:${args.mode}`); })();
     console.log(JSON.stringify(result, null, 2));

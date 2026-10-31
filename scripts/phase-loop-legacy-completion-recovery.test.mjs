@@ -27,6 +27,17 @@ const dependent = `- [ ] E-dependent: must wait for target.
   Forbidden changes: do not edit unrelated files.
   Verification: run \`node --test scripts/dependent.test.mjs\`.`;
 
+const actorDeployment = {
+  schema_version: 1,
+  repository: 'example-org/example-repo',
+  roles: {
+    implementation: { github_login: 'implementation-worker', branch_prefixes: ['implementation/'] },
+    review: { github_login: 'reviewer-worker' },
+    merge: { github_login: 'reviewer-worker' }
+  },
+  constraints: { require_independent_review: true }
+};
+
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
@@ -56,10 +67,10 @@ function fixture() {
     schema_version: 1,
     pr_url: 'https://github.com/globalpocket/brownie/pull/793',
     state: 'OPEN',
-    author: 'brownie-agent',
+    author: 'implementation-worker',
     head_sha: 'a'.repeat(40),
     latest_review: {
-      author: 'globalpocket',
+      author: 'reviewer-worker',
       state: 'CHANGES_REQUESTED',
       commit_id: 'a'.repeat(40),
       body: 'Implement the actual journey and record its output before requesting review again.'
@@ -72,7 +83,7 @@ function fixture() {
     selected_todo: dependent,
     failure_evidence: { reason: 'terminal_completion_evidence_missing' }
   });
-  return { root, state, completion, snapshot, review };
+  return { root, state, completion, snapshot, review, actorDeployment };
 }
 
 test('detect blocks a descendant whose absent prerequisite has only a legacy completion record', () => {
@@ -90,6 +101,7 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
     completionPath: value.completion,
     snapshotPath: value.snapshot,
     reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
     now: '2026-10-31T00:00:00.000Z'
   });
   assert.equal(result.recovered, true, JSON.stringify(result));
@@ -113,7 +125,8 @@ test('recovery restores the exact target, invalidates only the false receipt, ar
     statePath: value.state,
     completionPath: value.completion,
     snapshotPath: value.snapshot,
-    reviewReceiptPath: value.review
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
   });
   assert.equal(retry.idempotent_recovery, true);
 });
@@ -128,9 +141,39 @@ test('recovery fails closed when the review receipt is not a same-head changes-r
     statePath: value.state,
     completionPath: value.completion,
     snapshotPath: value.snapshot,
-    reviewReceiptPath: value.review
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
   }), /review_rejection_receipt_invalid/);
   const todo = fs.readFileSync(path.join(value.root, '.brownie/todo.md'), 'utf8');
   assert(!todo.includes(target));
   assert(todo.includes(parent));
+});
+
+test('recovery refuses a snapshot from another claim before any state mutation', () => {
+  const value = fixture();
+  const snapshot = JSON.parse(fs.readFileSync(path.join(value.root, value.snapshot), 'utf8'));
+  snapshot.claim_id = 'other-claim';
+  writeJson(path.join(value.root, value.snapshot), snapshot);
+  assert.throws(() => recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment
+  }), /immutable_snapshot_claim_does_not_match_legacy_completion/);
+  const todo = fs.readFileSync(path.join(value.root, '.brownie/todo.md'), 'utf8');
+  assert(!todo.includes(target));
+  assert(todo.includes(parent));
+});
+
+test('recovery fails closed when the active deployment is unavailable', () => {
+  const value = fixture();
+  assert.throws(() => recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review
+  }), /actor_deployment_invalid/);
 });
