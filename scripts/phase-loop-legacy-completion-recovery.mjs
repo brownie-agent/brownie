@@ -598,7 +598,7 @@ export function recoverLegacyRejectedCompletion({
   const recoveryId = sha256(`${input.claimId}\n${sha256(input.selected)}\n${review.pr_url}\n${review.head_sha}`).slice(0, 24);
   const currentClaim = fs.existsSync(currentClaimPath) ? readJson(currentClaimPath) : null;
   const currentStatus = currentClaim?.status;
-  if (currentStatus === 'claimed' || currentStatus === 'in_progress') {
+  if (['claimed', 'in_progress', 'running'].includes(currentStatus)) {
     if (!(currentClaim?.claim_id === input.claimId && currentClaim?.legacy_completion_recovery?.recovery_id === recoveryId)) {
       throw new Error('active_claim_must_be_preserved_before_legacy_recovery');
     }

@@ -330,7 +330,7 @@ test('idempotent recovery reclaims a terminal claim that displaced its review-re
   assert.equal((todo.match(/E-target:/gu) ?? []).length, 1);
 });
 
-test('idempotent recovery refuses to replace an active foreign claim', () => {
+test('idempotent recovery refuses to replace a running foreign claim', () => {
   const value = fixture();
   const first = recoverLegacyRejectedCompletion({
     repoRoot: value.root,
@@ -344,7 +344,7 @@ test('idempotent recovery refuses to replace an active foreign claim', () => {
   writeJson(currentPath, {
     claim_id: 'active-foreign-claim',
     root_claim_id: 'active-foreign-claim',
-    status: 'in_progress',
+    status: 'running',
     selected_todo: target
   });
   assert.throws(() => recoverLegacyRejectedCompletion({
