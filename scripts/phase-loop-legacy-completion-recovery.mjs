@@ -18,7 +18,7 @@ import {
   resolveTodoState
 } from './phase-loop-todo-state.mjs';
 import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
-import { completionConditionSha256 } from './phase-loop-delivery-integrity.mjs';
+import { completionConditionSha256, validateTerminalDeliveryReceipt } from './phase-loop-delivery-integrity.mjs';
 import { validateTodoQueueIntegrity } from './phase-loop-todo-queue-integrity.mjs';
 
 const defaultTodo = '.brownie/todo.md';
@@ -469,7 +469,7 @@ function existingRepositoryRelativePath(root, value, label) {
   return relative;
 }
 
-function persistedReviewReworkSource({ root, stateRoot, feedback }) {
+function reviewReworkFeedbackIdentity(feedback) {
   const claimId = typeof feedback?.claim_id === 'string' ? feedback.claim_id : '';
   const recoveryId = typeof feedback?.recovery_id === 'string' ? feedback.recovery_id : '';
   const selectedFirstLine = typeof feedback?.selected_todo_first_line === 'string'
@@ -477,7 +477,7 @@ function persistedReviewReworkSource({ root, stateRoot, feedback }) {
     : '';
   if (
     feedback?.kind !== 'phase_loop_review_rework_required'
-    || feedback?.completed !== false
+    || (feedback?.completed !== false && feedback?.completed !== true)
     || !claimId
     || feedback?.root_claim_id !== claimId
     || !recoveryId
@@ -486,6 +486,102 @@ function persistedReviewReworkSource({ root, stateRoot, feedback }) {
   ) {
     throw new Error('review_rework_lineage_feedback_invalid');
   }
+  return {
+    claimId,
+    recoveryId,
+    selectedFirstLine,
+    selectedTodoSha256: typeof feedback?.recovery_inputs?.selected_todo_sha256 === 'string'
+      ? feedback.recovery_inputs.selected_todo_sha256
+      : null,
+    prUrl: typeof feedback?.pr_url === 'string' ? feedback.pr_url : '',
+    reviewer: typeof feedback?.reviewer === 'string' ? feedback.reviewer : ''
+  };
+}
+
+function currentClaimMatchesReviewReworkFeedback({ currentClaim, identity }) {
+  return Boolean(
+    currentClaim
+    && currentClaim.claim_id === identity.claimId
+    && currentClaim.root_claim_id === identity.claimId
+    && currentClaim.legacy_completion_recovery?.recovery_id === identity.recoveryId
+    && exactSelectedTodoFirstLine(currentClaim.selected_todo) === identity.selectedFirstLine
+    && (!identity.selectedTodoSha256 || sha256(currentClaim.selected_todo) === identity.selectedTodoSha256)
+  );
+}
+
+function resolvedReviewReworkDelivery({ currentClaim, identity, todoText }) {
+  if (!currentClaimMatchesReviewReworkFeedback({ currentClaim, identity })) {
+    return { valid: false, reason: 'review_rework_delivery_claim_identity_mismatch' };
+  }
+  if (currentClaim.review_rework?.required !== false) {
+    return { valid: false, reason: 'review_rework_delivery_still_requires_rework' };
+  }
+  if (currentClaim.delivery_review?.reviewer !== identity.reviewer) {
+    return { valid: false, reason: 'review_rework_delivery_reviewer_mismatch' };
+  }
+  const targetId = todoId(identity.selectedFirstLine);
+  if (!targetId || findBlock(todoText, targetId)) {
+    return { valid: false, reason: 'review_rework_delivery_todo_not_durably_removed' };
+  }
+  const terminal = validateTerminalDeliveryReceipt({ claim: currentClaim });
+  if (!terminal.valid) {
+    return { valid: false, reason: 'review_rework_delivery_receipt_invalid', errors: terminal.errors };
+  }
+  return { valid: true, targetId };
+}
+
+function resolvePersistedReviewReworkFeedback({ root, stateRoot, feedbackPath, feedback, identity, currentClaim, now }) {
+  const archivePath = path.join(
+    stateRoot,
+    'todo-repair-feedback-archive',
+    `review-rework-${identity.recoveryId}-delivery-resolved.json`
+  );
+  if (!fs.existsSync(archivePath)) atomicJson(archivePath, feedback);
+  const completedFeedback = {
+    ...feedback,
+    completed: true,
+    resolved_at: now,
+    resolution: 'independent_review_ci_merge_and_semantic_delivery_verified',
+    resolution_delivery: {
+      claim_id: currentClaim.claim_id,
+      root_claim_id: currentClaim.root_claim_id,
+      pr_url: currentClaim.delivery_review.pr_url,
+      reviewer: currentClaim.delivery_review.reviewer,
+      merge_actor: currentClaim.delivery_review.merge_actor,
+      semantic_completion_evidence: true
+    },
+    archived_path: path.relative(root, archivePath)
+  };
+  atomicJson(feedbackPath, completedFeedback);
+  return {
+    schema_version: 1,
+    applicable: false,
+    resolved: true,
+    reason: 'review_rework_feedback_resolved_by_independent_delivery',
+    feedback_path: path.relative(root, feedbackPath),
+    archive_path: path.relative(root, archivePath)
+  };
+}
+
+function completedReviewReworkFeedbackValid({ root, feedback, identity }) {
+  if (
+    feedback?.completed !== true
+    || feedback?.resolution !== 'independent_review_ci_merge_and_semantic_delivery_verified'
+    || typeof feedback?.resolved_at !== 'string'
+    || !feedback.resolved_at
+    || feedback?.resolution_delivery?.claim_id !== identity.claimId
+    || feedback?.resolution_delivery?.root_claim_id !== identity.claimId
+    || typeof feedback?.resolution_delivery?.pr_url !== 'string'
+    || !feedback.resolution_delivery.pr_url
+    || feedback?.resolution_delivery?.semantic_completion_evidence !== true
+  ) {
+    throw new Error('review_rework_lineage_completed_feedback_invalid');
+  }
+  existingRepositoryRelativePath(root, feedback.archived_path, 'completed_feedback_archive');
+}
+
+function persistedReviewReworkSource({ root, stateRoot, identity }) {
+  const { claimId, recoveryId, selectedFirstLine } = identity;
 
   // A stale rebaseline is the only normal path that may displace a live
   // review-rework root. Search that bounded, audit-only namespace rather
@@ -547,12 +643,56 @@ export function reconcilePersistedReviewRework({
     return { schema_version: 1, applicable: false, reason: 'review_rework_feedback_absent' };
   }
   const feedback = readJson(feedbackPath);
-  const source = persistedReviewReworkSource({ root, stateRoot, feedback });
+  const identity = reviewReworkFeedbackIdentity(feedback);
+  if (feedback.completed === true) {
+    completedReviewReworkFeedbackValid({ root, feedback, identity });
+    return { schema_version: 1, applicable: false, reason: 'review_rework_feedback_already_resolved' };
+  }
   const currentClaimPath = path.join(stateRoot, 'todo-claims', 'current.json');
   if (!fs.existsSync(currentClaimPath)) {
     throw new Error('review_rework_lineage_current_claim_missing');
   }
   const currentClaim = readJson(currentClaimPath);
+  if (isLiveMatchingReviewReworkClaim({
+    currentClaim,
+    claimId: identity.claimId,
+    selected: currentClaim.selected_todo,
+    recoveryId: identity.recoveryId
+  }) && currentClaimMatchesReviewReworkFeedback({ currentClaim, identity })) {
+    const freshDispatch = ensureReviewReworkFreshDispatch({
+      root,
+      stateRoot,
+      currentClaimPath,
+      currentClaim,
+      claimId: identity.claimId,
+      selected: currentClaim.selected_todo,
+      recoveryId: identity.recoveryId,
+      prUrl: identity.prUrl,
+      reviewer: identity.reviewer,
+      now
+    });
+    return {
+      schema_version: 1,
+      applicable: false,
+      reason: 'review_rework_live_root_preserved',
+      feedback_path: path.relative(root, feedbackPath),
+      ...freshDispatch
+    };
+  }
+  const todoText = readText(path.resolve(root, todoPath));
+  const resolvedDelivery = resolvedReviewReworkDelivery({ currentClaim, identity, todoText });
+  if (resolvedDelivery.valid) {
+    return resolvePersistedReviewReworkFeedback({
+      root,
+      stateRoot,
+      feedbackPath,
+      feedback,
+      identity,
+      currentClaim,
+      now
+    });
+  }
+  const source = persistedReviewReworkSource({ root, stateRoot, identity });
   if (sha256(currentClaim?.selected_todo) !== sha256(source.selected_todo)) {
     throw new Error('review_rework_lineage_selected_todo_mismatch');
   }

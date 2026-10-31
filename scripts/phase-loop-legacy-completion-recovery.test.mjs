@@ -123,7 +123,7 @@ function fixture() {
     selected_todo: dependent,
     failure_evidence: { reason: 'terminal_completion_evidence_missing' }
   });
-  return { root, state, completion, snapshot, review, mergeReceipt, actorDeployment };
+  return { root, state, completion, snapshot, review, mergeReceipt, semanticCompletionEvidence, actorDeployment };
 }
 
 test('detect blocks a descendant whose absent prerequisite has only a legacy completion record', () => {
@@ -384,6 +384,85 @@ test('reconciles persisted review feedback before a displaced terminal claim can
   const displaced = JSON.parse(fs.readFileSync(path.join(value.root, reconciled.displaced_claim_archive_path), 'utf8'));
   assert.equal(displaced.claim_id, 'fresh-looking-terminal-claim');
   assert.equal(displaced.status, 'integrity_blocked');
+});
+
+test('reconciliation preserves a live review-rework root without requiring a stale archive', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const reconciled = reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:01:00.000Z'
+  });
+  assert.equal(reconciled.applicable, false, JSON.stringify(reconciled));
+  assert.equal(reconciled.reason, 'review_rework_live_root_preserved');
+  assert.equal(reconciled.fresh_runtime_dispatch_required, true);
+  assert.equal(fs.existsSync(path.join(value.root, value.state, 'todo-claims', 'stale-rebaseline-20261031T000010Z.json')), false);
+  const current = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  assert.equal(current.claim_id, 'legacy-claim');
+  assert.equal(current.review_rework_fresh_dispatch_pending, true);
+});
+
+test('reconciliation resolves review feedback only after same-root merged semantic delivery and durable TODO removal', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const completedClaim = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  completedClaim.status = 'completed';
+  completedClaim.review_rework = { required: false, resolved_at: '2026-10-31T00:01:00.000Z' };
+  completedClaim.delivery_review = {
+    pr_url: 'https://github.com/globalpocket/brownie/pull/806',
+    author: 'implementation-worker',
+    reviewer: 'reviewer-worker',
+    merge_actor: 'reviewer-worker',
+    merged: true,
+    approved: true,
+    ci_passed: true,
+    semantic_completion_evidence: value.semanticCompletionEvidence
+  };
+  writeJson(currentPath, completedClaim);
+  fs.writeFileSync(path.join(value.root, '.brownie/todo.md'), `# Queue\n\n${parent}\n\n${dependent}\n`);
+
+  const reconciled = reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:02:00.000Z'
+  });
+  assert.equal(reconciled.applicable, false, JSON.stringify(reconciled));
+  assert.equal(reconciled.resolved, true, JSON.stringify(reconciled));
+  const feedback = JSON.parse(fs.readFileSync(path.join(value.root, value.state, 'todo-repair-feedback.json'), 'utf8'));
+  assert.equal(feedback.completed, true);
+  assert.equal(feedback.resolution, 'independent_review_ci_merge_and_semantic_delivery_verified');
+  assert.equal(feedback.resolution_delivery.pr_url, completedClaim.delivery_review.pr_url);
+  assert.ok(fs.existsSync(path.join(value.root, feedback.archived_path)));
+
+  const retry = reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:03:00.000Z'
+  });
+  assert.equal(retry.applicable, false, JSON.stringify(retry));
+  assert.equal(retry.reason, 'review_rework_feedback_already_resolved');
 });
 
 test('idempotent recovery refuses to replace a running foreign claim', () => {
