@@ -577,7 +577,23 @@ function completedReviewReworkFeedbackValid({ root, feedback, identity }) {
   ) {
     throw new Error('review_rework_lineage_completed_feedback_invalid');
   }
-  existingRepositoryRelativePath(root, feedback.archived_path, 'completed_feedback_archive');
+  const archivePath = existingRepositoryRelativePath(root, feedback.archived_path, 'completed_feedback_archive');
+  const archived = readJson(path.resolve(root, archivePath));
+  let archivedIdentity;
+  try {
+    archivedIdentity = reviewReworkFeedbackIdentity(archived);
+  } catch {
+    throw new Error('review_rework_lineage_completed_feedback_archive_invalid');
+  }
+  if (
+    archived?.completed !== false
+    || archivedIdentity.claimId !== identity.claimId
+    || archivedIdentity.recoveryId !== identity.recoveryId
+    || archivedIdentity.selectedFirstLine !== identity.selectedFirstLine
+    || archivedIdentity.prUrl !== identity.prUrl
+  ) {
+    throw new Error('review_rework_lineage_completed_feedback_archive_invalid');
+  }
 }
 
 function persistedReviewReworkSource({ root, stateRoot, identity }) {

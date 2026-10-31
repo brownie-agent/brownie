@@ -463,6 +463,16 @@ test('reconciliation resolves review feedback only after same-root merged semant
   });
   assert.equal(retry.applicable, false, JSON.stringify(retry));
   assert.equal(retry.reason, 'review_rework_feedback_already_resolved');
+
+  const archived = JSON.parse(fs.readFileSync(path.join(value.root, feedback.archived_path), 'utf8'));
+  archived.claim_id = 'forged-root-claim';
+  writeJson(path.join(value.root, feedback.archived_path), archived);
+  assert.throws(() => reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:04:00.000Z'
+  }), /review_rework_lineage_completed_feedback_archive_invalid/);
 });
 
 test('idempotent recovery refuses to replace a running foreign claim', () => {
