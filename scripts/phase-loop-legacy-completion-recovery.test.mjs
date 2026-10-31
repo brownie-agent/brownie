@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +8,7 @@ import {
   attestLegacyMergedCompletion,
   recoverLegacyRejectedCompletion
 } from './phase-loop-legacy-completion-recovery.mjs';
+import { produceSemanticCompletionEvidence } from './phase-loop-delivery-integrity.mjs';
 
 const target = `- [ ] E-target: Patch only \`scripts/target.mjs\`.
   Route: implementation.
@@ -45,10 +45,6 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function sha256(value) {
-  return crypto.createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex');
-}
-
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-legacy-completion-recovery-'));
   fs.mkdirSync(path.join(root, '.brownie'), { recursive: true });
@@ -83,6 +79,22 @@ function fixture() {
       body: 'Implement the actual journey and record its output before requesting review again.'
     }
   });
+  const semanticCompletionEvidence = produceSemanticCompletionEvidence({
+    claim: { claim_id: 'legacy-claim', root_claim_id: 'legacy-claim', selected_todo: target },
+    stdoutPayload: {
+      ok: true,
+      run: {
+        completed: true,
+        terminal_completion_evidence: { final_state: 'succeeded' },
+        automation: { continuation_required: false }
+      }
+    },
+    verification: {
+      completed: true,
+      results: [{ command: 'node --test scripts/target.test.mjs', exit_code: 0 }]
+    }
+  });
+  if (!semanticCompletionEvidence) throw new Error('fixture_semantic_completion_evidence_missing');
   writeJson(path.join(root, mergeReceipt), {
     schema_version: 1,
     pr_url: 'https://github.com/globalpocket/brownie/pull/790',
@@ -101,14 +113,7 @@ function fixture() {
       passed: true,
       checks: [{ name: 'check', status: 'COMPLETED', conclusion: 'SUCCESS' }]
     },
-    semantic_completion_evidence: {
-      schema_version: 1,
-      root_claim_id: 'legacy-claim',
-      selected_todo_sha256: sha256(target),
-      completion_condition_sha256: sha256('target behavior is implemented and verified'),
-      verification_results: [{ command: 'node --test scripts/target.test.mjs', exit_code: 0 }],
-      observables: [{ kind: 'pull_request_diff', sha256: 'd'.repeat(64) }]
-    }
+    semantic_completion_evidence: semanticCompletionEvidence
   });
   writeJson(path.join(root, `${state}/todo-claims/current.json`), {
     claim_id: 'unrelated-e23d',

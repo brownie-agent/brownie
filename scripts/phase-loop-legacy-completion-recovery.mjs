@@ -18,6 +18,7 @@ import {
   resolveTodoState
 } from './phase-loop-todo-state.mjs';
 import { loadPhaseLoopActorDeployment, roleActor } from './phase-loop-actor-deployment.mjs';
+import { completionConditionSha256 } from './phase-loop-delivery-integrity.mjs';
 import { validateTodoQueueIntegrity } from './phase-loop-todo-queue-integrity.mjs';
 
 const defaultTodo = '.brownie/todo.md';
@@ -123,7 +124,7 @@ function mergedDeliveryReceiptValid(receipt, { claimId, selected, expectedAuthor
   const approval = receipt?.latest_approval;
   const semantic = receipt?.semantic_completion_evidence;
   const selectedHash = sha256(selected);
-  const completionCondition = lineValue(selected, 'Completion condition');
+  const completionConditionHash = completionConditionSha256({ selected_todo: selected });
   const verification = Array.isArray(semantic?.verification_results)
     ? semantic.verification_results
     : [];
@@ -150,7 +151,7 @@ function mergedDeliveryReceiptValid(receipt, { claimId, selected, expectedAuthor
     && semantic?.schema_version === 1
     && semantic.root_claim_id === claimId
     && semantic.selected_todo_sha256 === selectedHash
-    && semantic.completion_condition_sha256 === sha256(completionCondition)
+    && semantic.completion_condition_sha256 === completionConditionHash
     && verification.length > 0
     && verification.every((result) => result && typeof result.command === 'string' && result.command && result.exit_code === 0)
     && commandsCovered
