@@ -6752,6 +6752,45 @@ assert "Implement a fresh bounded journey; the retained baseline is rejected." i
 assert "review_rework_completion_policy" in effective_prompt, effective_prompt
 assert "fresh_reimplementation" in runtime_target, runtime_target
 PY
+
+  # The fresh-dispatch marker is intentionally consumed after the first
+  # admitted run.  A second invocation must nevertheless retain the
+  # CHANGES_REQUESTED completion block: the rejected baseline may not become
+  # a deterministic verified-noop completion merely because its local tests
+  # are green. Execute the exact fallback program after that marker becomes
+  # false; it must return repair feedback instead of a completion result.
+  review_rework_noop_gate="$(mktemp)"
+  python3 - "$PHASE_LOOP" "$review_rework_noop_gate" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = source.index("try_selected_todo_verified_noop_completion_fallback()")
+start = source.index("<<'PY'\n", start) + len("<<'PY'\n")
+end = source.index("\nPY\n}", start)
+pathlib.Path(sys.argv[2]).write_text(source[start:end], encoding="utf-8")
+PY
+  set +e
+  review_rework_noop_output="$(
+    cd "$review_rework_workspace" || exit 70
+    python3 "$review_rework_noop_gate" "$review_rework_state/todo-claims/current.json" "$review_rework_todo" "$review_rework_workspace" second-pass 2>&1
+  )"
+  review_rework_noop_status="$?"
+  set -e
+  test "$review_rework_noop_status" = "1"
+  printf '%s' "$review_rework_noop_output" | rg -q 'review_rework_dirty_baseline_requires_reimplementation'
+
+  python3 - "$review_rework_state/todo-claims/current.json" "$review_rework_todo" <<'PY'
+import json
+import pathlib
+import sys
+
+claim = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+todo = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+assert claim["review_rework_fresh_dispatch_pending"] is False, claim
+assert claim["status"] != "completed", claim
+assert "E-review-rework" in todo, todo
+PY
 fi
 
 if [ "$PHASE_LOOP_CLAIM_SMOKE_SECTION" = "review-rework" ]; then
