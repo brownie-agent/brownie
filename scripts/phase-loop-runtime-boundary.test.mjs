@@ -104,6 +104,7 @@ test('terminal evidence gaps terminalize the immutable source before any retry-c
     controller.indexOf('\nterminal_multitarget_replan_public_payload()', controller.indexOf('record_terminal_multitarget_replan_transition()')),
   );
   assert.match(sourceRecovery, /evidence\.get\("claim_snapshot_path"\)/);
+  assert.match(sourceRecovery, /resolve-claim-attempt[^\n]+--claim "\$ledger_claim_path"/);
   assert.match(sourceRecovery, /record-trajectory[^\n]+--type "todo\.failed"/);
   assert.match(sourceRecovery, /record-terminal-replan[^\n]+--claim "\$ledger_claim_path"/);
 

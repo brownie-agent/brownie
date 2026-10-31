@@ -555,44 +555,39 @@ PY
     return 78
   fi
   if [ "$evidence_source" = "prior_terminal_unproposed_workspace_write_ledger" ]; then
-    if ! source_state="$(python3 - "$ledger_claim_path" "$PHASE_LOOP_WORKSPACE_ROOT/.brownie/private/phase-loop/task-ledger.jsonl" <<'PY'
+    # Resolve the source attempt through the ledger adapter. In particular, a
+    # review-rework claim may retain its original claim id while its historical
+    # attempt is terminal; the adapter validates and selects the audit-bound
+    # isolated attempt. Do not reconstruct `${todo}@${claim}` in shell, or a
+    # terminal replan would read the old attempt while writing the new one.
+    local source_attempt_output
+    if ! source_attempt_output="$(node "$ROOT_DIR/scripts/phase-loop-task-ledger.mjs" resolve-claim-attempt --repo "$PHASE_LOOP_WORKSPACE_ROOT" --claim "$ledger_claim_path" 2>&1)"; then
+      PHASE_LOOP_TASK_LEDGER_FAILURE=1
+      PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="terminal multi-target replan could not resolve its immutable source attempt: ${source_attempt_output:-<no output>}"
+      return 78
+    fi
+    if ! source_state="$(python3 - "$source_attempt_output" <<'PY'
 import json
-import pathlib
 import re
 import sys
 
-claim_path = pathlib.Path(sys.argv[1])
-ledger_path = pathlib.Path(sys.argv[2])
 try:
-    claim = json.loads(claim_path.read_text(encoding="utf-8"))
-    claim_id = claim.get("claim_id")
-    selected = claim.get("selected_todo")
-    first = selected.splitlines()[0] if isinstance(selected, str) and selected.splitlines() else ""
-    match = re.match(r"^\s*(?:[-*]|\d+[.)])\s+\[[ xX]\]\s+([^:\s]+)", first)
-    task_id = f"{match.group(1)}@{claim_id}" if match and isinstance(claim_id, str) else ""
-except Exception:
-    task_id = ""
-if not task_id:
-    raise SystemExit(1)
-state = ""
-try:
-    for line in ledger_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        value = json.loads(line)
-        events = value.get("events") if isinstance(value, dict) and isinstance(value.get("events"), list) else [value]
-        for event in events:
-            if isinstance(event, dict) and event.get("task_id") == task_id and isinstance(event.get("to_state"), str):
-                state = event["to_state"]
-except FileNotFoundError:
-    pass
+    value = json.loads(sys.argv[1])
 except Exception:
     raise SystemExit(1)
-print(state)
+if value.get("ok") is not True:
+    raise SystemExit(1)
+task_id = value.get("task_id")
+state = value.get("task_state")
+if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9@._-]{1,512}", task_id):
+    raise SystemExit(1)
+if state is not None and not isinstance(state, str):
+    raise SystemExit(1)
+print(state or "")
 PY
 )"; then
       PHASE_LOOP_TASK_LEDGER_FAILURE=1
-      PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="terminal multi-target replan could not project the immutable source task state"
+      PHASE_LOOP_TASK_LEDGER_FAILURE_DETAIL="terminal multi-target replan source attempt projection was malformed: ${source_attempt_output:-<no output>}"
       return 78
     fi
     if [ "$source_state" = "running" ]; then

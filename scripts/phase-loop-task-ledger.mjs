@@ -343,6 +343,7 @@ function matchingTerminalReplan(events, {
 export function recordTerminalReplanWithChildren(repoRoot, {
   selected_todo,
   claim_id,
+  claim = null,
   run_id = null,
   reason,
   evidence_source = null,
@@ -368,8 +369,37 @@ export function recordTerminalReplanWithChildren(repoRoot, {
     if (!gate.ok) return { ok: false, code: 'terminal_replan_child_not_executable', task_id: child?.task_id, missing: gate.missing };
   }
 
-  const sourceTaskId = taskAttemptId(sourceTodoId, claim_id);
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
   const sourceSpecHash = crypto.createHash('sha256').update(selected_todo).digest('hex');
+  let sourceTaskId = taskAttemptId(sourceTodoId, claim_id);
+  if (claim != null) {
+    if (typeof claim !== 'object'
+      || claim.claim_id !== claim_id
+      || claim.selected_todo !== selected_todo) {
+      return { ok: false, code: 'terminal_replan_claim_snapshot_mismatch' };
+    }
+    const identity = reviewReworkLedgerAttemptIdentity(repoRoot, {
+      claim,
+      sourceTaskId: sourceTodoId,
+      spec: selected_todo,
+      events
+    });
+    if (!identity.ok) {
+      return {
+        ok: false,
+        code: identity.code,
+        reason: identity.reason,
+        claim_id,
+        source_task_id: sourceTaskId
+      };
+    }
+    sourceTaskId = identity.task_id;
+  }
   const fingerprint = terminalReplanFingerprint({
     sourceTaskId,
     claimId: claim_id,
@@ -379,12 +409,6 @@ export function recordTerminalReplanWithChildren(repoRoot, {
     children
   });
   const replanTaskId = terminalReplanTaskId(sourceTaskId, fingerprint);
-  let events;
-  try {
-    events = readTaskLedger(repoRoot);
-  } catch (error) {
-    return { ok: false, code: 'ledger_append_failed', error: error.message };
-  }
   const projection = taskProjection(events);
   const source = projection.get(sourceTaskId);
   if (!source) return { ok: false, code: 'terminal_replan_source_attempt_missing', task_id: sourceTaskId };
@@ -1003,13 +1027,29 @@ function reviewReworkLedgerAttemptIdentity(repoRoot, { claim, sourceTaskId, spec
 
   const selectedTodoSha256 = crypto.createHash('sha256').update(spec).digest('hex');
   const recoveryId = claim?.legacy_completion_recovery?.recovery_id;
+  const reviewRework = claim?.review_rework;
+  // The immutable source proof must survive both phases of a rework: while
+  // CHANGES_REQUESTED is being implemented and after its replacement has
+  // independently passed review/CI/merge. Requiring the former state here
+  // made a valid isolated attempt impossible to terminally complete after
+  // review reconciliation. Accept only those two explicit lifecycle states;
+  // the delivery-certificate gate remains responsible for authorizing
+  // todo.completed itself.
+  const reviewReworkLifecycleValid = (
+    reviewRework?.required === true
+    && reviewRework?.state === 'CHANGES_REQUESTED'
+  ) || (
+    reviewRework?.required === false
+    && reviewRework?.state === 'RESOLVED'
+    && reviewRework?.root_claim_id === claim.root_claim_id
+  );
   const required = [
     binding?.schema_version === 1,
     binding?.kind === 'review_rework_terminal_attempt_isolation',
     binding?.root_claim_id === claim.claim_id,
     typeof recoveryId === 'string' && recoveryId.length > 0 && binding?.recovery_id === recoveryId,
     claim?.legacy_completion_recovery?.invalidated_completion_claim_id === claim.claim_id,
-    claim?.review_rework?.required === true && claim?.review_rework?.state === 'CHANGES_REQUESTED',
+    reviewReworkLifecycleValid,
     binding?.selected_todo_sha256 === selectedTodoSha256,
     binding?.source_task_id === fallback,
     typeof binding?.source_terminal_event_id === 'string' && binding.source_terminal_event_id.length > 0,
@@ -1067,6 +1107,49 @@ function reviewReworkLedgerAttemptIdentity(repoRoot, { claim, sourceTaskId, spec
     return { ok: false, code: 'review_rework_ledger_attempt_invalid', reason: 'source_terminal_provenance_mismatch' };
   }
   return { ok: true, task_id: binding.ledger_attempt_id, isolated: true, source_task_id: fallback };
+}
+
+// Resolve the only ledger attempt that a claim is allowed to transition. The
+// shell controller uses this instead of reconstructing `${todo}@${claim}` so
+// every source-state read is governed by the same immutable review-rework
+// provenance checks as the subsequent write.
+export function resolveClaimLedgerAttempt(repoRoot, { claim }) {
+  const claimId = claim?.claim_id;
+  const spec = typeof claim?.selected_todo === 'string' ? claim.selected_todo : '';
+  const sourceTaskId = selectedTodoId(spec);
+  if (!claimId || !spec || !sourceTaskId) {
+    return { ok: false, code: 'claim_fields_missing' };
+  }
+  let events;
+  try {
+    events = readTaskLedger(repoRoot);
+  } catch (error) {
+    return { ok: false, code: 'ledger_append_failed', error: error.message };
+  }
+  const identity = reviewReworkLedgerAttemptIdentity(repoRoot, {
+    claim,
+    sourceTaskId,
+    spec,
+    events
+  });
+  if (!identity.ok) {
+    return {
+      ok: false,
+      code: identity.code,
+      reason: identity.reason,
+      claim_id: claimId,
+      source_task_id: sourceTaskId
+    };
+  }
+  const task = taskProjection(events).get(identity.task_id);
+  return {
+    ok: true,
+    code: 'claim_ledger_attempt_resolved',
+    task_id: identity.task_id,
+    source_task_id: identity.source_task_id ?? identity.task_id,
+    task_state: task?.to_state ?? null,
+    isolated: identity.isolated === true
+  };
 }
 
 function replacementChildren(todoPath, parentTaskId) {
@@ -1136,11 +1219,38 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   const result = recordTerminalReplanWithChildren(repo, {
     selected_todo: selectedTodo,
     claim_id: snapshot.claim?.claim_id ?? null,
+    claim: snapshot.claim,
     run_id: args.get('run') || null,
     reason,
     evidence_source: args.get('evidence-source') || null,
     children
   });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (!result.ok) process.exit(78);
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname) && process.argv[2] === 'resolve-claim-attempt') {
+  const args = new Map(process.argv.slice(3).reduce((pairs, value, index, values) => (
+    value.startsWith('--') ? [...pairs, [value.slice(2), values[index + 1]]] : pairs
+  ), []));
+  const repo = args.get('repo');
+  const claimPath = args.get('claim');
+  if (!repo || !claimPath) process.exit(2);
+  let snapshot;
+  try {
+    snapshot = readClaimSnapshot(claimPath);
+  } catch (error) {
+    snapshot = { ok: false, state: error?.code === 'ENOENT' ? 'absent' : 'unreadable', error };
+  }
+  if (!snapshot?.ok) {
+    process.stdout.write(`${JSON.stringify({
+      ok: false,
+      code: snapshot?.state === 'absent' ? 'claim_absent' : 'claim_unreadable',
+      claim_state: snapshot?.state ?? 'unreadable'
+    })}\n`);
+    process.exit(78);
+  }
+  const result = resolveClaimLedgerAttempt(repo, { claim: snapshot.claim });
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (!result.ok) process.exit(78);
 }

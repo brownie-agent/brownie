@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { appendTaskTransition, readTaskLedger, recordTerminalFailureRecovery, recordTerminalReplanWithChildren, recordTrajectory, replanTaskWithChildren, reviewReworkLedgerAttemptId, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
+import { appendTaskTransition, readTaskLedger, recordTerminalFailureRecovery, recordTerminalReplanWithChildren, recordTrajectory, replanTaskWithChildren, resolveClaimLedgerAttempt, reviewReworkLedgerAttemptId, taskAttemptId, taskIsExecutable, taskProjection, validateTaskLedger } from './phase-loop-task-ledger.mjs';
 
 function terminalEvidence(selectedTodo, claimId) {
   return {
@@ -17,7 +17,9 @@ function terminalEvidence(selectedTodo, claimId) {
 }
 
 function reviewReworkClaimForTerminalAttempt({ repo, claimId, selectedTodo, terminalEvent }) {
-  const sourceTaskId = taskAttemptId('T-review-rework', claimId);
+  const sourceTodoId = selectedTodo.match(/^(?:[-*]|\d+[.)])\s+\[\s\]\s+([^:\s]+)/u)?.[1];
+  assert.ok(sourceTodoId, 'selected TODO must provide an id');
+  const sourceTaskId = taskAttemptId(sourceTodoId, claimId);
   const selectedTodoSha256 = crypto.createHash('sha256').update(selectedTodo).digest('hex');
   const recoveryId = 'review-rework-recovery';
   const sourceTerminalEventSha256 = crypto.createHash('sha256').update(JSON.stringify(terminalEvent)).digest('hex');
@@ -52,7 +54,7 @@ function reviewReworkClaimForTerminalAttempt({ repo, claimId, selectedTodo, term
       recovery_id: recoveryId,
       invalidated_completion_claim_id: claimId
     },
-    review_rework: { required: true, state: 'CHANGES_REQUESTED' },
+    review_rework: { required: true, state: 'CHANGES_REQUESTED', root_claim_id: claimId },
     review_rework_ledger_attempt: {
       schema_version: 1,
       kind: 'review_rework_terminal_attempt_isolation',
@@ -629,6 +631,125 @@ test('isolates a review-rework execution from an erroneous terminal attempt of t
   assert.equal(continued.code, 'duplicate_trajectory');
   assert.equal(taskProjection(readTaskLedger(repo)).get(isolatedTaskId).to_state, 'replanned');
   assert.equal(taskProjection(readTaskLedger(repo)).get(sourceTaskId).to_state, 'completed');
+});
+
+test('an isolated review-rework attempt can complete after independent review resolves', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const selectedTodo = [
+    '- [ ] T-review-rework-complete: rejected implementation root',
+    '  Route: implementation.',
+    '  Patch only `scripts/root.mjs`.',
+    '  Verification: run `node --test scripts/root.test.mjs`.'
+  ].join('\n');
+  const claimId = 'claim-review-rework-complete';
+  const sourceTaskId = taskAttemptId('T-review-rework-complete', claimId);
+  const specHash = crypto.createHash('sha256').update(selectedTodo).digest('hex');
+  let terminalEvent;
+  for (const to_state of ['queued', 'claimed', 'running', 'completed']) {
+    const result = appendTaskTransition(repo, {
+      task_id: sourceTaskId,
+      to_state,
+      claim_id: claimId,
+      run_id: 'historical-run',
+      task_spec_sha256: specHash
+    });
+    assert.equal(result.ok, true);
+    if (to_state === 'completed') terminalEvent = result.event;
+  }
+  const claimPath = path.join(repo, 'claim.json');
+  const claim = reviewReworkClaimForTerminalAttempt({ repo, claimId, selectedTodo, terminalEvent });
+  fs.writeFileSync(claimPath, JSON.stringify(claim));
+
+  assert.equal(recordTrajectory(repo, { claimPath, type: 'todo.claimed', runId: 'rework-run' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath, type: 'workflow.routed', runId: 'rework-run' }).ok, true);
+  claim.status = 'completed';
+  claim.review_rework = {
+    required: false,
+    state: 'RESOLVED',
+    root_claim_id: claimId,
+    resolved_at: '2026-10-31T10:00:00Z'
+  };
+  fs.writeFileSync(claimPath, JSON.stringify(claim));
+
+  const completion = recordTrajectory(repo, { claimPath, type: 'todo.completed', runId: 'rework-merged-run' });
+  assert.equal(completion.ok, true, JSON.stringify(completion));
+  const isolatedTaskId = claim.review_rework_ledger_attempt.ledger_attempt_id;
+  const projection = taskProjection(readTaskLedger(repo));
+  assert.equal(projection.get(sourceTaskId).to_state, 'completed');
+  assert.equal(projection.get(isolatedTaskId).to_state, 'completed');
+});
+
+test('terminal replan binds a review-rework failure to its isolated attempt', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'brownie-task-ledger-'));
+  const todo = path.join(repo, '.brownie', 'todo.md');
+  const selectedTodo = [
+    '- [ ] T-review-rework-replan: rejected multi-target root',
+    '  Route: implementation.',
+    '  Patch only `scripts/a.mjs` and `scripts/b.mjs`.',
+    '  Verification: run `node --test scripts/root.test.mjs`.'
+  ].join('\n');
+  fs.mkdirSync(path.dirname(todo), { recursive: true });
+  fs.writeFileSync(todo, [
+    '- [ ] T-review-rework-replan-followup: review-directed replacement',
+    '  Route: implementation.',
+    '  Source TODO: T-review-rework-replan.',
+    '  Patch only `scripts/a.mjs`.',
+    '  Verification: run `node --test scripts/root.test.mjs`.',
+    ''
+  ].join('\n'));
+  const claimId = 'claim-review-rework-replan';
+  const sourceTaskId = taskAttemptId('T-review-rework-replan', claimId);
+  const specHash = crypto.createHash('sha256').update(selectedTodo).digest('hex');
+  let terminalEvent;
+  for (const to_state of ['queued', 'claimed', 'running', 'completed']) {
+    const result = appendTaskTransition(repo, {
+      task_id: sourceTaskId,
+      to_state,
+      claim_id: claimId,
+      run_id: 'historical-run',
+      task_spec_sha256: specHash
+    });
+    assert.equal(result.ok, true);
+    if (to_state === 'completed') terminalEvent = result.event;
+  }
+  const claimPath = path.join(repo, 'claim.json');
+  const claim = reviewReworkClaimForTerminalAttempt({ repo, claimId, selectedTodo, terminalEvent });
+  fs.writeFileSync(claimPath, JSON.stringify(claim));
+
+  assert.equal(recordTrajectory(repo, { claimPath, todoPath: todo, type: 'todo.claimed', runId: 'rework-run' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath, todoPath: todo, type: 'workflow.routed', runId: 'rework-run' }).ok, true);
+  assert.equal(recordTrajectory(repo, { claimPath, todoPath: todo, type: 'todo.failed', runId: 'rework-run' }).ok, true);
+  const resolved = resolveClaimLedgerAttempt(repo, { claim });
+  assert.equal(resolved.ok, true, JSON.stringify(resolved));
+  const isolatedTaskId = claim.review_rework_ledger_attempt.ledger_attempt_id;
+  assert.equal(resolved.task_id, isolatedTaskId);
+  assert.equal(resolved.task_state, 'failed');
+  const cliResolved = JSON.parse(execFileSync(process.execPath, [
+    path.join(process.cwd(), 'scripts', 'phase-loop-task-ledger.mjs'),
+    'resolve-claim-attempt', '--repo', repo, '--claim', claimPath
+  ], { encoding: 'utf8' }));
+  assert.equal(cliResolved.ok, true, JSON.stringify(cliResolved));
+  assert.equal(cliResolved.task_id, isolatedTaskId);
+  assert.equal(cliResolved.task_state, 'failed');
+
+  const replan = recordTerminalReplanWithChildren(repo, {
+    selected_todo: selectedTodo,
+    claim_id: claimId,
+    claim,
+    run_id: 'rework-replan-run',
+    reason: 'terminal_multitarget_leaf_split',
+    evidence_source: 'prior_terminal_unproposed_workspace_write_ledger',
+    children: [
+      { task_id: 'T-review-rework-replan-followup', route: 'implementation', patch_targets: ['scripts/a.mjs'], verification_commands: ['node --test scripts/root.test.mjs'] }
+    ]
+  });
+  assert.equal(replan.ok, true, JSON.stringify(replan));
+  assert.equal(replan.source_task_id, isolatedTaskId);
+  const projection = taskProjection(readTaskLedger(repo));
+  assert.equal(projection.get(sourceTaskId).to_state, 'completed');
+  assert.equal(projection.get(isolatedTaskId).to_state, 'failed');
+  assert.equal(projection.get(replan.task_id).parent_task_id, isolatedTaskId);
+  assert.equal(projection.get('T-review-rework-replan-followup').parent_task_id, replan.task_id);
 });
 
 test('fails closed when a review-rework isolation binding no longer matches its terminal source', () => {
