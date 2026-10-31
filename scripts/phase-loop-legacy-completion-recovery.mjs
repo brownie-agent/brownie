@@ -417,6 +417,85 @@ export function attestLegacyMergedCompletion({
   };
 }
 
+function ensureReviewReworkFreshDispatch({
+  root,
+  stateRoot,
+  currentClaimPath,
+  currentClaim,
+  claimId,
+  selected,
+  recoveryId,
+  prUrl,
+  reviewer,
+  now
+}) {
+  const sameRecoveredClaim = (
+    currentClaim
+    && currentClaim.claim_id === claimId
+    && currentClaim.root_claim_id === claimId
+    && currentClaim.legacy_completion_recovery?.recovery_id === recoveryId
+    && currentClaim.review_rework?.required === true
+    && currentClaim.review_rework?.state === 'CHANGES_REQUESTED'
+    && sha256(currentClaim.selected_todo) === sha256(selected)
+    && ['claimed', 'in_progress'].includes(currentClaim.status)
+  );
+  if (!sameRecoveredClaim) {
+    throw new Error('idempotent_recovery_requires_live_matching_review_rework_claim');
+  }
+  if (typeof currentClaim.review_rework_fresh_dispatch_activated_run_stamp === 'string'
+    && currentClaim.review_rework_fresh_dispatch_activated_run_stamp) {
+    return {
+      fresh_runtime_dispatch_required: false,
+      fresh_runtime_dispatch_marker_restored: false,
+      fresh_runtime_dispatch_activated_run_stamp: currentClaim.review_rework_fresh_dispatch_activated_run_stamp
+    };
+  }
+  if (currentClaim.review_rework_fresh_dispatch_pending === true) {
+    return {
+      fresh_runtime_dispatch_required: true,
+      fresh_runtime_dispatch_marker_restored: false
+    };
+  }
+
+  // v1 recovery records created before this marker existed can be repaired
+  // only while their exact root claim remains live.  Record the repair before
+  // publishing it, so a crash is auditable and rerunning is deterministic.
+  const auditPath = path.join(stateRoot, 'legacy-completion-fresh-dispatch-repairs', `${recoveryId}.json`);
+  const audit = {
+    schema_version: 1,
+    record_type: 'legacy_completion_review_rework_fresh_dispatch_repair',
+    recovery_id: recoveryId,
+    claim_id: claimId,
+    pr_url: prUrl,
+    reviewer,
+    reason: 'legacy_review_rework_claim_had_no_fresh_dispatch_marker',
+    repaired_at: now
+  };
+  if (!fs.existsSync(auditPath)) atomicJson(auditPath, audit);
+  const repairedClaim = {
+    ...currentClaim,
+    review_rework_fresh_dispatch_pending: true,
+    review_rework_fresh_dispatch_recovery_id: recoveryId,
+    review_rework_fresh_dispatch_reason: 'legacy_completion_rejected_by_independent_review',
+    review_rework_fresh_dispatch_requested_at: now,
+    status_history: [
+      ...(Array.isArray(currentClaim.status_history) ? currentClaim.status_history : []),
+      {
+        status: 'fresh_runtime_dispatch_required',
+        updated_at: now,
+        note: 'review-rework recovery invalidated a stale Runtime continuation and requires an admitted fresh run'
+      }
+    ],
+    updated_at: now
+  };
+  atomicJson(currentClaimPath, repairedClaim);
+  return {
+    fresh_runtime_dispatch_required: true,
+    fresh_runtime_dispatch_marker_restored: true,
+    fresh_runtime_dispatch_repair_audit_path: path.relative(root, auditPath)
+  };
+}
+
 export function recoverLegacyRejectedCompletion({
   repoRoot,
   todoPath = defaultTodo,
@@ -443,6 +522,7 @@ export function recoverLegacyRejectedCompletion({
   const snapshot = readJson(snapshotFile);
   const review = readJson(reviewFile);
   const todoText = readText(todoFile);
+  const currentClaimPath = path.join(stateRoot, 'todo-claims', 'current.json');
   const preliminaryClaimId = typeof completion?.claim_id === 'string' ? completion.claim_id : '';
   const preliminaryTargetId = typeof completion?.selected_todo_id === 'string' ? completion.selected_todo_id : '';
   const preliminarySelected = typeof snapshot?.selected_todo === 'string' ? snapshot.selected_todo.trimEnd() : '';
@@ -457,6 +537,19 @@ export function recoverLegacyRejectedCompletion({
       && record.invalidated_completion_claim_id === preliminaryClaimId
     ));
     if (alreadyRecovered) {
+      const currentClaim = fs.existsSync(currentClaimPath) ? readJson(currentClaimPath) : null;
+      const freshDispatch = ensureReviewReworkFreshDispatch({
+        root,
+        stateRoot,
+        currentClaimPath,
+        currentClaim,
+        claimId: preliminaryClaimId,
+        selected: preliminarySelected,
+        recoveryId: preliminaryRecoveryId,
+        prUrl: review.pr_url,
+        reviewer: expectedReviewer,
+        now
+      });
       return {
         schema_version: 1,
         recovered: false,
@@ -464,7 +557,8 @@ export function recoverLegacyRejectedCompletion({
         recovery_id: preliminaryRecoveryId,
         claim_id: preliminaryClaimId,
         selected_todo_id: preliminaryTargetId,
-        pr_url: review.pr_url
+        pr_url: review.pr_url,
+        ...freshDispatch
       };
     }
   }
@@ -474,7 +568,6 @@ export function recoverLegacyRejectedCompletion({
     record.selected_todo_id === input.targetId && record.invalidated_completion_claim_id === input.claimId
   ));
   const recoveryId = sha256(`${input.claimId}\n${sha256(input.selected)}\n${review.pr_url}\n${review.head_sha}`).slice(0, 24);
-  const currentClaimPath = path.join(stateRoot, 'todo-claims', 'current.json');
   const currentClaim = fs.existsSync(currentClaimPath) ? readJson(currentClaimPath) : null;
   const currentStatus = currentClaim?.status;
   if (currentStatus === 'claimed' || currentStatus === 'in_progress') {
@@ -542,6 +635,13 @@ export function recoverLegacyRejectedCompletion({
     queue_generation: currentClaim?.queue_generation ?? null,
     baseline_todo_text: restoredTodo,
     baseline_diff_files: Array.isArray(currentClaim?.baseline_diff_files) ? currentClaim.baseline_diff_files : [],
+    // Review rejection invalidates the prior Runtime continuation, not merely
+    // its completion claim.  The controller must issue a fresh `run` and may
+    // clear this marker only after that new session is admitted.
+    review_rework_fresh_dispatch_pending: true,
+    review_rework_fresh_dispatch_recovery_id: recoveryId,
+    review_rework_fresh_dispatch_reason: 'legacy_completion_rejected_by_independent_review',
+    review_rework_fresh_dispatch_requested_at: now,
     legacy_completion_recovery: {
       recovery_id: recoveryId,
       invalidated_completion_claim_id: input.claimId,
@@ -591,6 +691,7 @@ export function recoverLegacyRejectedCompletion({
     review_head_sha: review.head_sha,
     feedback: review.latest_review.body,
     recovery_id: recoveryId,
+    fresh_runtime_dispatch_required: true,
     updated_at: now
   };
   const audit = {
@@ -610,6 +711,7 @@ export function recoverLegacyRejectedCompletion({
     todo_after_sha256: sha256(restoredTodo),
     archived_current_claim_path: currentClaim ? path.relative(root, currentArchivePath) : null,
     invalidation_path: path.relative(root, invalidationPath),
+    fresh_runtime_dispatch_required: true,
     recovered_at: now
   };
 
@@ -632,6 +734,7 @@ export function recoverLegacyRejectedCompletion({
     claim_id: input.claimId,
     selected_todo_id: input.targetId,
     pr_url: review.pr_url,
+    fresh_runtime_dispatch_required: true,
     actor_deployment_path: actors.deploymentPath ? path.relative(root, actors.deploymentPath) : null,
     audit_path: path.relative(root, auditPath),
     invalidation_path: path.relative(root, invalidationPath),
