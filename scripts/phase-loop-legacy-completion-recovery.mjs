@@ -493,6 +493,18 @@ function existingRepositoryRelativePath(root, value, label) {
   return relative;
 }
 
+function existingPathInsideRoot(root, value, label) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`review_rework_lineage_${label}_path_invalid`);
+  }
+  const resolved = path.resolve(root, value);
+  const relative = path.relative(root, resolved);
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || !fs.existsSync(resolved)) {
+    throw new Error(`review_rework_lineage_${label}_path_invalid`);
+  }
+  return relative;
+}
+
 function reviewReworkFeedbackIdentity(feedback) {
   const claimId = typeof feedback?.claim_id === 'string' ? feedback.claim_id : '';
   const recoveryId = typeof feedback?.recovery_id === 'string' ? feedback.recovery_id : '';
@@ -620,45 +632,395 @@ function completedReviewReworkFeedbackValid({ root, feedback, identity }) {
   }
 }
 
-function persistedReviewReworkSource({ root, stateRoot, identity }) {
-  const { claimId, recoveryId, selectedFirstLine } = identity;
-
-  // A stale rebaseline is the only normal path that may displace a live
-  // review-rework root. Search that bounded, audit-only namespace rather
-  // than guessing from a PR, a current TODO, or an arbitrary old claim.
-  const claimsDir = path.join(stateRoot, 'todo-claims');
-  if (!fs.existsSync(claimsDir)) {
-    throw new Error('review_rework_lineage_source_missing');
+function reviewReworkImmutableInputs({ root, feedback, identity }) {
+  const inputs = feedback?.recovery_inputs;
+  if (!inputs || typeof inputs !== 'object' || !identity.selectedTodoSha256
+    || !/^[a-f0-9]{64}$/u.test(identity.selectedTodoSha256)) {
+    throw new Error('review_rework_lineage_recovery_inputs_invalid');
   }
-  const candidates = fs.readdirSync(claimsDir)
-    .filter((entry) => /^stale-rebaseline-[A-Za-z0-9TZ_-]+\.json$/u.test(entry))
+  return {
+    completion_path: existingRepositoryRelativePath(root, inputs.completion_record_path, 'completion'),
+    snapshot_path: existingRepositoryRelativePath(root, inputs.immutable_snapshot_path, 'snapshot'),
+    review_receipt_path: existingRepositoryRelativePath(root, inputs.review_receipt_path, 'review_receipt'),
+    selected_todo_sha256: identity.selectedTodoSha256
+  };
+}
+
+function immutableLineageSource({ root, identity, inputs, sourceClaimPath = null, sourceClaimSha256 = null, establishedAt, establishedBy }) {
+  const selected = readJson(path.resolve(root, inputs.snapshot_path))?.selected_todo;
+  if (typeof selected !== 'string' || sha256(selected.trimEnd()) !== inputs.selected_todo_sha256) {
+    throw new Error('review_rework_lineage_snapshot_selected_todo_mismatch');
+  }
+  return {
+    schema_version: 1,
+    kind: 'review_rework_immutable_recovery_inputs',
+    claim_id: identity.claimId,
+    root_claim_id: identity.claimId,
+    recovery_id: identity.recoveryId,
+    selected_todo_sha256: inputs.selected_todo_sha256,
+    completion_record_path: inputs.completion_path,
+    completion_record_sha256: sha256(readText(path.resolve(root, inputs.completion_path))),
+    immutable_snapshot_path: inputs.snapshot_path,
+    immutable_snapshot_sha256: sha256(readText(path.resolve(root, inputs.snapshot_path))),
+    review_receipt_path: inputs.review_receipt_path,
+    review_receipt_sha256: sha256(readText(path.resolve(root, inputs.review_receipt_path))),
+    source_claim_path: sourceClaimPath,
+    source_claim_sha256: sourceClaimSha256,
+    established_by: establishedBy,
+    established_at: establishedAt
+  };
+}
+
+function verifiedImmutableLineageSource({ root, feedback, identity }) {
+  const source = feedback?.lineage_source;
+  if (source == null) return null;
+  const inputs = reviewReworkImmutableInputs({ root, feedback, identity });
+  if (
+    source?.schema_version !== 1
+    || source?.kind !== 'review_rework_immutable_recovery_inputs'
+    || source?.claim_id !== identity.claimId
+    || source?.root_claim_id !== identity.claimId
+    || source?.recovery_id !== identity.recoveryId
+    || source?.selected_todo_sha256 !== inputs.selected_todo_sha256
+    || source?.completion_record_path !== inputs.completion_path
+    || source?.immutable_snapshot_path !== inputs.snapshot_path
+    || source?.review_receipt_path !== inputs.review_receipt_path
+    || typeof source?.established_at !== 'string'
+    || !source.established_at
+    || typeof source?.established_by !== 'string'
+    || !source.established_by
+  ) {
+    throw new Error('review_rework_lineage_source_pointer_invalid');
+  }
+  for (const [field, relativePath] of [
+    ['completion_record_sha256', inputs.completion_path],
+    ['immutable_snapshot_sha256', inputs.snapshot_path],
+    ['review_receipt_sha256', inputs.review_receipt_path]
+  ]) {
+    if (typeof source[field] !== 'string' || !/^[a-f0-9]{64}$/u.test(source[field])
+      || source[field] !== sha256(readText(path.resolve(root, relativePath)))) {
+      throw new Error('review_rework_lineage_source_pointer_digest_mismatch');
+    }
+  }
+  if ((source.source_claim_path == null) !== (source.source_claim_sha256 == null)) {
+    throw new Error('review_rework_lineage_source_pointer_provenance_invalid');
+  }
+  if (source.source_claim_path != null) {
+    const sourcePath = existingRepositoryRelativePath(root, source.source_claim_path, 'source_claim');
+    if (sourcePath !== source.source_claim_path
+      || typeof source.source_claim_sha256 !== 'string'
+      || !/^[a-f0-9]{64}$/u.test(source.source_claim_sha256)
+      || source.source_claim_sha256 !== sha256(readText(path.resolve(root, sourcePath)))) {
+      throw new Error('review_rework_lineage_source_pointer_provenance_invalid');
+    }
+  }
+  const selected = readJson(path.resolve(root, inputs.snapshot_path))?.selected_todo;
+  if (typeof selected !== 'string' || sha256(selected.trimEnd()) !== inputs.selected_todo_sha256) {
+    throw new Error('review_rework_lineage_snapshot_selected_todo_mismatch');
+  }
+  return {
+    source_claim_path: source.source_claim_path,
+    selected_todo: selected.trimEnd(),
+    completion_path: inputs.completion_path,
+    snapshot_path: inputs.snapshot_path,
+    review_receipt_path: inputs.review_receipt_path,
+    lineage_source: source,
+    migrated: false
+  };
+}
+
+function matchingArchivedReviewReworkSources({ root, stateRoot, feedback, identity }) {
+  const claimsDir = path.join(stateRoot, 'todo-claims');
+  if (!fs.existsSync(claimsDir)) return [];
+  const inputs = reviewReworkImmutableInputs({ root, feedback, identity });
+  const identityCandidates = fs.readdirSync(claimsDir)
+    .filter((entry) => /^stale-rebaseline-[A-Za-z0-9TZ_.-]+\.json$/u.test(entry))
     .sort()
-    .map((entry) => ({
-      path: path.join(claimsDir, entry),
-      value: readJson(path.join(claimsDir, entry))
-    }))
+    .map((entry) => ({ path: path.join(claimsDir, entry), value: readJson(path.join(claimsDir, entry)) }))
     .filter(({ value }) => (
-      value?.claim_id === claimId
-      && value?.root_claim_id === claimId
-      && value?.legacy_completion_recovery?.recovery_id === recoveryId
+      value?.claim_id === identity.claimId
+      && value?.root_claim_id === identity.claimId
+      && value?.legacy_completion_recovery?.recovery_id === identity.recoveryId
       && value?.review_rework?.required === true
       && value?.review_rework?.state === 'CHANGES_REQUESTED'
-      && exactSelectedTodoFirstLine(value?.selected_todo) === selectedFirstLine
+      && exactSelectedTodoFirstLine(value?.selected_todo) === identity.selectedFirstLine
     ));
-  if (candidates.length !== 1) {
-    throw new Error(candidates.length === 0
-      ? 'review_rework_lineage_source_missing'
-      : 'review_rework_lineage_source_ambiguous');
+  const candidates = identityCandidates
+    .filter(({ value }) => (
+      sha256(value?.selected_todo?.trimEnd()) === inputs.selected_todo_sha256
+      && value.legacy_completion_recovery?.completion_record_path === inputs.completion_path
+      && value.legacy_completion_recovery?.immutable_snapshot_path === inputs.snapshot_path
+      && value.legacy_completion_recovery?.review_receipt_path === inputs.review_receipt_path
+    ));
+  if (candidates.length !== identityCandidates.length) {
+    throw new Error('review_rework_lineage_source_provenance_mismatch');
   }
+  return candidates
+    .map(({ path: candidatePath, value }) => ({
+      path: candidatePath,
+      value,
+      recovered_at: value.legacy_completion_recovery?.recovered_at,
+      recovered_at_ms: Date.parse(value.legacy_completion_recovery?.recovered_at ?? '')
+    }));
+}
 
-  const candidate = candidates[0];
-  const recovery = candidate.value.legacy_completion_recovery;
+function persistedReviewReworkSource({ root, stateRoot, feedbackPath, feedback, identity, now }) {
+  const direct = verifiedImmutableLineageSource({ root, feedback, identity });
+  if (direct) return direct;
+
+  // Legacy feedback predates the immutable source pointer.  It may have been
+  // archived repeatedly by the stale-claim controller.  Migrate only when all
+  // candidates attest the same immutable inputs and exactly one earliest
+  // recovery timestamp exists; otherwise retain the executable fail-closed
+  // ambiguity rather than selecting by filename or most-recent controller run.
+  const candidates = matchingArchivedReviewReworkSources({ root, stateRoot, feedback, identity });
+  if (candidates.length === 0) throw new Error('review_rework_lineage_source_missing');
+  if (candidates.some((candidate) => !Number.isFinite(candidate.recovered_at_ms))) {
+    throw new Error('review_rework_lineage_source_recovery_time_invalid');
+  }
+  const earliest = Math.min(...candidates.map((candidate) => candidate.recovered_at_ms));
+  const canonical = candidates.filter((candidate) => candidate.recovered_at_ms === earliest);
+  if (canonical.length !== 1) throw new Error('review_rework_lineage_source_ambiguous');
+  const sourceCandidate = canonical[0];
+  const sourcePath = path.relative(root, sourceCandidate.path);
+  const sourceDigest = sha256(readText(sourceCandidate.path));
+  const inputs = reviewReworkImmutableInputs({ root, feedback, identity });
+  const lineageSource = immutableLineageSource({
+    root,
+    identity,
+    inputs,
+    sourceClaimPath: sourcePath,
+    sourceClaimSha256: sourceDigest,
+    establishedAt: now,
+    establishedBy: 'legacy_stale_rebaseline_lineage_migration'
+  });
+  const migrationId = sha256(`${identity.recoveryId}\n${sourcePath}\n${sourceDigest}`).slice(0, 24);
+  const migrationPath = path.join(stateRoot, 'review-rework-lineage-migrations', `${migrationId}.json`);
+  const migration = {
+    schema_version: 1,
+    record_type: 'review_rework_immutable_lineage_source_migration',
+    migration_id: migrationId,
+    recovery_id: identity.recoveryId,
+    claim_id: identity.claimId,
+    source_claim_path: sourcePath,
+    source_claim_sha256: sourceDigest,
+    source_recovered_at: sourceCandidate.recovered_at,
+    candidate_count: candidates.length,
+    candidate_paths: candidates.map((candidate) => path.relative(root, candidate.path)),
+    selected_todo_sha256: inputs.selected_todo_sha256,
+    migrated_at: now
+  };
+  if (!fs.existsSync(migrationPath)) atomicJson(migrationPath, migration);
+  const migratedFeedback = {
+    ...feedback,
+    lineage_source: lineageSource,
+    lineage_source_migration: {
+      migration_id: migrationId,
+      audit_path: path.relative(root, migrationPath),
+      migrated_at: now
+    },
+    updated_at: now
+  };
+  atomicJson(feedbackPath, migratedFeedback);
   return {
-    source_claim_path: path.relative(root, candidate.path),
-    selected_todo: candidate.value.selected_todo.trimEnd(),
-    completion_path: existingRepositoryRelativePath(root, recovery.completion_record_path, 'completion'),
-    snapshot_path: existingRepositoryRelativePath(root, recovery.immutable_snapshot_path, 'snapshot'),
-    review_receipt_path: existingRepositoryRelativePath(root, recovery.review_receipt_path, 'review_receipt')
+    source_claim_path: sourcePath,
+    selected_todo: sourceCandidate.value.selected_todo.trimEnd(),
+    completion_path: inputs.completion_path,
+    snapshot_path: inputs.snapshot_path,
+    review_receipt_path: inputs.review_receipt_path,
+    lineage_source: lineageSource,
+    lineage_migration_audit_path: path.relative(root, migrationPath),
+    migrated: true
+  };
+}
+
+function derivativePreemptionEligibility({ root, stateRoot, currentClaim, source, todoText }) {
+  const sourceTodo = todoId(source.selected_todo);
+  const derivativeTodo = todoId(currentClaim?.selected_todo);
+  const status = currentClaim?.status;
+  if (!['claimed', 'in_progress'].includes(status)) return { eligible: false, reason: 'active_derivative_status_not_preemptible' };
+  if (!sourceTodo || !derivativeTodo || currentClaim.claim_id !== currentClaim.root_claim_id
+    || currentClaim.claim_id === source.lineage_source?.claim_id
+    || lineValue(currentClaim.selected_todo, 'Route') !== 'todo-decomposition'
+    || sourceTodoId(currentClaim.selected_todo) !== sourceTodo) {
+    return { eligible: false, reason: 'active_claim_is_not_exact_review_rework_derivative' };
+  }
+  if (findBlock(todoText, sourceTodo)?.trimEnd() !== source.selected_todo
+    || findBlock(todoText, derivativeTodo)?.trimEnd() !== currentClaim.selected_todo.trimEnd()) {
+    return { eligible: false, reason: 'active_derivative_queue_identity_mismatch' };
+  }
+  if (!/^[0-9]{8}T[0-9]{6}Z$/u.test(String(currentClaim.run_stamp ?? ''))) {
+    return { eligible: false, reason: 'active_derivative_run_stamp_invalid' };
+  }
+  const executionRelative = typeof currentClaim.terminal_failure_execution_evidence_path === 'string'
+    ? existingPathInsideRoot(root, currentClaim.terminal_failure_execution_evidence_path, 'derivative_execution_evidence')
+    : path.relative(root, path.join(stateRoot, 'runs', `${currentClaim.run_stamp}.execution-evidence.json`));
+  const executionPath = path.resolve(root, executionRelative);
+  if (!fs.existsSync(executionPath)) return { eligible: false, reason: 'active_derivative_execution_evidence_missing' };
+  const execution = readJson(executionPath);
+  const progressPath = path.join(stateRoot, 'progress-state.json');
+  if (!fs.existsSync(progressPath)) return { eligible: false, reason: 'active_derivative_progress_state_missing' };
+  const progress = readJson(progressPath);
+  const projection = progress?.progress_projection ?? {};
+  const unapplied = progress?.workspace_changed === false
+    && progress?.claim_lifecycle?.claim_id === currentClaim.claim_id
+    && projection?.claim_id === currentClaim.claim_id
+    && projection?.selected_todo === currentClaim.selected_todo
+    && projection?.objective_apply_pending === true
+    && !String(projection?.applied ?? '').trim()
+    && projection?.objective_apply_authorization_consumed !== true
+    && projection?.selected_todo_still_pending_in_queue === true;
+  const executionMatches = execution?.claim_id === currentClaim.claim_id
+    && execution?.runtime_claim_id === currentClaim.claim_id
+    && execution?.selected_todo_sha256 === sha256(currentClaim.selected_todo.trimEnd())
+    && execution?.task_execution_confirmed === true
+    && execution?.signals?.stop_class === 'continuation_required'
+    && execution?.signals?.stop_reason === 'objective_proposal_candidate_ready';
+  if (!unapplied || !executionMatches) {
+    return { eligible: false, reason: 'active_derivative_has_applied_or_unverifiable_execution' };
+  }
+  return {
+    eligible: true,
+    source_todo_id: sourceTodo,
+    derivative_todo_id: derivativeTodo,
+    execution_path: path.relative(root, executionPath),
+    execution_sha256: sha256(readText(executionPath)),
+    progress_path: path.relative(root, progressPath),
+    progress_sha256: sha256(readText(progressPath)),
+    execution_attestation: {
+      task_execution_confirmed: execution.task_execution_confirmed,
+      stop_class: execution.signals.stop_class,
+      stop_reason: execution.signals.stop_reason
+    },
+    progress_attestation: {
+      workspace_changed: progress.workspace_changed,
+      claim_id: progress.claim_lifecycle.claim_id,
+      projection_claim_id: projection.claim_id,
+      objective_apply_pending: projection.objective_apply_pending,
+      objective_apply_authorization_consumed: projection.objective_apply_authorization_consumed ?? false,
+      applied: projection.applied ?? '',
+      selected_todo_still_pending_in_queue: projection.selected_todo_still_pending_in_queue
+    }
+  };
+}
+
+function preemptUnappliedReviewReworkDerivative({ root, stateRoot, currentClaimPath, currentClaim, source, todoText, now }) {
+  const eligibility = derivativePreemptionEligibility({ root, stateRoot, currentClaim, source, todoText });
+  if (!eligibility.eligible) return eligibility;
+  const claimDir = path.dirname(currentClaimPath);
+  const currentClaimText = readText(currentClaimPath);
+  const sourceDigest = sha256(currentClaimText);
+  const preemptionId = sha256(`${source.lineage_source.recovery_id}\n${currentClaim.claim_id}\n${sourceDigest}`).slice(0, 24);
+  const archivePath = path.join(claimDir, `review-rework-derivative-preempted-${preemptionId}.json`);
+  const auditPath = path.join(stateRoot, 'review-rework-derivative-preemptions', `${preemptionId}.json`);
+  const archived = {
+    ...currentClaim,
+    status: 'review_rework_derivative_preempted',
+    archive_reason: 'unapplied_todo_decomposition_derivative_preempted_by_changes_requested_root',
+    review_rework_preemption_id: preemptionId,
+    preempted_source_claim_sha256: sourceDigest,
+    preempted_at: now,
+    status_history: [...(Array.isArray(currentClaim.status_history) ? currentClaim.status_history : []), {
+      status: 'review_rework_derivative_preempted',
+      updated_at: now,
+      note: 'unapplied todo-decomposition derivative was archived so the exact changes-requested root could resume'
+    }]
+  };
+  if (!fs.existsSync(archivePath)) atomicJson(archivePath, archived);
+  const archiveDigest = sha256(readText(archivePath));
+  const audit = {
+    schema_version: 1,
+    record_type: 'review_rework_unapplied_derivative_preemption',
+    preemption_id: preemptionId,
+    state: 'preempted',
+    recovery_id: source.lineage_source.recovery_id,
+    root_claim_id: source.lineage_source.claim_id,
+    root_selected_todo_sha256: source.lineage_source.selected_todo_sha256,
+    derivative_claim_id: currentClaim.claim_id,
+    derivative_root_claim_id: currentClaim.root_claim_id,
+    derivative_selected_todo_sha256: sha256(currentClaim.selected_todo.trimEnd()),
+    derivative_source_todo_id: eligibility.source_todo_id,
+    derivative_todo_id: eligibility.derivative_todo_id,
+    source_claim_sha256: sourceDigest,
+    archive_path: path.relative(root, archivePath),
+    archive_sha256: archiveDigest,
+    execution_evidence_path: eligibility.execution_path,
+    execution_evidence_sha256: eligibility.execution_sha256,
+    progress_state_path: eligibility.progress_path,
+    progress_state_sha256: eligibility.progress_sha256,
+    execution_attestation: eligibility.execution_attestation,
+    progress_attestation: eligibility.progress_attestation,
+    preempted_at: now
+  };
+  if (!fs.existsSync(auditPath)) atomicJson(auditPath, audit);
+  const stillCurrent = fs.existsSync(currentClaimPath) ? readText(currentClaimPath) : null;
+  if (stillCurrent != null && sha256(stillCurrent) === sourceDigest) {
+    fs.unlinkSync(currentClaimPath);
+  } else if (stillCurrent != null) {
+    throw new Error('review_rework_derivative_preemption_current_claim_changed');
+  }
+  return {
+    eligible: true,
+    preempted: true,
+    preemption_id: preemptionId,
+    preemption_audit_path: path.relative(root, auditPath),
+    derivative_archive_path: path.relative(root, archivePath)
+  };
+}
+
+function auditedDerivativePreemption({ root, stateRoot, identity, input }) {
+  const directory = path.join(stateRoot, 'review-rework-derivative-preemptions');
+  if (!fs.existsSync(directory)) return null;
+  const matches = fs.readdirSync(directory)
+    .filter((entry) => /^[a-f0-9]{24}\.json$/u.test(entry))
+    .sort()
+    .map((entry) => ({ path: path.join(directory, entry), value: readJson(path.join(directory, entry)) }))
+    .filter(({ value }) => (
+      value?.schema_version === 1
+      && value?.record_type === 'review_rework_unapplied_derivative_preemption'
+      && value?.state === 'preempted'
+      && value?.recovery_id === identity.recoveryId
+      && value?.root_claim_id === input.claimId
+      && value?.root_selected_todo_sha256 === sha256(input.selected)
+    ));
+  if (matches.length > 1) throw new Error('review_rework_derivative_preemption_ambiguous');
+  if (matches.length === 0) return null;
+  const match = matches[0];
+  const archivePath = existingRepositoryRelativePath(root, match.value.archive_path, 'derivative_preemption_archive');
+  if (typeof match.value.archive_sha256 !== 'string'
+    || match.value.archive_sha256 !== sha256(readText(path.resolve(root, archivePath)))) {
+    throw new Error('review_rework_derivative_preemption_archive_digest_mismatch');
+  }
+  const archived = readJson(path.resolve(root, archivePath));
+  if (archived?.status !== 'review_rework_derivative_preempted'
+    || archived?.claim_id !== match.value.derivative_claim_id
+    || archived?.root_claim_id !== match.value.derivative_root_claim_id
+    || sha256(archived?.selected_todo?.trimEnd()) !== match.value.derivative_selected_todo_sha256
+    || archived?.preempted_source_claim_sha256 !== match.value.source_claim_sha256
+    || archived?.archive_reason !== 'unapplied_todo_decomposition_derivative_preempted_by_changes_requested_root'
+    || lineValue(archived?.selected_todo, 'Route') !== 'todo-decomposition'
+    || sourceTodoId(archived?.selected_todo) !== todoId(input.selected)) {
+    throw new Error('review_rework_derivative_preemption_archive_invalid');
+  }
+  if (
+    match.value.execution_attestation?.task_execution_confirmed !== true
+    || match.value.execution_attestation?.stop_class !== 'continuation_required'
+    || match.value.execution_attestation?.stop_reason !== 'objective_proposal_candidate_ready'
+    || match.value.progress_attestation?.workspace_changed !== false
+    || match.value.progress_attestation?.claim_id !== match.value.derivative_claim_id
+    || match.value.progress_attestation?.projection_claim_id !== match.value.derivative_claim_id
+    || match.value.progress_attestation?.objective_apply_pending !== true
+    || match.value.progress_attestation?.objective_apply_authorization_consumed !== false
+    || String(match.value.progress_attestation?.applied ?? '').trim()
+    || match.value.progress_attestation?.selected_todo_still_pending_in_queue !== true
+  ) {
+    throw new Error('review_rework_derivative_preemption_execution_attestation_invalid');
+  }
+  return {
+    preemption_id: match.value.preemption_id,
+    audit_path: path.relative(root, match.path),
+    archive_path: archivePath,
+    archived_claim: archived
   };
 }
 
@@ -689,11 +1051,8 @@ export function reconcilePersistedReviewRework({
     return { schema_version: 1, applicable: false, reason: 'review_rework_feedback_already_resolved' };
   }
   const currentClaimPath = path.join(stateRoot, 'todo-claims', 'current.json');
-  if (!fs.existsSync(currentClaimPath)) {
-    throw new Error('review_rework_lineage_current_claim_missing');
-  }
-  const currentClaim = readJson(currentClaimPath);
-  if (isLiveMatchingReviewReworkClaim({
+  let currentClaim = fs.existsSync(currentClaimPath) ? readJson(currentClaimPath) : null;
+  if (currentClaim && isLiveMatchingReviewReworkClaim({
     currentClaim,
     claimId: identity.claimId,
     selected: currentClaim.selected_todo,
@@ -720,7 +1079,9 @@ export function reconcilePersistedReviewRework({
     };
   }
   const todoText = readText(path.resolve(root, todoPath));
-  const resolvedDelivery = resolvedReviewReworkDelivery({ currentClaim, identity, todoText });
+  const resolvedDelivery = currentClaim
+    ? resolvedReviewReworkDelivery({ currentClaim, identity, todoText })
+    : { valid: false };
   if (resolvedDelivery.valid) {
     return resolvePersistedReviewReworkFeedback({
       root,
@@ -732,9 +1093,43 @@ export function reconcilePersistedReviewRework({
       now
     });
   }
-  const source = persistedReviewReworkSource({ root, stateRoot, identity });
-  if (sha256(currentClaim?.selected_todo) !== sha256(source.selected_todo)) {
-    throw new Error('review_rework_lineage_selected_todo_mismatch');
+  const source = persistedReviewReworkSource({
+    root,
+    stateRoot,
+    feedbackPath,
+    feedback,
+    identity,
+    now
+  });
+  let derivativePreemption = null;
+  if (currentClaim && sha256(currentClaim.selected_todo) !== sha256(source.selected_todo)) {
+    derivativePreemption = preemptUnappliedReviewReworkDerivative({
+      root,
+      stateRoot,
+      currentClaimPath,
+      currentClaim,
+      source,
+      todoText,
+      now
+    });
+    if (!derivativePreemption.preempted) {
+      throw new Error(derivativePreemption.reason === 'active_derivative_has_applied_or_unverifiable_execution'
+        ? 'review_rework_lineage_active_derivative_not_safely_preemptible'
+        : 'review_rework_lineage_selected_todo_mismatch');
+    }
+    currentClaim = null;
+  }
+  if (!currentClaim) {
+    const audited = auditedDerivativePreemption({
+      root,
+      stateRoot,
+      identity,
+      input: {
+        claimId: identity.claimId,
+        selected: source.selected_todo
+      }
+    });
+    if (!audited) throw new Error('review_rework_lineage_current_claim_missing');
   }
   const recovered = recoverLegacyRejectedCompletion({
     repoRoot: root,
@@ -752,7 +1147,14 @@ export function reconcilePersistedReviewRework({
     schema_version: 1,
     applicable: true,
     lineage_source_claim_path: source.source_claim_path,
+    lineage_source_migrated: source.migrated,
+    lineage_source_migration_audit_path: source.lineage_migration_audit_path ?? null,
     feedback_path: path.relative(root, feedbackPath),
+    ...(derivativePreemption?.preempted ? {
+      derivative_preemption_id: derivativePreemption.preemption_id,
+      derivative_preemption_audit_path: derivativePreemption.preemption_audit_path,
+      derivative_archive_path: derivativePreemption.derivative_archive_path
+    } : {}),
     ...recovered
   };
 }
@@ -1061,6 +1463,14 @@ export function recoverLegacyRejectedCompletion({
   ));
   const recoveryId = sha256(`${input.claimId}\n${sha256(input.selected)}\n${review.pr_url}\n${review.head_sha}`).slice(0, 24);
   const currentClaim = fs.existsSync(currentClaimPath) ? readJson(currentClaimPath) : null;
+  const derivativePreemption = alreadyInvalidated && currentClaim == null
+    ? auditedDerivativePreemption({
+      root,
+      stateRoot,
+      identity: { recoveryId },
+      input
+    })
+    : null;
   const currentStatus = currentClaim?.status;
   // A claim awaiting review, or carrying newly requested changes, has a
   // durable PR handoff that phase-loop.sh must reconcile.  It is neither a
@@ -1094,7 +1504,7 @@ export function recoverLegacyRejectedCompletion({
     claimId: input.claimId,
     selected: input.selected,
     invalidation
-  }) && !partialInitialRecovery) {
+  }) && !partialInitialRecovery && !derivativePreemption) {
     throw new Error('idempotent_recovery_requires_proven_terminal_displacement');
   }
 
@@ -1154,7 +1564,7 @@ export function recoverLegacyRejectedCompletion({
   const recoveryDir = path.join(stateRoot, 'legacy-completion-recoveries');
   const invalidationPath = path.join(stateRoot, 'todo-completion-invalidations', `${input.claimId}-${recoveryId}.json`);
   const displacedClaimDigest = currentClaim ? sha256(JSON.stringify(currentClaim)).slice(0, 16) : null;
-  const idempotentDisplacement = alreadyInvalidated && !partialInitialRecovery && !isLiveMatchingReviewReworkClaim({
+  const idempotentDisplacement = alreadyInvalidated && currentClaim != null && !partialInitialRecovery && !isLiveMatchingReviewReworkClaim({
     currentClaim,
     claimId: input.claimId,
     selected: input.selected,
@@ -1169,6 +1579,43 @@ export function recoverLegacyRejectedCompletion({
     : `${recoveryId}.json`);
   const todoSnapshotPath = path.join(recoveryDir, `${recoveryId}.todo-before.md`);
   const feedbackPath = path.join(stateRoot, 'todo-repair-feedback.json');
+  const feedbackIdentity = {
+    claimId: input.claimId,
+    recoveryId,
+    selectedTodoSha256: sha256(input.selected)
+  };
+  const feedbackInputs = {
+    completion_path: path.relative(root, completionFile),
+    snapshot_path: path.relative(root, snapshotFile),
+    review_receipt_path: path.relative(root, reviewFile),
+    selected_todo_sha256: sha256(input.selected)
+  };
+  const existingFeedback = fs.existsSync(feedbackPath) ? readJson(feedbackPath) : null;
+  let lineageSource = immutableLineageSource({
+    root,
+    identity: feedbackIdentity,
+    inputs: feedbackInputs,
+    establishedAt: now,
+    establishedBy: 'legacy_completion_recovery'
+  });
+  let lineageSourceMigration = null;
+  if (existingFeedback != null) {
+    const existingIdentity = reviewReworkFeedbackIdentity(existingFeedback);
+    if (existingIdentity.claimId !== input.claimId
+      || existingIdentity.recoveryId !== recoveryId
+      || existingIdentity.selectedTodoSha256 !== feedbackIdentity.selectedTodoSha256) {
+      throw new Error('review_rework_lineage_existing_feedback_identity_mismatch');
+    }
+    const existingLineage = verifiedImmutableLineageSource({
+      root,
+      feedback: existingFeedback,
+      identity: existingIdentity
+    });
+    if (existingLineage) {
+      lineageSource = existingLineage.lineage_source;
+      lineageSourceMigration = existingFeedback.lineage_source_migration ?? null;
+    }
+  }
   const restoredClaim = {
     schema_version: 1,
     claim_id: input.claimId,
@@ -1177,9 +1624,13 @@ export function recoverLegacyRejectedCompletion({
     selected_todo: input.selected,
     selected_todo_sha256: sha256(input.selected),
     queue_fingerprint: sha256(restoredTodo),
-    queue_generation: currentClaim?.queue_generation ?? null,
+    queue_generation: currentClaim?.queue_generation ?? derivativePreemption?.archived_claim?.queue_generation ?? null,
     baseline_todo_text: restoredTodo,
-    baseline_diff_files: Array.isArray(currentClaim?.baseline_diff_files) ? currentClaim.baseline_diff_files : [],
+    baseline_diff_files: Array.isArray(currentClaim?.baseline_diff_files)
+      ? currentClaim.baseline_diff_files
+      : (Array.isArray(derivativePreemption?.archived_claim?.baseline_diff_files)
+        ? derivativePreemption.archived_claim.baseline_diff_files
+        : []),
     // Review rejection invalidates the prior Runtime continuation, not merely
     // its completion claim.  The controller must issue a fresh `run` and may
     // clear this marker only after that new session is admitted.
@@ -1224,6 +1675,11 @@ export function recoverLegacyRejectedCompletion({
         status: 'legacy_completion_recovery_reasserted',
         updated_at: now,
         note: 'terminal claim that displaced the review-rework root was archived before restoring the same root claim'
+      }] : []),
+      ...(derivativePreemption ? [{
+        status: 'legacy_completion_recovery_reasserted',
+        updated_at: now,
+        note: 'unapplied todo-decomposition derivative was audit-archived before restoring the changes-requested root claim'
       }] : [])
     ],
     updated_at: now
@@ -1243,11 +1699,13 @@ export function recoverLegacyRejectedCompletion({
     feedback: review.latest_review.body,
     recovery_id: recoveryId,
     recovery_inputs: {
-      completion_record_path: path.relative(root, completionFile),
-      immutable_snapshot_path: path.relative(root, snapshotFile),
-      review_receipt_path: path.relative(root, reviewFile),
+      completion_record_path: feedbackInputs.completion_path,
+      immutable_snapshot_path: feedbackInputs.snapshot_path,
+      review_receipt_path: feedbackInputs.review_receipt_path,
       selected_todo_sha256: sha256(input.selected)
     },
+    lineage_source: lineageSource,
+    ...(lineageSourceMigration ? { lineage_source_migration: lineageSourceMigration } : {}),
     fresh_runtime_dispatch_required: true,
     updated_at: now
   };
@@ -1271,6 +1729,11 @@ export function recoverLegacyRejectedCompletion({
     fresh_runtime_dispatch_required: true,
     idempotent_displacement: idempotentDisplacement,
     idempotent_partial_initial_recovery: partialInitialRecovery,
+    audited_derivative_preemption: derivativePreemption ? {
+      preemption_id: derivativePreemption.preemption_id,
+      audit_path: derivativePreemption.audit_path,
+      archive_path: derivativePreemption.archive_path
+    } : null,
     recovered_at: now
   };
 
@@ -1290,6 +1753,7 @@ export function recoverLegacyRejectedCompletion({
     recovered: true,
     idempotent_recovery: alreadyInvalidated,
     idempotent_partial_initial_recovery: partialInitialRecovery,
+    audited_derivative_preemption: Boolean(derivativePreemption),
     recovery_id: recoveryId,
     claim_id: input.claimId,
     selected_todo_id: input.targetId,
@@ -1301,6 +1765,8 @@ export function recoverLegacyRejectedCompletion({
     current_claim_path: path.relative(root, currentClaimPath),
     displaced_claim_archive_path: currentClaim ? path.relative(root, currentArchivePath) : null,
     idempotent_displacement: idempotentDisplacement,
+    audited_derivative_preemption: Boolean(derivativePreemption),
+    derivative_preemption_audit_path: derivativePreemption?.audit_path ?? null,
     queue_validation: queueValidation
   };
 }

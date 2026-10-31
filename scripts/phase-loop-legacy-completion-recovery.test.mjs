@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -407,6 +408,188 @@ test('reconciles persisted review feedback before a displaced terminal claim can
   const displaced = JSON.parse(fs.readFileSync(path.join(value.root, reconciled.displaced_claim_archive_path), 'utf8'));
   assert.equal(displaced.claim_id, 'fresh-looking-terminal-claim');
   assert.equal(displaced.status, 'integrity_blocked');
+});
+
+test('migrates one canonical immutable lineage pointer from repeated rebaseline archives without choosing by filename', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const recoveredRoot = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  const feedbackPath = path.join(value.root, value.state, 'todo-repair-feedback.json');
+  const legacyFeedback = JSON.parse(fs.readFileSync(feedbackPath, 'utf8'));
+  delete legacyFeedback.lineage_source;
+  writeJson(feedbackPath, legacyFeedback);
+
+  const earliest = structuredClone(recoveredRoot);
+  earliest.legacy_completion_recovery.recovered_at = '2026-10-31T00:00:00.000Z';
+  const later = structuredClone(recoveredRoot);
+  later.legacy_completion_recovery.recovered_at = '2026-10-31T00:01:00.000Z';
+  writeJson(path.join(value.root, value.state, 'todo-claims', 'stale-rebaseline-20261031T000010Z.json'), later);
+  writeJson(path.join(value.root, value.state, 'todo-claims', 'stale-rebaseline-20261031T000009Z.json'), earliest);
+  writeJson(currentPath, {
+    claim_id: 'fresh-looking-terminal-claim',
+    root_claim_id: 'fresh-looking-terminal-claim',
+    status: 'integrity_blocked',
+    selected_todo: target,
+    status_history: [{ requested_status: 'completed', status: 'integrity_blocked', updated_at: '2026-10-31T00:02:00.000Z' }]
+  });
+
+  const reconciled = reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:03:00.000Z'
+  });
+  assert.equal(reconciled.recovered, true, JSON.stringify(reconciled));
+  assert.equal(reconciled.lineage_source_migrated, true);
+  const feedback = JSON.parse(fs.readFileSync(feedbackPath, 'utf8'));
+  assert.equal(feedback.lineage_source.established_by, 'legacy_stale_rebaseline_lineage_migration');
+  assert.match(feedback.lineage_source.source_claim_path, /20261031T000009Z/);
+  assert.ok(feedback.lineage_source_migration.audit_path);
+  assert.ok(fs.existsSync(path.join(value.root, feedback.lineage_source_migration.audit_path)));
+});
+
+test('fails closed when repeated rebaseline archives have no unique earliest recovery provenance', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const recoveredRoot = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  const feedbackPath = path.join(value.root, value.state, 'todo-repair-feedback.json');
+  const legacyFeedback = JSON.parse(fs.readFileSync(feedbackPath, 'utf8'));
+  delete legacyFeedback.lineage_source;
+  writeJson(feedbackPath, legacyFeedback);
+  recoveredRoot.legacy_completion_recovery.recovered_at = '2026-10-31T00:00:00.000Z';
+  writeJson(path.join(value.root, value.state, 'todo-claims', 'stale-rebaseline-20261031T000010Z.json'), recoveredRoot);
+  writeJson(path.join(value.root, value.state, 'todo-claims', 'stale-rebaseline-20261031T000011Z.json'), recoveredRoot);
+  writeJson(currentPath, {
+    claim_id: 'fresh-looking-terminal-claim',
+    root_claim_id: 'fresh-looking-terminal-claim',
+    status: 'integrity_blocked',
+    selected_todo: target,
+    status_history: [{ requested_status: 'completed', status: 'integrity_blocked', updated_at: '2026-10-31T00:02:00.000Z' }]
+  });
+  assert.throws(() => reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment
+  }), /review_rework_lineage_source_ambiguous/);
+});
+
+test('audits and preempts only an unapplied exact todo-decomposition derivative before restoring the changes-requested root', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const derivative = `- [ ] E-target-replan: Replan the rejected target only.\n  Route: todo-decomposition.\n  Source TODO: E-target.\n  Depends on: <none>.\n  Completion condition: a bounded replacement is proposed.\n  Forbidden changes: do not apply a workspace patch.\n  Verification: run \`node --test scripts/target.test.mjs\`.`;
+  const todoPath = path.join(value.root, '.brownie/todo.md');
+  fs.appendFileSync(todoPath, `\n${derivative}\n`);
+  const currentPath = path.join(value.root, first.current_claim_path);
+  const runStamp = '20261031T000100Z';
+  const evidencePath = path.join(value.root, value.state, 'runs', `${runStamp}.execution-evidence.json`);
+  writeJson(evidencePath, {
+    claim_id: 'unapplied-derivative',
+    runtime_claim_id: 'unapplied-derivative',
+    selected_todo_sha256: crypto.createHash('sha256').update(derivative).digest('hex'),
+    task_execution_confirmed: true,
+    signals: { stop_class: 'continuation_required', stop_reason: 'objective_proposal_candidate_ready' }
+  });
+  writeJson(currentPath, {
+    claim_id: 'unapplied-derivative',
+    root_claim_id: 'unapplied-derivative',
+    status: 'in_progress',
+    selected_todo: derivative,
+    run_stamp: runStamp,
+    terminal_failure_execution_evidence_path: path.relative(value.root, evidencePath)
+  });
+  writeJson(path.join(value.root, value.state, 'progress-state.json'), {
+    workspace_changed: false,
+    claim_lifecycle: { claim_id: 'unapplied-derivative' },
+    progress_projection: {
+      claim_id: 'unapplied-derivative',
+      selected_todo: derivative,
+      objective_apply_pending: true,
+      objective_apply_authorization_consumed: false,
+      applied: '',
+      selected_todo_still_pending_in_queue: true
+    }
+  });
+
+  const reconciled = reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:02:00.000Z'
+  });
+  assert.equal(reconciled.recovered, true, JSON.stringify(reconciled));
+  assert.ok(reconciled.derivative_preemption_audit_path);
+  const restored = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+  assert.equal(restored.claim_id, 'legacy-claim');
+  const audit = JSON.parse(fs.readFileSync(path.join(value.root, reconciled.derivative_preemption_audit_path), 'utf8'));
+  assert.equal(audit.state, 'preempted');
+  const archived = JSON.parse(fs.readFileSync(path.join(value.root, reconciled.derivative_archive_path), 'utf8'));
+  assert.equal(archived.status, 'review_rework_derivative_preempted');
+});
+
+test('does not preempt a review-rework derivative after workspace mutation evidence exists', () => {
+  const value = fixture();
+  const first = recoverLegacyRejectedCompletion({
+    repoRoot: value.root,
+    statePath: value.state,
+    completionPath: value.completion,
+    snapshotPath: value.snapshot,
+    reviewReceiptPath: value.review,
+    actorDeployment: value.actorDeployment,
+    now: '2026-10-31T00:00:00.000Z'
+  });
+  const derivative = `- [ ] E-target-replan: Replan the rejected target only.\n  Route: todo-decomposition.\n  Source TODO: E-target.\n  Depends on: <none>.\n  Completion condition: a bounded replacement is proposed.\n  Forbidden changes: do not apply a workspace patch.\n  Verification: run \`node --test scripts/target.test.mjs\`.`;
+  const todoPath = path.join(value.root, '.brownie/todo.md');
+  fs.appendFileSync(todoPath, `\n${derivative}\n`);
+  const currentPath = path.join(value.root, first.current_claim_path);
+  writeJson(currentPath, {
+    claim_id: 'applied-derivative',
+    root_claim_id: 'applied-derivative',
+    status: 'in_progress',
+    selected_todo: derivative,
+    run_stamp: '20261031T000100Z',
+    terminal_failure_execution_evidence_path: path.join(value.state, 'runs', '20261031T000100Z.execution-evidence.json')
+  });
+  writeJson(path.join(value.root, value.state, 'runs', '20261031T000100Z.execution-evidence.json'), {
+    claim_id: 'applied-derivative', runtime_claim_id: 'applied-derivative', selected_todo_sha256: '0'.repeat(64), task_execution_confirmed: true,
+    signals: { stop_class: 'continuation_required', stop_reason: 'objective_proposal_candidate_ready' }
+  });
+  writeJson(path.join(value.root, value.state, 'progress-state.json'), {
+    workspace_changed: true,
+    claim_lifecycle: { claim_id: 'applied-derivative' },
+    progress_projection: { claim_id: 'applied-derivative', selected_todo: derivative, objective_apply_pending: false, applied: 'true' }
+  });
+  assert.throws(() => reconcilePersistedReviewRework({
+    repoRoot: value.root,
+    statePath: value.state,
+    actorDeployment: value.actorDeployment
+  }), /review_rework_lineage_active_derivative_not_safely_preemptible/);
+  assert.equal(JSON.parse(fs.readFileSync(currentPath, 'utf8')).claim_id, 'applied-derivative');
 });
 
 test('reconciliation preserves a live review-rework root without requiring a stale archive', () => {
